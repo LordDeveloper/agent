@@ -116,36 +116,65 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/health
 
 در پنل بات، سرور را با `core=node_api` و `core_meta.agent_core` مناسب ثبت کنید.
 
-### Option B — GitHub Actions (بیلد خودکار لینوکس)
+### Option B — curl installer از GitHub (پیشنهادی برای VPS)
 
-ریپو: [LordDeveloper/agent](https://github.com/LordDeveloper/agent)
+ریپو خصوصی است؛ برای دانلود ریلیز به **GitHub Token** نیاز دارید.
 
-Workflow در `.github/workflows/release.yml`:
+#### ۱) ساخت توکن
 
-- روی `push` تگ `v*` یا `workflow_dispatch` اجرا می‌شود
-- با Docker باینری لینوکس می‌سازد
-- Artifact / GitHub Release با نام `agent-linux-amd64` منتشر می‌کند
+- Classic PAT با scopeی `repo`، یا
+- Fine-grained PAT روی ریپوی `LordDeveloper/agent` با permission: **Contents = Read-only**
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-نصب از ریلیز:
+#### ۲) نصب یک‌خطی
 
 ```bash
-curl -L -o /tmp/agent https://github.com/LordDeveloper/agent/releases/latest/download/agent-linux-amd64
-chmod +x /tmp/agent
-# install.sh را از همان ریلیز دانلود کنید
-curl -L -o /tmp/install.sh https://github.com/LordDeveloper/agent/releases/latest/download/install.sh
-curl -L -o /tmp/agent.service https://github.com/LordDeveloper/agent/releases/latest/download/agent.service
-mkdir -p /tmp/agent-pack/dist /tmp/agent-pack/systemd
-mv /tmp/agent /tmp/agent-pack/dist/agent
-mv /tmp/install.sh /tmp/agent-pack/install.sh
-mv /tmp/agent.service /tmp/agent-pack/systemd/agent.service
-cd /tmp/agent-pack
-sudo bash install.sh --with xray,wireguard --open-firewall
+export GITHUB_TOKEN=ghp_xxx   # یا fine-grained token
+
+# اسکریپت را از branch اصلی بکش (raw هم برای private با Bearer کار می‌کند)
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+  | sudo -E bash -s -- --with xray,wireguard --open-firewall
 ```
+
+یا از asset ریلیز:
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  -o /tmp/get-agent.sh \
+  "https://github.com/LordDeveloper/agent/releases/latest/download/get-agent.sh"
+sudo -E bash /tmp/get-agent.sh --with xray,wireguard
+```
+
+`get-agent.sh` آخرین `agent-linux-amd64` را از Releases می‌گیرد، در `/opt/agent/bin/agent` نصب می‌کند، unit systemd می‌سازد و در صورت نبودن `.env`، `GITHUB_TOKEN` را برای آپدیت‌های بعدی در `/etc/agent/.env` ذخیره می‌کند.
+
+### Option C — GitHub Actions (بیلد)
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+بعد از سبز شدن workflow، assetهای ریلیز شامل `agent-linux-amd64` و `get-agent.sh` هستند.
+
+---
+
+## Self-update
+
+روی سرور (باینری نصب‌شده):
+
+```bash
+sudo agent update --check
+sudo agent update
+# یا:
+sudo agent update --force
+```
+
+توکن از این منابع خوانده می‌شود (به ترتیب):
+
+1. `--token`
+2. `AGENT_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` در محیط
+3. همان کلیدها داخل `/etc/agent/.env`
 
 ---
 

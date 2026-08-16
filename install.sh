@@ -15,9 +15,8 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [--with xray,wireguard,amnezia] [--binary ./dist/agent] [--open-firewall] [--uninstall]
 
-Deploys the pre-built agent binary + .env config. Build the binary first:
-  make build          # Linux amd64 via Docker
-  # or copy dist/agent to the server
+Deploys a local pre-built binary. For remote GitHub install use:
+  scripts/get-agent.sh   # curl-friendly; supports private repos via GITHUB_TOKEN
 EOF
 }
 

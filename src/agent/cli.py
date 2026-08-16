@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from agent.ops import (
     write_env_file,
 )
 from agent.runtime import open_runtime
+from agent.update import check_for_update, perform_update, resolve_token
 
 
 def _print_json(data) -> None:
@@ -170,6 +172,41 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
+    from dotenv import load_dotenv
+
+    env_candidates = [
+        args.env_file if getattr(args, "env_file", None) else None,
+        os.environ.get("ENV_FILE"),
+        "/etc/agent/.env",
+        ".env",
+    ]
+    for candidate in env_candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.is_file():
+            load_dotenv(path, override=False)
+            break
+
+    token = args.token or resolve_token()
+    if args.check:
+        payload = check_for_update(repo=args.repo, token=token, asset_name=args.asset)
+        _print_json({"success": True, **payload})
+        return 0
+
+    result = perform_update(
+        repo=args.repo,
+        token=token,
+        asset_name=args.asset,
+        force=bool(args.force),
+        restart=not bool(args.no_restart),
+    )
+    _print_json({"success": True, **result})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent",
@@ -218,6 +255,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_wizard = sub.add_parser("wizard", help="Interactive setup (.env + optional cores/service)")
     p_wizard.add_argument("--env-path", default="/etc/agent/.env")
     p_wizard.set_defaults(func=cmd_wizard)
+
+    p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
+    _env_flag(p_update)
+    p_update.add_argument("--check", action="store_true", help="Only check for a newer release")
+    p_update.add_argument("--force", action="store_true", help="Reinstall latest even if versions match")
+    p_update.add_argument("--no-restart", action="store_true", help="Do not restart systemd service")
+    p_update.add_argument("--repo", default=None, help="owner/name (default: AGENT_GITHUB_REPO or LordDeveloper/agent)")
+    p_update.add_argument("--asset", default=None, help="Release asset name (default: agent-linux-amd64)")
+    p_update.add_argument(
+        "--token",
+        default=None,
+        help="GitHub token (default: AGENT_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN)",
+    )
+    p_update.set_defaults(func=cmd_update)
 
     return parser
 
