@@ -107,8 +107,41 @@ def write_env_file(
         pass
 
 
-def generate_token() -> str:
-    return secrets.token_hex(32)
+def generate_token(nbytes: int = 32) -> str:
+    if nbytes < 16 or nbytes > 128:
+        raise AgentError("VALIDATION_ERROR", "token size must be between 16 and 128 bytes")
+    return secrets.token_hex(nbytes)
+
+
+def set_env_value(path: Path, key: str, value: str) -> dict:
+    """Create or update a KEY=value line in an env file. Preserves other lines."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+
+    prefix = f"{key}="
+    replaced = False
+    out: list[str] = []
+    for line in lines:
+        if line.startswith(prefix) or line.startswith(f"export {prefix}"):
+            out.append(f"{key}={value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append(f"{key}={value}")
+
+    text = "\n".join(out).rstrip() + "\n"
+    path.write_text(text, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return {"path": str(path), "key": key, "updated": replaced, "created": not replaced}
 
 
 def systemd_unit_path() -> Path:

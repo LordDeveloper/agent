@@ -13,6 +13,7 @@ from agent.ops import (
     generate_token,
     install_core,
     service_action,
+    set_env_value,
     write_env_file,
 )
 from agent.runtime import open_runtime
@@ -172,6 +173,26 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_token(args: argparse.Namespace) -> int:
+    token = generate_token(int(args.bytes))
+    written = None
+    if args.write:
+        env_path = Path(args.env_file or os.environ.get("ENV_FILE") or "/etc/agent/.env")
+        written = set_env_value(env_path, "AUTH_TOKEN", token)
+    if args.json:
+        payload = {"success": True, "auth_token": token}
+        if written:
+            payload["env"] = written
+            payload["hint"] = "restart service: agent service restart"
+        _print_json(payload)
+    else:
+        print(token)
+        if written:
+            print(f"Wrote AUTH_TOKEN to {written['path']}", file=sys.stderr)
+            print("Restart service to apply: agent service restart", file=sys.stderr)
+    return 0
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -255,6 +276,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_wizard = sub.add_parser("wizard", help="Interactive setup (.env + optional cores/service)")
     p_wizard.add_argument("--env-path", default="/etc/agent/.env")
     p_wizard.set_defaults(func=cmd_wizard)
+
+    p_token = sub.add_parser("token", help="Generate AUTH_TOKEN (optionally write to .env)")
+    p_token.add_argument(
+        "--bytes",
+        type=int,
+        default=32,
+        help="Random bytes before hex encoding (default: 32 → 64 hex chars)",
+    )
+    p_token.add_argument(
+        "--write",
+        action="store_true",
+        help="Write AUTH_TOKEN into env file (default path: /etc/agent/.env)",
+    )
+    p_token.add_argument(
+        "--env",
+        dest="env_file",
+        default=None,
+        help="Env file path when using --write (default: ENV_FILE or /etc/agent/.env)",
+    )
+    p_token.add_argument("--json", action="store_true", help="Print JSON instead of bare token")
+    p_token.set_defaults(func=cmd_token)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)
