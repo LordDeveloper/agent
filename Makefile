@@ -13,6 +13,10 @@ test:
 smoke:
 	python scripts/smoke.py
 
-# Linux amd64 one-file binary via Docker (for VPS)
+# Linux binaries via Docker Buildx (default: gnu/amd64)
 build:
 	bash scripts/build.sh
+
+# All targets: gnu/musl × amd64/arm64
+build-all:
+	bash scripts/build.sh --all

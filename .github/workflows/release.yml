@@ -1,5 +1,13 @@
-# Build Linux amd64 agent binary and attach to GitHub Release.
+# Build Linux agent binaries for multiple arch + libc targets and attach to GitHub Release.
 # Repo: https://github.com/LordDeveloper/agent
+#
+# Assets:
+#   agent-linux-gnu-amd64   (Debian/Ubuntu/RHEL/... — glibc)
+#   agent-linux-gnu-arm64
+#   agent-linux-musl-amd64  (Alpine — musl)
+#   agent-linux-musl-arm64
+#   agent-linux-amd64       (alias → gnu-amd64)
+#   agent-linux-arm64       (alias → gnu-arm64)
 
 name: Release agent
 
@@ -13,42 +21,143 @@ permissions:
   contents: write
 
 jobs:
-  build-linux:
+  build:
+    name: build-${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            libc: gnu
+            arch: amd64
+            asset: agent-linux-gnu-amd64
+            dockerfile: Dockerfile
+          - platform: linux/arm64
+            libc: gnu
+            arch: arm64
+            asset: agent-linux-gnu-arm64
+            dockerfile: Dockerfile
+          - platform: linux/amd64
+            libc: musl
+            arch: amd64
+            asset: agent-linux-musl-amd64
+            dockerfile: Dockerfile.musl
+          - platform: linux/arm64
+            libc: musl
+            arch: arm64
+            asset: agent-linux-musl-arm64
+            dockerfile: Dockerfile.musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            -f "${{ matrix.dockerfile }}" \
+            --target export \
+            -o type=local,dest=dist/export \
+            .
+          cp -f dist/export/agent "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+          file "dist/${{ matrix.asset }}" || true
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  package:
+    name: package-release
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build binary via Docker
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+
+      - name: Assemble dist/
         run: |
           mkdir -p dist
-          docker build --target export -o type=local,dest=dist/export .
-          cp -f dist/export/agent dist/agent-linux-amd64
-          chmod +x dist/agent-linux-amd64
-          file dist/agent-linux-amd64
-          ls -lh dist/agent-linux-amd64
+          cp -f dist/artifacts/agent-linux-gnu-amd64/agent-linux-gnu-amd64 dist/agent-linux-gnu-amd64
+          cp -f dist/artifacts/agent-linux-gnu-arm64/agent-linux-gnu-arm64 dist/agent-linux-gnu-arm64
+          cp -f dist/artifacts/agent-linux-musl-amd64/agent-linux-musl-amd64 dist/agent-linux-musl-amd64
+          cp -f dist/artifacts/agent-linux-musl-arm64/agent-linux-musl-arm64 dist/agent-linux-musl-arm64
+          # Backward-compatible aliases (glibc)
+          cp -f dist/agent-linux-gnu-amd64 dist/agent-linux-amd64
+          cp -f dist/agent-linux-gnu-arm64 dist/agent-linux-arm64
+          chmod +x dist/agent-linux-*
+          ls -lh dist/agent-linux-*
+          # Installer scripts
+          cp -f scripts/get-agent.sh install.sh uninstall.sh systemd/agent.service .env.example dist/
+          chmod +x dist/get-agent.sh dist/install.sh dist/uninstall.sh
 
-      - name: Upload artifact
+      - name: Upload release bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agent-linux-amd64
+          name: agent-release-bundle
           path: |
+            dist/agent-linux-gnu-amd64
+            dist/agent-linux-gnu-arm64
+            dist/agent-linux-musl-amd64
+            dist/agent-linux-musl-arm64
             dist/agent-linux-amd64
-            scripts/get-agent.sh
-            install.sh
-            uninstall.sh
-            systemd/agent.service
-            .env.example
+            dist/agent-linux-arm64
+            dist/get-agent.sh
+            dist/install.sh
+            dist/uninstall.sh
+            dist/agent.service
+            dist/.env.example
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/agent-linux-gnu-amd64
+            dist/agent-linux-gnu-arm64
+            dist/agent-linux-musl-amd64
+            dist/agent-linux-musl-arm64
             dist/agent-linux-amd64
-            scripts/get-agent.sh
-            install.sh
-            uninstall.sh
-            systemd/agent.service
-            .env.example
+            dist/agent-linux-arm64
+            dist/get-agent.sh
+            dist/install.sh
+            dist/uninstall.sh
+            dist/agent.service
+            dist/.env.example
           generate_release_notes: true
+          body: |
+            ## Binaries
+
+            | Asset | Distro family | Arch |
+            |-------|---------------|------|
+            | `agent-linux-gnu-amd64` | Debian / Ubuntu / RHEL / Fedora (glibc) | amd64 |
+            | `agent-linux-gnu-arm64` | Debian / Ubuntu / RHEL / Fedora (glibc) | arm64 |
+            | `agent-linux-musl-amd64` | Alpine (musl) | amd64 |
+            | `agent-linux-musl-arm64` | Alpine (musl) | arm64 |
+            | `agent-linux-amd64` | alias → gnu-amd64 | amd64 |
+            | `agent-linux-arm64` | alias → gnu-arm64 | arm64 |
+
+            Install:
+            ```bash
+            export GITHUB_TOKEN=...
+            curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+              | sudo -E bash -s -- --with xray,wireguard
+            ```

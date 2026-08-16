@@ -16,12 +16,12 @@
 # Env:
 #   GITHUB_TOKEN / GH_TOKEN / AGENT_GITHUB_TOKEN
 #   AGENT_GITHUB_REPO   (default: LordDeveloper/agent)
-#   AGENT_GITHUB_ASSET  (default: agent-linux-amd64)
+#   AGENT_GITHUB_ASSET  (default: auto — agent-linux-{gnu|musl}-{amd64|arm64})
 
 set -euo pipefail
 
 REPO="${AGENT_GITHUB_REPO:-LordDeveloper/agent}"
-ASSET_NAME="${AGENT_GITHUB_ASSET:-agent-linux-amd64}"
+ASSET_NAME="${AGENT_GITHUB_ASSET:-}"
 TOKEN="${AGENT_GITHUB_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
 API="https://api.github.com"
 PREFIX="/opt/agent"
@@ -33,6 +33,35 @@ OPEN_FIREWALL=0
 FORCE=0
 TAG=""
 
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo "Unsupported arch: $(uname -m) (supported: amd64, arm64)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+detect_libc() {
+  if [[ -n "${AGENT_LIBC:-}" ]]; then
+    echo "${AGENT_LIBC}"
+    return
+  fi
+  if command -v ldd >/dev/null 2>&1; then
+    if ldd --version 2>&1 | grep -qi musl; then
+      echo "musl"
+      return
+    fi
+  fi
+  if ls /lib/ld-musl-*.so* >/dev/null 2>&1 || ls /lib/libc.musl-*.so* >/dev/null 2>&1; then
+    echo "musl"
+    return
+  fi
+  echo "gnu"
+}
+
 usage() {
   cat <<EOF
 Usage: get-agent.sh [options]
@@ -41,17 +70,22 @@ Options:
   --with CORES          Comma list: xray,wireguard,amnezia (default: xray)
   --repo OWNER/NAME     GitHub repo (default: ${REPO})
   --tag TAG             Install a specific release tag (default: latest)
-  --asset NAME          Binary asset name (default: ${ASSET_NAME})
+  --asset NAME          Binary asset (default: auto-detect arch/libc)
   --token TOKEN         GitHub token (or set GITHUB_TOKEN)
   --open-firewall       Allow agent port via ufw
   --force               Reinstall binary even if present
   -h, --help            Show help
 
+Detected asset examples:
+  agent-linux-gnu-amd64   Debian/Ubuntu/RHEL (glibc) amd64
+  agent-linux-gnu-arm64   Debian/Ubuntu/RHEL (glibc) arm64
+  agent-linux-musl-amd64  Alpine (musl) amd64
+  agent-linux-musl-arm64  Alpine (musl) arm64
+
 Private repo auth:
-  Create a PAT with read access to Releases/Contents, then:
-    export GITHUB_TOKEN=...
-    curl -fsSL -H "Authorization: Bearer \$GITHUB_TOKEN" \\
-      https://raw.githubusercontent.com/${REPO}/main/scripts/get-agent.sh | sudo -E bash
+  export GITHUB_TOKEN=...
+  curl -fsSL -H "Authorization: Bearer \$GITHUB_TOKEN" \\
+    https://raw.githubusercontent.com/${REPO}/main/scripts/get-agent.sh | sudo -E bash
 EOF
 }
 
@@ -74,14 +108,12 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64) ;;
-  *)
-    echo "Unsupported arch: $ARCH (amd64 only for now)"
-    exit 1
-    ;;
-esac
+HOST_ARCH="$(detect_arch)"
+HOST_LIBC="$(detect_libc)"
+if [[ -z "$ASSET_NAME" ]]; then
+  ASSET_NAME="agent-linux-${HOST_LIBC}-${HOST_ARCH}"
+fi
+echo "Target platform: libc=${HOST_LIBC} arch=${HOST_ARCH} asset=${ASSET_NAME}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -149,11 +181,23 @@ payload = json.loads(os.environ["RELEASE_JSON"])
 wanted = os.environ["ASSET_NAME"]
 tag = payload.get("tag_name") or ""
 assets = {a.get("name"): a for a in payload.get("assets") or []}
-asset = assets.get(wanted)
+candidates = [wanted]
+if wanted.startswith("agent-linux-gnu-"):
+    candidates.append(wanted.replace("agent-linux-gnu-", "agent-linux-", 1))
+elif wanted in {"agent-linux-amd64", "agent-linux-arm64"}:
+    candidates.append(wanted.replace("agent-linux-", "agent-linux-gnu-", 1))
+asset = None
+chosen = wanted
+for name in candidates:
+    if name in assets:
+        asset = assets[name]
+        chosen = name
+        break
 if not asset:
     names = ", ".join(assets) or "none"
     raise SystemExit(f"missing asset {wanted}; available: {names}")
 print(f"TAG={shlex.quote(tag)}")
+print(f"ASSET_NAME={shlex.quote(chosen)}")
 print(f"ASSET_ID={shlex.quote(str(asset['id']))}")
 print(f"HTML_URL={shlex.quote(payload.get('html_url') or '')}")
 PY
@@ -189,7 +233,7 @@ if [[ ! -f /etc/os-release ]]; then
 fi
 # shellcheck disable=SC1091
 source /etc/os-release
-echo "Installing Agent on ${PRETTY_NAME:-linux} ($ARCH) from ${TAG}"
+echo "Installing Agent on ${PRETTY_NAME:-linux} (${HOST_LIBC}/${HOST_ARCH}) from ${TAG}"
 
 mkdir -p "$PREFIX/bin" "$CONFIG_DIR" "$DATA_DIR"
 if [[ -x "$PREFIX/bin/agent" && "$FORCE" -ne 1 ]]; then
@@ -252,6 +296,9 @@ else
   fi
   if ! grep -q '^AGENT_GITHUB_REPO=' "$CONFIG_DIR/.env"; then
     printf 'AGENT_GITHUB_REPO=%s\n' "$REPO" >>"$CONFIG_DIR/.env"
+  fi
+  if ! grep -q '^AGENT_GITHUB_ASSET=' "$CONFIG_DIR/.env"; then
+    printf 'AGENT_GITHUB_ASSET=%s\n' "$ASSET_NAME" >>"$CONFIG_DIR/.env"
   fi
 fi
 

@@ -14,7 +14,20 @@ Repo: https://github.com/LordDeveloper/agent (private)
 
 ---
 
-## Install (VPS / Linux amd64)
+## Install (VPS / Linux)
+
+پشتیبانی‌شده:
+
+| Asset | توزیع‌ها | معماری |
+|-------|----------|--------|
+| `agent-linux-gnu-amd64` | Debian / Ubuntu / RHEL / CentOS / Fedora (glibc) | amd64 |
+| `agent-linux-gnu-arm64` | Debian / Ubuntu / RHEL / CentOS / Fedora (glibc) | arm64 |
+| `agent-linux-musl-amd64` | Alpine (musl) | amd64 |
+| `agent-linux-musl-arm64` | Alpine (musl) | arm64 |
+| `agent-linux-amd64` | alias → gnu-amd64 | amd64 |
+| `agent-linux-arm64` | alias → gnu-arm64 | arm64 |
+
+`get-agent.sh` و `agent update` به‌صورت خودکار `arch` + `libc` را تشخیص می‌دهند.
 
 ریپو خصوصی است؛ اول یک GitHub Token بسازید:
 
@@ -49,6 +62,12 @@ export GITHUB_TOKEN=ghp_xxxxxxxx
 curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
   "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
   | sudo -E bash -s -- --with xray,wireguard,amnezia --open-firewall
+```
+
+اجبار asset مشخص (مثلاً Alpine amd64):
+
+```bash
+sudo -E bash /tmp/get-agent.sh --asset agent-linux-musl-amd64 --with xray
 ```
 
 ### نصب از asset ریلیز
@@ -165,13 +184,23 @@ make dev
 
 ## Build binary (optional)
 
-### Windows + Docker Desktop
+### یک تارگت
 
-```powershell
-cd path\to\agent
-bash scripts/build.sh
-# خروجی: dist\agent (ELF لینوکس)
+```bash
+./scripts/build.sh                      # gnu/amd64
+./scripts/build.sh --arch arm64         # gnu/arm64
+./scripts/build.sh --libc musl --arch amd64
 ```
+
+### همه تارگت‌ها (gnu/musl × amd64/arm64)
+
+```bash
+make build-all
+# یا
+./scripts/build.sh --all
+```
+
+نیاز به Docker Buildx + QEMU دارد (روی Docker Desktop معمولاً آماده است).
 
 کپی به سرور و نصب لوکال:
 
