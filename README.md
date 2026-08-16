@@ -10,6 +10,111 @@ Self-hosted node agent for Linux VPS. Each core exposes **its own** resource mod
 
 WireGuard/Amnezia do **not** expose Xray-style `/inbounds` or `/clients` routes.
 
+Repo: https://github.com/LordDeveloper/agent (private)
+
+---
+
+## Install (VPS / Linux amd64)
+
+ریپو خصوصی است؛ اول یک GitHub Token بسازید:
+
+- **Classic PAT** با scopeی `repo`، یا
+- **Fine-grained PAT** روی همین ریپو با permission: **Contents = Read-only**
+
+### نصب سریع (پیشنهادی)
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxx
+
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+  | sudo -E bash -s -- --with xray,wireguard --open-firewall
+```
+
+فقط Xray:
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxx
+
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+  | sudo -E bash -s -- --with xray
+```
+
+هر سه core:
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxx
+
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+  | sudo -E bash -s -- --with xray,wireguard,amnezia --open-firewall
+```
+
+### نصب از asset ریلیز
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxx
+
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  -o /tmp/get-agent.sh \
+  "https://github.com/LordDeveloper/agent/releases/latest/download/get-agent.sh"
+
+chmod +x /tmp/get-agent.sh
+sudo -E bash /tmp/get-agent.sh --with xray,wireguard --open-firewall
+```
+
+نسخه مشخص:
+
+```bash
+sudo -E bash /tmp/get-agent.sh --tag v0.2.0 --with xray
+```
+
+### بعد از نصب
+
+```bash
+sudo systemctl status agent
+
+TOKEN=$(grep '^AUTH_TOKEN=' /etc/agent/.env | cut -d= -f2-)
+curl -s -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:8443/health
+
+/opt/agent/bin/agent version
+/opt/agent/bin/agent status
+/opt/agent/bin/agent core list
+```
+
+مسیرها:
+
+| Item | Path |
+|------|------|
+| Binary | `/opt/agent/bin/agent` |
+| Env | `/etc/agent/.env` |
+| Data | `/var/lib/agent` |
+| Service | `agent.service` |
+
+`get-agent.sh` در صورت نبودن `.env`، `GITHUB_TOKEN` را هم داخل `/etc/agent/.env` می‌نویسد تا `agent update` بعدی کار کند.
+
+### آپدیت
+
+```bash
+sudo agent update --check
+sudo agent update
+sudo agent update --force
+```
+
+### حذف سرویس (داده و `.env` می‌مانند)
+
+```bash
+curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://raw.githubusercontent.com/LordDeveloper/agent/main/uninstall.sh" \
+  -o /tmp/uninstall.sh
+sudo bash /tmp/uninstall.sh
+# یا اگر سورس/پکیج لوکال دارید:
+# sudo bash install.sh --uninstall
+```
+
+---
+
 ## Bot connection (`core_meta`)
 
 ```json
@@ -35,12 +140,14 @@ XRAY_API_BASE=http://127.0.0.1:8080
 XRAY_BINARY=/usr/local/bin/xray
 WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
+AGENT_GITHUB_REPO=LordDeveloper/agent
+AGENT_GITHUB_ASSET=agent-linux-amd64
+GITHUB_TOKEN=ghp_xxxxxxxx
 ```
 
 ## Dev / test locally
 
 ```bash
-# clone
 git clone https://github.com/LordDeveloper/agent.git
 cd agent
 
@@ -49,47 +156,28 @@ python -m venv .venv
 # Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env.dev
-make test        # or: pytest -q
-make smoke       # or: python scripts/smoke.py
-make dev         # uvicorn on 127.0.0.1:18443
+make test
+make smoke
+make dev
 ```
 
 ---
 
-## Build & install (recommended flow)
+## Build binary (optional)
 
-Agent باید روی **Linux amd64** VPS اجرا شود. باینری لینوکس را بسازید، بعد با `install.sh` روی سرور نصب کنید.
-
-### Option A — Build on Windows (Docker Desktop)
-
-روی ویندوز باینری لینوکس native با PyInstaller ساخته نمی‌شود؛ از Docker استفاده کنید (همان `make build`).
-
-1. [Docker Desktop](https://www.docker.com/products/docker-desktop/) را نصب و روشن کنید.
-2. در PowerShell:
+### Windows + Docker Desktop
 
 ```powershell
 cd path\to\agent
-# اگر WSL/Git Bash دارید:
 bash scripts/build.sh
-# یا مستقیم:
-docker build --target export -o type=local,dest=dist/export .
-Copy-Item -Force dist\export\agent dist\agent
+# خروجی: dist\agent (ELF لینوکس)
 ```
 
-خروجی: `dist/agent` (ELF لینوکس، نه `.exe`).
-
-3. فایل را به سرور کپی کنید:
-
-```powershell
-scp dist\agent root@YOUR_VPS:/tmp/agent
-scp install.sh root@YOUR_VPS:/tmp/install.sh
-scp systemd\agent.service root@YOUR_VPS:/tmp/agent.service
-```
-
-4. روی سرور:
+کپی به سرور و نصب لوکال:
 
 ```bash
-chmod +x /tmp/agent /tmp/install.sh
+scp dist/agent install.sh systemd/agent.service root@YOUR_VPS:/tmp/
+ssh root@YOUR_VPS
 mkdir -p /tmp/agent-pack/dist /tmp/agent-pack/systemd
 mv /tmp/agent /tmp/agent-pack/dist/agent
 mv /tmp/install.sh /tmp/agent-pack/install.sh
@@ -98,83 +186,14 @@ cd /tmp/agent-pack
 sudo bash install.sh --with xray,wireguard --open-firewall
 ```
 
-`install.sh` انجام می‌دهد:
-
-- باینری → `/opt/agent/bin/agent`
-- `.env` → `/etc/agent/.env` (اگر نبود، توکن تصادفی می‌سازد)
-- systemd unit → `agent.service`
-- در صورت نیاز پکیج‌های core (xray / wireguard)
-
-چک سلامت:
-
-```bash
-sudo systemctl status agent
-TOKEN=$(grep AUTH_TOKEN /etc/agent/.env | cut -d= -f2)
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/health
-/opt/agent/bin/agent core list
-```
-
-در پنل بات، سرور را با `core=node_api` و `core_meta.agent_core` مناسب ثبت کنید.
-
-### Option B — curl installer از GitHub (پیشنهادی برای VPS)
-
-ریپو خصوصی است؛ برای دانلود ریلیز به **GitHub Token** نیاز دارید.
-
-#### ۱) ساخت توکن
-
-- Classic PAT با scopeی `repo`، یا
-- Fine-grained PAT روی ریپوی `LordDeveloper/agent` با permission: **Contents = Read-only**
-
-#### ۲) نصب یک‌خطی
-
-```bash
-export GITHUB_TOKEN=ghp_xxx   # یا fine-grained token
-
-# اسکریپت را از branch اصلی بکش (raw هم برای private با Bearer کار می‌کند)
-curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-  "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
-  | sudo -E bash -s -- --with xray,wireguard --open-firewall
-```
-
-یا از asset ریلیز:
-
-```bash
-export GITHUB_TOKEN=ghp_xxx
-curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-  -o /tmp/get-agent.sh \
-  "https://github.com/LordDeveloper/agent/releases/latest/download/get-agent.sh"
-sudo -E bash /tmp/get-agent.sh --with xray,wireguard
-```
-
-`get-agent.sh` آخرین `agent-linux-amd64` را از Releases می‌گیرد، در `/opt/agent/bin/agent` نصب می‌کند، unit systemd می‌سازد و در صورت نبودن `.env`، `GITHUB_TOKEN` را برای آپدیت‌های بعدی در `/etc/agent/.env` ذخیره می‌کند.
-
-### Option C — GitHub Actions (بیلد)
+### GitHub Actions release
 
 ```bash
 git tag v0.2.0
 git push origin v0.2.0
 ```
 
-بعد از سبز شدن workflow، assetهای ریلیز شامل `agent-linux-amd64` و `get-agent.sh` هستند.
-
----
-
-## Self-update
-
-روی سرور (باینری نصب‌شده):
-
-```bash
-sudo agent update --check
-sudo agent update
-# یا:
-sudo agent update --force
-```
-
-توکن از این منابع خوانده می‌شود (به ترتیب):
-
-1. `--token`
-2. `AGENT_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` در محیط
-3. همان کلیدها داخل `/etc/agent/.env`
+پس از سبز شدن workflow، ریلیز شامل `agent-linux-amd64` و `get-agent.sh` است.
 
 ---
 
@@ -188,10 +207,3 @@ GET /api/v1/cores/wireguard/peers/{email}/ips
 ```
 
 Stats (`/stats/snapshot`) still use a shared billing DTO (`inbounds[].clients[]`) so the bot can read counters the same way for every core.
-
-## Uninstall
-
-```bash
-sudo bash install.sh --uninstall
-# /etc/agent و /var/lib/agent حفظ می‌شوند
-```
