@@ -155,6 +155,8 @@ LISTEN=0.0.0.0:8443
 AUTH_TOKEN=...
 ENABLED_CORES=xray,wireguard
 DATA_DIR=/var/lib/agent
+LOG_FILE=/var/lib/agent/agent.log
+LOG_LEVEL=INFO
 XRAY_API_BASE=http://127.0.0.1:8080
 XRAY_BINARY=/usr/local/bin/xray
 WIREGUARD_CONFIG_DIR=/etc/wireguard
@@ -163,6 +165,8 @@ AGENT_GITHUB_REPO=LordDeveloper/agent
 AGENT_GITHUB_ASSET=agent-linux-amd64
 GITHUB_TOKEN=ghp_xxxxxxxx
 ```
+
+درخواست‌های HTTP، خطاهای auth و exceptionهای مدیریت‌نشده داخل `agent.log` (پیش‌فرض: `$DATA_DIR/agent.log`) نوشته می‌شوند.
 
 ## Dev / test locally
 

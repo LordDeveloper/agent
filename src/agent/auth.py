@@ -6,9 +6,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicC
 
 from agent.config import AgentSettings
 from agent.errors import error_body
+from agent.logutil import get_logger
 
 security_bearer = HTTPBearer(auto_error=False)
 security_basic = HTTPBasic(auto_error=False)
+log = get_logger("auth")
 
 _FAIL_WINDOW = 60
 _MAX_FAILURES = 20
@@ -21,6 +23,7 @@ def _record_failure(key: str) -> None:
     bucket.append(now)
     _failures[key] = [t for t in bucket if now - t < _FAIL_WINDOW]
     if len(_failures[key]) >= _MAX_FAILURES:
+        log.warning("auth rate-limited client=%s", key)
         raise HTTPException(status_code=429, detail=error_body("INVALID_CREDENTIALS", "Too many auth failures"))
 
 
@@ -38,6 +41,7 @@ def verify_auth(
 
     token = settings.auth_token
     if not token and not (settings.auth_username and settings.auth_password):
+        log.error("auth not configured path=%s client=%s", request.url.path, client_key)
         raise HTTPException(
             status_code=500,
             detail=error_body("CONFIG_NOT_FOUND", "Agent auth is not configured"),
@@ -48,6 +52,7 @@ def verify_auth(
             _clear_failures(client_key)
             return
         _record_failure(client_key)
+        log.warning("invalid bearer token path=%s client=%s", request.url.path, client_key)
         raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid bearer token"))
 
     if basic and settings.auth_username and settings.auth_password:
@@ -55,11 +60,14 @@ def verify_auth(
             _clear_failures(client_key)
             return
         _record_failure(client_key)
+        log.warning("invalid basic credentials path=%s client=%s", request.url.path, client_key)
         raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid basic credentials"))
 
     if token:
         _record_failure(client_key)
+        log.warning("bearer token required path=%s client=%s", request.url.path, client_key)
         raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Bearer token required"))
 
     _record_failure(client_key)
+    log.warning("authentication required path=%s client=%s", request.url.path, client_key)
     raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Authentication required"))

@@ -1,7 +1,11 @@
 import os
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from agent import __version__
 from agent.audit import AuditLog
@@ -13,11 +17,47 @@ from agent.api.stats import router as stats_router
 from agent.api.xray import router as xray_router
 from agent.api.wireguard import router as wireguard_router
 from agent.api.amnezia import router as amnezia_router
+from agent.logutil import get_logger, resolve_log_path, setup_logging
 from agent.registry import CoreRegistry
+
+log = get_logger("http")
+
+
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        started = time.perf_counter()
+        client = request.client.host if request.client else "-"
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            log.exception(
+                "request failed method=%s path=%s client=%s duration_ms=%.1f",
+                request.method,
+                request.url.path,
+                client,
+                elapsed_ms,
+            )
+            raise
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        level = log.warning if response.status_code >= 400 else log.info
+        level(
+            "method=%s path=%s status=%s client=%s duration_ms=%.1f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            client,
+            elapsed_ms,
+        )
+        return response
 
 
 def create_app(env_file: str | None = None) -> FastAPI:
     settings = load_settings(env_file or os.environ.get("ENV_FILE"))
+    setup_logging(settings)
+    app_log = get_logger("app")
+
     store = Store(settings.resolve_db_path())
     audit = AuditLog(store)
     registry = CoreRegistry(settings, audit, store)
@@ -25,7 +65,15 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app_log.info(
+            "agent started version=%s listen=%s cores=%s log=%s",
+            __version__,
+            settings.listen,
+            ",".join(settings.cores()) or "-",
+            resolve_log_path(settings),
+        )
         yield
+        app_log.info("agent stopping")
         store.close()
 
     app = FastAPI(title="Agent", version=__version__, lifespan=lifespan)
@@ -33,6 +81,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.state.store = store
     app.state.audit = audit
     app.state.registry = registry
+    app.add_middleware(RequestLogMiddleware)
 
     auth = [Depends(verify_auth)]
     app.include_router(cores_router, prefix="/api/v1", dependencies=auth)
@@ -56,6 +105,25 @@ def create_app(env_file: str | None = None) -> FastAPI:
             "db": str(settings.resolve_db_path()),
             "cores": [c.model_dump() for c in reg.list_cores()],
         }
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        if isinstance(exc, HTTPException):
+            return await http_exception_handler(request, exc)
+
+        get_logger("app").exception(
+            "unhandled error method=%s path=%s: %s",
+            request.method,
+            request.url.path,
+            exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": "Internal Server Error"},
+            },
+        )
 
     return app
 

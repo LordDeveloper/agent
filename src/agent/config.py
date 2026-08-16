@@ -33,6 +33,8 @@ class AgentSettings(BaseSettings):
       LISTEN=0.0.0.0:8443
       AUTH_TOKEN=...
       ENABLED_CORES=xray,wireguard
+      LOG_FILE=/var/lib/agent/agent.log
+      LOG_LEVEL=INFO
       XRAY_API_BASE=http://127.0.0.1:8080
       XRAY_BINARY=/usr/local/bin/xray
     """
@@ -50,6 +52,10 @@ class AgentSettings(BaseSettings):
     data_dir: str = "/var/lib/agent"
     db_path: str = ""
     enabled_cores: str = "xray"
+    log_file: str = ""
+    log_level: str = "INFO"
+    log_max_bytes: int = 5_000_000
+    log_backup_count: int = 5
 
     xray_api_base: str = "http://127.0.0.1:8080"
     xray_username: str = ""
