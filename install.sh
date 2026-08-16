@@ -35,6 +35,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
   systemctl disable "$SERVICE_NAME" 2>/dev/null || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+  rm -f /usr/local/bin/agent
   systemctl daemon-reload
   rm -rf "$PREFIX"
   echo "Uninstalled $SERVICE_NAME (.env/data preserved in $CONFIG_DIR and $DATA_DIR)"
@@ -69,6 +70,7 @@ fi
 
 mkdir -p "$PREFIX/bin" "$CONFIG_DIR" "$DATA_DIR"
 install -m 755 "$BINARY_SRC" "$PREFIX/bin/agent"
+ln -sfn "$PREFIX/bin/agent" /usr/local/bin/agent
 
 if [[ ! -f "$CONFIG_DIR/.env" ]]; then
   TOKEN="$(openssl rand -hex 32)"
@@ -137,13 +139,14 @@ cat <<EOF
 
 Agent installed (binary).
 Binary: $PREFIX/bin/agent
+CLI:    /usr/local/bin/agent
 Env:    $CONFIG_DIR/.env
 API:    $API_BASE
 Token:  $TOKEN
 Health: curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:${LISTEN##*:}/health"
-CLI:
-  $PREFIX/bin/agent status
-  $PREFIX/bin/agent stats
-  $PREFIX/bin/agent core list
-  $PREFIX/bin/agent service status
+Commands:
+  agent status
+  agent stats
+  agent core list
+  agent service status
 EOF

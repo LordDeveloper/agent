@@ -240,6 +240,7 @@ if [[ -x "$PREFIX/bin/agent" && "$FORCE" -ne 1 ]]; then
   echo "Existing binary found at $PREFIX/bin/agent (use --force to replace before service restart)"
 fi
 install -m 755 "$BIN_PATH" "$PREFIX/bin/agent"
+ln -sfn "$PREFIX/bin/agent" /usr/local/bin/agent
 
 if [[ -f "$UNIT_PATH" ]]; then
   install -m 644 "$UNIT_PATH" "/etc/systemd/system/${SERVICE_NAME}.service"
@@ -348,6 +349,7 @@ cat <<EOF
 Agent installed from GitHub ${TAG}
 Release: ${HTML_URL}
 Binary:  $PREFIX/bin/agent
+CLI:     /usr/local/bin/agent  (symlink)
 Env:     $CONFIG_DIR/.env
 API:     $API_BASE
 Token:   ${TOKEN_VALUE}
