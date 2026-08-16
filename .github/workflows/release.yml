@@ -1,0 +1,52 @@
+# Build Linux amd64 agent binary and attach to GitHub Release.
+# Repo: https://github.com/LordDeveloper/agent
+
+name: Release agent
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build binary via Docker
+        run: |
+          mkdir -p dist
+          docker build --target export -o type=local,dest=dist/export .
+          cp -f dist/export/agent dist/agent-linux-amd64
+          chmod +x dist/agent-linux-amd64
+          file dist/agent-linux-amd64
+          ls -lh dist/agent-linux-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-linux-amd64
+          path: |
+            dist/agent-linux-amd64
+            install.sh
+            uninstall.sh
+            systemd/agent.service
+            .env.example
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agent-linux-amd64
+            install.sh
+            uninstall.sh
+            systemd/agent.service
+            .env.example
+          generate_release_notes: true

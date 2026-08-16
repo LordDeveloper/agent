@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from agent import __version__
+from agent.errors import AgentError
+from agent.ops import (
+    KNOWN_CORES,
+    generate_token,
+    install_core,
+    service_action,
+    write_env_file,
+)
+from agent.runtime import open_runtime
+
+
+def _print_json(data) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+
+def _env_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--env",
+        dest="env_file",
+        default=None,
+        help="Path to .env (default: ENV_FILE / /etc/agent/.env / ./.env)",
+    )
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from agent.main import create_app
+
+    runtime = open_runtime(args.env_file)
+    host, port = runtime.settings.listen_host_port()
+    if args.host:
+        host = args.host
+    if args.port:
+        port = args.port
+    runtime.close()
+    uvicorn.run(create_app(args.env_file), host=host, port=port, factory=False)
+    return 0
+
+
+def cmd_version(_: argparse.Namespace) -> int:
+    print(f"agent {__version__}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        cores = [c.model_dump() for c in runtime.registry.list_cores()]
+        _print_json(
+            {
+                "success": True,
+                "version": __version__,
+                "listen": runtime.settings.listen,
+                "db": str(runtime.settings.resolve_db_path()),
+                "enabled_cores": runtime.settings.cores(),
+                "cores": cores,
+            }
+        )
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        payload = {
+            "success": True,
+            "online": runtime.registry.online_users(args.core),
+            "snapshot": runtime.registry.usage_snapshot(args.core).model_dump(by_alias=True),
+        }
+        if args.online_only:
+            payload = {"success": True, "users": payload["online"]}
+        _print_json(payload)
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_core_list(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        enabled = set(runtime.settings.cores())
+        rows = []
+        for key in KNOWN_CORES:
+            if key in enabled:
+                info = runtime.registry.get(key)
+                rows.append(
+                    {
+                        "key": key,
+                        "enabled": True,
+                        "installed": info.installed(),
+                        "running": info.running(),
+                        "version": info.version(),
+                        "capabilities": info.capabilities(),
+                    }
+                )
+            else:
+                rows.append({"key": key, "enabled": False})
+        _print_json({"success": True, "cores": rows})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_core_install(args: argparse.Namespace) -> int:
+    result = install_core(args.name)
+    _print_json({"success": True, **result})
+    return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    result = service_action(args.action)
+    _print_json({"success": bool(result.get("ok", True)), **result})
+    return 0 if result.get("ok", True) else 1
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:
+    env_path = Path(args.env_path or "/etc/agent/.env")
+    print("Agent setup wizard")
+    print(f"Env file: {env_path}")
+
+    listen = input("Listen [0.0.0.0:8443]: ").strip() or "0.0.0.0:8443"
+    data_dir = input("Data dir [/var/lib/agent]: ").strip() or "/var/lib/agent"
+    token_in = input("Auth token [auto-generate]: ").strip()
+    token = token_in or generate_token()
+
+    print("Available cores: xray, wireguard, amnezia")
+    cores_in = input("Enable cores [xray]: ").strip() or "xray"
+    cores = [c.strip() for c in cores_in.split(",") if c.strip()]
+    unknown = [c for c in cores if c not in KNOWN_CORES]
+    if unknown:
+        print(f"Unknown cores: {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    install_now = input("Install selected cores now? [y/N]: ").strip().lower() in {"y", "yes"}
+    if install_now:
+        for core in cores:
+            print(f"Installing {core}...")
+            try:
+                result = install_core(core)
+                print(f"  ok: {result.get('message')}")
+            except AgentError as exc:
+                print(f"  failed: {exc.message}", file=sys.stderr)
+
+    write_env_file(env_path, listen=listen, token=token, data_dir=data_dir, cores=cores)
+    print(f"Wrote {env_path}")
+    print(f"Token: {token}")
+
+    svc = input("Install/enable systemd service? [y/N]: ").strip().lower() in {"y", "yes"}
+    if svc:
+        try:
+            service_action("install")
+            service_action("restart")
+            print("Service installed and restarted.")
+        except AgentError as exc:
+            print(f"Service setup failed: {exc.message}", file=sys.stderr)
+            return 1
+
+    print("Done. Start API with: agent serve")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent",
+        description="Netinja node agent CLI",
+    )
+    parser.add_argument("--version", action="store_true", help="Show version and exit")
+    sub = parser.add_subparsers(dest="command")
+
+    p_serve = sub.add_parser("serve", help="Run HTTP API server")
+    _env_flag(p_serve)
+    p_serve.add_argument("--host", default=None)
+    p_serve.add_argument("--port", type=int, default=None)
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_ver = sub.add_parser("version", help="Show version")
+    p_ver.set_defaults(func=cmd_version)
+
+    p_status = sub.add_parser("status", help="Show agent + cores status")
+    _env_flag(p_status)
+    p_status.set_defaults(func=cmd_status)
+
+    p_stats = sub.add_parser("stats", help="Show usage snapshot / online users")
+    _env_flag(p_stats)
+    p_stats.add_argument("--core", default=None, help="Limit to one core (xray|wireguard|amnezia)")
+    p_stats.add_argument("--online-only", action="store_true", help="Only print online users")
+    p_stats.set_defaults(func=cmd_stats)
+
+    p_core = sub.add_parser("core", help="Manage VPN cores")
+    core_sub = p_core.add_subparsers(dest="core_command", required=True)
+
+    p_core_list = core_sub.add_parser("list", help="List cores and capabilities")
+    _env_flag(p_core_list)
+    p_core_list.set_defaults(func=cmd_core_list)
+
+    p_core_install = core_sub.add_parser("install", help="Install a core on this host")
+    p_core_install.add_argument("name", choices=list(KNOWN_CORES))
+    p_core_install.set_defaults(func=cmd_core_install)
+
+    p_service = sub.add_parser("service", help="Manage systemd service")
+    p_service.add_argument(
+        "action",
+        choices=["install", "uninstall", "start", "stop", "restart", "status", "enable", "disable"],
+    )
+    p_service.set_defaults(func=cmd_service)
+
+    p_wizard = sub.add_parser("wizard", help="Interactive setup (.env + optional cores/service)")
+    p_wizard.add_argument("--env-path", default="/etc/agent/.env")
+    p_wizard.set_defaults(func=cmd_wizard)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if getattr(args, "version", False) and not getattr(args, "command", None):
+        return cmd_version(args)
+
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+
+    try:
+        return int(args.func(args))
+    except AgentError as exc:
+        _print_json({"success": False, "error": {"code": exc.code, "message": exc.message}})
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+def run() -> None:
+    raise SystemExit(main())

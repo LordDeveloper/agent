@@ -1,0 +1,14 @@
+[Unit]
+Description=Netinja node agent API
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent/.env
+WorkingDirectory=/opt/agent
+ExecStart=/opt/agent/bin/agent serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

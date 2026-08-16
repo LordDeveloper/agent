@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import os
+import secrets
+import shutil
+import subprocess
+from pathlib import Path
+
+from agent.errors import AgentError
+
+KNOWN_CORES = ("xray", "wireguard", "amnezia")
+
+
+def which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+
+def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=check, capture_output=True, text=True, timeout=300)
+
+
+def install_xray() -> dict:
+    """
+    Use a pre-built customized Xray binary (manual for now).
+    Later: download release binary from GitHub automatically.
+    """
+    binary = os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")
+    if which("xray") or Path(binary).is_file():
+        return {
+            "core": "xray",
+            "installed": True,
+            "message": "xray binary present",
+            "binary": binary if Path(binary).is_file() else which("xray"),
+            "api_base": os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
+        }
+
+    raise AgentError(
+        "VALIDATION_ERROR",
+        "xray binary not found; place customized httpapi build at XRAY_BINARY "
+        "(GitHub auto-download will be added later)",
+    )
+
+
+def install_wireguard() -> dict:
+    if which("wg"):
+        return {"core": "wireguard", "installed": True, "message": "already installed"}
+    if which("apt-get"):
+        run_cmd(["apt-get", "update", "-y"], check=False)
+        run_cmd(["apt-get", "install", "-y", "wireguard"], check=False)
+    if not which("wg"):
+        raise AgentError("VALIDATION_ERROR", "wireguard tools (wg) not available after install")
+    return {"core": "wireguard", "installed": True, "message": "installed"}
+
+
+def install_amnezia() -> dict:
+    # AmneziaWG usually needs kernel module; ensure WG tools first.
+    result = install_wireguard()
+    result["core"] = "amnezia"
+    result["message"] = (
+        "wireguard tools ready; AmneziaWG kernel module may need manual install on this kernel"
+    )
+    return result
+
+
+INSTALLERS = {
+    "xray": install_xray,
+    "wireguard": install_wireguard,
+    "amnezia": install_amnezia,
+}
+
+
+def install_core(name: str) -> dict:
+    key = name.strip().lower()
+    installer = INSTALLERS.get(key)
+    if installer is None:
+        raise AgentError("CONFIG_NOT_FOUND", f"Unknown core [{name}]. Known: {', '.join(KNOWN_CORES)}")
+    return installer()
+
+
+def write_env_file(
+    path: Path,
+    *,
+    listen: str,
+    token: str,
+    data_dir: str,
+    cores: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(
+        [
+            f"LISTEN={listen}",
+            f"AUTH_TOKEN={token}",
+            f"DATA_DIR={data_dir}",
+            f"DB_PATH={Path(data_dir) / 'agent.db'}",
+            f"ENABLED_CORES={','.join(cores)}",
+            "XRAY_API_BASE=http://127.0.0.1:8080",
+            "XRAY_BINARY=/usr/local/bin/xray",
+            "WIREGUARD_CONFIG_DIR=/etc/wireguard",
+            "AMNEZIA_CONFIG_DIR=/etc/amneziawg",
+            "",
+        ]
+    )
+    path.write_text(content, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def generate_token() -> str:
+    return secrets.token_hex(32)
+
+
+def systemd_unit_path() -> Path:
+    return Path("/etc/systemd/system/agent.service")
+
+
+def default_unit_text() -> str:
+    return """[Unit]
+Description=Netinja node agent API
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent/.env
+WorkingDirectory=/opt/agent
+ExecStart=/opt/agent/bin/agent serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def service_action(action: str) -> dict:
+    if not which("systemctl"):
+        raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found (Linux systemd required)")
+    if action == "install":
+        unit = systemd_unit_path()
+        unit.write_text(default_unit_text(), encoding="utf-8")
+        run_cmd(["systemctl", "daemon-reload"], check=False)
+        run_cmd(["systemctl", "enable", "agent"], check=False)
+        return {"action": "install", "unit": str(unit), "ok": True}
+    if action == "uninstall":
+        run_cmd(["systemctl", "stop", "agent"], check=False)
+        run_cmd(["systemctl", "disable", "agent"], check=False)
+        unit = systemd_unit_path()
+        if unit.exists():
+            unit.unlink()
+        run_cmd(["systemctl", "daemon-reload"], check=False)
+        return {"action": "uninstall", "ok": True}
+
+    allowed = {"start", "stop", "restart", "status", "enable", "disable"}
+    if action not in allowed:
+        raise AgentError("VALIDATION_ERROR", f"Unknown service action [{action}]")
+    proc = run_cmd(["systemctl", action, "agent"], check=False)
+    return {
+        "action": action,
+        "ok": proc.returncode == 0,
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
+        "code": proc.returncode,
+    }

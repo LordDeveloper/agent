@@ -1,0 +1,117 @@
+openapi: 3.1.0
+info:
+  title: Agent API
+  version: 0.2.0
+  description: Unified node agent for Xray, WireGuard, and AmneziaWG (NetinjaBot).
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+  - basicAuth: []
+paths:
+  /health:
+    get:
+      summary: Health and core status (also available at GET /health without /api/v1)
+  /cores:
+    get:
+      summary: List enabled cores + capabilities
+  /cores/{core}:
+    get:
+      summary: Core details
+  /cores/{core}/install:
+    post:
+      summary: Install core packages/binaries
+  /cores/{core}/enable:
+    post:
+      summary: Enable/start core
+  /cores/{core}/disable:
+    post:
+      summary: Disable/stop core
+  /cores/{core}/restart:
+    post:
+      summary: Restart core
+  /stats/online:
+    get:
+      summary: Online users
+      parameters:
+        - in: query
+          name: core
+          schema: { type: string }
+  /stats/snapshot:
+    get:
+      summary: Cumulative usage snapshot
+      parameters:
+        - in: query
+          name: core
+          schema: { type: string }
+
+  /cores/xray/inbounds:
+    get: { summary: List inbounds }
+    post: { summary: Create inbound (full JSON from bot) }
+  /cores/xray/inbounds/{id}:
+    get: { summary: Get inbound }
+    put: { summary: Update inbound }
+    delete: { summary: Delete inbound }
+  /cores/xray/inbounds/{id}/refresh:
+    post: { summary: Rebuild inbound (protocol switch) }
+  /cores/xray/inbounds/{id}/clients:
+    post: { summary: Add/update client }
+  /cores/xray/inbounds/{id}/clients/{key}:
+    put: { summary: Update client }
+    delete: { summary: Delete client }
+  /cores/xray/inbounds/{id}/clients/{key}/reset-traffic:
+    post: { summary: Reset client traffic counters }
+  /cores/xray/clients/{email}/ips:
+    get: { summary: Client IP logs }
+    delete: { summary: Clear IP logs marker }
+  /cores/xray/outbounds:
+    get: { summary: List outbounds }
+    post: { summary: Add outbounds }
+    delete: { summary: Remove outbounds }
+  /cores/xray/rules:
+    get: { summary: List routing rules }
+    post: { summary: Add rules }
+    delete: { summary: Remove rules }
+  /cores/xray/sourceip/block:
+    post: { summary: Block source IPs }
+  /cores/xray/config/import:
+    post: { summary: Import full config.json }
+  /cores/xray/backup:
+    post: { summary: Backup inbounds/outbounds/rules }
+  /cores/xray/restore:
+    post: { summary: Restore backup }
+  /cores/xray/x25519:
+    post: { summary: Generate X25519 keys }
+
+  /cores/wireguard/interfaces:
+    get: { summary: List interfaces }
+    post: { summary: Create interface }
+  /cores/wireguard/interfaces/{id}:
+    get: { summary: Get interface }
+    put: { summary: Update interface }
+    delete: { summary: Delete interface }
+  /cores/wireguard/interfaces/{id}/peers:
+    post: { summary: Add peer }
+  /cores/wireguard/interfaces/{id}/peers/{peer_id}:
+    put: { summary: Update peer }
+    delete: { summary: Delete peer }
+  /cores/wireguard/peers/{email}/ips:
+    get: { summary: Peer IP logs }
+    delete: { summary: Clear peer IP logs }
+  /cores/wireguard/backup:
+    post: { summary: Backup interfaces }
+
+  /cores/amnezia/interfaces:
+    get: { summary: List Amnezia interfaces }
+    post: { summary: Create Amnezia interface (+ obfuscation) }
+  /cores/amnezia/interfaces/{id}/peers:
+    post: { summary: Add Amnezia peer }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    basicAuth:
+      type: http
+      scheme: basic
