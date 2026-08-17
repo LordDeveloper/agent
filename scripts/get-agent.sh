@@ -278,6 +278,7 @@ WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
 AGENT_GITHUB_REPO=$REPO
 AGENT_GITHUB_ASSET=$ASSET_NAME
+XRAY_GITHUB_REPO=LordDeveloper/xray
 EOF
   if [[ -n "$TOKEN" ]]; then
     printf 'GITHUB_TOKEN=%s\n' "$TOKEN" >>"$CONFIG_DIR/.env"
@@ -307,13 +308,66 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
+install_xray_from_release() {
+  local xray_repo="${XRAY_GITHUB_REPO:-LordDeveloper/xray}"
+  local xray_asset="${XRAY_GITHUB_ASSET:-xray-linux-${HOST_LIBC}-${HOST_ARCH}}"
+  local dest="${XRAY_BINARY:-/usr/local/bin/xray}"
+  local gh="${GITHUB_TOKEN:-${GH_TOKEN:-${AGENT_GITHUB_TOKEN:-}}}"
+
+  if command -v xray >/dev/null 2>&1 || [[ -x "$dest" ]]; then
+    return 0
+  fi
+  if [[ -z "$gh" ]]; then
+    echo "xray not found; export GITHUB_TOKEN to download from ${xray_repo}" >&2
+    return 1
+  fi
+
+  echo "Installing xray from ${xray_repo} (${xray_asset})..."
+  local release_json
+  release_json="$(api_get "${API}/repos/${xray_repo}/releases/latest")" || {
+    echo "Failed to fetch xray release from ${xray_repo}" >&2
+    return 1
+  }
+
+  eval "$(RELEASE_JSON="$release_json" ASSET_NAME="$xray_asset" python3 - <<'PY'
+import json, os, shlex
+payload = json.loads(os.environ["RELEASE_JSON"])
+wanted = os.environ["ASSET_NAME"]
+assets = {a.get("name"): a for a in payload.get("assets") or []}
+candidates = [wanted]
+if wanted.startswith("xray-linux-gnu-"):
+    candidates.append(wanted.replace("xray-linux-gnu-", "xray-linux-", 1))
+elif wanted in {"xray-linux-amd64", "xray-linux-arm64"}:
+    candidates.append(wanted.replace("xray-linux-", "xray-linux-gnu-", 1))
+asset = None
+chosen = wanted
+for name in candidates:
+    if name in assets:
+        asset = assets[name]
+        chosen = name
+        break
+if not asset:
+    names = ", ".join(assets) or "none"
+    raise SystemExit(f"missing xray asset {wanted}; available: {names}")
+print(f"XRAY_ASSET_NAME={shlex.quote(chosen)}")
+print(f"XRAY_ASSET_ID={shlex.quote(str(asset['id']))}")
+PY
+)"
+
+  local tmp
+  tmp="$(mktemp)"
+  download_asset "$XRAY_ASSET_ID" "$tmp"
+  install -m 755 "$tmp" "$dest"
+  rm -f "$tmp"
+  ln -sfn "$dest" /usr/local/bin/xray 2>/dev/null || true
+  echo "xray installed: $dest"
+}
+
 install_core() {
   local core="$1"
   case "$core" in
     xray)
-      if ! command -v xray >/dev/null 2>&1; then
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install || true
-      fi
+      install_xray_from_release || true
       ;;
     wireguard)
       if command -v apt-get >/dev/null 2>&1; then

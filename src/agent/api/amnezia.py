@@ -121,9 +121,14 @@ def reset_peer_traffic(interface_id: str, peer_id: str, amnezia: AmneziaDriver =
 
 
 @router.get("/interfaces/{interface_id}/peers/{peer_id}/config")
-def peer_config(interface_id: str, peer_id: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
+def peer_config(
+    interface_id: str,
+    peer_id: str,
+    endpoint: str | None = None,
+    amnezia: AmneziaDriver = Depends(get_amnezia),
+):
     try:
-        config = amnezia.peer_config(interface_id, peer_id)
+        config = amnezia.peer_config(interface_id, peer_id, endpoint_host=endpoint or "127.0.0.1")
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config}

@@ -102,13 +102,56 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
+install_xray_from_release() {
+  local xray_repo="${XRAY_GITHUB_REPO:-LordDeveloper/xray}"
+  local xray_asset="${XRAY_GITHUB_ASSET:-}"
+  local dest="${XRAY_BINARY:-/usr/local/bin/xray}"
+  local gh="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+
+  if command -v xray >/dev/null 2>&1 || [[ -x "$dest" ]]; then
+    return 0
+  fi
+
+  if command -v agent >/dev/null 2>&1; then
+    if agent core install xray; then
+      return 0
+    fi
+  fi
+
+  if [[ -z "$gh" ]]; then
+    echo "xray not found; export GITHUB_TOKEN or run: agent core install xray" >&2
+    return 1
+  fi
+
+  if [[ -z "$xray_asset" ]]; then
+    local arch libc
+    case "$(uname -m)" in
+      x86_64|amd64) arch="amd64" ;;
+      aarch64|arm64) arch="arm64" ;;
+      *) echo "Unsupported arch for xray install: $(uname -m)" >&2; return 1 ;;
+    esac
+    libc="gnu"
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+      libc="musl"
+    fi
+    xray_asset="xray-linux-${libc}-${arch}"
+  fi
+
+  echo "Installing xray via agent API from ${xray_repo}..."
+  local port="${LISTEN##*:}"
+  local auth="${AUTH_TOKEN:-}"
+  curl -fsSL -X POST \
+    -H "Authorization: Bearer ${auth}" \
+    -H "Content-Type: application/json" \
+    -d "{\"github_token\":\"${gh}\"}" \
+    "http://127.0.0.1:${port}/api/v1/cores/xray/install"
+}
+
 install_core() {
   local core="$1"
   case "$core" in
     xray)
-      if ! command -v xray >/dev/null 2>&1; then
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-      fi
+      install_xray_from_release || true
       ;;
     wireguard)
       DEBIAN_FRONTEND=noninteractive apt-get update -y

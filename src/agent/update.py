@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from pathlib import Path
 
 from agent import __version__
 from agent.errors import AgentError
@@ -104,7 +105,54 @@ def resolve_token(explicit: str | None = None) -> str | None:
         or os.environ.get("GH_TOKEN")
         or ""
     ).strip()
-    return token or None
+    if token:
+        return token
+
+    for key in ("GITHUB_TOKEN", "AGENT_GITHUB_TOKEN", "GH_TOKEN"):
+        value = _read_env_file_value(key)
+        if value:
+            return value
+
+    return None
+
+
+def _read_env_file_value(key: str) -> str | None:
+    """Best-effort read of a single key from agent .env files (CLI without systemd)."""
+    from agent.config import default_env_paths
+
+    paths: list[Path] = []
+    explicit = os.environ.get("ENV_FILE")
+    if explicit:
+        paths.append(Path(explicit))
+    paths.extend(default_env_paths())
+
+    seen: set[Path] = set()
+    prefix = f"{key}="
+    export_prefix = f"export {prefix}"
+
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped.startswith(export_prefix):
+                    value = stripped[len(export_prefix) :].strip()
+                elif stripped.startswith(prefix):
+                    value = stripped[len(prefix) :].strip()
+                else:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                if value:
+                    return value
+        except OSError:
+            continue
+
+    return None
 
 
 def resolve_asset_name(explicit: str | None = None) -> str:
@@ -116,17 +164,19 @@ def resolve_asset_name(explicit: str | None = None) -> str:
     return detect_host_platform().asset_name
 
 
-def pick_release_asset(assets: list[dict], wanted: str) -> dict:
+def pick_release_asset(assets: list[dict], wanted: str, *, prefix: str = "agent") -> dict:
     by_name = {str(a.get("name")): a for a in assets}
     if wanted in by_name:
         return by_name[wanted]
 
-    # Fallback: gnu alias ↔ canonical name
+    # Fallback: gnu alias ↔ canonical name (agent-linux-gnu-amd64 ↔ agent-linux-amd64)
     fallbacks: list[str] = []
-    if wanted.startswith("agent-linux-gnu-"):
-        fallbacks.append(wanted.replace("agent-linux-gnu-", "agent-linux-", 1))
-    elif wanted in {"agent-linux-amd64", "agent-linux-arm64"}:
-        fallbacks.append(wanted.replace("agent-linux-", "agent-linux-gnu-", 1))
+    gnu_prefix = f"{prefix}-linux-gnu-"
+    short_prefix = f"{prefix}-linux-"
+    if wanted.startswith(gnu_prefix):
+        fallbacks.append(wanted.replace(gnu_prefix, short_prefix, 1))
+    elif wanted in {f"{prefix}-linux-amd64", f"{prefix}-linux-arm64"}:
+        fallbacks.append(wanted.replace(short_prefix, gnu_prefix, 1))
 
     for name in fallbacks:
         if name in by_name:
@@ -238,7 +288,7 @@ def fetch_latest_release(
     payload = response.json()
     tag = str(payload.get("tag_name") or "")
     assets = payload.get("assets") or []
-    match = pick_release_asset(assets, wanted)
+    match = pick_release_asset(assets, wanted, prefix="agent")
 
     asset_id = int(match["id"])
     chosen_name = str(match.get("name") or wanted)

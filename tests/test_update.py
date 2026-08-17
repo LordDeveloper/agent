@@ -35,6 +35,12 @@ def test_pick_release_asset_fallback():
     assert chosen["id"] == 7
 
 
+def test_pick_xray_release_asset_fallback():
+    assets = [{"id": 9, "name": "xray-linux-amd64"}]
+    chosen = pick_release_asset(assets, "xray-linux-gnu-amd64", prefix="xray")
+    assert chosen["id"] == 9
+
+
 def test_fetch_latest_release(monkeypatch):
     payload = {
         "tag_name": "v0.2.0",

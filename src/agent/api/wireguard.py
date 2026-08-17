@@ -109,9 +109,14 @@ def reset_peer_traffic(interface_id: str, peer_id: str, wg: WireGuardDriver = De
 
 
 @router.get("/interfaces/{interface_id}/peers/{peer_id}/config")
-def peer_config(interface_id: str, peer_id: str, wg: WireGuardDriver = Depends(get_wg)):
+def peer_config(
+    interface_id: str,
+    peer_id: str,
+    endpoint: str | None = None,
+    wg: WireGuardDriver = Depends(get_wg),
+):
     try:
-        config = wg.peer_config(interface_id, peer_id)
+        config = wg.peer_config(interface_id, peer_id, endpoint_host=endpoint or "127.0.0.1")
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config}

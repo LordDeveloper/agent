@@ -19,26 +19,35 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return subprocess.run(args, check=check, capture_output=True, text=True, timeout=300)
 
 
-def install_xray() -> dict:
+def install_xray(*, github_token: str | None = None) -> dict:
     """
-    Use a pre-built customized Xray binary (manual for now).
-    Later: download release binary from GitHub automatically.
+    Install customized Xray binary from LordDeveloper/xray GitHub Releases.
+    Uses GITHUB_TOKEN (or request body github_token) for private repo access.
     """
+    from agent.xray_release import install_xray_binary, xray_binary_present
+
     binary = os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")
-    if which("xray") or Path(binary).is_file():
+    if xray_binary_present(binary):
+        resolved = binary if Path(binary).is_file() else which("xray")
         return {
             "core": "xray",
             "installed": True,
+            "downloaded": False,
             "message": "xray binary present",
-            "binary": binary if Path(binary).is_file() else which("xray"),
+            "binary": resolved,
             "api_base": os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
         }
 
-    raise AgentError(
-        "VALIDATION_ERROR",
-        "xray binary not found; place customized httpapi build at XRAY_BINARY "
-        "(GitHub auto-download will be added later)",
-    )
+    dest = Path(binary)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AgentError(
+            "VALIDATION_ERROR",
+            f"Cannot create directory for XRAY_BINARY [{dest.parent}]: {exc}",
+        ) from exc
+
+    return install_xray_binary(dest, token=github_token)
 
 
 def install_wireguard() -> dict:
@@ -69,11 +78,13 @@ INSTALLERS = {
 }
 
 
-def install_core(name: str) -> dict:
+def install_core(name: str, *, github_token: str | None = None) -> dict:
     key = name.strip().lower()
     installer = INSTALLERS.get(key)
     if installer is None:
         raise AgentError("CONFIG_NOT_FOUND", f"Unknown core [{name}]. Known: {', '.join(KNOWN_CORES)}")
+    if key == "xray":
+        return installer(github_token=github_token)
     return installer()
 
 
