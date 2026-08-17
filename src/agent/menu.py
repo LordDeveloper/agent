@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-import json
 import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Callable
 
 import httpx
 
 from agent import __version__
 from agent.errors import AgentError
-from agent.ops import KNOWN_CORES, generate_token, install_core, service_action, which, write_env_file
+from agent.ops import (
+    KNOWN_CORES,
+    generate_token,
+    install_core,
+    service_action,
+    service_is_active,
+    service_logs,
+    which,
+    write_env_file,
+)
 from agent.tui import (
     BLUE,
     CYAN,
@@ -47,8 +55,10 @@ def _print(text: str = "") -> None:
     print(text)
 
 
-def _dump(data: Any) -> None:
-    _print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+def _print_block(text: str, *, max_lines: int = 20, color: str = WHITE) -> None:
+    lines = [line.rstrip() for line in str(text).splitlines() if line.strip()]
+    for line in lines[:max_lines]:
+        _print(paint(f"  {line}", color))
 
 
 def _host_info() -> dict[str, str]:
@@ -79,25 +89,40 @@ def _host_info() -> dict[str, str]:
 
 def _service_state() -> tuple[str, str]:
     try:
-        result = service_action("status")
-        if result.get("ok"):
+        if service_is_active():
             return "Running", GREEN
         return "Stopped", RED
     except AgentError:
         return "Unavailable", YELLOW
 
 
-def _core_state(name: str) -> tuple[str, str]:
+def _core_installed(name: str) -> bool:
     if name == "xray":
-        binary = Path("/usr/local/bin/xray")
-        installed = binary.is_file() or which("xray") is not None
-    elif name == "wireguard":
-        installed = which("wg") is not None
-    else:
-        installed = which("awg") is not None or which("wg") is not None
+        return Path("/usr/local/bin/xray").is_file() or which("xray") is not None
+    if name == "wireguard":
+        return which("wg") is not None
+    return which("awg") is not None
+
+
+def _enabled_cores() -> set[str]:
+    try:
+        from agent.config import load_settings
+
+        return set(load_settings().cores())
+    except Exception:
+        return set()
+
+
+def _core_state(name: str) -> tuple[str, str]:
+    enabled = name in _enabled_cores()
+    installed = _core_installed(name)
+    if enabled and installed:
+        return "Enabled", GREEN
+    if enabled:
+        return "Enabled (missing binary)", YELLOW
     if installed:
-        return "Installed", GREEN
-    return "Not installed", RED
+        return "Installed (disabled)", YELLOW
+    return "Disabled", DIM
 
 
 def render_header(subtitle: str | None = None) -> None:
@@ -135,6 +160,130 @@ def _run_action(title: str, fn: Callable[[], None]) -> None:
     except KeyboardInterrupt:
         _print(paint("\n  Cancelled.", YELLOW))
     pause()
+
+
+def _show_agent_status() -> None:
+    from agent.runtime import open_runtime
+
+    runtime = open_runtime()
+    try:
+        enabled = ", ".join(runtime.settings.cores()) or "-"
+        _print(kv("Listen", runtime.settings.listen, CYAN))
+        _print(kv("Enabled cores", enabled, GREEN))
+        _print()
+        for info in runtime.registry.list_cores():
+            bits = [
+                "installed" if info.installed else "missing",
+                "running" if info.running else "stopped",
+            ]
+            version = info.version or "-"
+            color = GREEN if info.running else YELLOW
+            _print(paint(f"  {info.label:<12} {version}  ({', '.join(bits)})", color))
+    finally:
+        runtime.close()
+
+
+def _show_core_list() -> None:
+    _show_agent_status()
+
+
+def _show_service_action(action: str) -> None:
+    if action == "status":
+        active = service_is_active()
+        _print(kv("Active", "running" if active else "stopped", GREEN if active else RED))
+        logs = service_logs(12)
+        if logs:
+            _print()
+            _print(paint("  Recent logs:", DIM))
+            for line in logs:
+                _print(paint(f"  {line}", WHITE))
+        return
+
+    result = service_action(action)
+    ok = bool(result.get("ok", True))
+    _print(kv("Result", "ok" if ok else "failed", GREEN if ok else RED))
+    if result.get("unit"):
+        _print(kv("Unit", str(result["unit"]), CYAN))
+    if result.get("stdout"):
+        _print()
+        _print_block(str(result["stdout"]), max_lines=16)
+    if result.get("stderr"):
+        _print()
+        _print_block(str(result["stderr"]), max_lines=8, color=RED)
+
+
+def _show_install(name: str) -> None:
+    result = install_core(name)
+    _print(kv("Core", str(result.get("core") or name), CYAN))
+    _print(kv("Installed", "yes" if result.get("installed") else "no", GREEN))
+    if result.get("message"):
+        _print(kv("Message", str(result["message"]), WHITE))
+    if result.get("binary"):
+        _print(kv("Binary", str(result["binary"]), DIM))
+
+
+def _show_stats(*, online_only: bool) -> None:
+    from agent.runtime import open_runtime
+
+    runtime = open_runtime()
+    try:
+        if online_only:
+            users = runtime.registry.online_users()
+            _print(kv("Online", str(len(users)), GREEN))
+            _print()
+            if not users:
+                _print(paint("  No online users.", DIM))
+                return
+            for email in users:
+                _print(paint(f"  • {email}", WHITE))
+            return
+
+        snapshot = runtime.registry.usage_snapshot()
+        if not snapshot.inbounds:
+            _print(paint("  No usage data.", DIM))
+            return
+        for inbound in snapshot.inbounds:
+            _print(paint(f"  {inbound.tag}  in={inbound.incoming}  out={inbound.outgoing}", CYAN))
+            for client in inbound.clients:
+                label = client.email or client.id or "-"
+                _print(paint(f"    {label}  in={client.incoming}  out={client.outgoing}", WHITE))
+    finally:
+        runtime.close()
+
+
+def _show_update(*, check: bool, force: bool) -> None:
+    from agent.update import check_for_update, perform_update
+
+    if check:
+        payload = check_for_update()
+        _print(kv("Current", f"v{payload.get('current_version')}", CYAN))
+        _print(kv("Latest", f"v{payload.get('latest_version')}", GREEN))
+        if payload.get("update_available"):
+            _print(paint("  A newer release is available.", YELLOW))
+        else:
+            _print(paint("  Already up to date.", GREEN))
+        return
+
+    payload = perform_update(force=force, restart=True)
+    _print(kv("Current", f"v{payload.get('previous_version') or payload.get('current_version')}", CYAN))
+    _print(kv("Latest", f"v{payload.get('installed_version') or payload.get('latest_version')}", GREEN))
+    if payload.get("updated"):
+        _print(paint("  Agent binary updated.", GREEN))
+    else:
+        _print(paint(f"  {payload.get('message') or 'Already up to date.'}", GREEN))
+
+
+def _show_token(*, write: bool) -> None:
+    from agent.ops import set_env_value
+
+    token = generate_token()
+    _print(kv("Token", token, YELLOW))
+    if not write:
+        return
+    env_path = Path("/etc/agent/.env")
+    written = set_env_value(env_path, "AUTH_TOKEN", token)
+    _print(kv("Wrote", str(written.get("path") or env_path), GREEN))
+    _print(paint("  Restart service to apply: Service → Restart", DIM))
 
 
 def _wizard() -> None:
@@ -194,18 +343,11 @@ def _cores_menu() -> None:
         if picked in {None, "back"}:
             return
         if picked == "list":
-            from agent.cli import cmd_core_list
-
-            _run_action("Core list", lambda: cmd_core_list(SimpleNamespace(env_file=None)))
+            _run_action("Core list", _show_core_list)
             continue
         if not confirm(f"Install {picked} on this host?", default=True):
             continue
-
-        def _install(name: str = picked) -> None:
-            result = install_core(name)
-            _dump({"success": True, **result})
-
-        _run_action(f"Install {picked}", _install)
+        _run_action(f"Install {picked}", lambda name=picked: _show_install(name))
 
 
 def _service_menu() -> None:
@@ -234,7 +376,7 @@ def _service_menu() -> None:
             continue
         if picked in {"uninstall", "stop"} and not confirm(f"{picked.capitalize()} agent service?", default=False):
             continue
-        _run_action(f"Service {picked}", lambda action=picked: _dump(service_action(action)))
+        _run_action(f"Service {picked}", lambda action=picked: _show_service_action(action))
 
 
 def _stats_menu() -> None:
@@ -249,13 +391,9 @@ def _stats_menu() -> None:
         )
         if picked in {None, "back"}:
             return
-        from agent.cli import cmd_stats
-
         _run_action(
             "Online users" if picked == "online" else "Usage snapshot",
-            lambda online=picked == "online": cmd_stats(
-                SimpleNamespace(env_file=None, core=None, online_only=online)
-            ),
+            lambda online=picked == "online": _show_stats(online_only=online),
         )
 
 
@@ -272,20 +410,12 @@ def _update_menu() -> None:
         )
         if picked in {None, "back"}:
             return
-        from agent.cli import cmd_update
-
-        args = SimpleNamespace(
-            env_file=None,
-            token=None,
-            check=picked == "check",
-            repo=None,
-            asset=None,
-            force=picked == "force",
-            no_restart=False,
-        )
         if picked != "check" and not confirm("Download and install the latest agent release?", default=True):
             continue
-        _run_action("Update agent", lambda ns=args: cmd_update(ns))
+        _run_action(
+            "Update agent",
+            lambda check=picked == "check", force=picked == "force": _show_update(check=check, force=force),
+        )
 
 
 def _token_menu() -> None:
@@ -300,20 +430,14 @@ def _token_menu() -> None:
         )
         if picked in {None, "back"}:
             return
-        from agent.cli import cmd_token
-
         _run_action(
             "Auth token",
-            lambda write=picked == "write": cmd_token(
-                SimpleNamespace(bytes=32, write=write, env_file=None, json=True)
-            ),
+            lambda write=picked == "write": _show_token(write=write),
         )
 
 
 def _status() -> None:
-    from agent.cli import cmd_status
-
-    _run_action("Status", lambda: cmd_status(SimpleNamespace(env_file=None)))
+    _run_action("Status", _show_agent_status)
 
 
 def run_interactive() -> int:

@@ -8,9 +8,9 @@ from agent.tui import LOGO, LOGO_ASCII, TAGLINE, decode_key
 def test_logo_and_tagline():
     assert "█" in LOGO
     assert LOGO.count("\n") >= 5
-    assert "AGENT" in LOGO_ASCII
+    assert LOGO_ASCII.count("\n") >= 4
     assert "Netinja" in TAGLINE
-    assert __version__ == "0.3.7"
+    assert __version__ == "0.3.8"
 
 
 def test_decode_key_arrows_and_enter():

@@ -33,8 +33,10 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         client = request.client.host if request.client else "-"
         try:
             response = await call_next(request)
-        except Exception:
+        except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
+            if isinstance(exc, HTTPException):
+                raise
             log.exception(
                 "request failed method=%s path=%s client=%s duration_ms=%.1f",
                 request.method,

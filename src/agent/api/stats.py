@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query, Request
 
 from agent.auth import verify_auth
+from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
 from agent.routing import resolve_core_key
 
@@ -16,7 +17,10 @@ def stats_online(
     core: str | None = Query(None),
     registry: CoreRegistry = Depends(get_registry),
 ):
-    users = registry.online_users(resolve_core_key(core))
+    try:
+        users = registry.online_users(resolve_core_key(core))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "users": users}
 
 
@@ -25,5 +29,8 @@ def stats_snapshot(
     core: str | None = Query(None),
     registry: CoreRegistry = Depends(get_registry),
 ):
-    snapshot = registry.usage_snapshot(resolve_core_key(core))
+    try:
+        snapshot = registry.usage_snapshot(resolve_core_key(core))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **snapshot.model_dump()}

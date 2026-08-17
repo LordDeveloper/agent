@@ -206,3 +206,20 @@ def service_action(action: str) -> dict:
         "stderr": (proc.stderr or "").strip(),
         "code": proc.returncode,
     }
+
+
+def service_is_active() -> bool:
+    if not which("systemctl"):
+        return False
+    proc = run_cmd(["systemctl", "is-active", "agent"], check=False)
+    return (proc.stdout or "").strip() == "active"
+
+
+def service_logs(limit: int = 16) -> list[str]:
+    if not which("journalctl"):
+        return []
+    proc = run_cmd(
+        ["journalctl", "-u", "agent", "-n", str(max(1, limit)), "--no-pager", "-o", "short-iso"],
+        check=False,
+    )
+    return [line.rstrip() for line in (proc.stdout or "").splitlines() if line.strip()]

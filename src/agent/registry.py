@@ -28,6 +28,10 @@ class CoreRegistry:
     def list_cores(self) -> list[CoreInfo]:
         return [self._info(driver) for driver in self._drivers.values()]
 
+    def has(self, key: str) -> bool:
+        resolved = resolve_core_key(key) or ""
+        return resolved in self._drivers
+
     def get(self, key: str) -> CoreDriver:
         resolved = resolve_core_key(key) or ""
         driver = self._drivers.get(resolved)

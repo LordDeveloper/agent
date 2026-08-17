@@ -216,4 +216,7 @@ def test_disabled_core_routes_are_hidden(tmp_path, fake_xray):
         assert client.get("/api/v1/cores/wireguard/interfaces", headers=headers).status_code == 404
         assert client.get("/cores/wireguard/health").status_code == 404
         assert client.get("/cores/xray/health").status_code == 200
+        stats = client.get("/api/v1/stats/snapshot?core=amnezia", headers=headers)
+        assert stats.status_code == 404
+        assert "not enabled" in stats.text
     _clear_env()
