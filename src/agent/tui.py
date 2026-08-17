@@ -122,13 +122,13 @@ def decode_key(seq: str) -> str:
         return "ctrl-c"
     if seq in {"\x1b"}:
         return "esc"
-    if seq in {"\x1b[A", "\x00H", "\xe0H"}:
+    if seq in {"\x1b[A", "\x1bOA", "\x00H", "\xe0H"}:
         return "up"
-    if seq in {"\x1b[B", "\x00P", "\xe0P"}:
+    if seq in {"\x1b[B", "\x1bOB", "\x00P", "\xe0P"}:
         return "down"
-    if seq in {"\x1b[C", "\x00M", "\xe0M"}:
+    if seq in {"\x1b[C", "\x1bOC", "\x00M", "\xe0M"}:
         return "right"
-    if seq in {"\x1b[D", "\x00K", "\xe0K"}:
+    if seq in {"\x1b[D", "\x1bOD", "\x00K", "\xe0K"}:
         return "left"
     if seq in {" ", "\x20"}:
         return "space"
@@ -154,7 +154,7 @@ def read_key() -> str:
         ch = sys.stdin.read(1)
         if ch == "\x1b":
             extra = sys.stdin.read(1)
-            if extra == "[":
+            if extra in {"[", "O"}:
                 extra += sys.stdin.read(1)
             return decode_key(ch + extra)
         return decode_key(ch)
@@ -196,9 +196,7 @@ def select(choices: Iterable[Choice], *, pointer: str = "❯") -> str | None:
                     block.append(paint(f"  {pointer} {label}", REVERSE + item.color))
                 else:
                     block.append(paint(f"    {label}", item.color))
-            sys.stdout.write("\n".join(block) + "\n")
-            sys.stdout.write(paint("\n  ↑/↓ move   Enter select   Esc back\n", DIM))
-            sys.stdout.flush()
+            drawn = _draw_menu(block, "↑/↓ move   Enter select   Esc back")
 
             key = read_key()
             if key == "ctrl-c":
@@ -216,7 +214,7 @@ def select(choices: Iterable[Choice], *, pointer: str = "❯") -> str | None:
                     if item.shortcut is not None and key == item.shortcut:
                         return item.value
 
-            _move_up(len(block) + 3)
+            _move_up(drawn)
     finally:
         show_cursor()
 
@@ -258,9 +256,7 @@ def multi_select(choices: list[Choice], selected: set[str] | None = None) -> lis
                 block.append(paint("  ❯ Done", REVERSE + GREEN))
             else:
                 block.append(paint("    Done", WHITE))
-            sys.stdout.write("\n".join(block) + "\n")
-            sys.stdout.write(paint("\n  Space toggle   Enter confirm   Esc back\n", DIM))
-            sys.stdout.flush()
+            drawn = _draw_menu(block, "Space toggle   Enter confirm   Esc back")
 
             key = read_key()
             if key == "ctrl-c":
@@ -286,11 +282,23 @@ def multi_select(choices: list[Choice], selected: set[str] | None = None) -> lis
                     picked.remove(value)
                 else:
                     picked.add(value)
-            _move_up(len(block) + 3)
+            _move_up(drawn)
     finally:
         show_cursor()
 
 
+def _draw_menu(lines: list[str], hint: str) -> int:
+    body = "\n".join(lines)
+    footer = paint(f"  {hint}", DIM)
+    text = f"{body}\n\n{footer}\n"
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    return text.count("\n")
+
+
 def _move_up(lines: int) -> None:
-    sys.stdout.write(f"\033[{max(lines, 1)}A\033[J")
+    if lines < 1:
+        return
+    # Stay on column 0, then erase only the menu block — not the header above it.
+    sys.stdout.write(f"\r\033[{lines}A\033[J")
     sys.stdout.flush()

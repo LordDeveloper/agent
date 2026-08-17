@@ -19,6 +19,20 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return subprocess.run(args, check=check, capture_output=True, text=True, timeout=300)
 
 
+def _prepare_xray_service(result: dict) -> dict:
+    try:
+        from agent.xray_service import ensure_xray_runtime
+
+        result["service"] = ensure_xray_runtime(
+            binary=str(result.get("binary") or os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")),
+            api_base=str(result.get("api_base") or os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080")),
+            start=False,
+        )
+    except AgentError as exc:
+        result["service_error"] = exc.message
+    return result
+
+
 def install_xray(*, github_token: str | None = None) -> dict:
     """
     Install customized Xray binary from LordDeveloper/xray GitHub Releases.
@@ -29,14 +43,14 @@ def install_xray(*, github_token: str | None = None) -> dict:
     binary = os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")
     if xray_binary_present(binary):
         resolved = binary if Path(binary).is_file() else which("xray")
-        return {
+        return _prepare_xray_service({
             "core": "xray",
             "installed": True,
             "downloaded": False,
             "message": "xray binary present",
             "binary": resolved,
             "api_base": os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
-        }
+        })
 
     dest = Path(binary)
     try:
@@ -47,7 +61,8 @@ def install_xray(*, github_token: str | None = None) -> dict:
             f"Cannot create directory for XRAY_BINARY [{dest.parent}]: {exc}",
         ) from exc
 
-    return install_xray_binary(dest, token=github_token)
+    result = install_xray_binary(dest, token=github_token)
+    return _prepare_xray_service(result)
 
 
 def install_wireguard() -> dict:
@@ -106,6 +121,7 @@ def write_env_file(
             f"ENABLED_CORES={','.join(cores)}",
             "XRAY_API_BASE=http://127.0.0.1:8080",
             "XRAY_BINARY=/usr/local/bin/xray",
+            "XRAY_CONFIG=/usr/local/etc/xray/config.json",
             "WIREGUARD_CONFIG_DIR=/etc/wireguard",
             "AMNEZIA_CONFIG_DIR=/etc/amneziawg",
             "",

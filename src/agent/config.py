@@ -14,6 +14,7 @@ class XraySettings(BaseModel):
     username: str = ""
     password: str = ""
     binary: str = "/usr/local/bin/xray"
+    config: str = "/usr/local/etc/xray/config.json"
     timeout: float = 15.0
     connect_timeout: float = 3.0
 
@@ -37,6 +38,7 @@ class AgentSettings(BaseSettings):
       LOG_LEVEL=INFO
       XRAY_API_BASE=http://127.0.0.1:8080
       XRAY_BINARY=/usr/local/bin/xray
+      XRAY_CONFIG=/usr/local/etc/xray/config.json
     """
 
     model_config = SettingsConfigDict(
@@ -61,6 +63,7 @@ class AgentSettings(BaseSettings):
     xray_username: str = ""
     xray_password: str = ""
     xray_binary: str = "/usr/local/bin/xray"
+    xray_config: str = "/usr/local/etc/xray/config.json"
 
     wireguard_config_dir: str = "/etc/wireguard"
     amnezia_config_dir: str = "/etc/amneziawg"
@@ -72,6 +75,7 @@ class AgentSettings(BaseSettings):
             username=self.xray_username,
             password=self.xray_password,
             binary=self.xray_binary,
+            config=self.xray_config,
         )
 
     @property

@@ -44,15 +44,24 @@ def attach_lifecycle(router: APIRouter, *, core: str, get_driver: Callable) -> N
 
     @router.post("/enable")
     def core_enable(driver=Depends(get_driver)):
-        return {"success": True, "result": driver.enable()}
+        try:
+            return {"success": True, "result": driver.enable()}
+        except AgentError as exc:
+            raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.post("/disable")
     def core_disable(driver=Depends(get_driver)):
-        return {"success": True, "result": driver.disable()}
+        try:
+            return {"success": True, "result": driver.disable()}
+        except AgentError as exc:
+            raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.post("/restart")
     def core_restart(driver=Depends(get_driver)):
-        return {"success": True, "result": driver.restart()}
+        try:
+            return {"success": True, "result": driver.restart()}
+        except AgentError as exc:
+            raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.get("/errors")
     def core_errors(

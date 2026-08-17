@@ -16,7 +16,7 @@ from agent.drivers.xray_http import XrayHttpClient
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_xray_client, record_is_enabled
-from agent.support.process import service_is_active, systemctl
+from agent.support.process import service_is_active
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
@@ -97,16 +97,34 @@ class XrayDriver(CoreDriver):
         return install_xray()
 
     def enable(self) -> dict[str, Any]:
-        return systemctl("enable", _XRAY_UNIT) | systemctl("start", _XRAY_UNIT)
+        from agent.xray_service import ensure_xray_runtime
+
+        xray = self.settings.xray
+        return ensure_xray_runtime(
+            binary=xray.binary,
+            config_path=xray.config,
+            api_base=xray.api_base,
+            username=xray.username,
+            password=xray.password,
+            start=True,
+        )
 
     def disable(self) -> dict[str, Any]:
-        return systemctl("stop", _XRAY_UNIT) | systemctl("disable", _XRAY_UNIT)
+        from agent.xray_service import stop_xray_service
+
+        return stop_xray_service()
 
     def restart(self) -> dict[str, Any]:
-        try:
-            return systemctl("restart", _XRAY_UNIT)
-        except AgentError:
-            return {"restarted": True, "logger": self.client.restart_logger()}
+        from agent.xray_service import restart_xray_service
+
+        xray = self.settings.xray
+        return restart_xray_service(
+            binary=xray.binary,
+            config_path=xray.config,
+            api_base=xray.api_base,
+            username=xray.username,
+            password=xray.password,
+        )
 
     def inbound_tag(self, inbound_id: int | str) -> str:
         if isinstance(inbound_id, str) and inbound_id.startswith("inbound-"):
@@ -399,4 +417,6 @@ class XrayDriver(CoreDriver):
         return UsageSnapshotModel(inbounds=rows)
 
     def online_users(self) -> list[str]:
+        if not self.running():
+            return []
         return self.client.online_users()
