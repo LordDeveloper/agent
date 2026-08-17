@@ -20,12 +20,17 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: agent-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build-${{ matrix.asset }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - platform: linux/amd64
@@ -52,11 +57,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # Native shell setup avoids intermittent 429/503 from codeload.github.com when
+      # downloading docker/setup-qemu-action and docker/setup-buildx-action tarballs.
+      - name: Set up QEMU and Buildx
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          docker buildx create --name agent-builder --driver docker-container --use \
+            2>/dev/null || docker buildx use agent-builder
+          docker buildx inspect --bootstrap
 
       - name: Build ${{ matrix.asset }}
         run: |
