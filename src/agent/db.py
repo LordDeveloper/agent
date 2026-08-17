@@ -51,6 +51,8 @@ class Store:
                     resource TEXT NOT NULL,
                     detail TEXT NOT NULL DEFAULT ''
                 );
+
+                DROP TABLE IF EXISTS core_errors;
                 """
             )
             self._conn.commit()

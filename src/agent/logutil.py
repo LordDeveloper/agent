@@ -62,3 +62,19 @@ def setup_logging(settings: AgentSettings) -> logging.Logger:
 
     logger.info("logging started path=%s level=%s", log_path, level_name)
     return logger
+
+
+def reset_logging() -> None:
+    """Drop handlers so tests can bind a fresh agent.log."""
+    global _configured
+
+    logger = get_logger()
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    _configured = False
+
+
+def flush_logging() -> None:
+    for handler in get_logger().handlers:
+        handler.flush()

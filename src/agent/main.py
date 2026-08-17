@@ -17,8 +17,12 @@ from agent.api.stats import router as stats_router
 from agent.api.xray import router as xray_router
 from agent.api.wireguard import router as wireguard_router
 from agent.api.amnezia import router as amnezia_router
+from agent.errorlog import CoreErrorCaptureMiddleware, CoreErrorLog
 from agent.logutil import get_logger, resolve_log_path, setup_logging
 from agent.registry import CoreRegistry
+from agent.api.lifecycle import health_payload
+from agent.routing import ROUTE_SLUGS
+from agent.errors import AgentError
 
 log = get_logger("http")
 
@@ -60,6 +64,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
     store = Store(settings.resolve_db_path())
     audit = AuditLog(store)
+    errors = CoreErrorLog(resolve_log_path(settings))
     registry = CoreRegistry(settings, audit, store)
     enabled = set(settings.cores())
 
@@ -80,7 +85,9 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.store = store
     app.state.audit = audit
+    app.state.errors = errors
     app.state.registry = registry
+    app.add_middleware(CoreErrorCaptureMiddleware)
     app.add_middleware(RequestLogMiddleware)
 
     auth = [Depends(verify_auth)]
@@ -106,6 +113,25 @@ def create_app(env_file: str | None = None) -> FastAPI:
             "cores": [c.model_dump() for c in reg.list_cores()],
         }
 
+    def _register_public_core_health(core_key: str, slug: str) -> None:
+        @app.get(f"/cores/{slug}/health", name=f"{slug}-public-health")
+        def public_core_health(request: Request):
+            try:
+                driver = request.app.state.registry.get(core_key)
+            except AgentError:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "success": False,
+                        "error": {"code": "CONFIG_NOT_FOUND", "message": f"Core [{core_key}] is not enabled"},
+                    },
+                )
+            return health_payload(driver)
+
+    for core_key, slug in ROUTE_SLUGS.items():
+        if core_key in enabled:
+            _register_public_core_health(core_key, slug)
+
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         if isinstance(exc, HTTPException):
@@ -117,11 +143,12 @@ def create_app(env_file: str | None = None) -> FastAPI:
             request.url.path,
             exc,
         )
+        message = f"{type(exc).__name__}: {exc}".strip()[:400] or "Internal Server Error"
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": {"code": "INTERNAL_ERROR", "message": "Internal Server Error"},
+                "error": {"code": "INTERNAL_ERROR", "message": message},
             },
         )
 

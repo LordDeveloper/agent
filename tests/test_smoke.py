@@ -86,6 +86,34 @@ def test_health_no_auth(client: TestClient):
     assert r.json()["success"] is True
 
 
+def test_per_core_health_is_isolated(client: TestClient):
+    xray = client.get("/cores/xray/health")
+    assert xray.status_code == 200, xray.text
+    body = xray.json()
+    assert body["core"] == "xray"
+    assert body["slug"] == "xray"
+    assert "cores" not in body
+
+    wg = client.get("/cores/wireguard/health")
+    assert wg.status_code == 200, wg.text
+    assert wg.json()["core"] == "wireguard"
+    assert wg.json()["slug"] == "wireguard"
+
+    awg = client.get("/cores/amnezia/health")
+    assert awg.status_code == 200, awg.text
+    assert awg.json()["core"] == "amnezia"
+    assert awg.json()["slug"] == "amnezia"
+
+    auth = client.get("/api/v1/cores/xray/health")
+    assert auth.status_code == 401
+
+    headers = {"Authorization": "Bearer dev-token"}
+    scoped = client.get("/api/v1/cores/xray/health", headers=headers)
+    assert scoped.status_code == 200
+    assert scoped.json()["core"] == "xray"
+    assert "cores" not in scoped.json()
+
+
 def test_api_requires_auth(client: TestClient):
     r = client.get("/api/v1/cores")
     assert r.status_code == 401
@@ -147,4 +175,6 @@ def test_disabled_core_routes_are_hidden(tmp_path, fake_xray):
     with TestClient(create_app(str(env))) as client:
         assert client.get("/api/v1/cores/xray/inbounds", headers=headers).status_code == 200
         assert client.get("/api/v1/cores/wireguard/interfaces", headers=headers).status_code == 404
+        assert client.get("/cores/wireguard/health").status_code == 404
+        assert client.get("/cores/xray/health").status_code == 200
     _clear_env()

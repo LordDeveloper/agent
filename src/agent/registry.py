@@ -7,6 +7,7 @@ from agent.drivers.wireguard import WireGuardDriver
 from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError
 from agent.models import CoreInfo, UsageSnapshotModel
+from agent.routing import resolve_core_key
 
 
 class CoreRegistry:
@@ -28,7 +29,8 @@ class CoreRegistry:
         return [self._info(driver) for driver in self._drivers.values()]
 
     def get(self, key: str) -> CoreDriver:
-        driver = self._drivers.get(key)
+        resolved = resolve_core_key(key) or ""
+        driver = self._drivers.get(resolved)
         if driver is None:
             raise AgentError("CONFIG_NOT_FOUND", f"Core [{key}] is not enabled", 404)
         return driver

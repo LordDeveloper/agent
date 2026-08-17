@@ -58,7 +58,7 @@ class ClientPayload(BaseModel):
     enable: Optional[bool] = True
     is_enabled: Optional[bool] = None
     expiryTime: Optional[int] = None
-    expires_at: Optional[str] = None
+    expires_at: Optional[Any] = None
     totalGB: Optional[float] = None
     volume: Optional[float] = None
     up: Optional[int] = None

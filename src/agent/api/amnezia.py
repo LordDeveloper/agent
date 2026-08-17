@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
+from agent.api.lifecycle import attach_lifecycle, health_payload
 from agent.drivers.amnezia import AmneziaDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import AmneziaInterfacePayload, AmneziaPeerPayload
@@ -15,20 +16,21 @@ def get_registry(request: Request) -> CoreRegistry:
 
 
 def get_amnezia(registry: CoreRegistry = Depends(get_registry)) -> AmneziaDriver:
-    driver = registry.get("amnezia")
+    try:
+        driver = registry.get("amnezia")
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
     if not isinstance(driver, AmneziaDriver):
         raise_agent_error("UNSUPPORTED_CAPABILITY", "Amnezia core is not available")
     return driver
 
 
+attach_lifecycle(router, core="amnezia", get_driver=get_amnezia)
+
+
 @router.get("/status")
 def status(amnezia: AmneziaDriver = Depends(get_amnezia)):
-    return {
-        "success": True,
-        "installed": amnezia.installed(),
-        "running": amnezia.running(),
-        "version": amnezia.version(),
-    }
+    return health_payload(amnezia)
 
 
 @router.get("/interfaces")

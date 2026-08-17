@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
+from agent.api.lifecycle import attach_lifecycle, health_payload
 from agent.drivers.wireguard import WireGuardDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import WgInterfacePayload, WgPeerPayload
@@ -15,20 +16,21 @@ def get_registry(request: Request) -> CoreRegistry:
 
 
 def get_wg(registry: CoreRegistry = Depends(get_registry)) -> WireGuardDriver:
-    driver = registry.get("wireguard")
+    try:
+        driver = registry.get("wireguard")
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
     if not isinstance(driver, WireGuardDriver) or driver.key != "wireguard":
         raise_agent_error("UNSUPPORTED_CAPABILITY", "WireGuard core is not available")
     return driver
 
 
+attach_lifecycle(router, core="wireguard", get_driver=get_wg)
+
+
 @router.get("/status")
 def status(wg: WireGuardDriver = Depends(get_wg)):
-    return {
-        "success": True,
-        "installed": wg.installed(),
-        "running": wg.running(),
-        "version": wg.version(),
-    }
+    return health_payload(wg)
 
 
 @router.get("/interfaces")

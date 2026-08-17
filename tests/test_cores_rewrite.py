@@ -68,6 +68,27 @@ def test_normalize_xray_client_aliases():
     assert row["up"] == 20
 
 
+def test_normalize_xray_client_ignores_nested_traffic_and_date_objects():
+    row = normalize_xray_client(
+        {
+            "id": "u1",
+            "email": "abc",
+            "is_enabled": "1",
+            "volume": "1073741824",
+            "max_connection": "3",
+            "expires_at": {"date": "2030-01-01 00:00:00", "timezone": "UTC"},
+            "incoming": {"uplink": 1},
+            "outgoing": ["bad"],
+        }
+    )
+    assert row["enable"] is True
+    assert row["limitIp"] == 3
+    assert abs(row["totalGB"] - 1.0) < 0.001
+    assert row["expiryTime"] > 0
+    assert row["down"] == 0
+    assert row["up"] == 0
+
+
 def test_wireguard_interfaces_and_peers(wg_client):
     headers = {"Authorization": "Bearer dev-token"}
     r = wg_client.post(

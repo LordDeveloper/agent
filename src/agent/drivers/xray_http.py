@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ class XrayHttpClient:
         auth = None
         if settings.username and settings.password:
             auth = (settings.username, settings.password)
+        self._lock = Lock()
         self._client = httpx.Client(
             base_url=base,
             auth=auth,
@@ -41,15 +43,16 @@ class XrayHttpClient:
     ) -> Any:
         headers = {"Content-Type": "application/json"} if files is None and json_body is not None else None
         try:
-            response = self._client.request(
-                method,
-                path,
-                params=params,
-                json=json_body if files is None else None,
-                files=files,
-                data=data,
-                headers=headers,
-            )
+            with self._lock:
+                response = self._client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json_body if files is None else None,
+                    files=files,
+                    data=data,
+                    headers=headers,
+                )
         except httpx.HTTPError as exc:
             raise AgentError("CONFIG_NOT_FOUND", f"Xray HTTP API unreachable: {exc}", 502) from exc
 

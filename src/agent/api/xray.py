@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
+from agent.api.lifecycle import attach_lifecycle, health_payload
 from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import ClientPayload, InboundPayload
@@ -15,27 +16,28 @@ def get_registry(request: Request) -> CoreRegistry:
 
 
 def get_xray(registry: CoreRegistry = Depends(get_registry)) -> XrayDriver:
-    driver = registry.get("xray")
+    try:
+        driver = registry.get("xray")
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
     if not isinstance(driver, XrayDriver):
         raise_agent_error("UNSUPPORTED_CAPABILITY", "Xray core is not available")
     return driver
 
 
+attach_lifecycle(router, core="xray", get_driver=get_xray)
+
+
 @router.get("/status")
 def xray_status(xray: XrayDriver = Depends(get_xray)):
-    return {
-        "success": True,
-        "installed": xray.installed(),
-        "running": xray.running(),
-        "version": xray.version(),
-        # Bot-compatible shape used by AdminServerManage / ServerService checks.
-        "obj": {"xray": {"state": "running" if xray.running() else "stop", "errorMsg": ""}},
+    payload = health_payload(xray)
+    payload["obj"] = {
+        "xray": {
+            "state": "running" if payload["running"] else "stop",
+            "errorMsg": "",
+        },
     }
-
-
-@router.post("/restart")
-def xray_restart(xray: XrayDriver = Depends(get_xray)):
-    return {"success": True, "result": xray.restart()}
+    return payload
 
 
 @router.get("/inbounds")
@@ -108,6 +110,8 @@ def update_client(inbound_id: str, client_key: str, payload: ClientPayload, xray
         client = xray.update_client(inbound_id, client_key, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    except Exception as exc:
+        raise_agent_error("INTERNAL_ERROR", f"{type(exc).__name__}: {exc}", 500)
     return {"success": True, "client": client}
 
 
@@ -126,6 +130,8 @@ def reset_traffic(inbound_id: str, client_key: str, xray: XrayDriver = Depends(g
         client = xray.reset_client_traffic(inbound_id, client_key)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    except Exception as exc:
+        raise_agent_error("INTERNAL_ERROR", f"{type(exc).__name__}: {exc}", 500)
     return {"success": True, "client": client}
 
 
