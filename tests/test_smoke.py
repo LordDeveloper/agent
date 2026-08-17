@@ -143,6 +143,45 @@ def test_xray_flow(client: TestClient, fake_xray):
     assert body["inbounds"]
     assert body["inbounds"][0]["clients"]
     assert body["inbounds"][0]["clients"][0]["incoming"] == 10
+    assert "up" not in body["inbounds"][0]["clients"][0]
+    assert "down" not in body["inbounds"][0]["clients"][0]
+
+
+def test_xray_client_rejects_xui_field_names(client: TestClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    r = client.post(
+        "/api/v1/cores/xray/inbounds",
+        headers=headers,
+        json=_sample_inbound(12, 11443),
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.post(
+        "/api/v1/cores/xray/inbounds/12/clients",
+        headers=headers,
+        json={
+            "email": "netinja1",
+            "id": "33333333-3333-3333-3333-333333333333",
+            "enable": True,
+            "totalGB": 2048,
+            "limitIp": 2,
+            "expiryTime": 1893456000000,
+            "down": 5,
+            "up": 7,
+            "subId": "legacy",
+            "tgId": 1,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()["client"]
+    assert body["is_enabled"] is True
+    assert body["volume"] == 2048
+    assert body["max_connection"] == 2
+    assert body["incoming"] == 5
+    assert body["outgoing"] == 7
+    assert body["expires_at"].startswith("2030-01-01")
+    for key in ("enable", "totalGB", "limitIp", "expiryTime", "up", "down", "subId", "tgId"):
+        assert key not in body
 
 
 def test_xray_roundtrip_via_http_api(tmp_path, fake_xray):

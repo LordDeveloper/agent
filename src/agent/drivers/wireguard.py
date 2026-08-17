@@ -16,7 +16,7 @@ from agent.db import Store
 from agent.drivers.base import CoreDriver
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.support import normalize_peer
+from agent.support import normalize_peer, record_is_enabled
 from agent.support.process import run
 
 _ONLINE_HANDSHAKE_SECONDS = 180
@@ -295,7 +295,7 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("ip_logs", [])
         peer.setdefault("persistent_keepalive", 25)
 
-        if peer.get("enable") is False:
+        if not record_is_enabled(peer):
             # Keep record disabled without applying to live interface.
             pass
 
@@ -364,7 +364,7 @@ class WireGuardDriver(CoreDriver):
         for iface in self.list_interfaces():
             clients = []
             for peer in iface.get("peers", []):
-                if peer.get("enable") is False:
+                if not record_is_enabled(peer):
                     continue
                 clients.append(
                     ClientUsageModel(
@@ -391,7 +391,7 @@ class WireGuardDriver(CoreDriver):
         online: list[str] = []
         for iface in self.list_interfaces():
             for peer in iface.get("peers", []):
-                if peer.get("online") and peer.get("enable") is not False:
+                if peer.get("online") and record_is_enabled(peer):
                     online.append(str(peer.get("email") or peer.get("id")))
         return online
 
@@ -529,7 +529,7 @@ class WireGuardDriver(CoreDriver):
         conf_path = config_dir / f"{iface['name']}.conf"
         lines = self._interface_lines(iface)
         for peer in iface.get("peers", []):
-            if peer.get("enable") is False:
+            if not record_is_enabled(peer):
                 continue
             lines.extend(
                 [

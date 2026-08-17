@@ -15,7 +15,7 @@ from agent.drivers.base import CoreDriver
 from agent.drivers.xray_http import XrayHttpClient
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.support import normalize_xray_client
+from agent.support import normalize_xray_client, record_is_enabled
 from agent.support.process import service_is_active, systemctl
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
@@ -134,7 +134,9 @@ class XrayDriver(CoreDriver):
         elif "id" not in inbound:
             inbound["id"] = tag
         inbound.setdefault("settings", {})
-        inbound["settings"].setdefault("clients", [])
+        inbound["settings"]["clients"] = [
+            normalize_xray_client(client) for client in inbound["settings"].get("clients") or []
+        ]
         return inbound
 
     def list_inbounds(self) -> list[dict[str, Any]]:
@@ -229,7 +231,7 @@ class XrayDriver(CoreDriver):
             inbound, str(client.get("email"))
         )
         tag = str(inbound["tag"])
-        if client.get("enable") is False:
+        if not record_is_enabled(client):
             if existing:
                 self.delete_client(inbound_id, str(existing.get("email") or existing.get("id")))
             return client
@@ -248,7 +250,7 @@ class XrayDriver(CoreDriver):
         if current is None:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
         merged = normalize_xray_client({**current, **payload})
-        if merged.get("enable") is False:
+        if not record_is_enabled(merged):
             self.delete_client(inbound_id, client_key)
             return merged
         self.client.edit_users(str(inbound["tag"]), [merged])

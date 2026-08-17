@@ -49,6 +49,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_menu(_: argparse.Namespace) -> int:
+    from agent.menu import run_interactive
+
+    return run_interactive()
+
+
 def cmd_version(_: argparse.Namespace) -> int:
     print(f"agent {__version__}")
     return 0
@@ -231,7 +237,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent",
-        description="Netinja node agent CLI",
+        description="Netinja node agent CLI. Run without arguments for the interactive menu.",
     )
     parser.add_argument("--version", action="store_true", help="Show version and exit")
     sub = parser.add_subparsers(dest="command")
@@ -241,6 +247,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=None)
     p_serve.add_argument("--port", type=int, default=None)
     p_serve.set_defaults(func=cmd_serve)
+
+    p_menu = sub.add_parser("menu", help="Interactive nested menu (arrow keys)")
+    p_menu.set_defaults(func=cmd_menu)
 
     p_ver = sub.add_parser("version", help="Show version")
     p_ver.set_defaults(func=cmd_version)
@@ -323,6 +332,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_version(args)
 
     if not getattr(args, "command", None):
+        from agent.menu import run_interactive
+        from agent.tui import is_interactive
+
+        if is_interactive():
+            return run_interactive()
         parser.print_help()
         return 0
 

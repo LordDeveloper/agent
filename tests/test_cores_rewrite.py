@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent.main import create_app
-from agent.support import normalize_xray_client
+from agent.support import normalize_peer, normalize_xray_client
 
 
 def _clear_env() -> None:
@@ -47,7 +47,7 @@ def wg_client(tmp_path, monkeypatch):
     _clear_env()
 
 
-def test_normalize_xray_client_aliases():
+def test_normalize_xray_client_uses_netinja_fields():
     row = normalize_xray_client(
         {
             "id": "u1",
@@ -60,33 +60,78 @@ def test_normalize_xray_client_aliases():
             "outgoing": 20,
         }
     )
-    assert row["enable"] is True
-    assert row["limitIp"] == 2
-    assert abs(row["totalGB"] - 1.0) < 0.001
-    assert row["expiryTime"] > 0
-    assert row["down"] == 10
-    assert row["up"] == 20
+    assert row["is_enabled"] is True
+    assert row["max_connection"] == 2
+    assert row["volume"] == 1024**3
+    assert row["expires_at"].startswith("2030-01-01")
+    assert row["incoming"] == 10
+    assert row["outgoing"] == 20
+    assert "enable" not in row
+    assert "limitIp" not in row
+    assert "totalGB" not in row
+    assert "expiryTime" not in row
+    assert "up" not in row
+    assert "down" not in row
 
 
-def test_normalize_xray_client_ignores_nested_traffic_and_date_objects():
+def test_normalize_xray_client_maps_legacy_xui_then_drops_them():
     row = normalize_xray_client(
         {
             "id": "u1",
             "email": "abc",
-            "is_enabled": "1",
-            "volume": "1073741824",
-            "max_connection": "3",
-            "expires_at": {"date": "2030-01-01 00:00:00", "timezone": "UTC"},
-            "incoming": {"uplink": 1},
-            "outgoing": ["bad"],
+            "enable": "1",
+            "totalGB": 1073741824,
+            "limitIp": "3",
+            "expiryTime": {"date": "2030-01-01 00:00:00", "timezone": "UTC"},
+            "down": {"uplink": 1},
+            "up": ["bad"],
         }
     )
-    assert row["enable"] is True
-    assert row["limitIp"] == 3
-    assert abs(row["totalGB"] - 1.0) < 0.001
-    assert row["expiryTime"] > 0
-    assert row["down"] == 0
-    assert row["up"] == 0
+    assert row["is_enabled"] is True
+    assert row["max_connection"] == 3
+    assert row["volume"] == 1073741824
+    assert row["expires_at"].startswith("2030-01-01")
+    assert row["incoming"] == 0
+    assert row["outgoing"] == 0
+    assert "enable" not in row
+    assert "totalGB" not in row
+    assert "limitIp" not in row
+    assert "expiryTime" not in row
+    assert "down" not in row
+    assert "up" not in row
+    assert "subId" not in row
+    assert "tgId" not in row
+
+
+def test_normalize_peer_maps_legacy_xui_then_drops_them():
+    row = normalize_peer(
+        {
+            "name": "peer1",
+            "enable": False,
+            "totalGB": 2048,
+            "limitIp": 1,
+            "expiryTime": 1893456000000,
+            "down": 11,
+            "up": 22,
+            "subId": 9,
+            "tgId": 8,
+        }
+    )
+    assert row["email"] == "peer1"
+    assert row["is_enabled"] is False
+    assert row["max_connection"] == 1
+    assert row["volume"] == 2048
+    assert row["expires_at"].startswith("2030-01-01")
+    assert row["incoming"] == 11
+    assert row["outgoing"] == 22
+    assert "enable" not in row
+    assert "totalGB" not in row
+    assert "limitIp" not in row
+    assert "expiryTime" not in row
+    assert "up" not in row
+    assert "down" not in row
+    assert "subId" not in row
+    assert "tgId" not in row
 
 
 def test_wireguard_interfaces_and_peers(wg_client):
@@ -108,10 +153,17 @@ def test_wireguard_interfaces_and_peers(wg_client):
     r = wg_client.post(
         "/api/v1/cores/wireguard/interfaces/7/peers",
         headers=headers,
-        json={"email": "peer1", "is_enabled": True},
+        json={"email": "peer1", "is_enabled": True, "volume": 1024, "incoming": 0, "outgoing": 0},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["peer"]["email"] == "peer1"
+    peer = r.json()["peer"]
+    assert peer["email"] == "peer1"
+    assert peer["is_enabled"] is True
+    assert peer["volume"] == 1024
+    assert "enable" not in peer
+    assert "totalGB" not in peer
+    assert "up" not in peer
+    assert "down" not in peer
 
     r = wg_client.get("/api/v1/stats/snapshot?core=wireguard", headers=headers)
     assert r.status_code == 200

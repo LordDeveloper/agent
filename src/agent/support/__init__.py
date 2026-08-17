@@ -69,43 +69,55 @@ def _expiry_ms(value: Any) -> int | None:
         return None
 
 
+_XUI_KEYS = ("enable", "expiryTime", "totalGB", "limitIp", "up", "down", "subId", "tgId")
+
+
+def record_is_enabled(row: dict[str, Any], default: bool = True) -> bool:
+    if "is_enabled" in row:
+        return _as_bool(row.get("is_enabled"), default)
+    if "enable" in row:
+        return _as_bool(row.get("enable"), default)
+    return default
+
+
+def _expires_at_iso(value: Any) -> str | None:
+    ms = _expiry_ms(value)
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
 def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Accept NetinjaBot / x-ui style aliases and produce Xray settings.clients fields.
-    Unknown extras are kept so customized cores can persist them in config.json.
-    """
+    """Canonical Netinja client fields. x-ui aliases are accepted then dropped."""
     client = deepcopy(payload)
     client.pop("format", None)
 
-    if "is_enabled" in client:
-        client["enable"] = _as_bool(client.pop("is_enabled"))
-    elif "enable" in client:
-        client["enable"] = _as_bool(client["enable"])
+    client["is_enabled"] = record_is_enabled(client)
 
-    if "max_connection" in client and "limitIp" not in client:
-        client["limitIp"] = _as_int(client.pop("max_connection"))
-    elif "limitIp" in client:
-        client["limitIp"] = _as_int(client["limitIp"])
+    if "max_connection" in client or "limitIp" in client:
+        client["max_connection"] = _as_int(client.get("max_connection", client.get("limitIp")))
 
-    if "volume" in client and "totalGB" not in client:
-        volume_f = _as_float(client.pop("volume"))
-        # Bot remaining volume is usually bytes; x-ui style uses GB.
-        client["totalGB"] = volume_f / (1024**3) if volume_f > 1024 else volume_f
+    if "volume" in client:
+        client["volume"] = _as_int(client.get("volume"))
     elif "totalGB" in client:
-        client["totalGB"] = _as_float(client["totalGB"])
+        # 3x-ui `totalGB` is already bytes (same as Netinja `volume`).
+        client["volume"] = _as_int(client.get("totalGB"))
 
-    if "expires_at" in client and "expiryTime" not in client:
-        ms = _expiry_ms(client.pop("expires_at"))
-        if ms is not None:
-            client["expiryTime"] = ms
-    elif "expiryTime" in client:
-        ms = _expiry_ms(client["expiryTime"])
-        client["expiryTime"] = ms if ms is not None else 0
+    expires = client.get("expires_at", client.get("expiryTime"))
+    if expires is not None:
+        iso = _expires_at_iso(expires)
+        if iso is not None:
+            client["expires_at"] = iso
+        elif expires in (0, "0", False, ""):
+            client["expires_at"] = None
 
-    if "incoming" in client and "down" not in client:
-        client["down"] = _as_int(client.get("incoming"))
-    if "outgoing" in client and "up" not in client:
-        client["up"] = _as_int(client.get("outgoing"))
+    if "incoming" in client or "down" in client:
+        client["incoming"] = _as_int(client.get("incoming", client.get("down")))
+    if "outgoing" in client or "up" in client:
+        client["outgoing"] = _as_int(client.get("outgoing", client.get("up")))
+
+    for key in _XUI_KEYS:
+        client.pop(key, None)
 
     return client
 
@@ -118,21 +130,30 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
     if "name" in peer and "email" not in peer:
         peer["email"] = peer["name"]
 
-    if "is_enabled" in peer:
-        peer["enable"] = _as_bool(peer.pop("is_enabled"))
-    elif "enable" in peer:
-        peer["enable"] = _as_bool(peer["enable"])
-    else:
-        peer.setdefault("enable", True)
+    peer["is_enabled"] = record_is_enabled(peer)
 
-    if "max_connection" in peer:
-        peer["limitIp"] = _as_int(peer.pop("max_connection"))
+    if "max_connection" in peer or "limitIp" in peer:
+        peer["max_connection"] = _as_int(peer.get("max_connection", peer.get("limitIp")))
 
-    if "expires_at" in peer:
-        ms = _expiry_ms(peer["expires_at"])
-        if ms is not None:
-            peer["expires_at"] = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    expires = peer.get("expires_at", peer.get("expiryTime"))
+    if expires is not None:
+        iso = _expires_at_iso(expires)
+        if iso is not None:
+            peer["expires_at"] = iso
+        elif expires in (0, "0", False, ""):
+            peer["expires_at"] = None
+
     if "volume" in peer:
         peer["volume"] = _as_int(peer["volume"])
+    elif "totalGB" in peer:
+        peer["volume"] = _as_int(peer.get("totalGB"))
+
+    if "incoming" in peer or "down" in peer:
+        peer["incoming"] = _as_int(peer.get("incoming", peer.get("down")))
+    if "outgoing" in peer or "up" in peer:
+        peer["outgoing"] = _as_int(peer.get("outgoing", peer.get("up")))
+
+    for key in _XUI_KEYS:
+        peer.pop(key, None)
 
     return peer

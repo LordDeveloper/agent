@@ -8,9 +8,7 @@ class ClientUsageModel(BaseModel):
     email: Optional[str] = None
     incoming: int = 0
     outgoing: int = 0
-    inbound_id: Optional[int | str] = Field(None, alias="inboundId")
-
-    model_config = {"populate_by_name": True}
+    inbound_id: Optional[int | str] = None
 
 
 class InboundUsageModel(BaseModel):
@@ -54,21 +52,12 @@ class ClientPayload(BaseModel):
     email: Optional[str] = None
     password: Optional[str] = None
     flow: Optional[str] = None
-    alterId: Optional[int] = None
-    enable: Optional[bool] = True
     is_enabled: Optional[bool] = None
-    expiryTime: Optional[int] = None
     expires_at: Optional[Any] = None
-    totalGB: Optional[float] = None
-    volume: Optional[float] = None
-    up: Optional[int] = None
-    down: Optional[int] = None
-    outgoing: Optional[int] = None
+    volume: Optional[int] = None
     incoming: Optional[int] = None
-    limitIp: Optional[int] = None
+    outgoing: Optional[int] = None
     max_connection: Optional[int] = None
-    subId: Optional[str] = None
-    tgId: Optional[str] = None
     public_key: Optional[str] = None
     allowed_ips: Optional[str] = None
     obfuscation: Optional[dict[str, Any]] = None
@@ -96,13 +85,11 @@ class WgPeerPayload(BaseModel):
     allowed_ips: Optional[str] = None
     persistent_keepalive: int = 25
     is_enabled: Optional[bool] = None
-    enable: Optional[bool] = True
-    volume: Optional[float] = None
+    volume: Optional[int] = None
     max_connection: Optional[int] = None
     incoming: Optional[int] = None
     outgoing: Optional[int] = None
-    _incoming: Optional[int] = None
-    _outgoing: Optional[int] = None
+    expires_at: Optional[str] = None
 
 
 class AmneziaObfuscation(BaseModel):

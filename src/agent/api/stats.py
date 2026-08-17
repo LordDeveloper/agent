@@ -26,4 +26,4 @@ def stats_snapshot(
     registry: CoreRegistry = Depends(get_registry),
 ):
     snapshot = registry.usage_snapshot(resolve_core_key(core))
-    return {"success": True, **snapshot.model_dump(by_alias=True)}
+    return {"success": True, **snapshot.model_dump()}
