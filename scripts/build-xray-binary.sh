@@ -15,6 +15,12 @@ REPO="${XRAY_GITHUB_REPO:-LordDeveloper/xray}"
 REF="${XRAY_GITHUB_REF:-}"
 TOKEN="${XRAY_RELEASE_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
 
+# Resolve output before cd/trap cleanup — relative paths must not land inside WORKDIR.
+if [[ "$OUT" != /* ]]; then
+  OUT="$(pwd)/$OUT"
+fi
+mkdir -p "$(dirname "$OUT")"
+
 need() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
