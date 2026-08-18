@@ -131,17 +131,41 @@ class XrayHttpClient:
     def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
         return self.post("/api/inbounds/remove", {"tags": tags})
 
-    def add_users(self, tag: str, clients: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post(
-            "/api/inbounds/users/add",
-            {"inbounds": [{"tag": tag, "settings": {"clients": clients}}]},
-        )
+    def add_users(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+        *,
+        protocol: str | None = None,
+        inbound_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from agent.support import xray_users_settings
 
-    def edit_users(self, tag: str, clients: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post(
-            "/api/inbounds/users/edit",
-            {"inbounds": [{"tag": tag, "settings": {"clients": clients}}]},
-        )
+        inbound: dict[str, Any] = {
+            "tag": tag,
+            "settings": xray_users_settings(protocol or "vless", inbound_settings, clients),
+        }
+        if protocol:
+            inbound["protocol"] = protocol
+        return self.post("/api/inbounds/users/add", {"inbounds": [inbound]})
+
+    def edit_users(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+        *,
+        protocol: str | None = None,
+        inbound_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from agent.support import xray_users_settings
+
+        inbound: dict[str, Any] = {
+            "tag": tag,
+            "settings": xray_users_settings(protocol or "vless", inbound_settings, clients),
+        }
+        if protocol:
+            inbound["protocol"] = protocol
+        return self.post("/api/inbounds/users/edit", {"inbounds": [inbound]})
 
     def remove_users(self, tag: str, emails: list[str]) -> dict[str, Any]:
         return self.post("/api/inbounds/users/remove", {"tag": tag, "emails": emails})

@@ -1,10 +1,12 @@
+from pathlib import Path
+
 import os
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent.main import create_app
-from agent.support import normalize_peer, normalize_xray_client
+from agent.support import normalize_peer, normalize_xray_client, xray_protocol_user, xray_users_settings
 
 
 def _clear_env() -> None:
@@ -132,6 +134,86 @@ def test_normalize_peer_maps_legacy_xui_then_drops_them():
     assert "down" not in row
     assert "subId" not in row
     assert "tgId" not in row
+
+
+def test_xray_protocol_user_strips_netinja_fields_and_null_flow():
+    user = xray_protocol_user(
+        "vless",
+        {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "abc",
+            "flow": None,
+            "encryption": "none",
+            "is_enabled": True,
+            "volume": 1024,
+            "incoming": 1,
+            "outgoing": 2,
+            "expires_at": "2030-01-01T00:00:00+00:00",
+            "max_connection": 3,
+            "subscribe_id": 9,
+            "password": "secret",
+        },
+    )
+    assert user == {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "email": "abc",
+    }
+
+
+def test_xray_protocol_user_keeps_vision_flow():
+    user = xray_protocol_user(
+        "vless",
+        {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "abc",
+            "flow": "xtls-rprx-vision",
+        },
+    )
+    assert user["flow"] == "xtls-rprx-vision"
+
+
+def test_xray_users_settings_adds_vless_decryption():
+    settings = xray_users_settings(
+        "vless",
+        {"fallbacks": [{"dest": 80}]},
+        [{"id": "11111111-1111-1111-1111-111111111111", "email": "abc", "volume": 1}],
+    )
+    assert settings["decryption"] == "none"
+    assert settings["clients"] == settings["users"]
+    assert settings["clients"] == [{"id": "11111111-1111-1111-1111-111111111111", "email": "abc"}]
+    assert settings["fallbacks"] == [{"dest": 80}]
+
+
+def test_validate_wg_conf_strip_uses_absolute_config_path(tmp_path, monkeypatch):
+    from agent.support.config_validate import validate_wg_conf_stripped
+
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+
+        class Result:
+            returncode = 0
+            stdout = "[Interface]\nPrivateKey = x\nListenPort = 51820\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("agent.support.config_validate.subprocess.run", fake_run)
+    conf_dir = tmp_path / "amneziawg"
+    conf_dir.mkdir()
+    out = validate_wg_conf_stripped(
+        "[Interface]\nPrivateKey = x\nListenPort = 51820\n",
+        quick_bin="awg-quick",
+        config_dir=conf_dir,
+    )
+    assert seen["args"][0] == "awg-quick"
+    assert seen["args"][1] == "strip"
+    conf_path = Path(seen["args"][2])
+    assert conf_path.is_absolute()
+    assert conf_path.suffix == ".conf"
+    assert conf_path.parent == conf_dir
+    assert out.startswith("[Interface]")
 
 
 def test_wireguard_interfaces_and_peers(wg_client):

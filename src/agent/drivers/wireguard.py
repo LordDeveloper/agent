@@ -255,8 +255,7 @@ class WireGuardDriver(CoreDriver):
         up = self._bring_up(iface)
         if not up.get("ok"):
             self.store.delete_doc(self.key, self._kind, str(iface_id))
-            conf = self._config_dir() / f"{iface['name']}.conf"
-            conf.unlink(missing_ok=True)
+            self._conf_file(iface["name"]).unlink(missing_ok=True)
             detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
             raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
         return iface
@@ -277,9 +276,7 @@ class WireGuardDriver(CoreDriver):
     def delete_interface(self, interface_id: int | str) -> bool:
         iface = self.get_interface(interface_id)
         self._bring_down(iface)
-        conf = self._config_dir() / f"{iface['name']}.conf"
-        if conf.exists():
-            conf.unlink()
+        self._conf_file(iface["name"]).unlink(missing_ok=True)
         if not self.store.delete_doc(self.key, self._kind, str(iface.get("id"))):
             raise AgentError("CONFIG_NOT_FOUND", f"Interface [{interface_id}] not found", 404)
         self.audit.record("delete", f"{self.key}/interface/{interface_id}")
@@ -463,6 +460,9 @@ class WireGuardDriver(CoreDriver):
             return shutil.which("awg-quick") or shutil.which("wg-quick")
         return shutil.which("wg-quick")
 
+    def _conf_file(self, name: str) -> Path:
+        return self._config_dir() / f"{name}.conf"
+
     def _peer_dump(self, iface_name: str) -> dict[str, dict[str, Any]]:
         if not iface_name:
             return {}
@@ -570,20 +570,19 @@ class WireGuardDriver(CoreDriver):
         return result.returncode == 0
 
     def _sync_conf(self, iface: dict[str, Any]) -> None:
-        config_dir = self._config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        conf_path = config_dir / f"{iface['name']}.conf"
-        conf_path.write_text(self._render_conf(iface), encoding="utf-8")
+        self._config_dir().mkdir(parents=True, exist_ok=True)
+        self._conf_file(iface["name"]).write_text(self._render_conf(iface), encoding="utf-8")
 
     def _bring_up(self, iface: dict[str, Any]) -> dict[str, Any]:
         self._validate_before_apply(iface)
         self._sync_conf(iface)
         quick = self._quick_bin()
         name = iface["name"]
+        conf = str(self._conf_file(name))
         if not quick:
             return {"name": name, "ok": False, "message": "wg-quick not found"}
-        down = run([quick, "down", name], check=False)
-        up = run([quick, "up", name], check=False)
+        down = run([quick, "down", conf], check=False)
+        up = run([quick, "up", conf], check=False)
         return {
             "name": name,
             "ok": up.returncode == 0,
@@ -595,7 +594,7 @@ class WireGuardDriver(CoreDriver):
         name = iface["name"]
         if not quick:
             return {"name": name, "ok": False, "message": "wg-quick not found"}
-        result = run([quick, "down", name], check=False)
+        result = run([quick, "down", str(self._conf_file(name))], check=False)
         return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
 
     def _apply_live(self, iface: dict[str, Any]) -> None:
@@ -604,7 +603,7 @@ class WireGuardDriver(CoreDriver):
         cli = self._cli_bin()
         quick = self._quick_bin()
         name = iface["name"]
-        conf_path = self._config_dir() / f"{name}.conf"
+        conf_path = self._conf_file(name)
         backup = conf_path.read_text(encoding="utf-8") if conf_path.exists() else None
 
         if not cli or not quick:
@@ -617,7 +616,7 @@ class WireGuardDriver(CoreDriver):
 
         try:
             self._sync_conf(iface)
-            strip = run([quick, "strip", name], check=False)
+            strip = run([quick, "strip", str(conf_path)], check=False)
             if strip.returncode != 0 or not strip.stdout:
                 detail = (strip.stderr or strip.stdout or "wg-quick strip failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")

@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -82,27 +81,26 @@ def validate_wg_conf_stripped(
     if not conf_text.strip():
         raise _validation_error("WireGuard config is empty")
 
-    temp_name = f"wgval{uuid.uuid4().hex[:8]}"
-    temp_path = config_dir / f"{temp_name}.conf"
     config_dir.mkdir(parents=True, exist_ok=True)
-    temp_path.write_text(conf_text, encoding="utf-8")
-    env = os.environ.copy()
-    env["WG_CONFIG_DIR"] = str(config_dir)
+    # Pass an absolute .conf path. wg-quick/awg-quick look up a bare interface
+    # name only in their default dir (/etc/wireguard or /etc/amnezia/amneziawg).
+    fd, temp_path = tempfile.mkstemp(prefix="wgval", suffix=".conf", dir=str(config_dir))
+    os.close(fd)
     try:
+        Path(temp_path).write_text(conf_text, encoding="utf-8")
         strip = subprocess.run(
-            [quick_bin, "strip", temp_name],
+            [quick_bin, "strip", temp_path],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
-            env=env,
         )
         if strip.returncode != 0 or not (strip.stdout or "").strip():
             detail = (strip.stderr or strip.stdout or "wg-quick strip failed").strip()
             raise _validation_error(f"WireGuard config rejected by wg-quick strip: {detail}")
         return strip.stdout
     finally:
-        temp_path.unlink(missing_ok=True)
+        Path(temp_path).unlink(missing_ok=True)
 
 
 def validate_xray_inbound(inbound: dict[str, Any]) -> None:

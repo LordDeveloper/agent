@@ -15,7 +15,7 @@ from agent.drivers.base import CoreDriver
 from agent.drivers.xray_http import XrayHttpClient
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.support import normalize_xray_client, record_is_enabled
+from agent.support import normalize_xray_client, record_is_enabled, xray_protocol_user
 from agent.support.config_validate import (
     validate_xray_config,
     validate_xray_config_mutation,
@@ -292,7 +292,7 @@ class XrayDriver(CoreDriver):
             if str(row.get("tag")) != tag:
                 continue
             settings = row.setdefault("settings", {})
-            clients = list(settings.get("clients") or [])
+            clients = list(settings.get("clients") or settings.get("users") or [])
             replaced = False
             for idx, current in enumerate(clients):
                 if str(current.get("id")) == str(client.get("id")) or str(current.get("email")) == str(
@@ -304,8 +304,31 @@ class XrayDriver(CoreDriver):
             if not replaced:
                 clients.append(client)
             settings["clients"] = clients
+            if str(row.get("protocol") or "").lower() == "vless":
+                settings["users"] = clients
+                settings.setdefault("decryption", "none")
             return
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found in Xray config", 404)
+
+    def _protocol_of(self, inbound: dict[str, Any]) -> str:
+        return str(inbound.get("protocol") or "vless").strip().lower()
+
+    def _wire_clients(self, inbound: dict[str, Any], clients: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        protocol = self._protocol_of(inbound)
+        settings = inbound.get("settings") or {}
+        rows = clients if clients is not None else settings.get("clients") or settings.get("users") or []
+        return [xray_protocol_user(protocol, client) for client in rows]
+
+    def _wire_inbound(self, inbound: dict[str, Any]) -> dict[str, Any]:
+        payload = deepcopy(inbound)
+        payload.pop("id", None)
+        settings = payload.setdefault("settings", {})
+        native = self._wire_clients(payload)
+        settings["clients"] = native
+        if self._protocol_of(payload) == "vless":
+            settings.setdefault("decryption", "none")
+            settings["users"] = native
+        return payload
 
     def _normalize(self, row: dict[str, Any]) -> dict[str, Any]:
         inbound = deepcopy(row)
@@ -317,7 +340,7 @@ class XrayDriver(CoreDriver):
             inbound["id"] = tag
         inbound.setdefault("settings", {})
         inbound["settings"]["clients"] = [
-            normalize_xray_client(client) for client in inbound["settings"].get("clients") or []
+            normalize_xray_client(client) for client in inbound["settings"].get("clients") or inbound["settings"].get("users") or []
         ]
         return inbound
 
@@ -358,7 +381,7 @@ class XrayDriver(CoreDriver):
         inbound.setdefault("streamSettings", {})
         inbound.setdefault("sniffing", {})
 
-        api_payload = {k: v for k, v in inbound.items() if k != "id"}
+        api_payload = self._wire_inbound(inbound)
         self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
@@ -375,7 +398,7 @@ class XrayDriver(CoreDriver):
             clients = payload["settings"].get("clients")
             if clients is not None:
                 inbound["settings"]["clients"] = [normalize_xray_client(c) for c in clients]
-        api_payload = {k: v for k, v in inbound.items() if k != "id"}
+        api_payload = self._wire_inbound(inbound)
         self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
@@ -403,7 +426,7 @@ class XrayDriver(CoreDriver):
         inbound.setdefault("settings", {})
         inbound.setdefault("streamSettings", existing.get("streamSettings") or {})
         inbound.setdefault("sniffing", existing.get("sniffing") or {})
-        api_payload = {k: v for k, v in inbound.items() if k != "id"}
+        api_payload = self._wire_inbound(inbound)
         self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
@@ -435,6 +458,8 @@ class XrayDriver(CoreDriver):
             inbound, str(client.get("email"))
         )
         tag = str(inbound["tag"])
+        protocol = self._protocol_of(inbound)
+        native = xray_protocol_user(protocol, client)
         if not record_is_enabled(client):
             if existing:
                 self.delete_client(inbound_id, str(existing.get("email") or existing.get("id")))
@@ -442,15 +467,25 @@ class XrayDriver(CoreDriver):
 
         if existing:
             self._validate_config_mutation(
-                lambda cfg: self._merge_client_in_config(cfg, tag, client),
+                lambda cfg: self._merge_client_in_config(cfg, tag, native),
             )
-            self._api().edit_users(tag, [client])
+            self._api().edit_users(
+                tag,
+                [native],
+                protocol=protocol,
+                inbound_settings=inbound.get("settings"),
+            )
             self.audit.record("update", f"xray/client/{client['id']}")
         else:
             self._validate_config_mutation(
-                lambda cfg: self._merge_client_in_config(cfg, tag, client),
+                lambda cfg: self._merge_client_in_config(cfg, tag, native),
             )
-            self._api().add_users(tag, [client])
+            self._api().add_users(
+                tag,
+                [native],
+                protocol=protocol,
+                inbound_settings=inbound.get("settings"),
+            )
             self.audit.record("create", f"xray/client/{client['id']}")
         return client
 
@@ -463,10 +498,16 @@ class XrayDriver(CoreDriver):
         if not record_is_enabled(merged):
             self.delete_client(inbound_id, client_key)
             return merged
+        native = xray_protocol_user(self._protocol_of(inbound), merged)
         self._validate_config_mutation(
-            lambda cfg: self._merge_client_in_config(cfg, str(inbound["tag"]), merged),
+            lambda cfg: self._merge_client_in_config(cfg, str(inbound["tag"]), native),
         )
-        self._api().edit_users(str(inbound["tag"]), [merged])
+        self._api().edit_users(
+            str(inbound["tag"]),
+            [native],
+            protocol=self._protocol_of(inbound),
+            inbound_settings=inbound.get("settings"),
+        )
         self.audit.record("update", f"xray/client/{client_key}")
         return merged
 
@@ -517,7 +558,7 @@ class XrayDriver(CoreDriver):
             item.pop("id", None)
             settings = item.setdefault("settings", {})
             settings["clients"] = [normalize_xray_client(c) for c in settings.get("clients") or []]
-            cleaned.append(item)
+            cleaned.append(self._wire_inbound(item))
         if cleaned:
             self._api().add_inbounds(cleaned)
         if payload.get("outbounds"):

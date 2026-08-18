@@ -58,14 +58,14 @@ class FakeXrayHttpClient:
         self._inbounds = [i for i in self._inbounds if i.get("tag") not in tagset]
         return {"status": "ok"}
 
-    def add_users(self, tag: str, clients: list[dict[str, Any]]) -> dict[str, Any]:
+    def add_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         for inbound in self._inbounds:
             if inbound.get("tag") == tag:
                 inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
                 return {"added_users": len(clients)}
         raise RuntimeError(f"inbound {tag} missing")
 
-    def edit_users(self, tag: str, clients: list[dict[str, Any]]) -> dict[str, Any]:
+    def edit_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         for inbound in self._inbounds:
             if inbound.get("tag") != tag:
                 continue
