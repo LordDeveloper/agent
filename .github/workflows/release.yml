@@ -113,8 +113,13 @@ jobs:
       - name: Build ${{ matrix.asset }}
         env:
           GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          XRAY_RELEASE_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           XRAY_GITHUB_REPO: LordDeveloper/xray
         run: |
+          if [[ -z "${GITHUB_TOKEN}" ]]; then
+            echo "Missing XRAY_RELEASE_TOKEN secret (required to clone private ${XRAY_GITHUB_REPO})" >&2
+            exit 1
+          fi
           chmod +x scripts/build-xray-binary.sh
           mkdir -p dist
           scripts/build-xray-binary.sh "${{ matrix.arch }}" "dist/${{ matrix.asset }}"
