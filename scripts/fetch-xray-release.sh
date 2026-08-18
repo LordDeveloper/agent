@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download a prebuilt xray asset from GitHub Releases.
+# Fetch prebuilt xray from GitHub Releases, or build from source when no release exists.
 # Usage: fetch-xray-release.sh ASSET_NAME OUTPUT_PATH
 # Env: XRAY_GITHUB_REPO (default: LordDeveloper/xray), GITHUB_TOKEN / GH_TOKEN
 
@@ -10,6 +10,18 @@ OUT="${2:?usage: fetch-xray-release.sh ASSET_NAME OUTPUT_PATH}"
 REPO="${XRAY_GITHUB_REPO:-LordDeveloper/xray}"
 TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-${AGENT_GITHUB_TOKEN:-}}}"
 API="https://api.github.com"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+arch_from_asset() {
+  case "$1" in
+    *arm64*) echo arm64 ;;
+    *amd64*) echo amd64 ;;
+    *)
+      echo "Cannot detect arch from asset name: $1" >&2
+      exit 1
+      ;;
+  esac
+}
 
 auth_args=()
 if [[ -n "$TOKEN" ]]; then
@@ -40,11 +52,15 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Fetching latest xray release from ${REPO} (asset=${ASSET})..."
-RELEASE_JSON="$(api_get "${API}/repos/${REPO}/releases/latest")"
+echo "Trying latest xray release from ${REPO} (asset=${ASSET})..."
+set +e
+RELEASE_JSON="$(api_get "${API}/repos/${REPO}/releases/latest" 2>/dev/null)"
+RELEASE_RC=$?
+set -e
 
-eval "$(RELEASE_JSON="$RELEASE_JSON" ASSET_NAME="$ASSET" python3 - <<'PY'
-import json, os, shlex
+if [[ "$RELEASE_RC" -eq 0 ]] && [[ -n "$RELEASE_JSON" ]]; then
+  if eval "$(RELEASE_JSON="$RELEASE_JSON" ASSET_NAME="$ASSET" python3 - <<'PY'
+import json, os, shlex, sys
 payload = json.loads(os.environ["RELEASE_JSON"])
 wanted = os.environ["ASSET_NAME"]
 assets = {a.get("name"): a for a in payload.get("assets") or []}
@@ -61,15 +77,21 @@ for name in candidates:
         chosen = name
         break
 if not asset:
-    names = ", ".join(assets) or "none"
-    raise SystemExit(f"missing xray asset {wanted}; available: {names}")
+    sys.exit(1)
 print(f"ASSET_ID={shlex.quote(str(asset['id']))}")
 print(f"CHOSEN={shlex.quote(chosen)}")
 print(f"TAG={shlex.quote(payload.get('tag_name') or '')}")
 PY
-)"
+  )"; then
+    mkdir -p "$(dirname "$OUT")"
+    download_asset "$ASSET_ID" "$OUT"
+    chmod +x "$OUT"
+    echo "Downloaded ${CHOSEN} (${TAG}) -> ${OUT}"
+    exit 0
+  fi
+fi
 
-mkdir -p "$(dirname "$OUT")"
-download_asset "$ASSET_ID" "$OUT"
-chmod +x "$OUT"
-echo "Downloaded ${CHOSEN} (${TAG}) -> ${OUT}"
+echo "No release asset for ${ASSET}; building from cloned ${REPO}..."
+ARCH="$(arch_from_asset "$ASSET")"
+chmod +x "${ROOT}/scripts/build-xray-binary.sh"
+"${ROOT}/scripts/build-xray-binary.sh" "$ARCH" "$OUT"

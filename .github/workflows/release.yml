@@ -8,7 +8,7 @@
 #   agent-linux-musl-arm64
 #   agent-linux-amd64       (alias → gnu-amd64)
 #   agent-linux-arm64       (alias → gnu-arm64)
-#   xray-linux-gnu-amd64 / xray-linux-gnu-arm64  (mirrored from LordDeveloper/xray)
+#   xray-linux-gnu-amd64 / xray-linux-gnu-arm64  (built from cloned LordDeveloper/xray)
 #   amneziawg-linux-gnu-amd64.tar.gz / amneziawg-linux-gnu-arm64.tar.gz
 
 name: Release agent
@@ -88,26 +88,36 @@ jobs:
           if-no-files-found: error
 
   build-xray:
-    name: fetch-xray-${{ matrix.asset }}
-    runs-on: ubuntu-latest
+    name: build-xray-${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - asset: xray-linux-gnu-amd64
-          - asset: xray-linux-gnu-arm64
+          - arch: amd64
+            asset: xray-linux-gnu-amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            asset: xray-linux-gnu-arm64
+            runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch ${{ matrix.asset }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: Build ${{ matrix.asset }}
         env:
           GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           XRAY_GITHUB_REPO: LordDeveloper/xray
         run: |
-          chmod +x scripts/fetch-xray-release.sh
+          chmod +x scripts/build-xray-binary.sh
           mkdir -p dist
-          scripts/fetch-xray-release.sh "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+          scripts/build-xray-binary.sh "${{ matrix.arch }}" "dist/${{ matrix.asset }}"
           ls -lh "dist/${{ matrix.asset }}"
 
       - name: Upload xray artifact
