@@ -89,7 +89,16 @@ class XrayHttpClient:
 
     def online_users(self) -> list[str]:
         body = self.get("/api/stats/online/users")
-        return [str(u) for u in (body.get("users") or [])]
+        users: list[str] = []
+        for item in body.get("users") or []:
+            if isinstance(item, str) and item.strip():
+                users.append(item.strip())
+                continue
+            if isinstance(item, dict):
+                value = item.get("email") or item.get("id") or item.get("user")
+                if value:
+                    users.append(str(value))
+        return users
 
     def online_ips(self, email: str) -> list[str]:
         body = self.get("/api/stats/online/iplist", params={"email": email})

@@ -21,6 +21,77 @@ from agent.support.config_validate import validate_wg_conf_stripped, validate_wg
 from agent.support.process import run
 
 _ONLINE_HANDSHAKE_SECONDS = 180
+_IP_WINDOW_SECONDS = 600
+_IP_LOG_LIMIT = 50
+
+
+def endpoint_host(endpoint: str | None) -> str | None:
+    if not endpoint or endpoint in ("(none)", ""):
+        return None
+    raw = str(endpoint).strip()
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end > 0:
+            return raw[1:end] or None
+    if raw.count(":") == 1:
+        return raw.rsplit(":", 1)[0].strip() or None
+    return raw or None
+
+
+def _parse_ip_log(item: Any) -> tuple[str | None, int]:
+    if isinstance(item, str) and item.strip():
+        return item.strip(), 0
+    if isinstance(item, dict):
+        ip = str(item.get("ip") or item.get("host") or "").strip()
+        try:
+            seen = int(item.get("seen_at") or 0)
+        except (TypeError, ValueError):
+            seen = 0
+        return (ip or None), seen
+    return None, 0
+
+
+def remember_peer_ip(peer: dict[str, Any], host: str | None, *, now: int | None = None, limit: int = _IP_LOG_LIMIT) -> None:
+    ip = endpoint_host(host)
+    if not ip:
+        return
+
+    stamp = int(now or time.time())
+    logs: list[dict[str, Any]] = []
+    found = False
+    for item in list(peer.get("ip_logs") or []):
+        current, seen = _parse_ip_log(item)
+        if not current:
+            continue
+        if current == ip:
+            logs.append({"ip": current, "seen_at": stamp})
+            found = True
+            continue
+        logs.append({"ip": current, "seen_at": seen or stamp})
+    if not found:
+        logs.append({"ip": ip, "seen_at": stamp})
+    peer["ip_logs"] = logs[-limit:]
+
+
+def recent_peer_ips(
+    peer: dict[str, Any],
+    *,
+    window: int = _IP_WINDOW_SECONDS,
+    now: int | None = None,
+) -> list[str]:
+    stamp = int(now or time.time())
+    ips: list[str] = []
+    for item in peer.get("ip_logs") or []:
+        ip, seen = _parse_ip_log(item)
+        if not ip:
+            continue
+        if seen == 0 or (stamp - seen) <= window:
+            if ip not in ips:
+                ips.append(ip)
+    live = endpoint_host(peer.get("endpoint")) if peer.get("online") else None
+    if live and live not in ips:
+        ips.insert(0, live)
+    return ips
 
 
 def _wg_keypair(cli: str = "wg") -> tuple[str, str]:
@@ -69,11 +140,7 @@ def accumulate_transfer(
 
     if endpoint and endpoint not in ("(none)", ""):
         peer["endpoint"] = endpoint
-        ips = list(peer.get("ip_logs") or [])
-        host = endpoint.rsplit(":", 1)[0].strip("[]")
-        if host and host not in ips:
-            ips.append(host)
-            peer["ip_logs"] = ips[-50:]
+        remember_peer_ip(peer, endpoint)
 
     if handshake_at > 0:
         peer["handshake_at"] = datetime.fromtimestamp(handshake_at, tz=timezone.utc).isoformat()
@@ -146,11 +213,7 @@ class WireGuardDriver(CoreDriver):
         for iface in self.list_interfaces():
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
-                    if peer.get("ip_logs"):
-                        return list(peer["ip_logs"])
-                    endpoint = peer.get("endpoint") or ""
-                    if endpoint and endpoint not in ("(none)", ""):
-                        return [endpoint.rsplit(":", 1)[0].strip("[]")]
+                    return recent_peer_ips(peer)
         return []
 
     def clear_peer_ips(self, email: str) -> bool:
@@ -159,7 +222,6 @@ class WireGuardDriver(CoreDriver):
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     peer["ip_logs"] = []
-                    peer["endpoint"] = None
                     changed = True
             if changed:
                 self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
@@ -318,6 +380,7 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("handshake_at", None)
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
+        peer.setdefault("max_connection", 0)
         peer.setdefault("persistent_keepalive", 25)
 
         if not record_is_enabled(peer):
@@ -444,6 +507,7 @@ class WireGuardDriver(CoreDriver):
                     peer.get("handshake_at"),
                     peer.get("online"),
                     peer.get("endpoint"),
+                    str(peer.get("ip_logs") or []),
                 )
                 accumulate_transfer(
                     peer,
@@ -460,6 +524,7 @@ class WireGuardDriver(CoreDriver):
                     peer.get("handshake_at"),
                     peer.get("online"),
                     peer.get("endpoint"),
+                    str(peer.get("ip_logs") or []),
                 )
                 if before != after:
                     changed = True

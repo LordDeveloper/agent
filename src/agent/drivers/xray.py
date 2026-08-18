@@ -542,13 +542,11 @@ class XrayDriver(CoreDriver):
         return current
 
     def client_ips(self, email: str) -> list[str]:
-        blocked = set(self.store.get_meta(self.key, f"cleared_ips:{email}", []) or [])
-        return [ip for ip in self._api().online_ips(email) if ip not in blocked]
+        # Xray reports currently-online IPs, not an accumulating log.
+        # Do not hide live addresses after a "clear" — the bot needs them for device lists.
+        return self._api().online_ips(email)
 
     def clear_client_ips(self, email: str) -> bool:
-        # Live sessions cannot be flushed remotely; mark current IPs ignored until reconnect.
-        current = self._api().online_ips(email)
-        self.store.set_meta(self.key, f"cleared_ips:{email}", current)
         return True
 
     def backup(self) -> dict[str, Any]:
