@@ -254,3 +254,25 @@ def test_wireguard_interfaces_and_peers(wg_client):
     r = wg_client.post("/api/v1/cores/wireguard/backup", headers=headers)
     assert r.status_code == 200
     assert r.json()["backup"]["interfaces"]
+
+
+def test_wireguard_interfaces_get_distinct_subnets(wg_client):
+    headers = {"Authorization": "Bearer dev-token"}
+    first = wg_client.post(
+        "/api/v1/cores/wireguard/interfaces",
+        headers=headers,
+        json={"id": 1, "listen_port": 51821},
+    )
+    second = wg_client.post(
+        "/api/v1/cores/wireguard/interfaces",
+        headers=headers,
+        json={"id": 2, "listen_port": 51822},
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    a = first.json()["interface"]["subnet"]
+    b = second.json()["interface"]["subnet"]
+    assert a != b
+    assert a.endswith("/24") and b.endswith("/24")
+    assert 80 <= int(a.split(".")[1]) <= 95
+    assert 80 <= int(b.split(".")[1]) <= 95

@@ -10,7 +10,7 @@ def test_logo_and_tagline():
     assert LOGO.count("\n") >= 5
     assert LOGO_ASCII.count("\n") >= 4
     assert "Netinja" in TAGLINE
-    assert __version__ == "0.3.22"
+    assert __version__ == "0.3.23"
 
 
 def test_decode_key_arrows_and_enter():

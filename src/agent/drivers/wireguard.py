@@ -242,7 +242,7 @@ class WireGuardDriver(CoreDriver):
             "id": iface_id,
             "name": name,
             "listen_port": int(payload.get("listen_port", 51820)),
-            "subnet": payload.get("subnet", "10.8.0.0/16"),
+            "subnet": self._unique_subnet(payload.get("subnet"), exclude_id=iface_id),
             "private_key": private_key,
             "public_key": public_key,
             "peers": list(payload.get("peers") or []),
@@ -259,6 +259,23 @@ class WireGuardDriver(CoreDriver):
             detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
             raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
         return iface
+
+    def _unique_subnet(self, requested: Any, *, exclude_id: int | str | None = None) -> str:
+        used = {
+            str(row.get("subnet") or "")
+            for row in self.list_interfaces()
+            if exclude_id is None or str(row.get("id")) != str(exclude_id)
+        }
+        wanted = str(requested or "").strip()
+        if wanted and wanted not in used:
+            return wanted
+        base = 112 if self.key == "amnezia" else 80
+        for second in range(base, base + 16):
+            for third in range(256):
+                cidr = f"10.{second}.{third}.0/24"
+                if cidr not in used:
+                    return cidr
+        raise AgentError("VALIDATION_ERROR", "No free subnet for WireGuard/Amnezia interface")
 
     def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         iface = self.get_interface(interface_id)
