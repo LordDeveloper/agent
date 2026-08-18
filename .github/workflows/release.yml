@@ -112,12 +112,13 @@ jobs:
 
       - name: Build ${{ matrix.asset }}
         env:
-          GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          XRAY_RELEASE_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          XRAY_RELEASE_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN }}
           XRAY_GITHUB_REPO: LordDeveloper/xray
         run: |
-          if [[ -z "${GITHUB_TOKEN}" ]]; then
-            echo "Missing XRAY_RELEASE_TOKEN secret (required to clone private ${XRAY_GITHUB_REPO})" >&2
+          if [[ -z "${XRAY_RELEASE_TOKEN}" ]]; then
+            echo "Set repository secret XRAY_RELEASE_TOKEN (PAT with read access to ${XRAY_GITHUB_REPO})." >&2
+            echo "The default GITHUB_TOKEN cannot clone private cross-repo sources." >&2
             exit 1
           fi
           chmod +x scripts/build-xray-binary.sh
