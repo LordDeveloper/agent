@@ -10,6 +10,11 @@ class FakeXrayHttpClient:
     def __init__(self, settings=None, transport=None):
         self.settings = settings
         self._inbounds: list[dict[str, Any]] = []
+        self._outbounds: list[dict[str, Any]] = [
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "blocked"},
+        ]
+        self._rules: list[dict[str, Any]] = []
         self._online: list[str] = []
         self._ips: dict[str, list[str]] = {}
         self._user_traffic: dict[str, dict[str, int]] = {}
@@ -98,28 +103,47 @@ class FakeXrayHttpClient:
             if email:
                 return [u for u in users if str(u.get("email")) == email]
             return deepcopy(users)
-    def list_outbounds(self) -> list[dict[str, Any]]:
         return []
 
+    def list_outbounds(self) -> list[dict[str, Any]]:
+        return deepcopy(self._outbounds)
+
     def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        for outbound in outbounds:
+            tag = outbound.get("tag")
+            self._outbounds = [row for row in self._outbounds if row.get("tag") != tag]
+            self._outbounds.append(deepcopy(outbound))
         return {"added": len(outbounds)}
 
     def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return {"updated": len(outbounds)}
+        return self.add_outbounds(outbounds)
 
     def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
+        tagset = set(tags)
+        self._outbounds = [row for row in self._outbounds if row.get("tag") not in tagset]
         return {"removed": len(tags)}
 
     def list_rules(self) -> list[dict[str, Any]]:
-        return []
+        return deepcopy(self._rules)
 
     def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = True) -> dict[str, Any]:
+        if not should_append:
+            self._rules = []
+        self._rules.extend(deepcopy(rules))
         return {"added": len(rules)}
 
     def edit_rule(self, rule: dict[str, Any]) -> dict[str, Any]:
+        tag = rule.get("tag")
+        for idx, current in enumerate(self._rules):
+            if current.get("tag") == tag:
+                self._rules[idx] = deepcopy(rule)
+                return {"updated": 1}
+        self._rules.append(deepcopy(rule))
         return {"updated": 1}
 
     def remove_rules(self, tags: list[str]) -> dict[str, Any]:
+        tagset = set(tags)
+        self._rules = [row for row in self._rules if row.get("tag") not in tagset]
         return {"removed": len(tags)}
 
     def block_source_ips(self, source_ips: list[str], **kwargs) -> dict[str, Any]:

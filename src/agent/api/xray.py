@@ -146,38 +146,137 @@ def clear_ips(email: str, xray: XrayDriver = Depends(get_xray)):
     return {"success": True}
 
 
+def _as_rows(body: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    rows = body.get(key) or ([body] if body else [])
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _as_tags(body: dict[str, Any]) -> list[str]:
+    tags = body.get("tags") or ([body.get("tag")] if body.get("tag") else [])
+    return [str(tag).strip() for tag in tags if str(tag).strip()]
+
+
+@router.get("/console")
+def xray_console(xray: XrayDriver = Depends(get_xray)):
+    try:
+        payload = xray.console()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
+@router.get("/config")
+def get_config(xray: XrayDriver = Depends(get_xray)):
+    try:
+        config = xray.dumped_config()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "config": config, "config_path": xray.settings.xray.config}
+
+
+@router.put("/config")
+def put_config(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    try:
+        if body.get("section"):
+            result = xray.replace_section(str(body.get("section")), body.get("value"))
+        else:
+            config = body.get("config") if isinstance(body.get("config"), dict) else body
+            result = xray.apply_config(dict(config or {}))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
+
+
+@router.get("/logs")
+def xray_logs(kind: str = "error", lines: int = 200, xray: XrayDriver = Depends(get_xray)):
+    try:
+        payload = xray.tail_logs(kind=kind, lines=lines)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
+@router.post("/logger/restart")
+def restart_logger(xray: XrayDriver = Depends(get_xray)):
+    try:
+        result = xray.restart_logger()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
+
+
 @router.get("/outbounds")
 def list_outbounds(xray: XrayDriver = Depends(get_xray)):
-    return {"success": True, "outbounds": xray.list_outbounds()}
+    try:
+        rows = xray.list_outbounds()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "outbounds": rows}
 
 
 @router.post("/outbounds")
 def add_outbounds(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
-    rows = body.get("outbounds") or ([body] if body else [])
-    return {"success": True, "result": xray.add_outbounds(list(rows))}
+    try:
+        result = xray.add_outbounds(_as_rows(body, "outbounds"))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
+
+
+@router.put("/outbounds")
+def edit_outbounds(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    try:
+        result = xray.edit_outbounds(_as_rows(body, "outbounds"))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
 
 
 @router.delete("/outbounds")
 def remove_outbounds(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
-    tags = list(body.get("tags") or [])
-    return {"success": True, "result": xray.remove_outbounds(tags)}
+    try:
+        result = xray.remove_outbounds(_as_tags(body))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
 
 
 @router.get("/rules")
 def list_rules(xray: XrayDriver = Depends(get_xray)):
-    return {"success": True, "rules": xray.list_rules()}
+    try:
+        rows = xray.list_rules()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "rules": rows}
 
 
 @router.post("/rules")
 def add_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     rules = body.get("rules") or body.get("routing", {}).get("rules") or []
-    return {"success": True, "result": xray.add_rules(list(rules))}
+    try:
+        result = xray.add_rules([row for row in rules if isinstance(row, dict)])
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
+
+
+@router.put("/rules")
+def edit_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    rules = body.get("rules") or ([body] if body else [])
+    try:
+        result = xray.edit_rules([row for row in rules if isinstance(row, dict)])
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
 
 
 @router.delete("/rules")
 def remove_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
-    tags = list(body.get("tags") or [])
-    return {"success": True, "result": xray.remove_rules(tags)}
+    try:
+        result = xray.remove_rules(_as_tags(body))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
 
 
 @router.post("/sourceip/block")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -20,6 +21,14 @@ from agent.support.config_validate import (
     validate_xray_config,
     validate_xray_config_mutation,
     validate_xray_inbound,
+)
+from agent.support.xray_console import (
+    MANAGED_SECTIONS,
+    log_file_path,
+    redact_secrets,
+    restore_redacted_secrets,
+    routing_without_rules,
+    tail_file,
 )
 from agent.support.process import service_is_active
 from agent.xray_service import api_base_from_config, xray_auth_from_config
@@ -174,6 +183,8 @@ class XrayDriver(CoreDriver):
             "source_ip_block",
             "routing_rules",
             "outbounds",
+            "xray_console",
+            "xray_logs",
         ]
 
     def installed(self) -> bool:
@@ -599,11 +610,169 @@ class XrayDriver(CoreDriver):
             pass
         raise AgentError("UNSUPPORTED_CAPABILITY", "x25519 generation failed", 400)
 
+    def read_config(self) -> dict[str, Any]:
+        path = Path(self.settings.xray.config)
+        if not path.is_file():
+            raise AgentError("CONFIG_NOT_FOUND", f"Xray config not found: {path}", 404)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AgentError("VALIDATION_ERROR", f"Invalid Xray config JSON: {exc}", 422) from exc
+        if not isinstance(data, dict):
+            raise AgentError("VALIDATION_ERROR", "Xray config must be a JSON object", 422)
+        return data
+
+    def dumped_config(self) -> dict[str, Any]:
+        return redact_secrets(self.read_config())
+
+    def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(config, dict) or not config:
+            raise AgentError("VALIDATION_ERROR", "Xray config must be a non-empty object", 422)
+
+        path = Path(self.settings.xray.config)
+        current: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                current = self.read_config()
+            except AgentError:
+                current = {}
+        payload = restore_redacted_secrets(config, current)
+        if not isinstance(payload, dict):
+            raise AgentError("VALIDATION_ERROR", "Xray config must be a JSON object", 422)
+
+        binary = self._binary()
+        if binary:
+            validate_xray_config(binary, payload)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(serialized, encoding="utf-8")
+        tmp.replace(path)
+
+        try:
+            result = self._api().import_config(payload, path=str(path))
+        except AgentError:
+            from agent.xray_service import restart_xray_service
+
+            xray = self.settings.xray
+            result = restart_xray_service(
+                binary=xray.binary,
+                config_path=xray.config,
+                api_base=xray.api_base,
+                username=xray.username,
+                password=xray.password,
+            )
+        self.audit.record("update", "xray/config")
+        return result if isinstance(result, dict) else {"ok": True}
+
+    def replace_section(self, section: str, value: Any) -> dict[str, Any]:
+        name = str(section or "").strip()
+        if name not in MANAGED_SECTIONS:
+            raise AgentError("VALIDATION_ERROR", f"Unsupported Xray section [{name}]", 422)
+        config = self.read_config()
+        if value in (None, {}, []):
+            config.pop(name, None)
+        elif name == "routing" and isinstance(value, dict):
+            current = dict(config.get("routing") or {})
+            keep_rules = "rules" not in value
+            rules = current.get("rules")
+            current.update(value)
+            if keep_rules and rules is not None:
+                current["rules"] = rules
+            config["routing"] = current
+        else:
+            config[name] = value
+        return self.apply_config(config)
+
+    def console(self) -> dict[str, Any]:
+        config: dict[str, Any] = {}
+        config_error: str | None = None
+        try:
+            config = self.read_config()
+        except AgentError as exc:
+            config_error = exc.message
+
+        outbounds: list[dict[str, Any]] = list(config.get("outbounds") or [])
+        rules: list[dict[str, Any]] = list((config.get("routing") or {}).get("rules") or [])
+        api_ok = False
+        api_error: str | None = None
+        try:
+            outbounds = self.list_outbounds()
+            rules = self.list_rules()
+            api_ok = True
+        except AgentError as exc:
+            api_error = exc.message
+
+        inbound_tags = [str(row.get("tag")) for row in (config.get("inbounds") or []) if row.get("tag")]
+        outbound_tags = [str(row.get("tag")) for row in outbounds if isinstance(row, dict) and row.get("tag")]
+
+        return {
+            "config_path": self.settings.xray.config,
+            "config_error": config_error,
+            "api_ok": api_ok,
+            "api_error": api_error,
+            "log": config.get("log") or {},
+            "dns": config.get("dns") or {},
+            "routing": routing_without_rules(config.get("routing") if isinstance(config.get("routing"), dict) else {}),
+            "policy": config.get("policy") or {},
+            "reverse": config.get("reverse") or {},
+            "observatory": config.get("observatory") or {},
+            "burstObservatory": config.get("burstObservatory") or {},
+            "stats": config.get("stats") if isinstance(config.get("stats"), dict) else {},
+            "metrics": config.get("metrics") or {},
+            "transport": config.get("transport") or {},
+            "outbounds": outbounds,
+            "rules": rules,
+            "inbound_tags": inbound_tags,
+            "outbound_tags": outbound_tags,
+        }
+
+    def tail_logs(self, kind: str = "error", lines: int = 200) -> dict[str, Any]:
+        requested = str(kind or "error").strip().lower()
+        if requested not in {"error", "access", "all"}:
+            requested = "error"
+        lines = max(20, min(int(lines or 200), 2000))
+        log = {}
+        try:
+            log = dict(self.read_config().get("log") or {})
+        except AgentError:
+            log = {}
+
+        paths = {
+            "error": log_file_path(log, "error"),
+            "access": log_file_path(log, "access"),
+        }
+        kinds = ("error", "access") if requested == "all" else (requested,)
+        files: dict[str, dict[str, Any]] = {}
+        for name in kinds:
+            path = paths.get(name)
+            files[name] = {
+                "path": str(path) if path else None,
+                "content": tail_file(path, lines) if path else "",
+                "missing": path is None or not path.is_file(),
+            }
+
+        return {
+            "kind": requested,
+            "lines": lines,
+            "loglevel": log.get("loglevel") or log.get("logLevel") or "",
+            "files": files,
+        }
+
+    def restart_logger(self) -> dict[str, Any]:
+        result = self._api().restart_logger()
+        self.audit.record("update", "xray/logger")
+        return result if isinstance(result, dict) else {"ok": True}
+
     def list_outbounds(self) -> list[dict[str, Any]]:
         return self._api().list_outbounds()
 
     def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
         return self._api().add_outbounds(outbounds)
+
+    def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._api().edit_outbounds(outbounds)
 
     def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
         return self._api().remove_outbounds(tags)
@@ -613,6 +782,12 @@ class XrayDriver(CoreDriver):
 
     def add_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         return self._api().add_rules(rules)
+
+    def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {"updated": 0}
+        for rule in rules:
+            result = self._api().edit_rule(rule)
+        return result
 
     def remove_rules(self, tags: list[str]) -> dict[str, Any]:
         return self._api().remove_rules(tags)
