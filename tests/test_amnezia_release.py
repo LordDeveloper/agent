@@ -95,8 +95,8 @@ def test_install_amnezia_bundle_extracts_binaries(tmp_path, monkeypatch):
     archive = buf.getvalue()
 
     class FakeRelease:
-        tag = "v0.3.13"
-        version = "0.3.13"
+        tag = "v0.3.14"
+        version = "0.3.14"
         asset_name = "amneziawg-linux-gnu-amd64.tar.gz"
         asset_id = 1
         asset_url = "https://example.invalid/asset"
