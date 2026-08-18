@@ -17,6 +17,7 @@ from agent.drivers.base import CoreDriver
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
+from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.support.process import run
 
 _ONLINE_HANDSHAKE_SECONDS = 180
@@ -241,7 +242,7 @@ class WireGuardDriver(CoreDriver):
             "id": iface_id,
             "name": name,
             "listen_port": int(payload.get("listen_port", 51820)),
-            "subnet": payload.get("subnet", "10.8.0.0/24"),
+            "subnet": payload.get("subnet", "10.8.0.0/16"),
             "private_key": private_key,
             "public_key": public_key,
             "peers": list(payload.get("peers") or []),
@@ -251,16 +252,26 @@ class WireGuardDriver(CoreDriver):
 
         self.store.put_doc(self.key, self._kind, str(iface_id), iface)
         self.audit.record("create", f"{self.key}/interface/{iface_id}")
-        self._sync_conf(iface)
-        self._bring_up(iface)
+        up = self._bring_up(iface)
+        if not up.get("ok"):
+            self.store.delete_doc(self.key, self._kind, str(iface_id))
+            conf = self._config_dir() / f"{iface['name']}.conf"
+            conf.unlink(missing_ok=True)
+            detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
+            raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
         return iface
 
     def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         iface = self.get_interface(interface_id)
+        previous = deepcopy(iface)
         iface.update({k: v for k, v in payload.items() if k not in ("id",)})
+        self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
-        self._sync_conf(iface)
-        self._apply_live(iface)
+        try:
+            self._apply_live(iface)
+        except AgentError:
+            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            raise
         return iface
 
     def delete_interface(self, interface_id: int | str) -> bool:
@@ -501,7 +512,7 @@ class WireGuardDriver(CoreDriver):
     def _interface_lines(self, iface: dict[str, Any]) -> list[str]:
         address = iface["subnet"]
         if "/" not in str(address):
-            address = f"{address}/24"
+            address = f"{address}/16"
         # Prefer host .1 in subnet for server address.
         try:
             network = ipaddress.ip_network(address, strict=False)
@@ -523,10 +534,7 @@ class WireGuardDriver(CoreDriver):
         lines.append("")
         return lines
 
-    def _sync_conf(self, iface: dict[str, Any]) -> None:
-        config_dir = self._config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        conf_path = config_dir / f"{iface['name']}.conf"
+    def _render_conf(self, iface: dict[str, Any]) -> str:
         lines = self._interface_lines(iface)
         for peer in iface.get("peers", []):
             if not record_is_enabled(peer):
@@ -540,13 +548,35 @@ class WireGuardDriver(CoreDriver):
                     "",
                 ]
             )
-            peer_obf = peer.get("obfuscation") or {}
-            # Peer-level Amnezia params are unusual; keep on interface primarily.
-            if peer_obf:
-                pass
-        conf_path.write_text("\n".join(lines), encoding="utf-8")
+        return "\n".join(lines)
+
+    def _validate_before_apply(self, iface: dict[str, Any]) -> None:
+        validate_wg_iface(iface)
+        quick = self._quick_bin()
+        if not quick:
+            return
+        conf_text = self._render_conf(iface)
+        validate_wg_conf_stripped(
+            conf_text,
+            quick_bin=quick,
+            config_dir=self._config_dir(),
+        )
+
+    def _interface_is_up(self, name: str) -> bool:
+        cli = self._cli_bin()
+        if not cli or not name:
+            return False
+        result = run([cli, "show", name], check=False, timeout=5)
+        return result.returncode == 0
+
+    def _sync_conf(self, iface: dict[str, Any]) -> None:
+        config_dir = self._config_dir()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        conf_path = config_dir / f"{iface['name']}.conf"
+        conf_path.write_text(self._render_conf(iface), encoding="utf-8")
 
     def _bring_up(self, iface: dict[str, Any]) -> dict[str, Any]:
+        self._validate_before_apply(iface)
         self._sync_conf(iface)
         quick = self._quick_bin()
         name = iface["name"]
@@ -569,16 +599,35 @@ class WireGuardDriver(CoreDriver):
         return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
 
     def _apply_live(self, iface: dict[str, Any]) -> None:
-        self._sync_conf(iface)
+        self._validate_before_apply(iface)
+
         cli = self._cli_bin()
         quick = self._quick_bin()
         name = iface["name"]
+        conf_path = self._config_dir() / f"{name}.conf"
+        backup = conf_path.read_text(encoding="utf-8") if conf_path.exists() else None
+
         if not cli or not quick:
+            self._sync_conf(iface)
             return
-        # Prefer hot sync when interface already up.
-        strip = run([quick, "strip", name], check=False)
-        if strip.returncode == 0 and strip.stdout:
+
+        if not self._interface_is_up(name):
+            self._sync_conf(iface)
+            return
+
+        try:
+            self._sync_conf(iface)
+            strip = run([quick, "strip", name], check=False)
+            if strip.returncode != 0 or not strip.stdout:
+                detail = (strip.stderr or strip.stdout or "wg-quick strip failed").strip()
+                raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
             sync = run([cli, "syncconf", name, "/dev/stdin"], check=False, input_text=strip.stdout)
-            if sync.returncode == 0:
-                return
-        self._bring_up(iface)
+            if sync.returncode != 0:
+                detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
+                raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
+        except AgentError:
+            if backup is not None:
+                conf_path.write_text(backup, encoding="utf-8")
+            else:
+                conf_path.unlink(missing_ok=True)
+            raise

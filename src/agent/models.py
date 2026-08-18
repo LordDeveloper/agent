@@ -30,6 +30,7 @@ class CoreInfo(BaseModel):
     running: bool = False
     version: Optional[str] = None
     capabilities: list[str] = Field(default_factory=list)
+    enabled: bool = True
 
 
 class InboundPayload(BaseModel):
@@ -69,7 +70,7 @@ class WgInterfacePayload(BaseModel):
     id: Optional[int | str] = None
     name: Optional[str] = None
     listen_port: int = 51820
-    subnet: str = "10.8.0.0/24"
+    subnet: str = "10.8.0.0/16"
     private_key: Optional[str] = None
     public_key: Optional[str] = None
     obfuscation: Optional[dict[str, Any]] = None

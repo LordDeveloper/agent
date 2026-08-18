@@ -96,13 +96,10 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(cores_router, prefix="/api/v1", dependencies=auth)
     app.include_router(stats_router, prefix="/api/v1", dependencies=auth)
 
-    # Each core owns its own API surface; only mount what is enabled.
-    if "xray" in enabled:
-        app.include_router(xray_router, prefix="/api/v1", dependencies=auth)
-    if "wireguard" in enabled:
-        app.include_router(wireguard_router, prefix="/api/v1", dependencies=auth)
-    if "amnezia" in enabled:
-        app.include_router(amnezia_router, prefix="/api/v1", dependencies=auth)
+    # Core APIs are always mounted; ENABLED_CORES only marks preferred cores in health.
+    app.include_router(xray_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(wireguard_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(amnezia_router, prefix="/api/v1", dependencies=auth)
 
     @app.get("/health")
     def root_health(request: Request):
@@ -131,8 +128,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
             return health_payload(driver)
 
     for core_key, slug in ROUTE_SLUGS.items():
-        if core_key in enabled:
-            _register_public_core_health(core_key, slug)
+        _register_public_core_health(core_key, slug)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):

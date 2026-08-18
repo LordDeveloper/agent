@@ -21,9 +21,8 @@ class CoreRegistry:
             "wireguard": WireGuardDriver,
             "amnezia": AmneziaDriver,
         }
-        for key in settings.cores():
-            if key in factories:
-                self._drivers[key] = factories[key](settings, audit, store)
+        for key, factory in factories.items():
+            self._drivers[key] = factory(settings, audit, store)
 
     def list_cores(self) -> list[CoreInfo]:
         return [self._info(driver) for driver in self._drivers.values()]
@@ -63,4 +62,5 @@ class CoreRegistry:
             running=driver.running(),
             version=driver.version(),
             capabilities=driver.capabilities(),
+            enabled=driver.key in self.settings.cores(),
         )

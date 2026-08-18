@@ -23,6 +23,135 @@ def httpapi_listen(api_base: str) -> str:
     return f"{host}:{port}"
 
 
+def api_base_from_config(config_path: Path, fallback: str) -> str:
+    if not config_path.is_file():
+        return fallback.rstrip("/")
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback.rstrip("/")
+
+    httpapi = data.get("httpapi")
+    if not isinstance(httpapi, dict):
+        return fallback.rstrip("/")
+
+    listen = str(httpapi.get("listen") or "").strip()
+    if not listen:
+        return fallback.rstrip("/")
+    if "://" in listen:
+        return listen.rstrip("/")
+
+    host, sep, port = listen.partition(":")
+    if not sep:
+        return f"http://127.0.0.1:{listen}".rstrip("/")
+    return f"http://{host or '127.0.0.1'}:{port or 8080}".rstrip("/")
+
+
+def xray_auth_from_config(config_path: Path, username: str, password: str) -> tuple[str, str]:
+    if not config_path.is_file():
+        return username, password
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return username, password
+
+    httpapi = data.get("httpapi")
+    if not isinstance(httpapi, dict):
+        return username, password
+
+    return (
+        str(httpapi.get("username") or username),
+        str(httpapi.get("password") or password),
+    )
+
+
+def _httpapi_matches(desired: dict[str, Any], current: dict[str, Any]) -> bool:
+    for key in ("listen", "config_path", "username", "password"):
+        if str(desired.get(key) or "") != str(current.get(key) or ""):
+            return False
+    return True
+
+
+def ensure_xray_httpapi_config(
+    config_path: Path,
+    *,
+    api_base: str,
+    username: str = "",
+    password: str = "",
+) -> bool:
+    desired_httpapi: dict[str, Any] = {
+        "listen": httpapi_listen(api_base),
+        "config_path": str(config_path),
+    }
+    if username:
+        desired_httpapi["username"] = username
+    if password:
+        desired_httpapi["password"] = password
+
+    if not config_path.is_file():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = default_xray_config(
+            api_base=api_base,
+            username=username,
+            password=password,
+            config_path=str(config_path),
+        )
+        config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return True
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = default_xray_config(
+            api_base=api_base,
+            username=username,
+            password=password,
+            config_path=str(config_path),
+        )
+        config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return True
+
+    current = data.get("httpapi") if isinstance(data.get("httpapi"), dict) else {}
+    if _httpapi_matches(desired_httpapi, current):
+        return False
+
+    data["httpapi"] = {**current, **desired_httpapi}
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
+def wait_xray_http_api(
+    *,
+    api_base: str,
+    username: str = "",
+    password: str = "",
+    attempts: int = 20,
+    delay: float = 0.25,
+) -> None:
+    import httpx
+
+    auth = (username, password) if username and password else None
+    url = f"{api_base.rstrip('/')}/api/stats/sys"
+    last_error = "unknown"
+
+    for _ in range(max(1, attempts)):
+        try:
+            response = httpx.get(url, auth=auth, timeout=3.0)
+            if response.status_code < 500:
+                return
+            last_error = f"HTTP {response.status_code}"
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+        time.sleep(delay)
+
+    raise AgentError(
+        "CONFIG_NOT_FOUND",
+        f"Xray HTTP API unreachable at [{api_base}]: {last_error}",
+    )
+
+
 def default_xray_config(
     *,
     api_base: str = "http://127.0.0.1:8080",
@@ -159,12 +288,13 @@ def ensure_xray_runtime(
     cfg = Path(config_path)
     unit = Path(unit_path)
 
-    wrote_config = write_xray_config_if_missing(
+    httpapi_changed = ensure_xray_httpapi_config(
         cfg,
         api_base=api_base,
         username=username,
         password=password,
     )
+    wrote_config = httpapi_changed
     write_xray_unit(unit, resolved_binary, str(cfg))
 
     result: dict[str, Any] = {
@@ -172,6 +302,7 @@ def ensure_xray_runtime(
         "config": str(cfg),
         "unit": str(unit),
         "wrote_config": wrote_config,
+        "httpapi_synced": httpapi_changed,
         "started": False,
     }
 
@@ -183,10 +314,20 @@ def ensure_xray_runtime(
 
     run_cmd(["systemctl", "daemon-reload"], check=False)
     enabled = systemctl("enable", XRAY_UNIT)
-    started = systemctl("start", XRAY_UNIT)
+    if httpapi_changed and service_is_active(XRAY_UNIT):
+        systemctl("restart", XRAY_UNIT)
+        started = {"ok": True}
+    else:
+        started = systemctl("start", XRAY_UNIT)
 
     for _ in range(8):
         if service_is_active(XRAY_UNIT):
+            try:
+                wait_xray_http_api(api_base=api_base, username=username, password=password)
+            except AgentError as exc:
+                logs = _journal(XRAY_UNIT)
+                detail = exc.message or logs or "xray HTTP API did not become reachable"
+                raise AgentError("VALIDATION_ERROR", detail) from exc
             result["started"] = True
             result["enable"] = enabled
             result["start"] = started
@@ -233,6 +374,7 @@ def restart_xray_service(
             "VALIDATION_ERROR",
             f"Failed to restart xray.service: {restarted.get('stderr') or logs or 'unknown error'}",
         )
+    wait_xray_http_api(api_base=api_base, username=username, password=password)
     prepared["restart"] = restarted
     prepared["started"] = service_is_active(XRAY_UNIT)
     return prepared
