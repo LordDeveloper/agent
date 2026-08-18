@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: agent-release-${{ github.workflow }}-${{ github.ref }}
@@ -29,52 +30,50 @@ concurrency:
 jobs:
   build:
     name: build-${{ matrix.asset }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include:
           - platform: linux/amd64
-            libc: gnu
-            arch: amd64
             asset: agent-linux-gnu-amd64
             dockerfile: Dockerfile
+            runs-on: ubuntu-latest
           - platform: linux/arm64
-            libc: gnu
-            arch: arm64
             asset: agent-linux-gnu-arm64
             dockerfile: Dockerfile
+            runs-on: ubuntu-24.04-arm
           - platform: linux/amd64
-            libc: musl
-            arch: amd64
             asset: agent-linux-musl-amd64
             dockerfile: Dockerfile.musl
+            runs-on: ubuntu-latest
           - platform: linux/arm64
-            libc: musl
-            arch: arm64
             asset: agent-linux-musl-arm64
             dockerfile: Dockerfile.musl
+            runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU and Buildx
-        run: |
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          docker buildx create --name agent-builder --driver docker-container --use \
-            2>/dev/null || docker buildx use agent-builder
-          docker buildx inspect --bootstrap
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build ${{ matrix.asset }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          target: export
+          provenance: false
+          sbom: false
+          outputs: type=local,dest=dist/export
+          cache-from: type=gha,scope=${{ matrix.asset }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.asset }}
+
+      - name: Package binary
         run: |
           mkdir -p dist
-          docker buildx build \
-            --platform "${{ matrix.platform }}" \
-            -f "${{ matrix.dockerfile }}" \
-            --target export \
-            -o type=local,dest=dist/export \
-            .
           cp -f dist/export/agent "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
           file "dist/${{ matrix.asset }}" || true
@@ -107,14 +106,25 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26.x'
           cache: false
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-xray-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-xray-binary.sh') }}
+          restore-keys: |
+            go-xray-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build ${{ matrix.asset }}
         env:
           XRAY_RELEASE_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN }}
           XRAY_GITHUB_REPO: LordDeveloper/xray
+          GOTOOLCHAIN: local
         run: |
           if [[ -z "${XRAY_RELEASE_TOKEN}" ]]; then
             echo "Set repository secret XRAY_RELEASE_TOKEN (PAT with read access to ${XRAY_GITHUB_REPO})." >&2
@@ -156,10 +166,15 @@ jobs:
           go-version: '1.22'
           cache: false
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential git
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-amnezia-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-amneziawg-bundle.sh') }}
+          restore-keys: |
+            go-amnezia-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build ${{ matrix.asset }}
         env:
