@@ -33,26 +33,29 @@ def _prepare_xray_service(result: dict) -> dict:
     return result
 
 
-def install_xray(*, github_token: str | None = None) -> dict:
+def install_xray(*, github_token: str | None = None, force: bool = False) -> dict:
     """
-    Install customized Xray binary from LordDeveloper/xray GitHub Releases.
-    Uses GITHUB_TOKEN (or request body github_token) for private repo access.
+    Install customized Xray binary from agent GitHub Releases (bundled xray asset),
+    falling back to LordDeveloper/xray when needed.
     """
-    from agent.xray_release import install_xray_binary, xray_binary_present
+    from agent.xray_release import install_xray_binary
+    from agent.xray_service import binary_has_httpapi, stop_xray_service
 
     binary = os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")
-    if xray_binary_present(binary):
-        resolved = binary if Path(binary).is_file() else which("xray")
+    dest = Path(binary)
+    ready = dest.is_file() and binary_has_httpapi(dest)
+    had_stock = dest.is_file() and not ready
+    if ready and not force:
         return _prepare_xray_service({
             "core": "xray",
             "installed": True,
             "downloaded": False,
-            "message": "xray binary present",
-            "binary": resolved,
+            "httpapi_capable": True,
+            "message": "customized xray binary present",
+            "binary": str(dest),
             "api_base": os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
         })
 
-    dest = Path(binary)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -61,8 +64,35 @@ def install_xray(*, github_token: str | None = None) -> dict:
             f"Cannot create directory for XRAY_BINARY [{dest.parent}]: {exc}",
         ) from exc
 
+    if dest.is_file():
+        try:
+            stop_xray_service()
+        except AgentError:
+            pass
+
     result = install_xray_binary(dest, token=github_token)
-    return _prepare_xray_service(result)
+    result["replaced_stock"] = had_stock
+    result["httpapi_capable"] = binary_has_httpapi(dest)
+    if dest.is_file() and not result["httpapi_capable"]:
+        raise AgentError(
+            "UNSUPPORTED_CAPABILITY",
+            "Downloaded Xray binary still has no HTTP API. "
+            "Confirm agent release includes xray-linux-* or set XRAY_GITHUB_REPO=LordDeveloper/xray "
+            "with GITHUB_TOKEN that can read that private repo.",
+        )
+    result = _prepare_xray_service(result)
+    if result.get("downloaded") or force:
+        try:
+            from agent.xray_service import ensure_xray_runtime
+
+            result["service"] = ensure_xray_runtime(
+                binary=str(dest),
+                api_base=os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
+                start=True,
+            )
+        except AgentError as exc:
+            result["service_error"] = exc.message
+    return result
 
 
 def install_wireguard() -> dict:
@@ -76,14 +106,18 @@ def install_wireguard() -> dict:
     return {"core": "wireguard", "installed": True, "message": "installed"}
 
 
-def install_amnezia() -> dict:
-    # AmneziaWG usually needs kernel module; ensure WG tools first.
-    result = install_wireguard()
-    result["core"] = "amnezia"
-    result["message"] = (
-        "wireguard tools ready; AmneziaWG kernel module may need manual install on this kernel"
-    )
-    return result
+def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:
+    from agent.amnezia_release import amnezia_bundle_present, install_amnezia_bundle
+
+    if amnezia_bundle_present() and not force:
+        return {
+            "core": "amnezia",
+            "installed": True,
+            "downloaded": False,
+            "message": "amneziawg bundle present",
+        }
+
+    return install_amnezia_bundle(token=github_token, force=force)
 
 
 INSTALLERS = {
@@ -93,13 +127,13 @@ INSTALLERS = {
 }
 
 
-def install_core(name: str, *, github_token: str | None = None) -> dict:
+def install_core(name: str, *, github_token: str | None = None, force: bool = False) -> dict:
     key = name.strip().lower()
     installer = INSTALLERS.get(key)
     if installer is None:
         raise AgentError("CONFIG_NOT_FOUND", f"Unknown core [{name}]. Known: {', '.join(KNOWN_CORES)}")
-    if key == "xray":
-        return installer(github_token=github_token)
+    if key in {"xray", "amnezia"}:
+        return installer(github_token=github_token, force=force)
     return installer()
 
 

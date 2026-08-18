@@ -248,16 +248,35 @@ def _auth_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
-def fetch_latest_release(
+def _parse_release_payload(
+    payload: dict,
     *,
-    repo: str | None = None,
-    token: str | None = None,
-    asset_name: str | None = None,
-    timeout: float = 60.0,
+    repo_id: str,
+    wanted: str,
+    prefix: str,
 ) -> ReleaseInfo:
-    repo_id = resolve_repo(repo)
+    tag = str(payload.get("tag_name") or "")
+    assets = payload.get("assets") or []
+    match = pick_release_asset(assets, wanted, prefix=prefix)
+    asset_id = int(match["id"])
+    chosen_name = str(match.get("name") or wanted)
+    return ReleaseInfo(
+        tag=tag,
+        version=normalize_version(tag),
+        asset_name=chosen_name,
+        asset_id=asset_id,
+        asset_url=f"{GITHUB_API}/repos/{repo_id}/releases/assets/{asset_id}",
+        html_url=str(payload.get("html_url") or ""),
+    )
+
+
+def _fetch_latest_release_payload(
+    repo_id: str,
+    *,
+    token: str | None = None,
+    timeout: float = 60.0,
+) -> dict:
     auth = resolve_token(token)
-    wanted = resolve_asset_name(asset_name)
     url = f"{GITHUB_API}/repos/{repo_id}/releases/latest"
 
     try:
@@ -276,8 +295,7 @@ def fetch_latest_release(
         raise AgentError(
             "CONFIG_NOT_FOUND",
             f"Release not found for [{repo_id}]. Private repos require GITHUB_TOKEN; "
-            "also ensure at least one published release with asset "
-            f"[{wanted}].",
+            "also ensure at least one published release includes the requested asset.",
         )
     if response.status_code >= 400:
         raise AgentError(
@@ -285,21 +303,43 @@ def fetch_latest_release(
             f"GitHub API error HTTP {response.status_code}: {response.text[:300]}",
         )
 
-    payload = response.json()
-    tag = str(payload.get("tag_name") or "")
-    assets = payload.get("assets") or []
-    match = pick_release_asset(assets, wanted, prefix="agent")
+    return response.json()
 
-    asset_id = int(match["id"])
-    chosen_name = str(match.get("name") or wanted)
-    return ReleaseInfo(
-        tag=tag,
-        version=normalize_version(tag),
-        asset_name=chosen_name,
-        asset_id=asset_id,
-        asset_url=f"{GITHUB_API}/repos/{repo_id}/releases/assets/{asset_id}",
-        html_url=str(payload.get("html_url") or ""),
-    )
+
+def fetch_release_for_asset(
+    *,
+    repo: str,
+    asset_name: str,
+    prefix: str,
+    token: str | None = None,
+    timeout: float = 60.0,
+) -> ReleaseInfo:
+    repo_id = repo.strip().strip("/")
+    wanted = asset_name.strip()
+    payload = _fetch_latest_release_payload(repo_id, token=token, timeout=timeout)
+    try:
+        return _parse_release_payload(payload, repo_id=repo_id, wanted=wanted, prefix=prefix)
+    except AgentError as exc:
+        if exc.code != "CONFIG_NOT_FOUND" or not wanted.endswith(".tar.gz"):
+            raise
+        # musl hosts may reuse gnu bundle when a musl-specific tarball is absent.
+        gnu = wanted.replace("-linux-musl-", "-linux-gnu-", 1)
+        if gnu == wanted:
+            raise
+        return _parse_release_payload(payload, repo_id=repo_id, wanted=gnu, prefix=prefix)
+
+
+def fetch_latest_release(
+    *,
+    repo: str | None = None,
+    token: str | None = None,
+    asset_name: str | None = None,
+    timeout: float = 60.0,
+) -> ReleaseInfo:
+    repo_id = resolve_repo(repo)
+    wanted = resolve_asset_name(asset_name)
+    payload = _fetch_latest_release_payload(repo_id, token=token, timeout=timeout)
+    return _parse_release_payload(payload, repo_id=repo_id, wanted=wanted, prefix="agent")
 
 
 def download_release_asset(

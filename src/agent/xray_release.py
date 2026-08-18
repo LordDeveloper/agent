@@ -5,23 +5,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import httpx
-
-from agent import __version__
 from agent.errors import AgentError
 from agent.ops import run_cmd, which
 from agent.update import (
     ReleaseInfo,
     detect_host_platform,
     download_release_asset,
-    normalize_version,
-    pick_release_asset,
-    resolve_token,
+    fetch_release_for_asset,
+    resolve_repo,
 )
 
-DEFAULT_XRAY_REPO = "LordDeveloper/xray"
-GITHUB_API = "https://api.github.com"
-
+DEFAULT_XRAY_REPO = "LordDeveloper/agent"
+LEGACY_XRAY_REPO = "LordDeveloper/xray"
 
 def resolve_xray_repo(explicit: str | None = None) -> str:
     return (
@@ -41,17 +36,6 @@ def resolve_xray_asset_name(explicit: str | None = None) -> str:
     return f"xray-linux-{host.libc}-{host.arch}"
 
 
-def _auth_headers(token: str | None) -> dict[str, str]:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": f"netinja-agent/{__version__}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
 def fetch_xray_release(
     *,
     repo: str | None = None,
@@ -59,49 +43,33 @@ def fetch_xray_release(
     asset_name: str | None = None,
     timeout: float = 60.0,
 ) -> ReleaseInfo:
-    repo_id = resolve_xray_repo(repo)
-    auth = resolve_token(token)
     wanted = resolve_xray_asset_name(asset_name)
-    url = f"{GITHUB_API}/repos/{repo_id}/releases/latest"
+    primary = resolve_xray_repo(repo)
+    candidates = [primary]
+    if primary == DEFAULT_XRAY_REPO and LEGACY_XRAY_REPO not in candidates:
+        candidates.append(LEGACY_XRAY_REPO)
 
-    try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            response = client.get(url, headers=_auth_headers(auth))
-    except httpx.HTTPError as exc:
-        raise AgentError("UPSTREAM_ERROR", f"GitHub request failed: {exc}") from exc
+    last_error: AgentError | None = None
+    for repo_id in candidates:
+        try:
+            return fetch_release_for_asset(
+                repo=repo_id,
+                asset_name=wanted,
+                prefix="xray",
+                token=token,
+                timeout=timeout,
+            )
+        except AgentError as exc:
+            last_error = exc
+            if exc.code == "CONFIG_NOT_FOUND" and repo_id != candidates[-1]:
+                continue
+            raise
 
-    if response.status_code == 401:
-        raise AgentError(
-            "UNAUTHORIZED",
-            "GitHub rejected credentials. Set GITHUB_TOKEN (classic PAT with repo scope, "
-            "or fine-grained token with Contents: Read on LordDeveloper/xray).",
-        )
-    if response.status_code == 404:
-        raise AgentError(
-            "CONFIG_NOT_FOUND",
-            f"Release not found for [{repo_id}]. Private repo requires GITHUB_TOKEN; "
-            f"ensure a published release includes asset [{wanted}].",
-        )
-    if response.status_code >= 400:
-        raise AgentError(
-            "UPSTREAM_ERROR",
-            f"GitHub API error HTTP {response.status_code}: {response.text[:300]}",
-        )
-
-    payload = response.json()
-    tag = str(payload.get("tag_name") or "")
-    assets = payload.get("assets") or []
-    match = pick_release_asset(assets, wanted, prefix="xray")
-
-    asset_id = int(match["id"])
-    chosen_name = str(match.get("name") or wanted)
-    return ReleaseInfo(
-        tag=tag,
-        version=normalize_version(tag),
-        asset_name=chosen_name,
-        asset_id=asset_id,
-        asset_url=f"{GITHUB_API}/repos/{repo_id}/releases/assets/{asset_id}",
-        html_url=str(payload.get("html_url") or ""),
+    if last_error is not None:
+        raise last_error
+    raise AgentError(
+        "CONFIG_NOT_FOUND",
+        f"No xray release asset [{wanted}] found in {', '.join(candidates)}.",
     )
 
 

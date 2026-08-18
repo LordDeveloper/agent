@@ -1,171 +1,266 @@
-# Build Linux agent binaries for multiple arch + libc targets and attach to GitHub Release.
-# Repo: https://github.com/LordDeveloper/agent
-#
-# Assets:
-#   agent-linux-gnu-amd64   (Debian/Ubuntu/RHEL/... — glibc)
-#   agent-linux-gnu-arm64
-#   agent-linux-musl-amd64  (Alpine — musl)
-#   agent-linux-musl-arm64
-#   agent-linux-amd64       (alias → gnu-amd64)
-#   agent-linux-arm64       (alias → gnu-arm64)
-
-name: Release agent
-
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-concurrency:
-  group: agent-release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: build-${{ matrix.asset }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - platform: linux/amd64
-            libc: gnu
-            arch: amd64
-            asset: agent-linux-gnu-amd64
-            dockerfile: Dockerfile
-          - platform: linux/arm64
-            libc: gnu
-            arch: arm64
-            asset: agent-linux-gnu-arm64
-            dockerfile: Dockerfile
-          - platform: linux/amd64
-            libc: musl
-            arch: amd64
-            asset: agent-linux-musl-amd64
-            dockerfile: Dockerfile.musl
-          - platform: linux/arm64
-            libc: musl
-            arch: arm64
-            asset: agent-linux-musl-arm64
-            dockerfile: Dockerfile.musl
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Native shell setup avoids intermittent 429/503 from codeload.github.com when
-      # downloading docker/setup-qemu-action and docker/setup-buildx-action tarballs.
-      - name: Set up QEMU and Buildx
-        run: |
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          docker buildx create --name agent-builder --driver docker-container --use \
-            2>/dev/null || docker buildx use agent-builder
-          docker buildx inspect --bootstrap
-
-      - name: Build ${{ matrix.asset }}
-        run: |
-          mkdir -p dist
-          docker buildx build \
-            --platform "${{ matrix.platform }}" \
-            -f "${{ matrix.dockerfile }}" \
-            --target export \
-            -o type=local,dest=dist/export \
-            .
-          cp -f dist/export/agent "dist/${{ matrix.asset }}"
-          chmod +x "dist/${{ matrix.asset }}"
-          file "dist/${{ matrix.asset }}" || true
-          ls -lh "dist/${{ matrix.asset }}"
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
-          if-no-files-found: error
-
-  package:
-    name: package-release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all binaries
-        uses: actions/download-artifact@v4
-        with:
-          path: dist/artifacts
-
-      - name: Assemble dist/
-        run: |
-          mkdir -p dist
-          cp -f dist/artifacts/agent-linux-gnu-amd64/agent-linux-gnu-amd64 dist/agent-linux-gnu-amd64
-          cp -f dist/artifacts/agent-linux-gnu-arm64/agent-linux-gnu-arm64 dist/agent-linux-gnu-arm64
-          cp -f dist/artifacts/agent-linux-musl-amd64/agent-linux-musl-amd64 dist/agent-linux-musl-amd64
-          cp -f dist/artifacts/agent-linux-musl-arm64/agent-linux-musl-arm64 dist/agent-linux-musl-arm64
-          # Backward-compatible aliases (glibc)
-          cp -f dist/agent-linux-gnu-amd64 dist/agent-linux-amd64
-          cp -f dist/agent-linux-gnu-arm64 dist/agent-linux-arm64
-          chmod +x dist/agent-linux-*
-          ls -lh dist/agent-linux-*
-          # Installer scripts
-          cp -f scripts/get-agent.sh install.sh uninstall.sh systemd/agent.service .env.example dist/
-          chmod +x dist/get-agent.sh dist/install.sh dist/uninstall.sh
-
-      - name: Upload release bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent-release-bundle
-          path: |
-            dist/agent-linux-gnu-amd64
-            dist/agent-linux-gnu-arm64
-            dist/agent-linux-musl-amd64
-            dist/agent-linux-musl-arm64
-            dist/agent-linux-amd64
-            dist/agent-linux-arm64
-            dist/get-agent.sh
-            dist/install.sh
-            dist/uninstall.sh
-            dist/agent.service
-            dist/.env.example
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/agent-linux-gnu-amd64
-            dist/agent-linux-gnu-arm64
-            dist/agent-linux-musl-amd64
-            dist/agent-linux-musl-arm64
-            dist/agent-linux-amd64
-            dist/agent-linux-arm64
-            dist/get-agent.sh
-            dist/install.sh
-            dist/uninstall.sh
-            dist/agent.service
-            dist/.env.example
-          generate_release_notes: true
-          body: |
-            ## Binaries
-
-            | Asset | Distro family | Arch |
-            |-------|---------------|------|
-            | `agent-linux-gnu-amd64` | Debian / Ubuntu / RHEL / Fedora (glibc) | amd64 |
-            | `agent-linux-gnu-arm64` | Debian / Ubuntu / RHEL / Fedora (glibc) | arm64 |
-            | `agent-linux-musl-amd64` | Alpine (musl) | amd64 |
-            | `agent-linux-musl-arm64` | Alpine (musl) | arm64 |
-            | `agent-linux-amd64` | alias → gnu-amd64 | amd64 |
-            | `agent-linux-arm64` | alias → gnu-arm64 | arm64 |
-
-            Install:
-            ```bash
-            export GITHUB_TOKEN=...
-            curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
-              | sudo -E bash -s -- --with xray,wireguard
-            ```
+# Build Linux agent binaries for multiple arch + libc targets and attach to GitHub Release.
+# Repo: https://github.com/LordDeveloper/agent
+#
+# Assets:
+#   agent-linux-gnu-amd64   (Debian/Ubuntu/RHEL/... — glibc)
+#   agent-linux-gnu-arm64
+#   agent-linux-musl-amd64  (Alpine — musl)
+#   agent-linux-musl-arm64
+#   agent-linux-amd64       (alias → gnu-amd64)
+#   agent-linux-arm64       (alias → gnu-arm64)
+#   xray-linux-gnu-amd64 / xray-linux-gnu-arm64  (mirrored from LordDeveloper/xray)
+#   amneziawg-linux-gnu-amd64.tar.gz / amneziawg-linux-gnu-arm64.tar.gz
+
+name: Release agent
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - platform: linux/amd64
+            libc: gnu
+            arch: amd64
+            asset: agent-linux-gnu-amd64
+            dockerfile: Dockerfile
+          - platform: linux/arm64
+            libc: gnu
+            arch: arm64
+            asset: agent-linux-gnu-arm64
+            dockerfile: Dockerfile
+          - platform: linux/amd64
+            libc: musl
+            arch: amd64
+            asset: agent-linux-musl-amd64
+            dockerfile: Dockerfile.musl
+          - platform: linux/arm64
+            libc: musl
+            arch: arm64
+            asset: agent-linux-musl-arm64
+            dockerfile: Dockerfile.musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU and Buildx
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          docker buildx create --name agent-builder --driver docker-container --use \
+            2>/dev/null || docker buildx use agent-builder
+          docker buildx inspect --bootstrap
+
+      - name: Build ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            -f "${{ matrix.dockerfile }}" \
+            --target export \
+            -o type=local,dest=dist/export \
+            .
+          cp -f dist/export/agent "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+          file "dist/${{ matrix.asset }}" || true
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  build-xray:
+    name: fetch-xray-${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: xray-linux-gnu-amd64
+          - asset: xray-linux-gnu-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ${{ matrix.asset }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.XRAY_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          XRAY_GITHUB_REPO: LordDeveloper/xray
+        run: |
+          chmod +x scripts/fetch-xray-release.sh
+          mkdir -p dist
+          scripts/fetch-xray-release.sh "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload xray artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  build-amneziawg:
+    name: build-amneziawg-${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+            asset: amneziawg-linux-gnu-amd64.tar.gz
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+            asset: amneziawg-linux-gnu-arm64.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential git
+
+      - name: Build ${{ matrix.asset }}
+        env:
+          AMNEZIAWG_GO_TAG: v3.1.20260814
+        run: |
+          chmod +x scripts/build-amneziawg-bundle.sh
+          mkdir -p dist
+          scripts/build-amneziawg-bundle.sh "${{ matrix.arch }}" "dist/${{ matrix.asset }}"
+          tar -tzf "dist/${{ matrix.asset }}"
+
+      - name: Upload amneziawg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  package:
+    name: package-release
+    needs: [build, build-xray, build-amneziawg]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+
+      - name: Assemble dist/
+        run: |
+          mkdir -p dist
+          cp -f dist/artifacts/agent-linux-gnu-amd64/agent-linux-gnu-amd64 dist/agent-linux-gnu-amd64
+          cp -f dist/artifacts/agent-linux-gnu-arm64/agent-linux-gnu-arm64 dist/agent-linux-gnu-arm64
+          cp -f dist/artifacts/agent-linux-musl-amd64/agent-linux-musl-amd64 dist/agent-linux-musl-amd64
+          cp -f dist/artifacts/agent-linux-musl-arm64/agent-linux-musl-arm64 dist/agent-linux-musl-arm64
+          cp -f dist/artifacts/xray-linux-gnu-amd64/xray-linux-gnu-amd64 dist/xray-linux-gnu-amd64
+          cp -f dist/artifacts/xray-linux-gnu-arm64/xray-linux-gnu-arm64 dist/xray-linux-gnu-arm64
+          cp -f dist/artifacts/amneziawg-linux-gnu-amd64.tar.gz/amneziawg-linux-gnu-amd64.tar.gz dist/amneziawg-linux-gnu-amd64.tar.gz
+          cp -f dist/artifacts/amneziawg-linux-gnu-arm64.tar.gz/amneziawg-linux-gnu-arm64.tar.gz dist/amneziawg-linux-gnu-arm64.tar.gz
+          cp -f dist/xray-linux-gnu-amd64 dist/xray-linux-amd64
+          cp -f dist/xray-linux-gnu-arm64 dist/xray-linux-arm64
+          cp -f dist/agent-linux-gnu-amd64 dist/agent-linux-amd64
+          cp -f dist/agent-linux-gnu-arm64 dist/agent-linux-arm64
+          chmod +x dist/agent-linux-* dist/xray-linux-*
+          ls -lh dist/agent-linux-* dist/xray-linux-* dist/amneziawg-*.tar.gz
+          cp -f scripts/get-agent.sh install.sh uninstall.sh systemd/agent.service .env.example dist/
+          chmod +x dist/get-agent.sh dist/install.sh dist/uninstall.sh
+
+      - name: Upload release bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-release-bundle
+          path: |
+            dist/agent-linux-gnu-amd64
+            dist/agent-linux-gnu-arm64
+            dist/agent-linux-musl-amd64
+            dist/agent-linux-musl-arm64
+            dist/agent-linux-amd64
+            dist/agent-linux-arm64
+            dist/xray-linux-gnu-amd64
+            dist/xray-linux-gnu-arm64
+            dist/xray-linux-amd64
+            dist/xray-linux-arm64
+            dist/amneziawg-linux-gnu-amd64.tar.gz
+            dist/amneziawg-linux-gnu-arm64.tar.gz
+            dist/get-agent.sh
+            dist/install.sh
+            dist/uninstall.sh
+            dist/agent.service
+            dist/.env.example
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agent-linux-gnu-amd64
+            dist/agent-linux-gnu-arm64
+            dist/agent-linux-musl-amd64
+            dist/agent-linux-musl-arm64
+            dist/agent-linux-amd64
+            dist/agent-linux-arm64
+            dist/xray-linux-gnu-amd64
+            dist/xray-linux-gnu-arm64
+            dist/xray-linux-amd64
+            dist/xray-linux-arm64
+            dist/amneziawg-linux-gnu-amd64.tar.gz
+            dist/amneziawg-linux-gnu-arm64.tar.gz
+            dist/get-agent.sh
+            dist/install.sh
+            dist/uninstall.sh
+            dist/agent.service
+            dist/.env.example
+          generate_release_notes: true
+          body: |
+            ## Binaries
+
+            | Asset | Distro family | Arch |
+            |-------|---------------|------|
+            | `agent-linux-gnu-amd64` | Debian / Ubuntu / RHEL / Fedora (glibc) | amd64 |
+            | `agent-linux-gnu-arm64` | Debian / Ubuntu / RHEL / Fedora (glibc) | arm64 |
+            | `agent-linux-musl-amd64` | Alpine (musl) | amd64 |
+            | `agent-linux-musl-arm64` | Alpine (musl) | arm64 |
+            | `xray-linux-gnu-amd64` | bundled customized Xray | amd64 |
+            | `xray-linux-gnu-arm64` | bundled customized Xray | arm64 |
+            | `amneziawg-linux-gnu-amd64.tar.gz` | awg + awg-quick + amneziawg-go | amd64 |
+            | `amneziawg-linux-gnu-arm64.tar.gz` | awg + awg-quick + amneziawg-go | arm64 |
+
+            Install:
+            ```bash
+            export GITHUB_TOKEN=...
+            curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://raw.githubusercontent.com/LordDeveloper/agent/main/scripts/get-agent.sh" \
+              | sudo -E bash -s -- --with xray,amnezia
+            ```
+
+            AmneziaWG is built from [amnezia-vpn/amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go/tags) tag `v3.1.20260814`.
+

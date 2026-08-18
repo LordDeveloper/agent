@@ -14,6 +14,55 @@ from agent.support.process import service_is_active, systemctl
 XRAY_UNIT = "xray"
 DEFAULT_CONFIG_PATH = "/usr/local/etc/xray/config.json"
 DEFAULT_UNIT_PATH = "/etc/systemd/system/xray.service"
+_HTTPAPI_NEEDLES = (b"httpapi", b"/api/stats/sys", b"/api/inbounds/list")
+STOCK_XRAY_HINT = (
+    "Xray binary has no HTTP API (usually official/XTLS Xray). "
+    "Reinstall the customized core from LordDeveloper/xray via the admin panel "
+    "(node needs GITHUB_TOKEN)."
+)
+
+
+def binary_has_httpapi(binary: str | Path | None) -> bool:
+    """True when the binary looks like customized Xray with HTTP API."""
+    if not binary:
+        return False
+    path = Path(binary)
+    if not path.is_file():
+        resolved = which("xray")
+        if not resolved:
+            return False
+        path = Path(resolved)
+    try:
+        leftover = b""
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(256 * 1024)
+                if not chunk:
+                    return False
+                blob = leftover + chunk
+                if any(needle in blob for needle in _HTTPAPI_NEEDLES):
+                    return True
+                leftover = blob[-32:]
+    except OSError:
+        return False
+
+
+def client_api_base(listen: str, fallback: str = "http://127.0.0.1:8080") -> str:
+    text = (listen or "").strip() or fallback
+    if "://" in text:
+        parsed = urlparse(text)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8080
+    else:
+        host, sep, port = text.partition(":")
+        if not sep:
+            host, port = "127.0.0.1", text
+        host = host or "127.0.0.1"
+        port = port or 8080
+    hostname = str(host).strip("[]")
+    if hostname in {"0.0.0.0", "::", ""}:
+        hostname = "127.0.0.1"
+    return f"http://{hostname}:{port}".rstrip("/")
 
 
 def httpapi_listen(api_base: str) -> str:
@@ -25,27 +74,21 @@ def httpapi_listen(api_base: str) -> str:
 
 def api_base_from_config(config_path: Path, fallback: str) -> str:
     if not config_path.is_file():
-        return fallback.rstrip("/")
+        return client_api_base(fallback)
 
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return fallback.rstrip("/")
+        return client_api_base(fallback)
 
     httpapi = data.get("httpapi")
     if not isinstance(httpapi, dict):
-        return fallback.rstrip("/")
+        return client_api_base(fallback)
 
     listen = str(httpapi.get("listen") or "").strip()
     if not listen:
-        return fallback.rstrip("/")
-    if "://" in listen:
-        return listen.rstrip("/")
-
-    host, sep, port = listen.partition(":")
-    if not sep:
-        return f"http://127.0.0.1:{listen}".rstrip("/")
-    return f"http://{host or '127.0.0.1'}:{port or 8080}".rstrip("/")
+        return client_api_base(fallback)
+    return client_api_base(listen, fallback)
 
 
 def xray_auth_from_config(config_path: Path, username: str, password: str) -> tuple[str, str]:
@@ -150,6 +193,15 @@ def wait_xray_http_api(
         "CONFIG_NOT_FOUND",
         f"Xray HTTP API unreachable at [{api_base}]: {last_error}",
     )
+
+
+def _unreachable_detail(api_error: str, logs: str = "") -> str:
+    parts = [api_error]
+    snippet = " ".join((logs or "").split())
+    if snippet:
+        parts.append(snippet[-700:])
+    parts.append(STOCK_XRAY_HINT)
+    return " | ".join(parts)
 
 
 def default_xray_config(
@@ -296,6 +348,8 @@ def ensure_xray_runtime(
     )
     wrote_config = httpapi_changed
     write_xray_unit(unit, resolved_binary, str(cfg))
+    reachable_api = api_base_from_config(cfg, api_base)
+    auth_user, auth_pass = xray_auth_from_config(cfg, username, password)
 
     result: dict[str, Any] = {
         "binary": resolved_binary,
@@ -304,14 +358,23 @@ def ensure_xray_runtime(
         "wrote_config": wrote_config,
         "httpapi_synced": httpapi_changed,
         "started": False,
+        "httpapi": reachable_api,
+        "httpapi_capable": binary_has_httpapi(resolved_binary),
     }
 
     if not start:
         return result
 
+    if not binary_has_httpapi(resolved_binary):
+        raise AgentError(
+            "UNSUPPORTED_CAPABILITY",
+            f"Xray at [{resolved_binary}] has no HTTP API. {STOCK_XRAY_HINT}",
+        )
+
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found; cannot start xray.service")
 
+    run_cmd(["systemctl", "reset-failed", XRAY_UNIT], check=False)
     run_cmd(["systemctl", "daemon-reload"], check=False)
     enabled = systemctl("enable", XRAY_UNIT)
     if httpapi_changed and service_is_active(XRAY_UNIT):
@@ -320,14 +383,21 @@ def ensure_xray_runtime(
     else:
         started = systemctl("start", XRAY_UNIT)
 
-    for _ in range(8):
+    for _ in range(20):
         if service_is_active(XRAY_UNIT):
             try:
-                wait_xray_http_api(api_base=api_base, username=username, password=password)
+                wait_xray_http_api(
+                    api_base=reachable_api,
+                    username=auth_user,
+                    password=auth_pass,
+                    attempts=40,
+                    delay=0.3,
+                )
             except AgentError as exc:
-                logs = _journal(XRAY_UNIT)
-                detail = exc.message or logs or "xray HTTP API did not become reachable"
-                raise AgentError("VALIDATION_ERROR", detail) from exc
+                raise AgentError(
+                    "VALIDATION_ERROR",
+                    _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+                ) from exc
             result["started"] = True
             result["enable"] = enabled
             result["start"] = started
@@ -338,7 +408,7 @@ def ensure_xray_runtime(
     detail = started.get("stderr") or started.get("stdout") or logs or "xray.service did not become active"
     raise AgentError(
         "VALIDATION_ERROR",
-        f"Failed to start xray.service: {detail}",
+        _unreachable_detail(f"Failed to start xray.service: {detail}", logs),
     )
 
 
@@ -366,15 +436,38 @@ def restart_xray_service(
     )
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found; cannot restart xray.service")
+    if not binary_has_httpapi(prepared.get("binary") or binary):
+        raise AgentError(
+            "UNSUPPORTED_CAPABILITY",
+            f"Xray at [{prepared.get('binary') or binary}] has no HTTP API. {STOCK_XRAY_HINT}",
+        )
+    run_cmd(["systemctl", "reset-failed", XRAY_UNIT], check=False)
     run_cmd(["systemctl", "daemon-reload"], check=False)
     restarted = systemctl("restart", XRAY_UNIT)
     if not restarted.get("ok") and not service_is_active(XRAY_UNIT):
         logs = _journal(XRAY_UNIT)
         raise AgentError(
             "VALIDATION_ERROR",
-            f"Failed to restart xray.service: {restarted.get('stderr') or logs or 'unknown error'}",
+            _unreachable_detail(
+                f"Failed to restart xray.service: {restarted.get('stderr') or logs or 'unknown error'}",
+                logs,
+            ),
         )
-    wait_xray_http_api(api_base=api_base, username=username, password=password)
+    reachable_api = str(prepared.get("httpapi") or api_base_from_config(Path(config_path), api_base))
+    auth_user, auth_pass = xray_auth_from_config(Path(config_path), username, password)
+    try:
+        wait_xray_http_api(
+            api_base=reachable_api,
+            username=auth_user,
+            password=auth_pass,
+            attempts=40,
+            delay=0.3,
+        )
+    except AgentError as exc:
+        raise AgentError(
+            "VALIDATION_ERROR",
+            _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+        ) from exc
     prepared["restart"] = restarted
     prepared["started"] = service_is_active(XRAY_UNIT)
     return prepared

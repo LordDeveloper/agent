@@ -122,7 +122,7 @@ def cmd_core_list(args: argparse.Namespace) -> int:
 
 
 def cmd_core_install(args: argparse.Namespace) -> int:
-    result = install_core(args.name)
+    result = install_core(args.name, force=bool(getattr(args, "force", False)))
     _print_json({"success": True, **result})
     return 0
 
@@ -273,6 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_core_install = core_sub.add_parser("install", help="Install a core on this host")
     p_core_install.add_argument("name", choices=list(KNOWN_CORES))
+    p_core_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if a customized binary is already present",
+    )
     p_core_install.set_defaults(func=cmd_core_install)
 
     p_service = sub.add_parser("service", help="Manage systemd service")

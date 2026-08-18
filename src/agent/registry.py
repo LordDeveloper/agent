@@ -36,6 +36,8 @@ class CoreRegistry:
         driver = self._drivers.get(resolved)
         if driver is None:
             raise AgentError("CONFIG_NOT_FOUND", f"Core [{key}] is not enabled", 404)
+        if resolved not in self.settings.cores():
+            raise AgentError("CONFIG_NOT_FOUND", f"Core [{key}] is not enabled", 404)
         return driver
 
     def usage_snapshot(self, core: str | None = None) -> UsageSnapshotModel:

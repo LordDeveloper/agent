@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 from agent.errorlog import CoreErrorLog
 from agent.errors import AgentError, raise_agent_error
@@ -35,9 +35,16 @@ def attach_lifecycle(router: APIRouter, *, core: str, get_driver: Callable) -> N
         return health_payload(driver)
 
     @router.post("/install")
-    def core_install():
+    def core_install(body: dict[str, Any] | None = Body(default=None)):
+        payload = body or {}
+        token = payload.get("github_token")
+        force = bool(payload.get("force"))
         try:
-            result = run_install(core)
+            result = run_install(
+                core,
+                github_token=token if isinstance(token, str) else None,
+                force=force,
+            )
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)
         return {"success": True, "result": result}

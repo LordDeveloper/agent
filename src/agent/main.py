@@ -22,6 +22,7 @@ from agent.logutil import get_logger, resolve_log_path, setup_logging
 from agent.registry import CoreRegistry
 from agent.api.lifecycle import health_payload
 from agent.routing import ROUTE_SLUGS
+from agent.core_supervisor import bootstrap_enabled_cores
 from agent.errors import AgentError
 
 log = get_logger("http")
@@ -79,6 +80,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
             ",".join(settings.cores()) or "-",
             resolve_log_path(settings),
         )
+        bootstrap_enabled_cores(settings, registry, app_log)
         yield
         app_log.info("agent stopping")
         store.close()

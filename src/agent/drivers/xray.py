@@ -208,9 +208,14 @@ class XrayDriver(CoreDriver):
         return install_xray()
 
     def enable(self) -> dict[str, Any]:
-        from agent.xray_service import ensure_xray_runtime
+        from agent.ops import install_xray
+        from agent.xray_service import binary_has_httpapi, ensure_xray_runtime
 
         xray = self.settings.xray
+        binary = self._binary()
+        if not binary or not binary_has_httpapi(binary):
+            install_xray(force=True)
+
         return ensure_xray_runtime(
             binary=xray.binary,
             config_path=xray.config,

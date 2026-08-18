@@ -17,6 +17,27 @@ def test_httpapi_listen_parses_api_base():
     assert httpapi_listen("http://0.0.0.0:9090/") == "0.0.0.0:9090"
 
 
+def test_client_api_base_rewrites_wildcard_bind():
+    from agent.xray_service import client_api_base
+
+    assert client_api_base("0.0.0.0:8080") == "http://127.0.0.1:8080"
+    assert client_api_base("http://0.0.0.0:9090/") == "http://127.0.0.1:9090"
+    assert client_api_base("127.0.0.1:8080") == "http://127.0.0.1:8080"
+
+
+def test_binary_has_httpapi_detects_custom_marker(tmp_path):
+    from agent.xray_service import binary_has_httpapi
+
+    stock = tmp_path / "stock-xray"
+    stock.write_bytes(b"Xray, Penetrates Everything.")
+    custom = tmp_path / "custom-xray"
+    custom.write_bytes(b"Xray httpapi /api/stats/sys")
+
+    assert binary_has_httpapi(stock) is False
+    assert binary_has_httpapi(custom) is True
+    assert binary_has_httpapi(tmp_path / "missing") is False
+
+
 def test_default_config_enables_httpapi():
     cfg = default_xray_config(api_base="http://127.0.0.1:8080", config_path="/tmp/xray.json")
     assert cfg["httpapi"]["listen"] == "127.0.0.1:8080"
@@ -62,7 +83,7 @@ def test_ensure_writes_unit_and_config(tmp_path, monkeypatch):
 
 def test_ensure_start_without_systemctl_raises(tmp_path, monkeypatch):
     binary = tmp_path / "xray"
-    binary.write_text("x", encoding="utf-8")
+    binary.write_bytes(b"xray httpapi /api/stats/sys")
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
     try:
         ensure_xray_runtime(
@@ -74,3 +95,63 @@ def test_ensure_start_without_systemctl_raises(tmp_path, monkeypatch):
         assert False, "expected AgentError"
     except AgentError as exc:
         assert "systemctl" in exc.message
+
+
+def test_ensure_start_rejects_stock_binary(tmp_path, monkeypatch):
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"Xray, Penetrates Everything.")
+    monkeypatch.setattr("agent.xray_service.which", lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None)
+    try:
+        ensure_xray_runtime(
+            binary=str(binary),
+            config_path=str(tmp_path / "config.json"),
+            unit_path=str(tmp_path / "xray.service"),
+            start=True,
+        )
+        assert False, "expected AgentError"
+    except AgentError as exc:
+        assert "HTTP API" in exc.message
+
+
+def test_install_xray_skips_customized_binary(tmp_path, monkeypatch):
+    from agent.ops import install_xray
+
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"customized xray httpapi /api/inbounds/list")
+    monkeypatch.setenv("XRAY_BINARY", str(binary))
+    monkeypatch.setenv("XRAY_API_BASE", "http://127.0.0.1:8080")
+
+    called = {"download": False}
+
+    def fake_download(dest, token=None):
+        called["download"] = True
+        return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
+
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
+    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
+    result = install_xray()
+    assert called["download"] is False
+    assert result["downloaded"] is False
+    assert result["httpapi_capable"] is True
+
+
+def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
+    from agent.ops import install_xray
+
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"Xray, Penetrates Everything.")
+    monkeypatch.setenv("XRAY_BINARY", str(binary))
+    monkeypatch.setattr("agent.ops.which", lambda cmd: None)
+    monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
+    monkeypatch.setattr("agent.xray_service.systemctl", lambda *args, **kwargs: {"ok": True})
+
+    def fake_download(dest, token=None):
+        dest.write_bytes(b"customized xray httpapi /api/stats/sys")
+        return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
+
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
+    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
+    result = install_xray()
+    assert result["downloaded"] is True
+    assert result["replaced_stock"] is True
+    assert result["httpapi_capable"] is True

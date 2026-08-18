@@ -278,7 +278,7 @@ WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
 AGENT_GITHUB_REPO=$REPO
 AGENT_GITHUB_ASSET=$ASSET_NAME
-XRAY_GITHUB_REPO=LordDeveloper/xray
+XRAY_GITHUB_REPO=$REPO
 EOF
   if [[ -n "$TOKEN" ]]; then
     printf 'GITHUB_TOKEN=%s\n' "$TOKEN" >>"$CONFIG_DIR/.env"
@@ -309,16 +309,25 @@ systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
 install_xray_from_release() {
-  local xray_repo="${XRAY_GITHUB_REPO:-LordDeveloper/xray}"
+  local xray_repo="${XRAY_GITHUB_REPO:-${REPO}}"
   local xray_asset="${XRAY_GITHUB_ASSET:-xray-linux-${HOST_LIBC}-${HOST_ARCH}}"
   local dest="${XRAY_BINARY:-/usr/local/bin/xray}"
   local gh="${GITHUB_TOKEN:-${GH_TOKEN:-${AGENT_GITHUB_TOKEN:-}}}"
 
-  if command -v xray >/dev/null 2>&1 || [[ -x "$dest" ]]; then
+  xray_has_httpapi() {
+    local bin="$1"
+    [[ -f "$bin" ]] && grep -a -q -E 'httpapi|/api/stats/sys|/api/inbounds/list' "$bin"
+  }
+
+  if [[ "$FORCE" -ne 1 ]] && xray_has_httpapi "$dest"; then
+    echo "customized xray already present at $dest"
     return 0
   fi
   if [[ -z "$gh" ]]; then
-    echo "xray not found; export GITHUB_TOKEN to download from ${xray_repo}" >&2
+    if xray_has_httpapi "$dest"; then
+      return 0
+    fi
+    echo "xray HTTP API missing; export GITHUB_TOKEN to download customized core from ${xray_repo}" >&2
     return 1
   fi
 
@@ -363,6 +372,66 @@ PY
   echo "xray installed: $dest"
 }
 
+install_amnezia_from_release() {
+  local bundle_asset="amneziawg-linux-${HOST_LIBC}-${HOST_ARCH}.tar.gz"
+  local bin_dir="/usr/local/bin"
+  local gh="${GITHUB_TOKEN:-${GH_TOKEN:-${AGENT_GITHUB_TOKEN:-}}}"
+
+  amnezia_present() {
+    [[ -x "$bin_dir/awg" && -x "$bin_dir/awg-quick" && -x "$bin_dir/amneziawg-go" ]]
+  }
+
+  if [[ "$FORCE" -ne 1 ]] && amnezia_present; then
+    echo "amneziawg bundle already present in $bin_dir"
+    return 0
+  fi
+
+  echo "Installing AmneziaWG from ${REPO} (${bundle_asset})..."
+  local release_json
+  release_json="$RELEASE_JSON"
+  if [[ -z "$release_json" ]]; then
+    release_json="$(api_get "${API}/repos/${REPO}/releases/latest")" || {
+      echo "Failed to fetch agent release for AmneziaWG" >&2
+      return 1
+    }
+  fi
+
+  eval "$(RELEASE_JSON="$release_json" ASSET_NAME="$bundle_asset" python3 - <<'PY'
+import json, os, shlex
+payload = json.loads(os.environ["RELEASE_JSON"])
+wanted = os.environ["ASSET_NAME"]
+assets = {a.get("name"): a for a in payload.get("assets") or []}
+candidates = [wanted]
+if wanted.startswith("amneziawg-linux-musl-"):
+    candidates.append(wanted.replace("amneziawg-linux-musl-", "amneziawg-linux-gnu-", 1))
+asset = None
+chosen = wanted
+for name in candidates:
+    if name in assets:
+        asset = assets[name]
+        chosen = name
+        break
+if not asset:
+    names = ", ".join(assets) or "none"
+    raise SystemExit(f"missing amneziawg asset {wanted}; available: {names}")
+print(f"AMNEZIA_ASSET_NAME={shlex.quote(chosen)}")
+print(f"AMNEZIA_ASSET_ID={shlex.quote(str(asset['id']))}")
+PY
+)"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local archive="${tmpdir}/${AMNEZIA_ASSET_NAME}"
+  download_asset "$AMNEZIA_ASSET_ID" "$archive"
+  tar -xzf "$archive" -C "$tmpdir" awg awg-quick amneziawg-go
+  install -m 755 "$tmpdir/awg" "$bin_dir/awg"
+  install -m 755 "$tmpdir/awg-quick" "$bin_dir/awg-quick"
+  install -m 755 "$tmpdir/amneziawg-go" "$bin_dir/amneziawg-go"
+  ln -sfn "$bin_dir/amneziawg-go" "$bin_dir/amneziawg" 2>/dev/null || true
+  rm -rf "$tmpdir"
+  echo "AmneziaWG installed: awg, awg-quick, amneziawg-go -> $bin_dir"
+}
+
 install_core() {
   local core="$1"
   case "$core" in
@@ -376,11 +445,7 @@ install_core() {
       fi
       ;;
     amnezia)
-      if command -v apt-get >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard || true
-      fi
-      echo "AmneziaWG kernel module may require manual install on this kernel"
+      install_amnezia_from_release || true
       ;;
   esac
 }
