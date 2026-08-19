@@ -17,6 +17,7 @@ from agent.api.stats import router as stats_router
 from agent.api.xray import router as xray_router
 from agent.api.wireguard import router as wireguard_router
 from agent.api.amnezia import router as amnezia_router
+from agent.api.tls import router as tls_router
 from agent.errorlog import CoreErrorCaptureMiddleware, CoreErrorLog
 from agent.logutil import get_logger, resolve_log_path, setup_logging
 from agent.registry import CoreRegistry
@@ -102,6 +103,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(xray_router, prefix="/api/v1", dependencies=auth)
     app.include_router(wireguard_router, prefix="/api/v1", dependencies=auth)
     app.include_router(amnezia_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(tls_router, prefix="/api/v1", dependencies=auth)
 
     @app.get("/health")
     def root_health(request: Request):
