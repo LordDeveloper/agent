@@ -8,7 +8,9 @@ from agent.errors import AgentError, raise_agent_error
 from agent.tls import (
     acme_installed,
     cert_paths,
+    certbot_installed,
     ensure_acme,
+    ensure_certbot,
     issue_cert,
     list_certs,
     renew_cert,
@@ -23,6 +25,7 @@ def tls_status():
     return {
         'success': True,
         'acme_installed': acme_installed(),
+        'certbot_installed': certbot_installed(),
     }
 
 
@@ -36,6 +39,15 @@ def install_acme(body: dict[str, Any] | None = Body(default=None)):
     return {'success': True, **result}
 
 
+@router.post('/install-certbot')
+def install_certbot_endpoint(body: dict[str, Any] | None = Body(default=None)):
+    try:
+        result = ensure_certbot()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {'success': True, **result}
+
+
 @router.post('/issue')
 def tls_issue(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
@@ -44,6 +56,7 @@ def tls_issue(body: dict[str, Any] = Body()):
     cf_account_id = body.get('cf_account_id') or None
     email = str(body.get('email', '')).strip()
     force = bool(body.get('force', False))
+    tool = str(body.get('tool', 'acme')).strip().lower()
 
     try:
         result = issue_cert(
@@ -53,6 +66,7 @@ def tls_issue(body: dict[str, Any] = Body()):
             cf_account_id=cf_account_id,
             email=email,
             force=force,
+            tool=tool,
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
@@ -63,9 +77,10 @@ def tls_issue(body: dict[str, Any] = Body()):
 def tls_renew(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
     force = bool(body.get('force', False))
+    tool = str(body.get('tool', 'acme')).strip().lower()
 
     try:
-        result = renew_cert(domain=domain, force=force)
+        result = renew_cert(domain=domain, force=force, tool=tool)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return result

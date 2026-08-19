@@ -418,6 +418,158 @@ def _update_menu() -> None:
         )
 
 
+def _tls_menu() -> None:
+    while True:
+        render_header("TLS Certificates")
+        picked = select(
+            [
+                Choice("status", "Status", CYAN, "1"),
+                Choice("install_acme", "Install acme.sh", GREEN, "2"),
+                Choice("install_certbot", "Install certbot", GREEN, "3"),
+                Choice("issue", "Issue certificate", YELLOW, "4"),
+                Choice("renew", "Renew certificate", YELLOW, "5"),
+                Choice("list", "List certificates", WHITE, "6"),
+                Choice("revoke", "Revoke certificate", RED, "7"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("TLS Status", _show_tls_status)
+        elif picked == "install_acme":
+            _run_action("Install acme.sh", _show_tls_install_acme)
+        elif picked == "install_certbot":
+            _run_action("Install certbot", _show_tls_install_certbot)
+        elif picked == "issue":
+            _tls_issue_flow()
+        elif picked == "renew":
+            _tls_renew_flow()
+        elif picked == "list":
+            _run_action("Certificates", _show_tls_list)
+        elif picked == "revoke":
+            _tls_revoke_flow()
+
+
+def _show_tls_status() -> None:
+    from agent.tls import acme_installed, certbot_installed
+    _print(kv("acme.sh", "installed" if acme_installed() else "not installed", GREEN if acme_installed() else RED))
+    _print(kv("certbot", "installed" if certbot_installed() else "not installed", GREEN if certbot_installed() else RED))
+
+
+def _show_tls_install_acme() -> None:
+    from agent.tls import ensure_acme
+    email = prompt_text("Email (optional)", "")
+    result = ensure_acme(email=email)
+    _print(kv("Path", str(result.get('path', '-')), GREEN))
+    _print(kv("Downloaded", "yes" if result.get('downloaded') else "already present", CYAN))
+
+
+def _show_tls_install_certbot() -> None:
+    from agent.tls import ensure_certbot
+    result = ensure_certbot()
+    _print(kv("Path", str(result.get('path', '-')), GREEN))
+    _print(kv("Downloaded", "yes" if result.get('downloaded') else "already present", CYAN))
+
+
+def _tls_issue_flow() -> None:
+    render_header("Issue TLS Certificate")
+    domain = prompt_text("Domain", "")
+    if not domain:
+        _print(paint("  Domain is required.", RED))
+        pause()
+        return
+
+    tool = select(
+        [
+            Choice("acme", "acme.sh", CYAN, "1"),
+            Choice("certbot", "certbot", GREEN, "2"),
+        ]
+    ) or "acme"
+
+    method = select(
+        [
+            Choice("standalone", "Standalone (port 80)", CYAN, "1"),
+            Choice("dns_cloudflare", "DNS Cloudflare", GREEN, "2"),
+        ]
+    ) or "standalone"
+
+    cf_token = None
+    if method == "dns_cloudflare":
+        cf_token = prompt_text("Cloudflare API Token", "")
+
+    force = confirm("Force re-issue?", default=False)
+
+    def _do():
+        from agent.tls import issue_cert
+        result = issue_cert(domain=domain, method=method, cf_token=cf_token, force=force, tool=tool)
+        _print(kv("Domain", result.get('domain', '-'), CYAN))
+        _print(kv("Tool", result.get('tool', '-'), WHITE))
+        _print(kv("Issued", "yes" if result.get('issued') else "cached", GREEN))
+        _print(kv("Cert", result.get('cert_file', '-'), DIM))
+        _print(kv("Key", result.get('key_file', '-'), DIM))
+
+    _run_action("Issue certificate", _do)
+
+
+def _tls_renew_flow() -> None:
+    render_header("Renew TLS Certificate")
+    domain = prompt_text("Domain", "")
+    if not domain:
+        _print(paint("  Domain is required.", RED))
+        pause()
+        return
+
+    tool = select(
+        [
+            Choice("acme", "acme.sh", CYAN, "1"),
+            Choice("certbot", "certbot", GREEN, "2"),
+        ]
+    ) or "acme"
+
+    force = confirm("Force renewal?", default=False)
+
+    def _do():
+        from agent.tls import renew_cert
+        result = renew_cert(domain=domain, force=force, tool=tool)
+        _print(kv("Domain", result.get('domain', '-'), CYAN))
+        _print(kv("Renewed", "yes" if result.get('renewed') else "no", GREEN))
+
+    _run_action("Renew certificate", _do)
+
+
+def _show_tls_list() -> None:
+    from agent.tls import list_certs
+    certs = list_certs()
+    if not certs:
+        _print(paint("  No certificates found.", DIM))
+        return
+    for cert in certs:
+        _print(paint(f"  {cert['domain']}", CYAN))
+        _print(paint(f"    cert: {cert['cert_file']}", DIM))
+        if cert.get('modified_at'):
+            _print(paint(f"    modified: {cert['modified_at']}", DIM))
+
+
+def _tls_revoke_flow() -> None:
+    render_header("Revoke TLS Certificate")
+    domain = prompt_text("Domain", "")
+    if not domain:
+        _print(paint("  Domain is required.", RED))
+        pause()
+        return
+    if not confirm(f"Revoke certificate for {domain}?", default=False):
+        return
+
+    def _do():
+        from agent.tls import revoke_cert
+        result = revoke_cert(domain=domain)
+        _print(kv("Revoked", "yes" if result.get('revoked') else "no", GREEN if result.get('revoked') else RED))
+        _print(kv("Files removed", "yes" if result.get('removed') else "no", DIM))
+
+    _run_action("Revoke certificate", _do)
+
+
 def _token_menu() -> None:
     while True:
         render_header("Token")
@@ -459,10 +611,11 @@ def run_interactive() -> int:
                     Choice("wizard", "Setup wizard", GREEN, "1"),
                     Choice("cores", "Cores", RED, "2"),
                     Choice("service", "Service", CYAN, "3"),
-                    Choice("status", "Check status", WHITE, "4"),
-                    Choice("stats", "Stats", WHITE, "5"),
-                    Choice("update", "Update agent", WHITE, "6"),
-                    Choice("token", "Auth token", WHITE, "7"),
+                    Choice("tls", "TLS Certificates", YELLOW, "4"),
+                    Choice("status", "Check status", WHITE, "5"),
+                    Choice("stats", "Stats", WHITE, "6"),
+                    Choice("update", "Update agent", WHITE, "7"),
+                    Choice("token", "Auth token", WHITE, "8"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]
             )
@@ -479,6 +632,8 @@ def run_interactive() -> int:
                 _cores_menu()
             elif picked == "service":
                 _service_menu()
+            elif picked == "tls":
+                _tls_menu()
             elif picked == "status":
                 _status()
             elif picked == "stats":

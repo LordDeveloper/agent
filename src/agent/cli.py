@@ -199,6 +199,64 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tls_status(_: argparse.Namespace) -> int:
+    from agent.tls import acme_installed, certbot_installed
+    _print_json({
+        'success': True,
+        'acme_installed': acme_installed(),
+        'certbot_installed': certbot_installed(),
+    })
+    return 0
+
+
+def cmd_tls_install_acme(args: argparse.Namespace) -> int:
+    from agent.tls import ensure_acme
+    result = ensure_acme(email=args.email or '')
+    _print_json({'success': True, **result})
+    return 0
+
+
+def cmd_tls_install_certbot(_: argparse.Namespace) -> int:
+    from agent.tls import ensure_certbot
+    result = ensure_certbot()
+    _print_json({'success': True, **result})
+    return 0
+
+
+def cmd_tls_issue(args: argparse.Namespace) -> int:
+    from agent.tls import issue_cert
+    result = issue_cert(
+        domain=args.domain,
+        method=args.method,
+        cf_token=args.cf_token,
+        email=args.email or '',
+        force=bool(args.force),
+        tool=args.tool,
+    )
+    _print_json(result)
+    return 0
+
+
+def cmd_tls_renew(args: argparse.Namespace) -> int:
+    from agent.tls import renew_cert
+    result = renew_cert(domain=args.domain, force=bool(args.force), tool=args.tool)
+    _print_json(result)
+    return 0
+
+
+def cmd_tls_list(_: argparse.Namespace) -> int:
+    from agent.tls import list_certs
+    _print_json({'success': True, 'certs': list_certs()})
+    return 0
+
+
+def cmd_tls_revoke(args: argparse.Namespace) -> int:
+    from agent.tls import revoke_cert
+    result = revoke_cert(domain=args.domain)
+    _print_json(result)
+    return 0
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -311,6 +369,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_token.add_argument("--json", action="store_true", help="Print JSON instead of bare token")
     p_token.set_defaults(func=cmd_token)
+
+    p_tls = sub.add_parser("tls", help="TLS certificate management (acme.sh & certbot)")
+    tls_sub = p_tls.add_subparsers(dest="tls_command", required=True)
+
+    p_tls_status = tls_sub.add_parser("status", help="Show acme.sh / certbot install status")
+    p_tls_status.set_defaults(func=cmd_tls_status)
+
+    p_tls_install_acme = tls_sub.add_parser("install-acme", help="Install acme.sh")
+    p_tls_install_acme.add_argument("--email", default="", help="Account email for Let's Encrypt")
+    p_tls_install_acme.set_defaults(func=cmd_tls_install_acme)
+
+    p_tls_install_certbot = tls_sub.add_parser("install-certbot", help="Install certbot")
+    p_tls_install_certbot.set_defaults(func=cmd_tls_install_certbot)
+
+    p_tls_issue = tls_sub.add_parser("issue", help="Issue a TLS certificate")
+    p_tls_issue.add_argument("domain", help="Domain name")
+    p_tls_issue.add_argument("--method", default="standalone", choices=["standalone", "dns_cloudflare"])
+    p_tls_issue.add_argument("--tool", default="acme", choices=["acme", "certbot"])
+    p_tls_issue.add_argument("--cf-token", default=None, dest="cf_token", help="Cloudflare API token")
+    p_tls_issue.add_argument("--email", default="", help="Email for registration")
+    p_tls_issue.add_argument("--force", action="store_true")
+    p_tls_issue.set_defaults(func=cmd_tls_issue)
+
+    p_tls_renew = tls_sub.add_parser("renew", help="Renew a TLS certificate")
+    p_tls_renew.add_argument("domain", help="Domain name")
+    p_tls_renew.add_argument("--tool", default="acme", choices=["acme", "certbot"])
+    p_tls_renew.add_argument("--force", action="store_true")
+    p_tls_renew.set_defaults(func=cmd_tls_renew)
+
+    p_tls_list = tls_sub.add_parser("list", help="List issued certificates")
+    p_tls_list.set_defaults(func=cmd_tls_list)
+
+    p_tls_revoke = tls_sub.add_parser("revoke", help="Revoke a certificate")
+    p_tls_revoke.add_argument("domain", help="Domain name")
+    p_tls_revoke.set_defaults(func=cmd_tls_revoke)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)

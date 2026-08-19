@@ -1,4 +1,4 @@
-"""TLS certificate management via acme.sh (standalone & DNS challenges)."""
+"""TLS certificate management via acme.sh and certbot (standalone & DNS challenges)."""
 
 from __future__ import annotations
 
@@ -19,11 +19,20 @@ CERT_BASE = Path(os.environ.get('TLS_CERT_DIR', '/var/lib/agent/certs'))
 
 ACME_INSTALL_URL = 'https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh'
 
+CERTBOT_BIN = Path(shutil.which('certbot') or '/usr/bin/certbot')
+CERTBOT_LIVE = Path('/etc/letsencrypt/live')
+
+TOOLS = ('acme', 'certbot')
+
 
 def _run(args: list[str], *, timeout: int = 300, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     merged = {**os.environ, **(env or {})}
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=merged)
 
+
+# ---------------------------------------------------------------------------
+# acme.sh helpers
+# ---------------------------------------------------------------------------
 
 def acme_installed() -> bool:
     return ACME_BIN.is_file()
@@ -65,6 +74,38 @@ def ensure_acme(email: str = '') -> dict:
     return {'installed': True, 'downloaded': True, 'path': str(ACME_BIN)}
 
 
+# ---------------------------------------------------------------------------
+# certbot helpers
+# ---------------------------------------------------------------------------
+
+def certbot_installed() -> bool:
+    return shutil.which('certbot') is not None
+
+
+def ensure_certbot() -> dict:
+    if certbot_installed():
+        return {'installed': True, 'downloaded': False, 'path': str(shutil.which('certbot'))}
+
+    apt = shutil.which('apt-get')
+    if apt:
+        proc = _run([apt, 'update', '-qq'], timeout=120)
+        proc = _run([apt, 'install', '-y', '-qq', 'certbot'], timeout=300)
+        if proc.returncode == 0 and certbot_installed():
+            return {'installed': True, 'downloaded': True, 'path': str(shutil.which('certbot'))}
+
+    snap = shutil.which('snap')
+    if snap:
+        proc = _run([snap, 'install', '--classic', 'certbot'], timeout=300)
+        if proc.returncode == 0 and certbot_installed():
+            return {'installed': True, 'downloaded': True, 'path': str(shutil.which('certbot'))}
+
+    raise AgentError('VALIDATION_ERROR', 'Failed to install certbot. Install it manually (apt install certbot or snap install --classic certbot).')
+
+
+# ---------------------------------------------------------------------------
+# cert directory / paths
+# ---------------------------------------------------------------------------
+
 def _cert_dir(domain: str) -> Path:
     return CERT_BASE / domain
 
@@ -82,7 +123,43 @@ def cert_exists(domain: str) -> bool:
     return Path(paths['cert_file']).is_file() and Path(paths['key_file']).is_file()
 
 
+# ---------------------------------------------------------------------------
+# issue / renew dispatchers
+# ---------------------------------------------------------------------------
+
 def issue_cert(
+    domain: str,
+    method: str = 'standalone',
+    cf_token: str | None = None,
+    cf_account_id: str | None = None,
+    email: str = '',
+    force: bool = False,
+    tool: str = 'acme',
+) -> dict:
+    tool = (tool or 'acme').strip().lower()
+    if tool not in TOOLS:
+        raise AgentError('VALIDATION_ERROR', f'Unknown tool [{tool}]. Use acme or certbot.')
+
+    if tool == 'certbot':
+        return _issue_cert_certbot(domain, method=method, cf_token=cf_token, email=email, force=force)
+    return _issue_cert_acme(domain, method=method, cf_token=cf_token, cf_account_id=cf_account_id, email=email, force=force)
+
+
+def renew_cert(domain: str, force: bool = False, tool: str = 'acme') -> dict:
+    tool = (tool or 'acme').strip().lower()
+    if tool not in TOOLS:
+        raise AgentError('VALIDATION_ERROR', f'Unknown tool [{tool}]. Use acme or certbot.')
+
+    if tool == 'certbot':
+        return _renew_cert_certbot(domain, force=force)
+    return _renew_cert_acme(domain, force=force)
+
+
+# ---------------------------------------------------------------------------
+# acme.sh issue / renew
+# ---------------------------------------------------------------------------
+
+def _issue_cert_acme(
     domain: str,
     method: str = 'standalone',
     cf_token: str | None = None,
@@ -105,6 +182,7 @@ def issue_cert(
             'success': True,
             'issued': False,
             'cached': True,
+            'tool': 'acme',
             'domain': domain,
             **paths,
         }
@@ -112,6 +190,8 @@ def issue_cert(
     args = [
         str(ACME_BIN), '--issue',
         '--home', str(ACME_HOME),
+        '--server', 'letsencrypt',
+        '--debug', '2',
         '-d', domain,
     ]
 
@@ -132,13 +212,16 @@ def issue_cert(
     if force:
         args += ['--force']
 
-    log.info('issuing certificate domain=%s method=%s', domain, method)
-    proc = _run(args, timeout=180, env=env)
+    log.info('issuing certificate domain=%s method=%s tool=acme', domain, method)
+    proc = _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()[:500] or proc.stdout.strip()[:500]
-        log.error('acme.sh --issue failed: %s', stderr)
-        raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {stderr}')
+        output = (proc.stdout or '').strip()
+        stderr = (proc.stderr or '').strip()
+        combined = f'{output}\n{stderr}'.strip()
+        last_lines = '\n'.join(combined.splitlines()[-20:])[:800]
+        log.error('acme.sh --issue failed: %s', last_lines)
+        raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {last_lines}')
 
     install_args = [
         str(ACME_BIN), '--install-cert',
@@ -151,17 +234,18 @@ def issue_cert(
     if proc.returncode != 0:
         raise AgentError('VALIDATION_ERROR', f'Certificate install failed: {proc.stderr.strip()[:300]}')
 
-    log.info('certificate issued domain=%s cert=%s', domain, paths['cert_file'])
+    log.info('certificate issued domain=%s cert=%s tool=acme', domain, paths['cert_file'])
     return {
         'success': True,
         'issued': True,
         'cached': False,
+        'tool': 'acme',
         'domain': domain,
         **paths,
     }
 
 
-def renew_cert(domain: str, force: bool = False) -> dict:
+def _renew_cert_acme(domain: str, force: bool = False) -> dict:
     if not domain or not domain.strip():
         raise AgentError('VALIDATION_ERROR', 'domain is required')
 
@@ -192,8 +276,137 @@ def renew_cert(domain: str, force: bool = False) -> dict:
     ]
     _run(install_args, timeout=60)
 
-    return {'success': True, 'renewed': True, 'domain': domain, **paths}
+    return {'success': True, 'renewed': True, 'tool': 'acme', 'domain': domain, **paths}
 
+
+# ---------------------------------------------------------------------------
+# certbot issue / renew
+# ---------------------------------------------------------------------------
+
+def _issue_cert_certbot(
+    domain: str,
+    method: str = 'standalone',
+    cf_token: str | None = None,
+    email: str = '',
+    force: bool = False,
+) -> dict:
+    if not domain or not domain.strip():
+        raise AgentError('VALIDATION_ERROR', 'domain is required')
+
+    domain = domain.strip().lower()
+    ensure_certbot()
+
+    out_dir = _cert_dir(domain)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = cert_paths(domain)
+
+    if cert_exists(domain) and not force:
+        return {
+            'success': True,
+            'issued': False,
+            'cached': True,
+            'tool': 'certbot',
+            'domain': domain,
+            **paths,
+        }
+
+    certbot = shutil.which('certbot') or str(CERTBOT_BIN)
+    args = [
+        certbot, 'certonly',
+        '--non-interactive',
+        '--agree-tos',
+        '-d', domain,
+    ]
+
+    if email:
+        args += ['--email', email]
+    else:
+        args += ['--register-unsafely-without-email']
+
+    env: dict[str, str] = {}
+
+    if method == 'standalone':
+        args += ['--standalone']
+    elif method in ('dns_cloudflare', 'dns_cf'):
+        if not cf_token:
+            raise AgentError('VALIDATION_ERROR', 'cf_token is required for DNS Cloudflare method')
+        cred_path = Path('/tmp/.certbot_cf_creds')
+        cred_path.write_text(f'dns_cloudflare_api_token = {cf_token}\n')
+        cred_path.chmod(0o600)
+        args += ['--dns-cloudflare', '--dns-cloudflare-credentials', str(cred_path)]
+    else:
+        raise AgentError('VALIDATION_ERROR', f'Unknown method [{method}]. Use standalone or dns_cloudflare.')
+
+    if force:
+        args += ['--force-renewal']
+
+    log.info('issuing certificate domain=%s method=%s tool=certbot', domain, method)
+    proc = _run(args, timeout=300, env=env)
+
+    if proc.returncode != 0:
+        output = (proc.stdout or '').strip()
+        stderr = (proc.stderr or '').strip()
+        combined = f'{output}\n{stderr}'.strip()
+        last_lines = '\n'.join(combined.splitlines()[-20:])[:800]
+        log.error('certbot certonly failed: %s', last_lines)
+        raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {last_lines}')
+
+    live_dir = CERTBOT_LIVE / domain
+    src_fullchain = live_dir / 'fullchain.pem'
+    src_privkey = live_dir / 'privkey.pem'
+
+    if src_fullchain.exists():
+        shutil.copy2(str(src_fullchain), paths['cert_file'])
+    if src_privkey.exists():
+        shutil.copy2(str(src_privkey), paths['key_file'])
+
+    if not Path(paths['cert_file']).is_file():
+        raise AgentError('VALIDATION_ERROR', 'certbot succeeded but certificate files not found in expected location.')
+
+    log.info('certificate issued domain=%s cert=%s tool=certbot', domain, paths['cert_file'])
+    return {
+        'success': True,
+        'issued': True,
+        'cached': False,
+        'tool': 'certbot',
+        'domain': domain,
+        **paths,
+    }
+
+
+def _renew_cert_certbot(domain: str, force: bool = False) -> dict:
+    if not domain or not domain.strip():
+        raise AgentError('VALIDATION_ERROR', 'domain is required')
+
+    domain = domain.strip().lower()
+    if not certbot_installed():
+        raise AgentError('VALIDATION_ERROR', 'certbot is not installed. Call install-certbot first.')
+
+    certbot = shutil.which('certbot') or str(CERTBOT_BIN)
+    args = [certbot, 'renew', '--non-interactive', '--cert-name', domain]
+    if force:
+        args += ['--force-renewal']
+
+    proc = _run(args, timeout=300)
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()[:500] or proc.stdout.strip()[:500]
+        raise AgentError('VALIDATION_ERROR', f'Certificate renew failed: {stderr}')
+
+    paths = cert_paths(domain)
+    live_dir = CERTBOT_LIVE / domain
+    src_fullchain = live_dir / 'fullchain.pem'
+    src_privkey = live_dir / 'privkey.pem'
+    if src_fullchain.exists():
+        shutil.copy2(str(src_fullchain), paths['cert_file'])
+    if src_privkey.exists():
+        shutil.copy2(str(src_privkey), paths['key_file'])
+
+    return {'success': True, 'renewed': True, 'tool': 'certbot', 'domain': domain, **paths}
+
+
+# ---------------------------------------------------------------------------
+# list / revoke (tool-agnostic, work on unified cert store)
+# ---------------------------------------------------------------------------
 
 def list_certs() -> list[dict]:
     certs = []
