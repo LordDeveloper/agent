@@ -458,8 +458,8 @@ class WireGuardDriver(CoreDriver):
                     ClientUsageModel(
                         id=str(peer.get("id")),
                         email=peer.get("email"),
-                        incoming=int(peer.get("incoming", 0)),
-                        outgoing=int(peer.get("outgoing", 0)),
+                        incoming=int(peer.get("_incoming", peer.get("incoming", 0)) or 0),
+                        outgoing=int(peer.get("_outgoing", peer.get("outgoing", 0)) or 0),
                         inbound_id=iface.get("id"),
                     )
                 )
@@ -482,6 +482,11 @@ class WireGuardDriver(CoreDriver):
                 if peer.get("online") and record_is_enabled(peer):
                     online.append(str(peer.get("email") or peer.get("id")))
         return online
+
+    def online_traffic(self) -> dict[str, dict[str, int]]:
+        from agent.support.online_traffic import online_traffic_from_snapshot
+
+        return online_traffic_from_snapshot(self)
 
     def sync_peer_stats(self) -> None:
         for iface in self.list_interfaces():

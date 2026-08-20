@@ -834,10 +834,18 @@ class XrayDriver(CoreDriver):
         return self._api().online_users()
 
     def online_traffic(self) -> dict[str, dict[str, int]]:
-        body = self._api().online_traffic()
+        from agent.support.online_traffic import online_traffic_from_snapshot
+
+        try:
+            body = self._api().online_traffic()
+        except AgentError as exc:
+            if exc.status != 404:
+                raise
+            return online_traffic_from_snapshot(self)
+
         users = body.get("users") or {}
         if not isinstance(users, dict):
-            return {}
+            return online_traffic_from_snapshot(self)
         out: dict[str, dict[str, int]] = {}
         for email, row in users.items():
             if not isinstance(row, dict):
