@@ -228,16 +228,24 @@ class WireGuardDriver(CoreDriver):
         return True
 
     def reset_peer_traffic(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
-        return self.update_peer(
-            interface_id,
-            peer_id,
-            {
-                "incoming": 0,
-                "outgoing": 0,
-                "_incoming": 0,
-                "_outgoing": 0,
-            },
-        )
+        """Zero billing totals and re-baseline kernel counters so the next sync delta is 0."""
+        self.sync_peer_stats()
+        iface = self.get_interface(interface_id)
+        for peer in iface.get("peers", []):
+            if str(peer.get("id")) != str(peer_id) and str(peer.get("email")) != str(peer_id):
+                continue
+            live = self._peer_dump(str(iface.get("name") or "")).get(str(peer.get("public_key") or ""), {})
+            return self.update_peer(
+                interface_id,
+                peer_id,
+                {
+                    "incoming": 0,
+                    "outgoing": 0,
+                    "_incoming": int(live.get("incoming", peer.get("_incoming", 0)) or 0),
+                    "_outgoing": int(live.get("outgoing", peer.get("_outgoing", 0)) or 0),
+                },
+            )
+        raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
     def backup(self) -> dict[str, Any]:
         return {"interfaces": self.list_interfaces(), "core": self.key}
@@ -458,8 +466,9 @@ class WireGuardDriver(CoreDriver):
                     ClientUsageModel(
                         id=str(peer.get("id")),
                         email=peer.get("email"),
-                        incoming=int(peer.get("_incoming", peer.get("incoming", 0)) or 0),
-                        outgoing=int(peer.get("_outgoing", peer.get("outgoing", 0)) or 0),
+                        # Billing must use cumulative totals, never raw kernel counters.
+                        incoming=int(peer.get("incoming", 0) or 0),
+                        outgoing=int(peer.get("outgoing", 0) or 0),
                         inbound_id=iface.get("id"),
                     )
                 )
