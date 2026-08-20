@@ -37,6 +37,13 @@ paths:
         - in: query
           name: core
           schema: { type: string }
+  /stats/online/traffic:
+    get:
+      summary: Traffic volume for currently online subscriptions
+      parameters:
+        - in: query
+          name: core
+          schema: { type: string }
   /stats/snapshot:
     get:
       summary: Cumulative usage snapshot

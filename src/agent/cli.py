@@ -87,7 +87,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
             "online": runtime.registry.online_users(args.core),
             "snapshot": runtime.registry.usage_snapshot(args.core).model_dump(by_alias=True),
         }
-        if args.online_only:
+        if getattr(args, "online_traffic", False):
+            payload = {"success": True, "users": runtime.registry.online_traffic(args.core)}
+        elif args.online_only:
             payload = {"success": True, "users": payload["online"]}
         _print_json(payload)
     finally:
@@ -320,6 +322,11 @@ def build_parser() -> argparse.ArgumentParser:
     _env_flag(p_stats)
     p_stats.add_argument("--core", default=None, help="Limit to one core (xray|wireguard|amnezia)")
     p_stats.add_argument("--online-only", action="store_true", help="Only print online users")
+    p_stats.add_argument(
+        "--online-traffic",
+        action="store_true",
+        help="Print uplink/downlink for currently online subscriptions",
+    )
     p_stats.set_defaults(func=cmd_stats)
 
     p_core = sub.add_parser("core", help="Manage VPN cores")

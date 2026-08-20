@@ -113,10 +113,39 @@ class XrayHttpClient:
         params = [("email", email) for email in emails] if emails else None
         return self.get("/api/stats/online/all", params=params)
 
-    def stats_query_grouped(self, pattern: str, group: str | None = None) -> dict[str, Any]:
+    def online_traffic(self, *, reset: bool = False) -> dict[str, Any]:
+        params: dict[str, str] = {}
+        if reset:
+            params["reset"] = "true"
+        return self.get("/api/stats/online/traffic", params=params or None)
+
+    def stats_query(
+        self,
+        pattern: str,
+        *,
+        reset: bool = False,
+        online_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"pattern": pattern}
+        if reset:
+            params["reset"] = "true"
+        if online_only:
+            params["online_only"] = "true"
+        body = self.get("/api/stats/query", params=params)
+        return list(body.get("stat") or [])
+
+    def stats_query_grouped(
+        self,
+        pattern: str,
+        group: str | None = None,
+        *,
+        online_only: bool = False,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {"pattern": pattern, "grouped": "true"}
         if group:
             params["group"] = group
+        if online_only:
+            params["online_only"] = "true"
         body = self.get("/api/stats/query", params=params)
         return dict(body.get("stats") or {})
 

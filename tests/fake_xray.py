@@ -32,13 +32,6 @@ class FakeXrayHttpClient:
     def online_ips(self, email: str) -> list[str]:
         return list(self._ips.get(email, []))
 
-    def stats_query_grouped(self, pattern: str, group: str | None = None) -> dict[str, Any]:
-        if group == "user" or pattern.startswith("user"):
-            return {"user": deepcopy(self._user_traffic)}
-        if group == "inbound" or pattern.startswith("inbound"):
-            return {"inbound": deepcopy(self._inbound_traffic)}
-        return {}
-
     def reset_user_traffic(self, email: str) -> None:
         self._user_traffic[email] = {"uplink": 0, "downlink": 0}
 
@@ -154,3 +147,29 @@ class FakeXrayHttpClient:
 
     def online_all(self, emails: list[str] | None = None) -> dict[str, Any]:
         return {"users": [{"email": e, "ips": self._ips.get(e, [])} for e in (emails or self._online)]}
+
+    def online_traffic(self, *, reset: bool = False) -> dict[str, Any]:
+        users: dict[str, dict[str, int]] = {}
+        for email in self._online:
+            traffic = dict(self._user_traffic.get(email) or {})
+            if traffic:
+                users[email] = traffic
+            else:
+                users[email] = {}
+        return {"users": users}
+
+    def stats_query_grouped(
+        self,
+        pattern: str,
+        group: str | None = None,
+        *,
+        online_only: bool = False,
+    ) -> dict[str, Any]:
+        if group == "user" or pattern.startswith("user"):
+            traffic = deepcopy(self._user_traffic)
+            if online_only:
+                traffic = {email: row for email, row in traffic.items() if email in self._online}
+            return {"user": traffic}
+        if group == "inbound" or pattern.startswith("inbound"):
+            return {"inbound": deepcopy(self._inbound_traffic)}
+        return {}

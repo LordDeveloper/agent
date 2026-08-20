@@ -832,3 +832,19 @@ class XrayDriver(CoreDriver):
         if not self.running():
             return []
         return self._api().online_users()
+
+    def online_traffic(self) -> dict[str, dict[str, int]]:
+        body = self._api().online_traffic()
+        users = body.get("users") or {}
+        if not isinstance(users, dict):
+            return {}
+        out: dict[str, dict[str, int]] = {}
+        for email, row in users.items():
+            if not isinstance(row, dict):
+                continue
+            entry: dict[str, int] = {}
+            for key in ("uplink", "downlink", "sessions"):
+                if key in row and row[key] is not None:
+                    entry[key] = int(row[key])
+            out[str(email)] = entry
+        return out

@@ -138,6 +138,13 @@ def test_xray_flow(client: TestClient, fake_xray):
     assert r.status_code == 200, r.text
 
     fake_xray._user_traffic["abc12345"] = {"uplink": 20, "downlink": 10}
+    fake_xray._online = ["abc12345"]
+    r = client.get("/api/v1/stats/online/traffic?core=xray", headers=headers)
+    traffic = r.json()
+    assert traffic["success"] is True
+    assert traffic["users"]["abc12345"]["uplink"] == 20
+    assert traffic["users"]["abc12345"]["downlink"] == 10
+
     r = client.get("/api/v1/stats/snapshot?core=xray", headers=headers)
     body = r.json()
     assert body["inbounds"]

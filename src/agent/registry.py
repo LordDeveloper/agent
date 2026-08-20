@@ -8,6 +8,7 @@ from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError
 from agent.models import CoreInfo, UsageSnapshotModel
 from agent.routing import resolve_core_key
+from agent.support.online_traffic import collect_online_traffic
 
 
 class CoreRegistry:
@@ -55,6 +56,9 @@ class CoreRegistry:
         for driver in self._drivers.values():
             users.extend(driver.online_users())
         return sorted(set(users))
+
+    def online_traffic(self, core: str | None = None) -> dict[str, dict[str, int]]:
+        return collect_online_traffic(self, resolve_core_key(core) if core else None)
 
     def _info(self, driver: CoreDriver) -> CoreInfo:
         return CoreInfo(

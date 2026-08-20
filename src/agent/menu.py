@@ -228,14 +228,20 @@ def _show_stats(*, online_only: bool) -> None:
     runtime = open_runtime()
     try:
         if online_only:
-            users = runtime.registry.online_users()
+            users = runtime.registry.online_traffic()
             _print(kv("Online", str(len(users)), GREEN))
             _print()
             if not users:
                 _print(paint("  No online users.", DIM))
                 return
-            for email in users:
-                _print(paint(f"  • {email}", WHITE))
+            for email, traffic in sorted(users.items()):
+                up = int(traffic.get("uplink") or 0)
+                down = int(traffic.get("downlink") or 0)
+                sessions = traffic.get("sessions")
+                line = f"  • {email}  up={up}  down={down}"
+                if sessions is not None:
+                    line += f"  sessions={sessions}"
+                _print(paint(line, WHITE))
             return
 
         snapshot = runtime.registry.usage_snapshot()
