@@ -126,6 +126,11 @@ def validate_xray_inbound(inbound: dict[str, Any]) -> None:
     if settings is not None and not isinstance(settings, dict):
         raise _validation_error("Xray inbound settings must be an object")
 
+    if isinstance(settings, dict) and protocol.lower() in {"shadowsocks", "ss"}:
+        method = str(settings.get("method") or "").strip()
+        if method == "":
+            settings["method"] = "chacha20-ietf-poly1305"
+
     stream = inbound.get("streamSettings")
     if stream is not None and not isinstance(stream, dict):
         raise _validation_error("Xray inbound streamSettings must be an object")
@@ -134,6 +139,19 @@ def validate_xray_inbound(inbound: dict[str, Any]) -> None:
 def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
     if not binary:
         raise _validation_error("Xray binary not found for config validation")
+
+    # Repair blank Shadowsocks ciphers before xray -test (legacy broken inbounds).
+    for inbound in config.get("inbounds") or []:
+        if not isinstance(inbound, dict):
+            continue
+        protocol = str(inbound.get("protocol") or "").strip().lower()
+        if protocol not in {"shadowsocks", "ss"}:
+            continue
+        settings = inbound.get("settings")
+        if not isinstance(settings, dict):
+            continue
+        if str(settings.get("method") or "").strip() == "":
+            settings["method"] = "chacha20-ietf-poly1305"
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
         json.dump(config, handle)

@@ -318,6 +318,9 @@ class XrayDriver(CoreDriver):
             if str(row.get("protocol") or "").lower() == "vless":
                 settings["users"] = clients
                 settings.setdefault("decryption", "none")
+            if str(row.get("protocol") or "").lower() in {"shadowsocks", "ss"}:
+                if str(settings.get("method") or "").strip() == "":
+                    settings["method"] = "chacha20-ietf-poly1305"
             return
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found in Xray config", 404)
 
@@ -336,9 +339,14 @@ class XrayDriver(CoreDriver):
         settings = payload.setdefault("settings", {})
         native = self._wire_clients(payload)
         settings["clients"] = native
-        if self._protocol_of(payload) == "vless":
+        protocol = self._protocol_of(payload)
+        if protocol == "vless":
             settings.setdefault("decryption", "none")
             settings["users"] = native
+        if protocol in {"shadowsocks", "ss"}:
+            method = str(settings.get("method") or "").strip()
+            if method == "":
+                settings["method"] = "chacha20-ietf-poly1305"
         return payload
 
     def _normalize(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -460,6 +468,7 @@ class XrayDriver(CoreDriver):
 
     def add_client(self, inbound_id: int | str, client: dict[str, Any]) -> dict[str, Any]:
         inbound = self.get_inbound(inbound_id)
+        inbound = self._ensure_shadowsocks_method(inbound)
         client = normalize_xray_client(client)
         client.setdefault("id", str(uuid.uuid4()))
         if not client.get("email"):
@@ -499,6 +508,27 @@ class XrayDriver(CoreDriver):
             )
             self.audit.record("create", f"xray/client/{client['id']}")
         return client
+
+    def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
+        """Persist a default AEAD cipher when a legacy SS inbound has a blank method."""
+        if self._protocol_of(inbound) not in {"shadowsocks", "ss"}:
+            return inbound
+
+        settings = inbound.setdefault("settings", {})
+        if str(settings.get("method") or "").strip() != "":
+            return inbound
+
+        settings["method"] = "chacha20-ietf-poly1305"
+        api_payload = self._wire_inbound(inbound)
+        self._validate_config_mutation(
+            lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
+            inbound=api_payload,
+        )
+        self._api().edit_inbounds([api_payload])
+        inbound_id = inbound.get("id") or self.id_from_tag(str(inbound.get("tag") or ""))
+        if inbound_id is None:
+            return inbound
+        return self.get_inbound(inbound_id)
 
     def update_client(self, inbound_id: int | str, client_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         inbound = self.get_inbound(inbound_id)
