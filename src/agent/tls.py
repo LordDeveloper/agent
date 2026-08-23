@@ -123,6 +123,31 @@ def cert_exists(domain: str) -> bool:
     return Path(paths['cert_file']).is_file() and Path(paths['key_file']).is_file()
 
 
+def normalize_domains(domain: str, domains: list[str] | None = None) -> list[str]:
+    """Primary domain first, then optional SAN domains (deduped, lowercased)."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    for raw in [domain, *(domains or [])]:
+        value = str(raw or '').strip().lower()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+
+    if not ordered:
+        raise AgentError('VALIDATION_ERROR', 'domain is required')
+
+    return ordered
+
+
+def _domain_args(domains: list[str]) -> list[str]:
+    args: list[str] = []
+    for item in domains:
+        args += ['-d', item]
+    return args
+
+
 # ---------------------------------------------------------------------------
 # issue / renew dispatchers
 # ---------------------------------------------------------------------------
@@ -135,14 +160,30 @@ def issue_cert(
     email: str = '',
     force: bool = False,
     tool: str = 'acme',
+    domains: list[str] | None = None,
 ) -> dict:
     tool = (tool or 'acme').strip().lower()
     if tool not in TOOLS:
         raise AgentError('VALIDATION_ERROR', f'Unknown tool [{tool}]. Use acme or certbot.')
 
     if tool == 'certbot':
-        return _issue_cert_certbot(domain, method=method, cf_token=cf_token, email=email, force=force)
-    return _issue_cert_acme(domain, method=method, cf_token=cf_token, cf_account_id=cf_account_id, email=email, force=force)
+        return _issue_cert_certbot(
+            domain,
+            method=method,
+            cf_token=cf_token,
+            email=email,
+            force=force,
+            domains=domains,
+        )
+    return _issue_cert_acme(
+        domain,
+        method=method,
+        cf_token=cf_token,
+        cf_account_id=cf_account_id,
+        email=email,
+        force=force,
+        domains=domains,
+    )
 
 
 def renew_cert(domain: str, force: bool = False, tool: str = 'acme') -> dict:
@@ -166,24 +207,24 @@ def _issue_cert_acme(
     cf_account_id: str | None = None,
     email: str = '',
     force: bool = False,
+    domains: list[str] | None = None,
 ) -> dict:
-    if not domain or not domain.strip():
-        raise AgentError('VALIDATION_ERROR', 'domain is required')
-
-    domain = domain.strip().lower()
+    san_domains = normalize_domains(domain, domains)
+    primary = san_domains[0]
     ensure_acme(email=email)
 
-    out_dir = _cert_dir(domain)
+    out_dir = _cert_dir(primary)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = cert_paths(domain)
+    paths = cert_paths(primary)
 
-    if cert_exists(domain) and not force:
+    if cert_exists(primary) and not force:
         return {
             'success': True,
             'issued': False,
             'cached': True,
             'tool': 'acme',
-            'domain': domain,
+            'domain': primary,
+            'domains': san_domains,
             **paths,
         }
 
@@ -192,7 +233,7 @@ def _issue_cert_acme(
         '--home', str(ACME_HOME),
         '--server', 'letsencrypt',
         '--debug', '2',
-        '-d', domain,
+        *_domain_args(san_domains),
     ]
 
     env: dict[str, str] = {}
@@ -212,7 +253,12 @@ def _issue_cert_acme(
     if force:
         args += ['--force']
 
-    log.info('issuing certificate domain=%s method=%s tool=acme', domain, method)
+    log.info(
+        'issuing certificate domain=%s domains=%s method=%s tool=acme',
+        primary,
+        ','.join(san_domains),
+        method,
+    )
     proc = _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
@@ -226,7 +272,7 @@ def _issue_cert_acme(
     install_args = [
         str(ACME_BIN), '--install-cert',
         '--home', str(ACME_HOME),
-        '-d', domain,
+        '-d', primary,
         '--fullchain-file', paths['cert_file'],
         '--key-file', paths['key_file'],
     ]
@@ -234,13 +280,14 @@ def _issue_cert_acme(
     if proc.returncode != 0:
         raise AgentError('VALIDATION_ERROR', f'Certificate install failed: {proc.stderr.strip()[:300]}')
 
-    log.info('certificate issued domain=%s cert=%s tool=acme', domain, paths['cert_file'])
+    log.info('certificate issued domain=%s cert=%s tool=acme', primary, paths['cert_file'])
     return {
         'success': True,
         'issued': True,
         'cached': False,
         'tool': 'acme',
-        'domain': domain,
+        'domain': primary,
+        'domains': san_domains,
         **paths,
     }
 
@@ -289,24 +336,24 @@ def _issue_cert_certbot(
     cf_token: str | None = None,
     email: str = '',
     force: bool = False,
+    domains: list[str] | None = None,
 ) -> dict:
-    if not domain or not domain.strip():
-        raise AgentError('VALIDATION_ERROR', 'domain is required')
-
-    domain = domain.strip().lower()
+    san_domains = normalize_domains(domain, domains)
+    primary = san_domains[0]
     ensure_certbot()
 
-    out_dir = _cert_dir(domain)
+    out_dir = _cert_dir(primary)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = cert_paths(domain)
+    paths = cert_paths(primary)
 
-    if cert_exists(domain) and not force:
+    if cert_exists(primary) and not force:
         return {
             'success': True,
             'issued': False,
             'cached': True,
             'tool': 'certbot',
-            'domain': domain,
+            'domain': primary,
+            'domains': san_domains,
             **paths,
         }
 
@@ -315,7 +362,8 @@ def _issue_cert_certbot(
         certbot, 'certonly',
         '--non-interactive',
         '--agree-tos',
-        '-d', domain,
+        '--cert-name', primary,
+        *_domain_args(san_domains),
     ]
 
     if email:
@@ -340,7 +388,12 @@ def _issue_cert_certbot(
     if force:
         args += ['--force-renewal']
 
-    log.info('issuing certificate domain=%s method=%s tool=certbot', domain, method)
+    log.info(
+        'issuing certificate domain=%s domains=%s method=%s tool=certbot',
+        primary,
+        ','.join(san_domains),
+        method,
+    )
     proc = _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
@@ -351,7 +404,7 @@ def _issue_cert_certbot(
         log.error('certbot certonly failed: %s', last_lines)
         raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {last_lines}')
 
-    live_dir = CERTBOT_LIVE / domain
+    live_dir = CERTBOT_LIVE / primary
     src_fullchain = live_dir / 'fullchain.pem'
     src_privkey = live_dir / 'privkey.pem'
 
@@ -363,13 +416,14 @@ def _issue_cert_certbot(
     if not Path(paths['cert_file']).is_file():
         raise AgentError('VALIDATION_ERROR', 'certbot succeeded but certificate files not found in expected location.')
 
-    log.info('certificate issued domain=%s cert=%s tool=certbot', domain, paths['cert_file'])
+    log.info('certificate issued domain=%s cert=%s tool=certbot', primary, paths['cert_file'])
     return {
         'success': True,
         'issued': True,
         'cached': False,
         'tool': 'certbot',
-        'domain': domain,
+        'domain': primary,
+        'domains': san_domains,
         **paths,
     }
 

@@ -51,6 +51,13 @@ def install_certbot_endpoint(body: dict[str, Any] | None = Body(default=None)):
 @router.post('/issue')
 def tls_issue(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
+    raw_domains = body.get('domains')
+    domains: list[str] | None = None
+    if isinstance(raw_domains, list):
+        domains = [str(item).strip() for item in raw_domains if str(item).strip()]
+    elif isinstance(raw_domains, str) and raw_domains.strip():
+        domains = [part.strip() for part in raw_domains.replace('،', ',').split(',') if part.strip()]
+
     method = str(body.get('method', 'standalone')).strip()
     cf_token = body.get('cf_token') or None
     cf_account_id = body.get('cf_account_id') or None
@@ -67,6 +74,7 @@ def tls_issue(body: dict[str, Any] = Body()):
             email=email,
             force=force,
             tool=tool,
+            domains=domains,
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
