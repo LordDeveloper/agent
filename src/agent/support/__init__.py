@@ -209,10 +209,12 @@ def xray_protocol_user(protocol: str, client: dict[str, Any]) -> dict[str, Any]:
     if protocol in {"shadowsocks", "ss"}:
         user = {}
         _copy_if_present(row, user, "email")
-        _copy_if_present(row, user, "password")
+        password = row.get("password") or row.get("id")
+        if password:
+            user["password"] = str(password)
         method = row.get("method") or row.get("cipher")
         if method:
-            user["method"] = method
+            user["method"] = str(method).strip()
         return user
 
     cleaned = {k: v for k, v in row.items() if k not in _NETINJA_CLIENT_KEYS and v is not None and v != ""}

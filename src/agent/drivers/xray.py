@@ -319,8 +319,13 @@ class XrayDriver(CoreDriver):
                 settings["users"] = clients
                 settings.setdefault("decryption", "none")
             if str(row.get("protocol") or "").lower() in {"shadowsocks", "ss"}:
-                if str(settings.get("method") or "").strip() == "":
-                    settings["method"] = "chacha20-ietf-poly1305"
+                method = str(settings.get("method") or "").strip()
+                if method == "":
+                    if "method" in settings:
+                        settings.pop("method", None)
+                    if str(settings.get("password") or "").strip() == "":
+                        settings.pop("password", None)
+                settings.setdefault("network", "tcp,udp")
             return
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found in Xray config", 404)
 
@@ -345,8 +350,17 @@ class XrayDriver(CoreDriver):
             settings["users"] = native
         if protocol in {"shadowsocks", "ss"}:
             method = str(settings.get("method") or "").strip()
+            clients = settings.get("clients") or settings.get("users") or []
             if method == "":
-                settings["method"] = "chacha20-ietf-poly1305"
+                if "method" in settings:
+                    # Blank method key breaks Xray; AEAD multi-user omits it.
+                    if clients:
+                        settings.pop("method", None)
+                        if str(settings.get("password") or "").strip() == "":
+                            settings.pop("password", None)
+                    else:
+                        settings["method"] = "chacha20-ietf-poly1305"
+            settings.setdefault("network", "tcp,udp")
         return payload
 
     def _normalize(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -510,15 +524,26 @@ class XrayDriver(CoreDriver):
         return client
 
     def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
-        """Persist a default AEAD cipher when a legacy SS inbound has a blank method."""
+        """Repair blank Shadowsocks method keys left by legacy broken inbounds."""
         if self._protocol_of(inbound) not in {"shadowsocks", "ss"}:
             return inbound
 
         settings = inbound.setdefault("settings", {})
-        if str(settings.get("method") or "").strip() != "":
+        method = str(settings.get("method") or "").strip()
+        clients = settings.get("clients") or settings.get("users") or []
+        if method != "":
+            return inbound
+        if "method" not in settings:
             return inbound
 
-        settings["method"] = "chacha20-ietf-poly1305"
+        if clients:
+            settings.pop("method", None)
+            if str(settings.get("password") or "").strip() == "":
+                settings.pop("password", None)
+        else:
+            settings["method"] = "chacha20-ietf-poly1305"
+
+        settings.setdefault("network", "tcp,udp")
         api_payload = self._wire_inbound(inbound)
         self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),

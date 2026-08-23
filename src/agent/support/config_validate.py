@@ -128,8 +128,15 @@ def validate_xray_inbound(inbound: dict[str, Any]) -> None:
 
     if isinstance(settings, dict) and protocol.lower() in {"shadowsocks", "ss"}:
         method = str(settings.get("method") or "").strip()
+        clients = settings.get("clients") or settings.get("users") or []
         if method == "":
-            settings["method"] = "chacha20-ietf-poly1305"
+            if "method" in settings and clients:
+                settings.pop("method", None)
+                if str(settings.get("password") or "").strip() == "":
+                    settings.pop("password", None)
+            elif "method" in settings or not clients:
+                settings["method"] = "chacha20-ietf-poly1305"
+        settings.setdefault("network", "tcp,udp")
 
     stream = inbound.get("streamSettings")
     if stream is not None and not isinstance(stream, dict):
@@ -150,8 +157,16 @@ def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
         settings = inbound.get("settings")
         if not isinstance(settings, dict):
             continue
-        if str(settings.get("method") or "").strip() == "":
-            settings["method"] = "chacha20-ietf-poly1305"
+        method = str(settings.get("method") or "").strip()
+        clients = settings.get("clients") or settings.get("users") or []
+        if method == "":
+            if "method" in settings and clients:
+                settings.pop("method", None)
+                if str(settings.get("password") or "").strip() == "":
+                    settings.pop("password", None)
+            elif "method" in settings or not clients:
+                settings["method"] = "chacha20-ietf-poly1305"
+        settings.setdefault("network", "tcp,udp")
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
         json.dump(config, handle)
