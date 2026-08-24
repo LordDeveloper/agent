@@ -259,6 +259,56 @@ def cmd_tls_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bbr_status(_: argparse.Namespace) -> int:
+    from agent.bbr import bbr_status
+    _print_json({'success': True, **bbr_status()})
+    return 0
+
+
+def cmd_bbr_install(args: argparse.Namespace) -> int:
+    from agent.bbr import bbr_install
+    result = bbr_install(apply=bool(getattr(args, 'apply', False)))
+    _print_json({'success': True, **result})
+    return 0
+
+
+def cmd_bbr_enable(_: argparse.Namespace) -> int:
+    from agent.bbr import bbr_enable
+    _print_json({'success': True, **bbr_enable()})
+    return 0
+
+
+def cmd_bbr_disable(args: argparse.Namespace) -> int:
+    from agent.bbr import bbr_disable
+    result = bbr_disable(remove_persistence=bool(getattr(args, 'remove_persistence', False)))
+    _print_json({'success': True, **result})
+    return 0
+
+
+def cmd_dns_leak_status(_: argparse.Namespace) -> int:
+    from agent.dns_leak import dns_leak_status
+    _print_json({'success': True, **dns_leak_status()})
+    return 0
+
+
+def cmd_dns_leak_apply(args: argparse.Namespace) -> int:
+    from agent.dns_leak import dns_leak_apply
+    result = dns_leak_apply(
+        interfaces=list(args.interface or []),
+        block_ipv6=not bool(getattr(args, 'allow_ipv6', False)),
+        with_dnsmasq=not bool(getattr(args, 'no_dnsmasq', False)),
+        upstream_dns=list(args.upstream or []) or None,
+    )
+    _print_json({'success': bool(result.get('applied', True)), **result})
+    return 0 if result.get('applied', True) else 1
+
+
+def cmd_dns_leak_remove(_: argparse.Namespace) -> int:
+    from agent.dns_leak import dns_leak_remove
+    _print_json({'success': True, **dns_leak_remove()})
+    return 0
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -411,6 +461,65 @@ def build_parser() -> argparse.ArgumentParser:
     p_tls_revoke = tls_sub.add_parser("revoke", help="Revoke a certificate")
     p_tls_revoke.add_argument("domain", help="Domain name")
     p_tls_revoke.set_defaults(func=cmd_tls_revoke)
+
+    p_bbr = sub.add_parser("bbr", help="BBR congestion-control management")
+    bbr_sub = p_bbr.add_subparsers(dest="bbr_command", required=True)
+
+    p_bbr_status = bbr_sub.add_parser("status", help="Show BBR support and active settings")
+    p_bbr_status.set_defaults(func=cmd_bbr_status)
+
+    p_bbr_install = bbr_sub.add_parser("install", help="Load tcp_bbr module and persist sysctl drop-in")
+    p_bbr_install.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply BBR sysctl settings immediately after install",
+    )
+    p_bbr_install.set_defaults(func=cmd_bbr_install)
+
+    p_bbr_enable = bbr_sub.add_parser("enable", help="Enable BBR (install prerequisites if needed)")
+    p_bbr_enable.set_defaults(func=cmd_bbr_enable)
+
+    p_bbr_disable = bbr_sub.add_parser("disable", help="Revert to cubic/pfifo_fast")
+    p_bbr_disable.add_argument(
+        "--remove-persistence",
+        action="store_true",
+        help="Also remove module-load and sysctl drop-ins",
+    )
+    p_bbr_disable.set_defaults(func=cmd_bbr_disable)
+
+    p_dns_leak = sub.add_parser("dns-leak", help="Prevent DNS leaks for VPN client subnets")
+    dns_sub = p_dns_leak.add_subparsers(dest="dns_leak_command", required=True)
+
+    p_dns_status = dns_sub.add_parser("status", help="Show DNS leak protection status")
+    p_dns_status.set_defaults(func=cmd_dns_leak_status)
+
+    p_dns_apply = dns_sub.add_parser("apply", help="Apply DNS redirect + IPv6 leak blocks")
+    p_dns_apply.add_argument(
+        "--interface",
+        action="append",
+        default=[],
+        help="VPN interface to protect (repeatable; auto-detect WireGuard/Amnezia when omitted)",
+    )
+    p_dns_apply.add_argument(
+        "--allow-ipv6",
+        action="store_true",
+        help="Do not block IPv6 on VPN interfaces",
+    )
+    p_dns_apply.add_argument(
+        "--no-dnsmasq",
+        action="store_true",
+        help="Skip dnsmasq resolver setup",
+    )
+    p_dns_apply.add_argument(
+        "--upstream",
+        action="append",
+        default=[],
+        help="Upstream DNS for dnsmasq (repeatable; default: 1.1.1.1 and 8.8.8.8)",
+    )
+    p_dns_apply.set_defaults(func=cmd_dns_leak_apply)
+
+    p_dns_remove = dns_sub.add_parser("remove", help="Remove DNS leak protection rules")
+    p_dns_remove.set_defaults(func=cmd_dns_leak_remove)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)

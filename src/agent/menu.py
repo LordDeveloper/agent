@@ -576,6 +576,127 @@ def _tls_revoke_flow() -> None:
     _run_action("Revoke certificate", _do)
 
 
+def _bbr_menu() -> None:
+    while True:
+        render_header("BBR")
+        picked = select(
+            [
+                Choice("status", "Status", CYAN, "1"),
+                Choice("install", "Install (module + sysctl)", GREEN, "2"),
+                Choice("enable", "Enable BBR", GREEN, "3"),
+                Choice("disable", "Disable BBR", YELLOW, "4"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("BBR Status", _show_bbr_status)
+        elif picked == "install":
+            apply = confirm("Apply BBR settings immediately after install?", default=True)
+            _run_action("Install BBR", lambda: _show_bbr_install(apply=apply))
+        elif picked == "enable":
+            if confirm("Enable BBR on this host?", default=True):
+                _run_action("Enable BBR", _show_bbr_enable)
+        elif picked == "disable":
+            remove = confirm("Remove persisted sysctl/module files?", default=False)
+            if confirm("Disable BBR and revert to cubic?", default=True):
+                _run_action("Disable BBR", lambda: _show_bbr_disable(remove_persistence=remove))
+
+
+def _show_bbr_status() -> None:
+    from agent.bbr import bbr_status
+
+    payload = bbr_status()
+    supported = bool(payload.get("supported"))
+    enabled = bool(payload.get("enabled"))
+    _print(kv("Supported", "yes" if supported else "no", GREEN if supported else RED))
+    _print(kv("Enabled", "yes" if enabled else "no", GREEN if enabled else YELLOW))
+    _print(kv("Module loaded", "yes" if payload.get("module_loaded") else "no", CYAN))
+    current = payload.get("current") or {}
+    _print(kv("Congestion control", str(current.get("tcp_congestion_control") or "-"), WHITE))
+    _print(kv("Default qdisc", str(current.get("default_qdisc") or "-"), WHITE))
+
+
+def _show_bbr_install(*, apply: bool) -> None:
+    from agent.bbr import bbr_install
+
+    result = bbr_install(apply=apply)
+    _print(kv("Installed", "yes", GREEN))
+    if result.get("applied"):
+        _print(kv("Applied", "yes", GREEN))
+    module = result.get("module") or {}
+    _print(kv("Module loaded", "yes" if module.get("loaded") else "no", CYAN))
+
+
+def _show_bbr_enable() -> None:
+    from agent.bbr import bbr_enable
+
+    result = bbr_enable()
+    _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
+
+
+def _show_bbr_disable(*, remove_persistence: bool) -> None:
+    from agent.bbr import bbr_disable
+
+    result = bbr_disable(remove_persistence=remove_persistence)
+    _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
+    _print(kv("Congestion control", str(result.get("tcp_congestion_control") or "-"), WHITE))
+
+
+def _dns_leak_menu() -> None:
+    while True:
+        render_header("DNS leak protection")
+        picked = select(
+            [
+                Choice("status", "Status", CYAN, "1"),
+                Choice("apply", "Apply protection", GREEN, "2"),
+                Choice("remove", "Remove protection", RED, "3"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("DNS leak status", _show_dns_leak_status)
+        elif picked == "apply":
+            if confirm("Apply DNS leak protection for VPN interfaces?", default=True):
+                _run_action("Apply DNS leak protection", _show_dns_leak_apply)
+        elif picked == "remove":
+            if confirm("Remove DNS leak protection rules?", default=False):
+                _run_action("Remove DNS leak protection", _show_dns_leak_remove)
+
+
+def _show_dns_leak_status() -> None:
+    from agent.dns_leak import dns_leak_status
+
+    payload = dns_leak_status()
+    active = bool(payload.get("active"))
+    _print(kv("Active", "yes" if active else "no", GREEN if active else YELLOW))
+    _print(kv("Backend", str(payload.get("backend") or "-"), CYAN))
+    interfaces = payload.get("interfaces") or []
+    _print(kv("VPN interfaces", str(len(interfaces)), WHITE))
+    for row in interfaces:
+        _print(paint(f"  • {row.get('name')}  gateway={row.get('gateway')}", DIM))
+
+
+def _show_dns_leak_apply() -> None:
+    from agent.dns_leak import dns_leak_apply
+
+    result = dns_leak_apply()
+    _print(kv("Applied", "yes" if result.get("applied") else "no", GREEN if result.get("applied") else RED))
+    _print(kv("Backend", str(result.get("backend") or "-"), CYAN))
+    for row in result.get("interfaces") or []:
+        _print(paint(f"  • {row.get('name')}  gateway={row.get('gateway')}", WHITE))
+
+
+def _show_dns_leak_remove() -> None:
+    from agent.dns_leak import dns_leak_remove
+
+    result = dns_leak_remove()
+    _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
+
+
 def _token_menu() -> None:
     while True:
         render_header("Token")
@@ -618,10 +739,12 @@ def run_interactive() -> int:
                     Choice("cores", "Cores", RED, "2"),
                     Choice("service", "Service", CYAN, "3"),
                     Choice("tls", "TLS Certificates", YELLOW, "4"),
-                    Choice("status", "Check status", WHITE, "5"),
-                    Choice("stats", "Stats", WHITE, "6"),
-                    Choice("update", "Update agent", WHITE, "7"),
-                    Choice("token", "Auth token", WHITE, "8"),
+                    Choice("bbr", "BBR", MAGENTA, "5"),
+                    Choice("dns_leak", "DNS leak protection", MAGENTA, "6"),
+                    Choice("status", "Check status", WHITE, "7"),
+                    Choice("stats", "Stats", WHITE, "8"),
+                    Choice("update", "Update agent", WHITE, "9"),
+                    Choice("token", "Auth token", WHITE, "10"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]
             )
@@ -640,6 +763,10 @@ def run_interactive() -> int:
                 _service_menu()
             elif picked == "tls":
                 _tls_menu()
+            elif picked == "bbr":
+                _bbr_menu()
+            elif picked == "dns_leak":
+                _dns_leak_menu()
             elif picked == "status":
                 _status()
             elif picked == "stats":
