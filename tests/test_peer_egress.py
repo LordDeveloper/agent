@@ -86,6 +86,8 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
 
     def fake_run(args, **kwargs):
         commands.append(list(args))
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="default via 10.0.0.1 dev eth1 proto dhcp metric 100\n")
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
@@ -115,12 +117,24 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert first["rules"] == 1
     table = table_id_for_interface("eth1")
     assert ["ip", "rule", "add", "from", "10.80.0.2/32", "lookup", str(table)] in commands
-    assert ["ip", "route", "replace", "default", "dev", "eth1", "table", str(table)] in commands
+    assert [
+        "ip",
+        "route",
+        "replace",
+        "default",
+        "via",
+        "10.0.0.1",
+        "dev",
+        "eth1",
+        "table",
+        str(table),
+    ] in commands
     script = tmp_path / "peer-egress-apply.sh"
     assert script.is_file()
     text = script.read_text(encoding="utf-8")
     assert f'lookup {table}' in text
-    assert 'dev "eth1"' in text
+    assert f'_default_for_iface "eth1" {table}' in text
+    assert "_default_for_iface" in text
 
     # Stale SQLite state must not skip re-apply (reboot scenario).
     commands.clear()
@@ -156,6 +170,36 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert second["rules"] == 0
     assert ["ip", "rule", "del", "from", "10.80.0.2/32", "lookup", str(table)] in commands
     assert ["ip", "route", "flush", "table", str(table)] in commands
+    store.close()
+
+
+def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeypatch):
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            # Main default is on eth0; exit iface `uk` is a tunnel without main default.
+            return _Result(stdout="default via 203.0.113.1 dev eth0\n")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None: {"ok": True, "skipped": True},
+    )
+
+    table = table_id_for_interface("uk")
+    result = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.90.68.3", "exit_interface": "uk", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert result["ok"] is True
+    assert ["ip", "route", "replace", "default", "dev", "uk", "table", str(table)] in commands
     store.close()
 
 

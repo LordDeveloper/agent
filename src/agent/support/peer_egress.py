@@ -126,6 +126,17 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         "set +e",
         "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true",
         "",
+        '_default_for_iface() {',
+        '  iface="$1"',
+        '  table="$2"',
+        '  via="$(ip -4 route show default 2>/dev/null | awk -v d="$iface" \'$0 ~ "dev "d {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}\')"',
+        '  if [ -n "$via" ]; then',
+        '    ip route replace default via "$via" dev "$iface" table "$table" 2>/dev/null || true',
+        '  else',
+        '    ip route replace default dev "$iface" table "$table" 2>/dev/null || true',
+        '  fi',
+        '}',
+        "",
     ]
 
     tables: dict[int, str] = {}
@@ -142,7 +153,7 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
 
     lines.append("")
     for table, iface in sorted(tables.items()):
-        lines.append(f'ip route replace default dev "{iface}" table {table} 2>/dev/null || true')
+        lines.append(f'_default_for_iface "{iface}" {table}')
 
     lines.append("")
     # Prefer nft at apply-time; fall back to iptables inside the script.
@@ -152,7 +163,10 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
             "  nft add table inet netinja_egress 2>/dev/null || true",
             "  nft add chain inet netinja_egress postrouting "
             '"{ type nat hook postrouting priority srcnat; policy accept; }" 2>/dev/null || true',
+            "  nft add chain inet netinja_egress forward "
+            '"{ type filter hook forward priority filter; policy accept; }" 2>/dev/null || true',
             "  nft flush chain inet netinja_egress postrouting 2>/dev/null || true",
+            "  nft flush chain inet netinja_egress forward 2>/dev/null || true",
         ]
     )
     for iface in sorted(masq):
@@ -161,6 +175,14 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
             f'  nft add rule inet netinja_egress postrouting oifname "{iface}" '
             f'masquerade comment "{comment}" 2>/dev/null || true'
         )
+        lines.append(
+            f'  nft add rule inet netinja_egress forward oifname "{iface}" '
+            f'accept comment "{comment}-fwd-out" 2>/dev/null || true'
+        )
+        lines.append(
+            f'  nft add rule inet netinja_egress forward iifname "{iface}" '
+            f'ct state related,established accept comment "{comment}-fwd-in" 2>/dev/null || true'
+        )
     lines.append("elif command -v iptables >/dev/null 2>&1; then")
     for iface in sorted(masq):
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
@@ -168,6 +190,16 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
             f'  iptables -t nat -C POSTROUTING -o "{iface}" -m comment --comment "{comment}" '
             f"-j MASQUERADE 2>/dev/null || "
             f'iptables -t nat -A POSTROUTING -o "{iface}" -m comment --comment "{comment}" -j MASQUERADE'
+        )
+        lines.append(
+            f'  iptables -C FORWARD -o "{iface}" -m comment --comment "{comment}-fwd-out" -j ACCEPT 2>/dev/null || '
+            f'iptables -I FORWARD 1 -o "{iface}" -m comment --comment "{comment}-fwd-out" -j ACCEPT'
+        )
+        lines.append(
+            f'  iptables -C FORWARD -i "{iface}" -m state --state RELATED,ESTABLISHED '
+            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT 2>/dev/null || '
+            f'iptables -I FORWARD 1 -i "{iface}" -m state --state RELATED,ESTABLISHED '
+            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT'
         )
     lines.append("fi")
     lines.append("")
@@ -281,7 +313,7 @@ def reconcile_core_egress(
     }
 
     for table, iface in desired_tables.items():
-        _ip(execute, ["route", "replace", "default", "dev", iface, "table", str(table)])
+        _install_default_route(execute, iface=iface, table=table)
 
     for table in prev_tables:
         if table not in desired_tables:
@@ -304,6 +336,7 @@ def reconcile_core_egress(
         if iface not in previous_masq:
             previous_masq.append(iface)
     _sync_masquerade(effective_masq, previous_ifaces=previous_masq, runner=execute)
+    _sync_forward(effective_masq, previous_ifaces=previous_masq, runner=execute)
 
     state = {
         "rules": [
@@ -339,6 +372,42 @@ def _ip(runner: Runner, args: list[str]) -> None:
         log.warning("ip %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
 
 
+def _install_default_route(runner: Runner, *, iface: str, table: int) -> None:
+    """Prefer `default via <gw> dev <iface>` when main table has a gateway on that NIC."""
+    via = _gateway_for_iface(runner, iface)
+    if via:
+        _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
+        return
+    _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
+
+
+def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
+    try:
+        result = runner(["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+    except Exception:
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    stdout = str(getattr(result, "stdout", "") or "")
+    for line in stdout.splitlines():
+        parts = line.split()
+        if "dev" not in parts:
+            continue
+        try:
+            dev = parts[parts.index("dev") + 1]
+        except (ValueError, IndexError):
+            continue
+        if dev != iface:
+            continue
+        if "via" in parts:
+            try:
+                return parts[parts.index("via") + 1]
+            except (ValueError, IndexError):
+                return None
+        return None
+    return None
+
+
 def _ensure_ip_forward(runner: Runner) -> None:
     try:
         path = "/proc/sys/net/ipv4/ip_forward"
@@ -363,6 +432,81 @@ def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: R
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner)
 
 
+def _sync_forward(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+    # nft FORWARD rules are installed inside _sync_masquerade_nft; only iptables needs a separate pass.
+    if shutil.which("nft"):
+        return
+    if shutil.which("iptables"):
+        _sync_forward_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner)
+
+
+def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+    wanted = set(ifaces)
+    for iface in previous_ifaces:
+        if iface in wanted:
+            continue
+        for comment, args in (
+            (f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out", ["-o", iface]),
+            (f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in", ["-i", iface, "-m", "state", "--state", "RELATED,ESTABLISHED"]),
+        ):
+            _iptables(
+                runner,
+                ["-D", "FORWARD", *args, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+            )
+    for iface in ifaces:
+        out_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out"
+        in_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in"
+        if not _iptables(
+            runner,
+            ["-C", "FORWARD", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
+            quiet=True,
+        ):
+            _iptables(
+                runner,
+                ["-I", "FORWARD", "1", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
+            )
+        if not _iptables(
+            runner,
+            [
+                "-C",
+                "FORWARD",
+                "-i",
+                iface,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-m",
+                "comment",
+                "--comment",
+                in_comment,
+                "-j",
+                "ACCEPT",
+            ],
+            quiet=True,
+        ):
+            _iptables(
+                runner,
+                [
+                    "-I",
+                    "FORWARD",
+                    "1",
+                    "-i",
+                    iface,
+                    "-m",
+                    "state",
+                    "--state",
+                    "RELATED,ESTABLISHED",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    in_comment,
+                    "-j",
+                    "ACCEPT",
+                ],
+            )
+
+
 def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
     _nft(runner, ["add", "table", "inet", "netinja_egress"])
     _nft(
@@ -376,7 +520,19 @@ def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
             "{ type nat hook postrouting priority srcnat; policy accept; }",
         ],
     )
+    _nft(
+        runner,
+        [
+            "add",
+            "chain",
+            "inet",
+            "netinja_egress",
+            "forward",
+            "{ type filter hook forward priority filter; policy accept; }",
+        ],
+    )
     _nft(runner, ["flush", "chain", "inet", "netinja_egress", _NFT_CHAIN])
+    _nft(runner, ["flush", "chain", "inet", "netinja_egress", "forward"])
     for iface in ifaces:
         _nft(
             runner,
@@ -391,6 +547,39 @@ def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
                 "masquerade",
                 "comment",
                 f"{_MASQ_COMMENT_PREFIX}{iface}",
+            ],
+        )
+        _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                "forward",
+                "oifname",
+                iface,
+                "accept",
+                "comment",
+                f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out",
+            ],
+        )
+        _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                "forward",
+                "iifname",
+                iface,
+                "ct",
+                "state",
+                "related,established",
+                "accept",
+                "comment",
+                f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in",
             ],
         )
 
