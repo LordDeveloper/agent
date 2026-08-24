@@ -90,6 +90,9 @@ paths:
   /cores/xray/x25519:
     post: { summary: Generate X25519 keys }
 
+  /network/interfaces:
+    get: { summary: List host network interfaces (for exit routing) }
+
   /cores/wireguard/interfaces:
     get: { summary: List interfaces }
     post: { summary: Create interface }

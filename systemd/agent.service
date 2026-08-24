@@ -1,12 +1,15 @@
 [Unit]
 Description=Netinja node agent API
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent serve
+# Re-apply peer egress after agent start (covers reboot when wg-quick already up).
+ExecStartPost=-/bin/sh -c 'test -x /var/lib/agent/peer-egress-apply.sh && /var/lib/agent/peer-egress-apply.sh || true'
 Restart=on-failure
 RestartSec=3
 

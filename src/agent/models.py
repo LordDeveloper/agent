@@ -91,6 +91,7 @@ class WgPeerPayload(BaseModel):
     incoming: Optional[int] = None
     outgoing: Optional[int] = None
     expires_at: Optional[str] = None
+    exit_interface: Optional[str] = None
 
 
 class AmneziaObfuscation(BaseModel):

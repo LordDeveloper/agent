@@ -169,6 +169,7 @@ class WireGuardDriver(CoreDriver):
             "client_traffic",
             "ip_logs",
             "backup_restore",
+            "peer_egress_routing",
         ]
 
     def installed(self) -> bool:
@@ -413,6 +414,11 @@ class WireGuardDriver(CoreDriver):
                 # Preserve traffic counters unless explicitly reset in payload.
                 for key, value in normalized.items():
                     merged[key] = value
+                if "exit_interface" in payload:
+                    if "exit_interface" in normalized:
+                        merged["exit_interface"] = normalized["exit_interface"]
+                    else:
+                        merged.pop("exit_interface", None)
                 iface["peers"][idx] = merged
                 self.update_interface(interface_id, iface)
                 return merged
@@ -627,6 +633,12 @@ class WireGuardDriver(CoreDriver):
         for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
             if obf.get(key) is not None:
                 lines.append(f"{key} = {obf[key]}")
+
+        # Re-apply policy routing whenever wg-quick brings the interface up (survives reboot).
+        from agent.support.peer_egress import apply_script_path
+
+        script = apply_script_path(self.settings.data_dir)
+        lines.append(f"PostUp = {script.as_posix()} >/dev/null 2>&1 || true")
         lines.append("")
         return lines
 
@@ -679,13 +691,22 @@ class WireGuardDriver(CoreDriver):
             return {"name": name, "ok": False, "message": "wg-quick not found"}
         down = run([quick, "down", conf], check=False)
         up = run([quick, "up", conf], check=False)
-        return {
+        result = {
             "name": name,
             "ok": up.returncode == 0,
             "stderr": (up.stderr or down.stderr or "").strip(),
         }
+        if result["ok"]:
+            self._sync_peer_egress()
+        return result
 
     def _bring_down(self, iface: dict[str, Any]) -> dict[str, Any]:
+        remaining = [
+            row
+            for row in self.list_interfaces()
+            if str(row.get("id")) != str(iface.get("id"))
+        ]
+        self._sync_peer_egress(remaining)
         quick = self._quick_bin()
         name = iface["name"]
         if not quick:
@@ -704,10 +725,12 @@ class WireGuardDriver(CoreDriver):
 
         if not cli or not quick:
             self._sync_conf(iface)
+            self._sync_peer_egress()
             return
 
         if not self._interface_is_up(name):
             self._sync_conf(iface)
+            self._sync_peer_egress()
             return
 
         try:
@@ -720,9 +743,26 @@ class WireGuardDriver(CoreDriver):
             if sync.returncode != 0:
                 detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
+            self._sync_peer_egress()
         except AgentError:
             if backup is not None:
                 conf_path.write_text(backup, encoding="utf-8")
             else:
                 conf_path.unlink(missing_ok=True)
             raise
+
+    def _sync_peer_egress(self, interfaces: list[dict[str, Any]] | None = None) -> None:
+        try:
+            from agent.support.peer_egress import reconcile_core_egress
+
+            rows = interfaces if interfaces is not None else self.list_interfaces()
+            reconcile_core_egress(
+                self.store,
+                self.key,
+                rows,
+                data_dir=self.settings.data_dir,
+            )
+        except Exception:
+            from agent.logutil import get_logger
+
+            get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)

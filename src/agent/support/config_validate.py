@@ -70,7 +70,11 @@ def validate_wg_iface(iface: dict[str, Any]) -> None:
         address = str(peer.get("address") or "").strip()
         if address:
             seen_ips.add(address.split("/", 1)[0])
-
+        exit_iface = str(peer.get("exit_interface") or "").strip()
+        if exit_iface and not _IFACE_NAME_RE.match(exit_iface):
+            raise _validation_error(
+                f"Peer [{peer.get('id') or peer.get('email')}] has invalid exit_interface [{exit_iface}]"
+            )
 
 def validate_wg_conf_stripped(
     conf_text: str,

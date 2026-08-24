@@ -235,18 +235,34 @@ def test_wireguard_interfaces_and_peers(wg_client):
     r = wg_client.post(
         "/api/v1/cores/wireguard/interfaces/7/peers",
         headers=headers,
-        json={"email": "peer1", "is_enabled": True, "volume": 1024, "incoming": 0, "outgoing": 0},
+        json={
+            "email": "peer1",
+            "is_enabled": True,
+            "volume": 1024,
+            "incoming": 0,
+            "outgoing": 0,
+            "exit_interface": "eth1",
+        },
     )
     assert r.status_code == 200, r.text
     peer = r.json()["peer"]
     assert peer["email"] == "peer1"
     assert peer["is_enabled"] is True
     assert peer["volume"] == 1024
+    assert peer["exit_interface"] == "eth1"
     assert "enable" not in peer
     assert "totalGB" not in peer
     assert "up" not in peer
     assert "down" not in peer
 
+    caps = wg_client.get("/api/v1/cores/wireguard/health", headers=headers)
+    assert caps.status_code == 200
+    assert "peer_egress_routing" in (caps.json().get("capabilities") or [])
+
+    r = wg_client.get("/api/v1/network/interfaces", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+    assert isinstance(r.json()["interfaces"], list)
     r = wg_client.get("/api/v1/stats/snapshot?core=wireguard", headers=headers)
     assert r.status_code == 200
     assert r.json()["inbounds"][0]["clients"][0]["email"] == "peer1"

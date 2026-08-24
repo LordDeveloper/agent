@@ -92,6 +92,13 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
     client = deepcopy(payload)
     client.pop("format", None)
 
+    # Keep opaque per-client bag (e.g. Shadowsocks AEAD method) for round-trips.
+    extra = client.get("extra")
+    if isinstance(extra, dict):
+        client["extra"] = {k: v for k, v in extra.items() if v is not None and v != ""}
+    elif "extra" in client:
+        client.pop("extra", None)
+
     client["is_enabled"] = record_is_enabled(client)
 
     if "max_connection" in client or "limitIp" in client:
@@ -213,6 +220,10 @@ def xray_protocol_user(protocol: str, client: dict[str, Any]) -> dict[str, Any]:
         if password:
             user["password"] = str(password)
         method = row.get("method") or row.get("cipher")
+        if not method:
+            extra = row.get("extra")
+            if isinstance(extra, dict):
+                method = extra.get("method") or extra.get("cipher")
         if method:
             user["method"] = str(method).strip()
         return user
@@ -271,6 +282,13 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         peer["incoming"] = _as_int(peer.get("incoming", peer.get("down")))
     if "outgoing" in peer or "up" in peer:
         peer["outgoing"] = _as_int(peer.get("outgoing", peer.get("up")))
+
+    if "exit_interface" in peer:
+        exit_iface = str(peer.get("exit_interface") or "").strip()
+        if exit_iface:
+            peer["exit_interface"] = exit_iface
+        else:
+            peer.pop("exit_interface", None)
 
     for key in _XUI_KEYS:
         peer.pop(key, None)
