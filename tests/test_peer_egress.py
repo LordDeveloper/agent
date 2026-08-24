@@ -134,7 +134,8 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     text = script.read_text(encoding="utf-8")
     assert f'lookup {table}' in text
     assert f'_default_for_iface "eth1" {table}' in text
-    assert "_default_for_iface" in text
+    assert "_iface_ready" in text
+    assert "peer-egress: skipped" in text or "interface missing" in text or "_iface_ready" in text
 
     # Stale SQLite state must not skip re-apply (reboot scenario).
     commands.clear()
@@ -170,6 +171,36 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert second["rules"] == 0
     assert ["ip", "rule", "del", "from", "10.80.0.2/32", "lookup", str(table)] in commands
     assert ["ip", "route", "flush", "table", str(table)] in commands
+    store.close()
+
+
+def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "link", "show"] and args[3:] == ["usa"]:
+            return _Result(returncode=1, stderr="Device \"usa\" does not exist.\n")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None: {"ok": True, "skipped": True},
+    )
+
+    table = table_id_for_interface("usa")
+    result = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert result["ok"] is True
+    assert result["rules"] == 0
+    assert ["ip", "rule", "add", "from", "10.90.68.3/32", "lookup", str(table)] not in commands
     store.close()
 
 
@@ -214,3 +245,5 @@ def test_render_apply_script_is_idempotent_shell():
     assert "ip_forward=1" in script
     assert f"lookup {table}" in script
     assert 'oifname "eth1"' in script or ' -o "eth1"' in script
+    assert "_iface_ready" in script
+    assert f'if _default_for_iface "eth1" {table}; then' in script

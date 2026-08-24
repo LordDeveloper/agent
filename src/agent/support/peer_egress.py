@@ -126,14 +126,22 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         "set +e",
         "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true",
         "",
+        '_iface_ready() {',
+        '  ip link show "$1" >/dev/null 2>&1',
+        '}',
+        "",
         '_default_for_iface() {',
         '  iface="$1"',
         '  table="$2"',
-        '  via="$(ip -4 route show default 2>/dev/null | awk -v d="$iface" \'$0 ~ "dev "d {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}\')"',
+        '  if ! _iface_ready "$iface"; then',
+        '    echo "peer-egress: exit interface missing: $iface (table $table)" >&2',
+        '    return 1',
+        '  fi',
+        '  via="$(ip -4 route show default 2>/dev/null | awk -v d="$iface" \'{for(i=1;i<=NF;i++) if($i=="dev" && $(i+1)==d){for(j=1;j<=NF;j++) if($j=="via"){print $(j+1); exit}}}\')"',
         '  if [ -n "$via" ]; then',
-        '    ip route replace default via "$via" dev "$iface" table "$table" 2>/dev/null || true',
+        '    ip route replace default via "$via" dev "$iface" table "$table" 2>/dev/null || return 1',
         '  else',
-        '    ip route replace default dev "$iface" table "$table" 2>/dev/null || true',
+        '    ip route replace default dev "$iface" table "$table" 2>/dev/null || return 1',
         '  fi',
         '}',
         "",
@@ -148,12 +156,16 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         iface = str(row["iface"])
         tables[table] = iface
         masq.add(iface)
-        lines.append(f'ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
-        lines.append(f'ip rule add from "{cidr}" lookup {table} 2>/dev/null || true')
-
-    lines.append("")
-    for table, iface in sorted(tables.items()):
-        lines.append(f'_default_for_iface "{iface}" {table}')
+        # Only install the policy rule when the exit NIC exists and default route lands.
+        lines.append(f'if _default_for_iface "{iface}" {table}; then')
+        lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
+        lines.append(f'  ip rule add from "{cidr}" lookup {table} 2>/dev/null || true')
+        lines.append("else")
+        lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
+        lines.append(
+            f'  echo "peer-egress: skipped {cidr} -> {iface} (interface missing or route failed)" >&2'
+        )
+        lines.append("fi")
 
     lines.append("")
     # Prefer nft at apply-time; fall back to iptables inside the script.
@@ -298,28 +310,35 @@ def reconcile_core_egress(
         if table:
             _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
 
+    applied: list[dict[str, str | int]] = []
     # Always re-apply desired rules (SQLite may say "applied" while OS lost them after reboot).
+    # Skip peers whose exit NIC is missing — orphan rules + empty tables cause unreachable.
     for row in desired:
         cidr = str(row["cidr"])
-        table = str(row["table"])
-        _ip(execute, ["rule", "del", "from", cidr, "lookup", table])
-        _ip(execute, ["rule", "add", "from", cidr, "lookup", table])
+        table = int(row["table"])
+        iface = str(row["iface"])
+        _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
+        if not _iface_exists(execute, iface):
+            log.warning("peer egress skipped %s: exit interface [%s] missing", cidr, iface)
+            continue
+        if not _install_default_route(execute, iface=iface, table=table):
+            log.warning("peer egress skipped %s: default route on [%s] failed", cidr, iface)
+            continue
+        _ip(execute, ["rule", "add", "from", cidr, "lookup", str(table)])
+        applied.append(row)
 
-    desired_tables = {int(row["table"]): str(row["iface"]) for row in desired}
+    desired_tables = {int(row["table"]): str(row["iface"]) for row in applied}
     prev_tables = {
         int(row.get("table") or 0): str(row.get("iface") or "")
         for row in prev_rules
         if int(row.get("table") or 0) > 0
     }
 
-    for table, iface in desired_tables.items():
-        _install_default_route(execute, iface=iface, table=table)
-
     for table in prev_tables:
         if table not in desired_tables:
             _ip(execute, ["route", "flush", "table", str(table)])
 
-    masq_ifaces = sorted({str(row["iface"]) for row in desired})
+    masq_ifaces = sorted({str(row["iface"]) for row in applied})
     # Merge masq with other cores so we don't drop shared exits while reconciling one core.
     other_masq: set[str] = set()
     for other in _EGRESS_CORES:
@@ -341,7 +360,7 @@ def reconcile_core_egress(
     state = {
         "rules": [
             {"addr": str(row["addr"]), "table": int(row["table"]), "iface": str(row["iface"])}
-            for row in desired
+            for row in applied
         ],
         "tables": sorted(desired_tables.keys()),
         "masq": masq_ifaces,
@@ -352,33 +371,39 @@ def reconcile_core_egress(
     return {
         "ok": True,
         "skipped": False,
-        "rules": len(desired),
+        "rules": len(applied),
+        "desired": len(desired),
         "masq": masq_ifaces,
         "persist": persist,
     }
 
 
-def _ip(runner: Runner, args: list[str]) -> None:
+def _ip(runner: Runner, args: list[str]) -> bool:
     try:
         result = runner(["ip", *args], check=False, timeout=10)
     except Exception as exc:
         log.warning("ip %s failed: %s", " ".join(args), exc)
-        return
+        return False
     if getattr(result, "returncode", 1) != 0:
         stderr = (getattr(result, "stderr", None) or getattr(result, "stdout", None) or "").strip()
         # delete of missing rule is expected
         if args[:1] == ["rule"] and "del" in args:
-            return
+            return True
         log.warning("ip %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
+        return False
+    return True
 
 
-def _install_default_route(runner: Runner, *, iface: str, table: int) -> None:
+def _iface_exists(runner: Runner, iface: str) -> bool:
+    return _ip(runner, ["link", "show", iface])
+
+
+def _install_default_route(runner: Runner, *, iface: str, table: int) -> bool:
     """Prefer `default via <gw> dev <iface>` when main table has a gateway on that NIC."""
     via = _gateway_for_iface(runner, iface)
     if via:
-        _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
-        return
-    _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
+        return _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
+    return _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
 
 
 def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
