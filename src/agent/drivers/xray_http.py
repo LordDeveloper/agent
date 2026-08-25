@@ -203,6 +203,186 @@ class XrayHttpClient:
     def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
         return self.post("/api/inbounds/remove", {"tags": tags})
 
+    @staticmethod
+    def _is_http_route_missing(exc: AgentError) -> bool:
+        if int(exc.status or 0) in {404, 405, 501}:
+            return True
+        message = str(exc.message or "").lower()
+        return "404 page not found" in message or "xray http api error (404)" in message
+
+    @staticmethod
+    def _client_email(client: dict[str, Any]) -> str:
+        return str(client.get("email") or "").strip()
+
+    @staticmethod
+    def _inbound_clients(inbound: dict[str, Any]) -> list[dict[str, Any]]:
+        settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else {}
+        rows = settings.get("clients") or settings.get("users") or []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    @staticmethod
+    def _strip_panel_inbound_fields(inbound: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(inbound)
+        for key in (
+            "id",
+            "remark",
+            "is_enabled",
+            "enable",
+            "expiryTime",
+            "expires_at",
+            "total",
+            "up",
+            "down",
+            "incoming",
+            "outgoing",
+            "format",
+            "preserve_clients",
+            "reset_clients",
+        ):
+            payload.pop(key, None)
+        stream = payload.get("streamSettings")
+        if isinstance(stream, dict):
+            stream = dict(stream)
+            stream.pop("domainSettings", None)
+            payload["streamSettings"] = stream
+        return payload
+
+    def _find_inbound_by_tag(self, tag: str) -> dict[str, Any]:
+        wanted = str(tag or "").strip()
+        for row in self.list_inbounds():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("tag") or "").strip() == wanted:
+                return dict(row)
+        raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found", 404)
+
+    def _mutate_users_via_inbound_edit(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+        *,
+        mode: str,
+        protocol: str | None = None,
+        inbound_settings: dict[str, Any] | None = None,
+        remove_emails: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Fallback when /api/inbounds/users/* is missing (older/partial Xray HTTP API).
+
+        Merges clients into the live inbound and POSTs /api/inbounds/edit with
+        preserve_clients=false so runtime + config pick up the user list.
+        """
+        from agent.support import xray_protocol_user
+
+        current = self._find_inbound_by_tag(tag)
+        proto = str(protocol or current.get("protocol") or "vless").strip().lower()
+        existing = self._inbound_clients(current)
+        by_email: dict[str, dict[str, Any]] = {}
+        extras: list[dict[str, Any]] = []
+        for row in existing:
+            email = self._client_email(row)
+            if email:
+                by_email[email] = row
+            else:
+                extras.append(row)
+
+        mode_key = str(mode or "upsert").strip().lower()
+        applied = 0
+        errors: list[dict[str, str]] = []
+
+        if mode_key == "remove":
+            drop = {str(email).strip() for email in (remove_emails or []) if str(email).strip()}
+            before = len(by_email)
+            by_email = {email: row for email, row in by_email.items() if email not in drop}
+            applied = max(0, before - len(by_email))
+        else:
+            for raw in clients:
+                if not isinstance(raw, dict):
+                    errors.append({"email": "", "message": "client must be an object"})
+                    continue
+                email = self._client_email(raw)
+                try:
+                    native = xray_protocol_user(proto, raw)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+                    continue
+                if mode_key == "add":
+                    if email and email in by_email:
+                        errors.append({"email": email, "message": "client already exists"})
+                        continue
+                    if email:
+                        by_email[email] = native
+                    else:
+                        extras.append(native)
+                    applied += 1
+                elif mode_key == "edit":
+                    if not email or email not in by_email:
+                        errors.append({"email": email, "message": "client not found"})
+                        continue
+                    by_email[email] = {**by_email[email], **native}
+                    applied += 1
+                else:  # upsert
+                    if email:
+                        by_email[email] = {**by_email.get(email, {}), **native}
+                    else:
+                        extras.append(native)
+                    applied += 1
+
+        settings = dict(current.get("settings") or {})
+        if isinstance(inbound_settings, dict):
+            for key, value in inbound_settings.items():
+                if key not in {"clients", "users"}:
+                    settings[key] = value
+        merged = extras + list(by_email.values())
+        settings["clients"] = merged
+        settings["users"] = merged
+        if proto == "vless":
+            settings.setdefault("decryption", "none")
+
+        payload = self._strip_panel_inbound_fields(current)
+        payload["tag"] = tag
+        payload["protocol"] = proto
+        payload["settings"] = settings
+        self.edit_inbounds([payload], preserve_clients=False)
+
+        failed = len(errors)
+        return {
+            "succeeded": applied,
+            "failed": failed,
+            "errors": errors,
+            "added_users": applied if mode_key in {"add", "upsert"} else 0,
+            "updated_users": applied if mode_key == "edit" else 0,
+            "removed_users": applied if mode_key == "remove" else 0,
+            "fallback": "inbounds/edit",
+        }
+
+    def _users_request(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        tag: str,
+        clients: list[dict[str, Any]],
+        mode: str,
+        protocol: str | None = None,
+        inbound_settings: dict[str, Any] | None = None,
+        remove_emails: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = self.post(path, payload)
+            return result if isinstance(result, dict) else {"status": "ok", "result": result}
+        except AgentError as exc:
+            if not self._is_http_route_missing(exc):
+                raise
+            return self._mutate_users_via_inbound_edit(
+                tag,
+                clients,
+                mode=mode,
+                protocol=protocol,
+                inbound_settings=inbound_settings,
+                remove_emails=remove_emails,
+            )
+
     def add_users(
         self,
         tag: str,
@@ -223,7 +403,15 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self.post("/api/inbounds/users/add", payload)
+        return self._users_request(
+            "/api/inbounds/users/add",
+            payload,
+            tag=tag,
+            clients=clients,
+            mode="add",
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
 
     def edit_users(
         self,
@@ -245,7 +433,15 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self.post("/api/inbounds/users/edit", payload)
+        return self._users_request(
+            "/api/inbounds/users/edit",
+            payload,
+            tag=tag,
+            clients=clients,
+            mode="edit",
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
 
     def upsert_users(
         self,
@@ -267,20 +463,48 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self.post("/api/inbounds/users/upsert", payload)
+        return self._users_request(
+            "/api/inbounds/users/upsert",
+            payload,
+            tag=tag,
+            clients=clients,
+            mode="upsert",
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
 
     def remove_users(self, tag: str, emails: list[str], *, atomic: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {"tag": tag, "emails": emails}
         if atomic:
             payload["atomic"] = True
-        return self.post("/api/inbounds/users/remove", payload)
+        try:
+            result = self.post("/api/inbounds/users/remove", payload)
+            return result if isinstance(result, dict) else {"status": "ok", "result": result}
+        except AgentError as exc:
+            if not self._is_http_route_missing(exc):
+                raise
+            return self._mutate_users_via_inbound_edit(
+                tag,
+                [],
+                mode="remove",
+                remove_emails=list(emails),
+            )
 
     def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"tag": tag}
         if email:
             params["email"] = email
-        body = self.get("/api/inbounds/users", params=params)
-        return list(body.get("users") or [])
+        try:
+            body = self.get("/api/inbounds/users", params=params)
+            return list(body.get("users") or [])
+        except AgentError as exc:
+            if not self._is_http_route_missing(exc):
+                raise
+            users = self._inbound_clients(self._find_inbound_by_tag(tag))
+            if email:
+                wanted = str(email).strip()
+                users = [row for row in users if self._client_email(row) == wanted]
+            return users
 
     def list_outbounds(self) -> list[dict[str, Any]]:
         body = self.get("/api/outbounds/list")

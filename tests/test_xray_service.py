@@ -189,3 +189,56 @@ def test_xray_http_maps_404_to_config_not_found():
         assert "404" in exc.message
     finally:
         client.close()
+
+
+def test_xray_http_users_upsert_falls_back_to_inbound_edit():
+    """When /users/* is missing but list/edit exist, upsert must still apply clients."""
+    from agent.config import XraySettings
+    from agent.drivers.xray_http import XrayHttpClient
+    import httpx
+    import json
+
+    state = {
+        "inbounds": [
+            {
+                "tag": "inbound-1642",
+                "protocol": "vless",
+                "listen": "0.0.0.0",
+                "port": 2053,
+                "settings": {"clients": [], "decryption": "none"},
+                "streamSettings": {"network": "ws", "domainSettings": {"addresses": {}}},
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/api/inbounds/list") and request.method == "GET":
+            return httpx.Response(200, json={"inbounds": state["inbounds"]})
+        if "/api/inbounds/users/" in path:
+            return httpx.Response(404, text="404 page not found")
+        if path.endswith("/api/inbounds/edit") and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            rows = body.get("inbounds") or []
+            assert rows and rows[0]["tag"] == "inbound-1642"
+            assert "domainSettings" not in (rows[0].get("streamSettings") or {})
+            clients = (rows[0].get("settings") or {}).get("clients") or []
+            assert len(clients) == 1
+            assert clients[0]["email"] == "probe-test"
+            state["inbounds"][0] = rows[0]
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(500, text=f"unexpected {request.method} {path}")
+
+    client = XrayHttpClient(XraySettings(api_base="http://test"), transport=httpx.MockTransport(handler))
+    try:
+        result = client.upsert_users(
+            "inbound-1642",
+            [{"id": "00000000-0000-4000-8000-000000000001", "email": "probe-test"}],
+            protocol="vless",
+            inbound_settings={"decryption": "none"},
+        )
+        assert result.get("succeeded") == 1
+        assert result.get("fallback") == "inbounds/edit"
+        assert state["inbounds"][0]["settings"]["clients"][0]["email"] == "probe-test"
+    finally:
+        client.close()
