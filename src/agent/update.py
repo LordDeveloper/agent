@@ -270,14 +270,22 @@ def _parse_release_payload(
     )
 
 
-def _fetch_latest_release_payload(
+def _fetch_release_payload(
     repo_id: str,
     *,
+    tag: str | None = None,
     token: str | None = None,
     timeout: float = 60.0,
 ) -> dict:
     auth = resolve_token(token)
-    url = f"{GITHUB_API}/repos/{repo_id}/releases/latest"
+    repo_id = repo_id.strip().strip("/")
+    if tag:
+        wanted = tag.strip()
+        if wanted.lower().startswith("tags/"):
+            wanted = wanted.split("/", 1)[1]
+        url = f"{GITHUB_API}/repos/{repo_id}/releases/tags/{wanted}"
+    else:
+        url = f"{GITHUB_API}/repos/{repo_id}/releases/latest"
 
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
@@ -292,10 +300,11 @@ def _fetch_latest_release_payload(
             "or fine-grained token with Contents: Read on this repository).",
         )
     if response.status_code == 404:
+        label = f"tag [{tag}]" if tag else "latest"
         raise AgentError(
             "CONFIG_NOT_FOUND",
-            f"Release not found for [{repo_id}]. Private repos require GITHUB_TOKEN; "
-            "also ensure at least one published release includes the requested asset.",
+            f"Release {label} not found for [{repo_id}]. Private repos require GITHUB_TOKEN; "
+            "also ensure the tag exists and includes the requested asset.",
         )
     if response.status_code >= 400:
         raise AgentError(
@@ -306,17 +315,27 @@ def _fetch_latest_release_payload(
     return response.json()
 
 
+def _fetch_latest_release_payload(
+    repo_id: str,
+    *,
+    token: str | None = None,
+    timeout: float = 60.0,
+) -> dict:
+    return _fetch_release_payload(repo_id, token=token, timeout=timeout)
+
+
 def fetch_release_for_asset(
     *,
     repo: str,
     asset_name: str,
     prefix: str,
     token: str | None = None,
+    tag: str | None = None,
     timeout: float = 60.0,
 ) -> ReleaseInfo:
     repo_id = repo.strip().strip("/")
     wanted = asset_name.strip()
-    payload = _fetch_latest_release_payload(repo_id, token=token, timeout=timeout)
+    payload = _fetch_release_payload(repo_id, tag=tag, token=token, timeout=timeout)
     try:
         return _parse_release_payload(payload, repo_id=repo_id, wanted=wanted, prefix=prefix)
     except AgentError as exc:

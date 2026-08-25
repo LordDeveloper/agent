@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -14,6 +15,7 @@ from agent.ops import (
     KNOWN_CORES,
     generate_token,
     install_core,
+    run_cmd,
     service_action,
     service_is_active,
     service_logs,
@@ -212,14 +214,104 @@ def _show_service_action(action: str) -> None:
         _print_block(str(result["stderr"]), max_lines=8, color=RED)
 
 
-def _show_install(name: str) -> None:
-    result = install_core(name)
+def _show_install(name: str, *, force: bool = False, tag: str | None = None) -> None:
+    result = install_core(name, force=force, tag=tag)
     _print(kv("Core", str(result.get("core") or name), CYAN))
     _print(kv("Installed", "yes" if result.get("installed") else "no", GREEN))
+    if result.get("release_tag") or result.get("tag"):
+        _print(kv("Release", str(result.get("release_tag") or result.get("tag")), CYAN))
+    if result.get("asset"):
+        _print(kv("Asset", str(result["asset"]), DIM))
+    if result.get("version"):
+        _print(kv("Version", str(result["version"]), WHITE))
     if result.get("message"):
         _print(kv("Message", str(result["message"]), WHITE))
     if result.get("binary"):
         _print(kv("Binary", str(result["binary"]), DIM))
+
+
+def _show_xray_status() -> None:
+    from agent.xray_service import binary_has_httpapi
+
+    binary = Path(os.environ.get("XRAY_BINARY", "/usr/local/bin/xray"))
+    path = binary if binary.is_file() else Path(which("xray") or "")
+    if not path.is_file():
+        _print(paint("  Xray binary not installed.", YELLOW))
+        return
+
+    _print(kv("Binary", str(path), CYAN))
+    capable = binary_has_httpapi(path)
+    _print(kv("HTTP API", "yes" if capable else "no", GREEN if capable else RED))
+    try:
+        proc = run_cmd([str(path), "version"], check=False, timeout=15)
+        version = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or "-"
+    except OSError:
+        version = "-"
+    _print(kv("Version", version, WHITE))
+
+
+def _xray_menu() -> None:
+    while True:
+        render_header("Xray")
+        picked = select(
+            [
+                Choice("latest", "Install / update latest release", GREEN, "1"),
+                Choice("tag", "Install custom tag", CYAN, "2"),
+                Choice("status", "Show binary status", WHITE, "3"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("Xray status", _show_xray_status)
+            continue
+        if picked == "latest":
+            if not confirm("Download latest LordDeveloper/xray release for this host?", default=True):
+                continue
+            _run_action(
+                "Install Xray (latest)",
+                lambda: _show_install("xray", force=True),
+            )
+            continue
+
+        tag = prompt_text("Release tag (e.g. v1.0.7)", default="")
+        tag = (tag or "").strip()
+        if not tag:
+            _print(paint("  Tag is required.", YELLOW))
+            pause()
+            continue
+        if not confirm(f"Install Xray release [{tag}]?", default=True):
+            continue
+        _run_action(
+            f"Install Xray ({tag})",
+            lambda t=tag: _show_install("xray", force=True, tag=t),
+        )
+
+
+def _cores_menu() -> None:
+    while True:
+        render_header("Cores")
+        picked = select(
+            [
+                Choice("list", "List cores", CYAN, "1"),
+                Choice("xray", "Xray", GREEN, "2"),
+                Choice("wireguard", "Install WireGuard", GREEN, "3"),
+                Choice("amnezia", "Install Amnezia", GREEN, "4"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "list":
+            _run_action("Core list", _show_core_list)
+            continue
+        if picked == "xray":
+            _xray_menu()
+            continue
+        if not confirm(f"Install {picked} on this host?", default=True):
+            continue
+        _run_action(f"Install {picked}", lambda name=picked: _show_install(name))
 
 
 def _show_stats(*, online_only: bool) -> None:
@@ -332,28 +424,6 @@ def _wizard() -> None:
             _print(paint("  Service installed and restarted.", GREEN))
         except AgentError as exc:
             _print(paint(f"  Service setup failed: {exc.message}", RED))
-
-
-def _cores_menu() -> None:
-    while True:
-        render_header("Cores")
-        picked = select(
-            [
-                Choice("list", "List cores", CYAN, "1"),
-                Choice("xray", "Install Xray", GREEN, "2"),
-                Choice("wireguard", "Install WireGuard", GREEN, "3"),
-                Choice("amnezia", "Install Amnezia", GREEN, "4"),
-                Choice("back", "Back", WHITE, "0"),
-            ]
-        )
-        if picked in {None, "back"}:
-            return
-        if picked == "list":
-            _run_action("Core list", _show_core_list)
-            continue
-        if not confirm(f"Install {picked} on this host?", default=True):
-            continue
-        _run_action(f"Install {picked}", lambda name=picked: _show_install(name))
 
 
 def _service_menu() -> None:

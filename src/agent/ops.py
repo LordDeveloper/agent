@@ -48,10 +48,15 @@ def _prepare_xray_service(result: dict) -> dict:
     return result
 
 
-def install_xray(*, github_token: str | None = None, force: bool = False) -> dict:
+def install_xray(
+    *,
+    github_token: str | None = None,
+    force: bool = False,
+    tag: str | None = None,
+) -> dict:
     """
-    Install customized Xray by cloning LordDeveloper/xray and building on this host.
-    Does not use GitHub Releases / Actions artifacts.
+    Install customized Xray from LordDeveloper/xray GitHub Releases
+    (host-matched Xray-linux-*.zip). Optional tag installs that release instead of latest.
     """
     from agent.xray_release import install_xray_binary
     from agent.xray_service import binary_has_httpapi, stop_xray_service
@@ -60,7 +65,7 @@ def install_xray(*, github_token: str | None = None, force: bool = False) -> dic
     dest = Path(binary)
     ready = dest.is_file() and binary_has_httpapi(dest)
     had_stock = dest.is_file() and not ready
-    if ready and not force:
+    if ready and not force and not tag:
         return _prepare_xray_service({
             "core": "xray",
             "installed": True,
@@ -85,18 +90,18 @@ def install_xray(*, github_token: str | None = None, force: bool = False) -> dic
         except AgentError:
             pass
 
-    result = install_xray_binary(dest, token=github_token)
+    result = install_xray_binary(dest, token=github_token, tag=tag)
     result["replaced_stock"] = had_stock
     result["httpapi_capable"] = binary_has_httpapi(dest)
     if dest.is_file() and not result["httpapi_capable"]:
         raise AgentError(
             "UNSUPPORTED_CAPABILITY",
-            "Built Xray binary still has no HTTP API. "
-            "Confirm LordDeveloper/xray source includes the HTTP API fork, "
-            "and GITHUB_TOKEN can clone that private repo.",
+            "Downloaded Xray binary still has no HTTP API. "
+            "Confirm LordDeveloper/xray release zip is the customized fork "
+            "(not stock XTLS), and GITHUB_TOKEN can read that repo if private.",
         )
     result = _prepare_xray_service(result)
-    if result.get("downloaded") or force:
+    if result.get("downloaded") or force or tag:
         try:
             from agent.xray_service import ensure_xray_runtime
 
@@ -142,12 +147,20 @@ INSTALLERS = {
 }
 
 
-def install_core(name: str, *, github_token: str | None = None, force: bool = False) -> dict:
+def install_core(
+    name: str,
+    *,
+    github_token: str | None = None,
+    force: bool = False,
+    tag: str | None = None,
+) -> dict:
     key = name.strip().lower()
     installer = INSTALLERS.get(key)
     if installer is None:
         raise AgentError("CONFIG_NOT_FOUND", f"Unknown core [{name}]. Known: {', '.join(KNOWN_CORES)}")
-    if key in {"xray", "amnezia"}:
+    if key == "xray":
+        return installer(github_token=github_token, force=force, tag=tag)
+    if key == "amnezia":
         return installer(github_token=github_token, force=force)
     return installer()
 

@@ -17,8 +17,8 @@ DEFAULT_UNIT_PATH = "/etc/systemd/system/xray.service"
 _HTTPAPI_NEEDLES = (b"httpapi", b"/api/stats/sys", b"/api/inbounds/list")
 STOCK_XRAY_HINT = (
     "Xray binary has no HTTP API (usually official/XTLS Xray). "
-    "Reinstall the customized core from github.com/LordDeveloper/xray via the admin panel "
-    "(agent clones the repo and builds on the node; private repos need GITHUB_TOKEN)."
+    "Reinstall from LordDeveloper/xray Releases via the admin panel or: "
+    "agent xray install --force (node may need GITHUB_TOKEN for private repos)."
 )
 
 

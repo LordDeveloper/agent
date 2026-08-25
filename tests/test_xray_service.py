@@ -1,4 +1,4 @@
-import json
+﻿import json
 from pathlib import Path
 
 from agent.xray_service import (
@@ -121,16 +121,16 @@ def test_install_xray_skips_customized_binary(tmp_path, monkeypatch):
     monkeypatch.setenv("XRAY_BINARY", str(binary))
     monkeypatch.setenv("XRAY_API_BASE", "http://127.0.0.1:8080")
 
-    called = {"build": False}
+    called = {"download": False}
 
-    def fake_build(dest, token=None):
-        called["build"] = True
+    def fake_download(dest, token=None, tag=None):
+        called["download"] = True
         return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
 
-    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_build)
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
     monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
     result = install_xray()
-    assert called["build"] is False
+    assert called["download"] is False
     assert result["downloaded"] is False
     assert result["httpapi_capable"] is True
 
@@ -145,18 +145,19 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
     monkeypatch.setattr("agent.xray_service.systemctl", lambda *args, **kwargs: {"ok": True})
 
-    def fake_build(dest, token=None):
+    def fake_download(dest, token=None, tag=None):
         dest.write_bytes(b"customized xray httpapi /api/stats/sys")
         return {
             "core": "xray",
             "installed": True,
             "downloaded": True,
-            "built_from_source": True,
             "binary": str(dest),
-            "source": "git",
+            "source": "release",
+            "release_tag": "v1.0.7",
+            "asset": "Xray-linux-64.zip",
         }
 
-    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_build)
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
     monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
     result = install_xray()
     assert result["downloaded"] is True
@@ -164,44 +165,95 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
     assert result["httpapi_capable"] is True
 
 
-def test_install_xray_binary_builds_from_git(tmp_path, monkeypatch):
+def test_resolve_xray_release_asset_and_tag():
+    from agent.xray_release import ASSET_BY_ARCH, resolve_xray_tag
+    from agent.update import pick_release_asset
+
+    assert resolve_xray_tag(None) is None
+    assert resolve_xray_tag("latest") is None
+    assert resolve_xray_tag("v1.0.7") == "v1.0.7"
+    assert ASSET_BY_ARCH["amd64"] == "Xray-linux-64.zip"
+    assert ASSET_BY_ARCH["arm64"] == "Xray-linux-arm64-v8a.zip"
+    assets = [
+        {"id": 1, "name": "Xray-linux-32.zip"},
+        {"id": 2, "name": "Xray-linux-64.zip"},
+        {"id": 3, "name": "Xray-linux-arm64-v8a.zip"},
+    ]
+    assert pick_release_asset(assets, "Xray-linux-64.zip", prefix="Xray")["id"] == 2
+
+
+def test_install_xray_binary_from_release_zip(tmp_path, monkeypatch):
+    import zipfile
+
+    from agent.update import ReleaseInfo
     from agent.xray_release import install_xray_binary
 
     dest = tmp_path / "bin" / "xray"
-    src = tmp_path / "src"
-
-    monkeypatch.setattr("agent.xray_release._ensure_linux", lambda: None)
     monkeypatch.setattr(
-        "agent.xray_release.sync_xray_repo",
-        lambda source, repo=None, ref=None, token=None: {
-            "repo": "LordDeveloper/xray",
-            "ref": "main",
-            "src_dir": str(src),
-            "commit": "abc1234",
-            "action": "cloned",
-            "url": "https://github.com/LordDeveloper/xray",
-        },
+        "agent.xray_release.detect_host_platform",
+        lambda: type("H", (), {"arch": "amd64", "libc": "gnu"})(),
+    )
+    monkeypatch.setattr("agent.xray_release.detect_arch", lambda: "amd64")
+    monkeypatch.setattr(
+        "agent.xray_release.fetch_xray_release",
+        lambda **kwargs: ReleaseInfo(
+            tag="v1.0.7",
+            version="1.0.7",
+            asset_name="Xray-linux-64.zip",
+            asset_id=1,
+            asset_url="https://example.invalid/asset",
+            html_url="https://github.com/LordDeveloper/xray/releases/tag/v1.0.7",
+        ),
     )
 
-    def fake_build(source, output, go_bin=None):
-        output.write_bytes(b"customized xray httpapi /api/inbounds/list")
-        output.chmod(0o755)
-        return output
+    def fake_download(release, dest_path, token=None, timeout=300.0):
+        with zipfile.ZipFile(dest_path, "w") as zf:
+            zf.writestr("xray", b"customized xray httpapi /api/stats/sys")
+            zf.writestr("geoip.dat", b"geo")
+        return dest_path
 
-    monkeypatch.setattr("agent.xray_release.build_xray_binary", fake_build)
-    monkeypatch.setattr("agent.xray_release.ensure_xray_geodata", lambda: [])
+    monkeypatch.setattr("agent.xray_release.download_release_asset", fake_download)
+    monkeypatch.setattr("agent.xray_release.which", lambda cmd: None)
     monkeypatch.setattr(
         "agent.xray_release.run_cmd",
-        lambda *args, **kwargs: type("P", (), {"stdout": "Xray 1.0.0\n", "stderr": "", "returncode": 0})(),
+        lambda *args, **kwargs: type("P", (), {"stdout": "Xray 1.0.7\n", "stderr": "", "returncode": 0})(),
     )
-    monkeypatch.setattr("agent.xray_release.which", lambda cmd: None)
+    monkeypatch.setenv("XRAY_GEO_DIR", str(tmp_path / "geo"))
 
-    result = install_xray_binary(dest, token="secret")
+    result = install_xray_binary(dest, tag="v1.0.7")
     assert dest.is_file()
-    assert result["built_from_source"] is True
-    assert result["source"] == "git"
-    assert result["commit"] == "abc1234"
-    assert result["repo"] == "LordDeveloper/xray"
+    assert result["source"] == "release"
+    assert result["release_tag"] == "v1.0.7"
+    assert result["asset"] == "Xray-linux-64.zip"
+    assert (tmp_path / "geo" / "geoip.dat").is_file()
+
+
+def test_install_xray_custom_tag_forces_download(tmp_path, monkeypatch):
+    from agent.ops import install_xray
+
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"customized xray httpapi /api/inbounds/list")
+    monkeypatch.setenv("XRAY_BINARY", str(binary))
+    monkeypatch.setattr("agent.ops.which", lambda cmd: None)
+    monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
+    monkeypatch.setattr("agent.xray_service.stop_xray_service", lambda: None)
+
+    def fake_download(dest, token=None, tag=None):
+        dest.write_bytes(b"customized xray httpapi /api/stats/sys")
+        return {
+            "core": "xray",
+            "installed": True,
+            "downloaded": True,
+            "binary": str(dest),
+            "release_tag": tag,
+            "source": "release",
+        }
+
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
+    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
+    result = install_xray(tag="v1.0.7")
+    assert result["downloaded"] is True
+    assert result["release_tag"] == "v1.0.7"
 
 
 def test_wait_xray_http_api_rejects_bare_404(monkeypatch):

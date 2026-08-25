@@ -102,27 +102,37 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-install_xray_from_source() {
+install_xray_from_release() {
   local dest="${XRAY_BINARY:-/usr/local/bin/xray}"
+  local tag="${XRAY_GITHUB_TAG:-}"
 
   if command -v xray >/dev/null 2>&1 || [[ -x "$dest" ]]; then
     return 0
   fi
 
   if command -v agent >/dev/null 2>&1; then
-    if agent core install xray; then
+    if [[ -n "$tag" ]]; then
+      if agent xray install --tag "$tag"; then
+        return 0
+      fi
+    elif agent xray install; then
       return 0
     fi
   fi
 
-  echo "xray not found; run: agent core install xray (clones github.com/LordDeveloper/xray and builds)" >&2
+  echo "xray not found; run: agent xray install [--tag v1.0.7]" >&2
   local port="${LISTEN##*:}"
   local auth="${AUTH_TOKEN:-}"
   local gh="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  local body="{\"github_token\":\"${gh}\",\"force\":false"
+  if [[ -n "$tag" ]]; then
+    body="${body},\"tag\":\"${tag}\""
+  fi
+  body="${body}}"
   curl -fsSL -X POST \
     -H "Authorization: Bearer ${auth}" \
     -H "Content-Type: application/json" \
-    -d "{\"github_token\":\"${gh}\",\"force\":false}" \
+    -d "${body}" \
     "http://127.0.0.1:${port}/api/v1/cores/xray/install"
 }
 
@@ -130,7 +140,7 @@ install_core() {
   local core="$1"
   case "$core" in
     xray)
-      install_xray_from_source || true
+      install_xray_from_release || true
       ;;
     wireguard)
       DEBIAN_FRONTEND=noninteractive apt-get update -y

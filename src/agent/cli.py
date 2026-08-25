@@ -14,6 +14,7 @@ from agent.ops import (
     install_core,
     service_action,
     set_env_value,
+    which,
     write_env_file,
 )
 from agent.runtime import open_runtime
@@ -124,8 +125,60 @@ def cmd_core_list(args: argparse.Namespace) -> int:
 
 
 def cmd_core_install(args: argparse.Namespace) -> int:
-    result = install_core(args.name, force=bool(getattr(args, "force", False)))
+    tag = getattr(args, "tag", None)
+    result = install_core(
+        args.name,
+        force=bool(getattr(args, "force", False)),
+        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    )
     _print_json({"success": True, **result})
+    return 0
+
+
+def cmd_xray_install(args: argparse.Namespace) -> int:
+    tag = getattr(args, "tag", None)
+    result = install_core(
+        "xray",
+        force=bool(getattr(args, "force", False)) or bool(tag),
+        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    )
+    _print_json({"success": True, **result})
+    return 0
+
+
+def cmd_xray_update(args: argparse.Namespace) -> int:
+    tag = getattr(args, "tag", None)
+    result = install_core(
+        "xray",
+        force=True,
+        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    )
+    _print_json({"success": True, **result})
+    return 0
+
+
+def cmd_xray_status(_: argparse.Namespace) -> int:
+    from agent.xray_service import binary_has_httpapi
+
+    binary = Path(os.environ.get("XRAY_BINARY", "/usr/local/bin/xray"))
+    path = binary if binary.is_file() else Path(which("xray") or "")
+    payload: dict = {
+        "success": True,
+        "core": "xray",
+        "installed": path.is_file(),
+        "binary": str(path) if path.is_file() else None,
+        "httpapi_capable": bool(path.is_file() and binary_has_httpapi(path)),
+        "version": None,
+    }
+    if path.is_file():
+        try:
+            from agent.ops import run_cmd
+
+            proc = run_cmd([str(path), "version"], check=False, timeout=15)
+            payload["version"] = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or None
+        except OSError:
+            pass
+    _print_json(payload)
     return 0
 
 
@@ -393,7 +446,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-download even if a customized binary is already present",
     )
+    p_core_install.add_argument(
+        "--tag",
+        default=None,
+        help="Xray release tag (e.g. v1.0.7). Default: latest. Ignored for other cores.",
+    )
     p_core_install.set_defaults(func=cmd_core_install)
+
+    p_xray = sub.add_parser("xray", help="Install / update Xray from LordDeveloper/xray Releases")
+    xray_sub = p_xray.add_subparsers(dest="xray_command", required=True)
+
+    p_xray_install = xray_sub.add_parser("install", help="Install Xray release zip for this host")
+    p_xray_install.add_argument("--tag", default=None, help="Release tag (default: latest)")
+    p_xray_install.add_argument("--force", action="store_true", help="Re-download even if present")
+    p_xray_install.set_defaults(func=cmd_xray_install)
+
+    p_xray_update = xray_sub.add_parser("update", help="Force reinstall latest (or --tag) Xray release")
+    p_xray_update.add_argument("--tag", default=None, help="Release tag (default: latest)")
+    p_xray_update.set_defaults(func=cmd_xray_update)
+
+    p_xray_status = xray_sub.add_parser("status", help="Show installed Xray binary status")
+    p_xray_status.set_defaults(func=cmd_xray_status)
 
     p_service = sub.add_parser("service", help="Manage systemd service")
     p_service.add_argument(
