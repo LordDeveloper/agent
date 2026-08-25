@@ -50,6 +50,7 @@ class FakeXrayHttpClient:
         return {"status": "ok"}
 
     def edit_inbounds(self, inbounds: list[dict[str, Any]], *, preserve_clients: bool | None = None) -> dict[str, Any]:
+        summaries: list[dict[str, Any]] = []
         for inbound in inbounds:
             tag = inbound.get("tag")
             existing = next((i for i in self._inbounds if i.get("tag") == tag), None)
@@ -60,7 +61,12 @@ class FakeXrayHttpClient:
                     settings["clients"] = deepcopy((existing.get("settings") or {}).get("clients") or [])
             self._inbounds = [i for i in self._inbounds if i.get("tag") != tag]
             self._inbounds.append(row)
-        return {"status": "ok", "preserve_clients": bool(preserve_clients)}
+            clients = (row.get("settings") or {}).get("clients") or []
+            summaries.append({"tag": tag, "clients_count": len(clients)})
+        result: dict[str, Any] = {"status": "ok", "preserve_clients": bool(preserve_clients)}
+        if preserve_clients:
+            result["inbounds"] = summaries
+        return result
 
     def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
         tagset = set(tags)

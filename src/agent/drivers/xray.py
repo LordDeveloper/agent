@@ -464,6 +464,33 @@ class XrayDriver(CoreDriver):
     def _wire_inbound(self, inbound: dict[str, Any]) -> dict[str, Any]:
         payload = deepcopy(inbound)
         payload.pop("id", None)
+        for key in (
+            "format",
+            "remark",
+            "is_enabled",
+            "enable",
+            "expiryTime",
+            "expires_at",
+            "total",
+            "up",
+            "down",
+            "incoming",
+            "outgoing",
+            "skip_template",
+            "clientMethod",
+            "share",
+            "acceptProxyProtocol",
+            "extra",
+            "preserve_clients",
+            "reset_clients",
+        ):
+            payload.pop(key, None)
+
+        stream = payload.get("streamSettings")
+        if isinstance(stream, dict):
+            # Panel-only share hosts; Xray streamConfig rejects this key.
+            stream.pop("domainSettings", None)
+
         settings = payload.setdefault("settings", {})
         native = self._wire_clients(payload)
         settings["clients"] = native
@@ -643,13 +670,16 @@ class XrayDriver(CoreDriver):
         clients: list[dict[str, Any]],
         *,
         mode: str = "upsert",
+        atomic: bool = False,
     ) -> dict[str, Any]:
         mode_key = str(mode or "upsert").strip().lower()
+        if mode_key == "edit":
+            mode_key = "update"
         if mode_key not in {"upsert", "add", "update"}:
-            raise AgentError("VALIDATION_ERROR", "mode must be upsert|add|update", 422)
+            raise AgentError("VALIDATION_ERROR", "mode must be upsert|add|edit|update", 422)
         if len(clients) > _CLIENT_BATCH_MAX:
             raise AgentError(
-                "VALIDATION_ERROR",
+                "PAYLOAD_TOO_LARGE",
                 f"client batch limit is {_CLIENT_BATCH_MAX} per request",
                 413,
             )
@@ -743,6 +773,7 @@ class XrayDriver(CoreDriver):
                             rows,
                             protocol=protocol,
                             inbound_settings=inbound.get("settings"),
+                            atomic=atomic,
                         )
                     elif op == "upsert":
                         result = self._api().upsert_users(
@@ -750,6 +781,7 @@ class XrayDriver(CoreDriver):
                             rows,
                             protocol=protocol,
                             inbound_settings=inbound.get("settings"),
+                            atomic=atomic,
                         )
                     else:
                         result = self._api().edit_users(
@@ -757,6 +789,7 @@ class XrayDriver(CoreDriver):
                             rows,
                             protocol=protocol,
                             inbound_settings=inbound.get("settings"),
+                            atomic=atomic,
                         )
                     if isinstance(result, dict) and ("failed" in result or "errors" in result):
                         batch_ok = int(result.get("succeeded") or 0)
@@ -803,6 +836,7 @@ class XrayDriver(CoreDriver):
                                     [row],
                                     protocol=protocol,
                                     inbound_settings=inbound.get("settings"),
+                                    atomic=False,
                                 )
                             elif op == "upsert":
                                 self._api().upsert_users(
@@ -810,6 +844,7 @@ class XrayDriver(CoreDriver):
                                     [row],
                                     protocol=protocol,
                                     inbound_settings=inbound.get("settings"),
+                                    atomic=False,
                                 )
                             else:
                                 self._api().edit_users(
@@ -817,6 +852,7 @@ class XrayDriver(CoreDriver):
                                     [row],
                                     protocol=protocol,
                                     inbound_settings=inbound.get("settings"),
+                                    atomic=False,
                                 )
                             succeeded += 1
                             applied.append(client)
@@ -870,7 +906,7 @@ class XrayDriver(CoreDriver):
             raise AgentError("VALIDATION_ERROR", "emails or ids required", 422)
         if len(email_keys) + len(id_keys) > _CLIENT_BATCH_MAX:
             raise AgentError(
-                "VALIDATION_ERROR",
+                "PAYLOAD_TOO_LARGE",
                 f"client batch limit is {_CLIENT_BATCH_MAX} per request",
                 413,
             )

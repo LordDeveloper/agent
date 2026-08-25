@@ -60,15 +60,25 @@ class XrayHttpClient:
             raise AgentError("INVALID_CREDENTIALS", "Xray HTTP API unauthorized", 401)
 
         if response.status_code >= 400:
+            code_hint = ""
             try:
                 body = response.json()
                 message = str(body.get("error") or body.get("message") or body)
+                code_hint = str(body.get("code") or "").strip().lower()
             except Exception:
                 message = response.text or "unknown"
+            detail = f"Xray HTTP API error ({response.status_code}): {message}"
+            # Bare Go mux 404s mean the custom HTTP API routes are missing (stock Xray).
+            if response.status_code == 404 or "page not found" in message.lower():
+                raise AgentError("CONFIG_NOT_FOUND", detail, 404)
+            if response.status_code in {401, 403}:
+                raise AgentError("INVALID_CREDENTIALS", detail, response.status_code)
+            if response.status_code == 413 or code_hint == "payload_too_large":
+                raise AgentError("PAYLOAD_TOO_LARGE", detail, 413)
             raise AgentError(
                 "VALIDATION_ERROR",
-                f"Xray HTTP API error ({response.status_code}): {message}",
-                response.status_code,
+                detail,
+                response.status_code if response.status_code >= 400 else 422,
             )
 
         if not response.content:
@@ -282,15 +292,21 @@ class XrayHttpClient:
         )
 
     def edit_rule(self, rule: dict[str, Any]) -> dict[str, Any]:
-        return self.post("/api/rules/edit", {"routing": {"rules": [rule]}})
+        rule_tag = str(rule.get("ruleTag") or rule.get("tag") or "").strip()
+        payload: dict[str, Any] = {"rule": rule}
+        if rule_tag:
+            payload["rule_tag"] = rule_tag
+        return self.post("/api/rules/edit", payload)
 
     def remove_rules(self, tags: list[str]) -> dict[str, Any]:
-        return self.post("/api/rules/remove", {"tags": tags})
+        # HTTPAPI accepts rule_tags / ruleTags / tags.
+        return self.post("/api/rules/remove", {"rule_tags": tags, "ruleTags": tags, "tags": tags})
 
     def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
-        """Prefer native Xray replace when available; caller may fall back to config write."""
+        """Atomically replace routing.rules. Omit balancers to keep existing ones."""
         body: dict[str, Any] = {"rules": rules}
         body.update({k: v for k, v in routing_extras.items() if v is not None})
+        # Never wipe balancers accidentally — only send when caller provides them.
         return self.post("/api/rules/replace", body)
 
     def block_source_ips(

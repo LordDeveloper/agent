@@ -155,3 +155,37 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
     assert result["downloaded"] is True
     assert result["replaced_stock"] is True
     assert result["httpapi_capable"] is True
+
+
+def test_wait_xray_http_api_rejects_bare_404(monkeypatch):
+    from agent.xray_service import wait_xray_http_api
+
+    class _Resp:
+        status_code = 404
+        text = "404 page not found"
+
+    monkeypatch.setattr("httpx.get", lambda *args, **kwargs: _Resp())
+
+    try:
+        wait_xray_http_api(api_base="http://127.0.0.1:9", attempts=1, delay=0)
+        assert False, "expected AgentError"
+    except AgentError as exc:
+        assert exc.code == "CONFIG_NOT_FOUND"
+        assert "404" in exc.message
+
+
+def test_xray_http_maps_404_to_config_not_found():
+    from agent.config import XraySettings
+    from agent.drivers.xray_http import XrayHttpClient
+    import httpx
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(404, text="404 page not found"))
+    client = XrayHttpClient(XraySettings(api_base="http://test"), transport=transport)
+    try:
+        client.list_inbounds()
+        assert False, "expected AgentError"
+    except AgentError as exc:
+        assert exc.code == "CONFIG_NOT_FOUND"
+        assert "404" in exc.message
+    finally:
+        client.close()

@@ -67,7 +67,7 @@ paths:
   /cores/xray/inbounds/{id}/clients:
     post: { summary: Add/update client }
   /cores/xray/inbounds/{id}/clients/batch:
-    post: { summary: Bulk upsert/add/update clients (max 200) }
+    post: { summary: Bulk upsert/add/edit/update clients (max 200; partial success; optional atomic) }
     delete: { summary: Bulk remove clients by email/id }
   /cores/xray/inbounds/{id}/clients/{key}:
     put: { summary: Update client }

@@ -182,9 +182,11 @@ def wait_xray_http_api(
     for _ in range(max(1, attempts)):
         try:
             response = httpx.get(url, auth=auth, timeout=3.0)
-            if response.status_code < 500:
+            # Only 2xx means the customized HTTP API is actually serving routes.
+            # Stock Xray / wrong port often answers bare "404 page not found".
+            if 200 <= response.status_code < 300:
                 return
-            last_error = f"HTTP {response.status_code}"
+            last_error = f"HTTP {response.status_code}: {(response.text or '').strip()[:120] or 'empty'}"
         except httpx.HTTPError as exc:
             last_error = str(exc)
         time.sleep(delay)

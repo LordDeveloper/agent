@@ -42,7 +42,11 @@ def xray_status(xray: XrayDriver = Depends(get_xray)):
 
 @router.get("/inbounds")
 def list_inbounds(xray: XrayDriver = Depends(get_xray)):
-    return {"success": True, "inbounds": xray.list_inbounds()}
+    try:
+        inbounds = xray.list_inbounds()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "inbounds": inbounds}
 
 
 @router.get("/inbounds/{inbound_id}")
@@ -121,8 +125,14 @@ def batch_clients(inbound_id: str, body: dict[str, Any], xray: XrayDriver = Depe
     if not isinstance(clients, list):
         raise_agent_error("VALIDATION_ERROR", "clients must be a list", 422)
     mode = str(body.get("mode") or "upsert")
+    atomic = bool(body.get("atomic", False))
     try:
-        result = xray.batch_clients(inbound_id, [row for row in clients if isinstance(row, dict)], mode=mode)
+        result = xray.batch_clients(
+            inbound_id,
+            [row for row in clients if isinstance(row, dict)],
+            mode=mode,
+            atomic=atomic,
+        )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **result}

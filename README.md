@@ -148,6 +148,18 @@ sudo bash /tmp/uninstall.sh
 `agent_core`: `xray` | `wireguard` | `amnezia`.  
 NetinjaBot `NodeApi` maps bot manager calls to the correct agent paths (for WG: `interfaces`/`peers`).
 
+## Xray provision (format / clients / routing)
+
+Requires customized Xray HTTP API **v1.0.2+** (`LordDeveloper/xray`). Agent never sends thousands of clients in a format update.
+
+Recommended three-step flow (panel / bot):
+
+1. **Format** — `PUT /api/v1/cores/xray/inbounds/{id}` or `POST .../refresh` with `preserve_clients=true` (default). Clients are omitted; Xray keeps them.
+2. **Users** — `POST .../inbounds/{id}/clients/batch` with `mode=upsert|add|edit|update`, chunks of **100–200** (hard max **200** → HTTP **413**). Partial success: `succeeded` / `failed` / `errors[]`.
+3. **Routing** — `PUT /api/v1/cores/xray/routing/rules` once (Agent → Xray `POST /api/rules/replace`). Do not loop remove+add.
+
+`XRAY_TIMEOUT` defaults to **45s** per Xray HTTP call (keep each step under reverse-proxy 60s limits).
+
 ## Flat `.env`
 
 ```env
@@ -159,6 +171,7 @@ LOG_FILE=/var/lib/agent/agent.log
 LOG_LEVEL=INFO
 XRAY_API_BASE=http://127.0.0.1:8080
 XRAY_BINARY=/usr/local/bin/xray
+XRAY_TIMEOUT=45
 WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
 AGENT_GITHUB_REPO=LordDeveloper/agent

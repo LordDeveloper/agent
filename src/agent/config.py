@@ -15,7 +15,8 @@ class XraySettings(BaseModel):
     password: str = ""
     binary: str = "/usr/local/bin/xray"
     config: str = "/usr/local/etc/xray/config.json"
-    timeout: float = 15.0
+    # Per-step timeout (format / batch / rules replace). Keep under proxy 60s budgets.
+    timeout: float = 45.0
     connect_timeout: float = 3.0
 
 
@@ -64,6 +65,8 @@ class AgentSettings(BaseSettings):
     xray_password: str = ""
     xray_binary: str = "/usr/local/bin/xray"
     xray_config: str = "/usr/local/etc/xray/config.json"
+    xray_timeout: float = 45.0
+    xray_connect_timeout: float = 3.0
 
     wireguard_config_dir: str = "/etc/wireguard"
     amnezia_config_dir: str = "/etc/amneziawg"
@@ -76,6 +79,8 @@ class AgentSettings(BaseSettings):
             password=self.xray_password,
             binary=self.xray_binary,
             config=self.xray_config,
+            timeout=float(self.xray_timeout),
+            connect_timeout=float(self.xray_connect_timeout),
         )
 
     @property

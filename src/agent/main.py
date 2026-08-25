@@ -136,6 +136,16 @@ def create_app(env_file: str | None = None) -> FastAPI:
     for core_key, slug in ROUTE_SLUGS.items():
         _register_public_core_health(core_key, slug)
 
+    @app.exception_handler(AgentError)
+    async def agent_error_handler(request: Request, exc: AgentError):
+        from agent.errors import ERROR_MAP, error_body
+
+        status = int(exc.status or ERROR_MAP.get(exc.code, 400) or 400)
+        return JSONResponse(
+            status_code=status,
+            content=error_body(exc.code, exc.message),
+        )
+
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         if isinstance(exc, HTTPException):
