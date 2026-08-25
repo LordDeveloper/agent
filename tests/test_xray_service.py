@@ -121,16 +121,16 @@ def test_install_xray_skips_customized_binary(tmp_path, monkeypatch):
     monkeypatch.setenv("XRAY_BINARY", str(binary))
     monkeypatch.setenv("XRAY_API_BASE", "http://127.0.0.1:8080")
 
-    called = {"download": False}
+    called = {"build": False}
 
-    def fake_download(dest, token=None):
-        called["download"] = True
+    def fake_build(dest, token=None):
+        called["build"] = True
         return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
 
-    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_build)
     monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
     result = install_xray()
-    assert called["download"] is False
+    assert called["build"] is False
     assert result["downloaded"] is False
     assert result["httpapi_capable"] is True
 
@@ -145,16 +145,63 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
     monkeypatch.setattr("agent.xray_service.systemctl", lambda *args, **kwargs: {"ok": True})
 
-    def fake_download(dest, token=None):
+    def fake_build(dest, token=None):
         dest.write_bytes(b"customized xray httpapi /api/stats/sys")
-        return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
+        return {
+            "core": "xray",
+            "installed": True,
+            "downloaded": True,
+            "built_from_source": True,
+            "binary": str(dest),
+            "source": "git",
+        }
 
-    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
+    monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_build)
     monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
     result = install_xray()
     assert result["downloaded"] is True
     assert result["replaced_stock"] is True
     assert result["httpapi_capable"] is True
+
+
+def test_install_xray_binary_builds_from_git(tmp_path, monkeypatch):
+    from agent.xray_release import install_xray_binary
+
+    dest = tmp_path / "bin" / "xray"
+    src = tmp_path / "src"
+
+    monkeypatch.setattr("agent.xray_release._ensure_linux", lambda: None)
+    monkeypatch.setattr(
+        "agent.xray_release.sync_xray_repo",
+        lambda source, repo=None, ref=None, token=None: {
+            "repo": "LordDeveloper/xray",
+            "ref": "main",
+            "src_dir": str(src),
+            "commit": "abc1234",
+            "action": "cloned",
+            "url": "https://github.com/LordDeveloper/xray",
+        },
+    )
+
+    def fake_build(source, output, go_bin=None):
+        output.write_bytes(b"customized xray httpapi /api/inbounds/list")
+        output.chmod(0o755)
+        return output
+
+    monkeypatch.setattr("agent.xray_release.build_xray_binary", fake_build)
+    monkeypatch.setattr("agent.xray_release.ensure_xray_geodata", lambda: [])
+    monkeypatch.setattr(
+        "agent.xray_release.run_cmd",
+        lambda *args, **kwargs: type("P", (), {"stdout": "Xray 1.0.0\n", "stderr": "", "returncode": 0})(),
+    )
+    monkeypatch.setattr("agent.xray_release.which", lambda cmd: None)
+
+    result = install_xray_binary(dest, token="secret")
+    assert dest.is_file()
+    assert result["built_from_source"] is True
+    assert result["source"] == "git"
+    assert result["commit"] == "abc1234"
+    assert result["repo"] == "LordDeveloper/xray"
 
 
 def test_wait_xray_http_api_rejects_bare_404(monkeypatch):

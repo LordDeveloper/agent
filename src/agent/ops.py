@@ -15,8 +15,23 @@ def which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
 
-def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=check, capture_output=True, text=True, timeout=300)
+def run_cmd(
+    args: list[str],
+    check: bool = True,
+    *,
+    timeout: float = 300,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        check=check,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=cwd,
+        env=env,
+    )
 
 
 def _prepare_xray_service(result: dict) -> dict:
@@ -35,8 +50,8 @@ def _prepare_xray_service(result: dict) -> dict:
 
 def install_xray(*, github_token: str | None = None, force: bool = False) -> dict:
     """
-    Install customized Xray binary from agent GitHub Releases (bundled xray asset),
-    falling back to LordDeveloper/xray when needed.
+    Install customized Xray by cloning LordDeveloper/xray and building on this host.
+    Does not use GitHub Releases / Actions artifacts.
     """
     from agent.xray_release import install_xray_binary
     from agent.xray_service import binary_has_httpapi, stop_xray_service
@@ -76,9 +91,9 @@ def install_xray(*, github_token: str | None = None, force: bool = False) -> dic
     if dest.is_file() and not result["httpapi_capable"]:
         raise AgentError(
             "UNSUPPORTED_CAPABILITY",
-            "Downloaded Xray binary still has no HTTP API. "
-            "Confirm agent release includes xray-linux-* or set XRAY_GITHUB_REPO=LordDeveloper/xray "
-            "with GITHUB_TOKEN that can read that private repo.",
+            "Built Xray binary still has no HTTP API. "
+            "Confirm LordDeveloper/xray source includes the HTTP API fork, "
+            "and GITHUB_TOKEN can clone that private repo.",
         )
     result = _prepare_xray_service(result)
     if result.get("downloaded") or force:
