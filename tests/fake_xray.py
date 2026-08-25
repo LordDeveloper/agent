@@ -15,6 +15,7 @@ class FakeXrayHttpClient:
             {"protocol": "blackhole", "tag": "blocked"},
         ]
         self._rules: list[dict[str, Any]] = []
+        self._routing_extras: dict[str, Any] = {}
         self._online: list[str] = []
         self._ips: dict[str, list[str]] = {}
         self._user_traffic: dict[str, dict[str, int]] = {}
@@ -48,8 +49,18 @@ class FakeXrayHttpClient:
             self._inbounds.append(deepcopy(inbound))
         return {"status": "ok"}
 
-    def edit_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.add_inbounds(inbounds)
+    def edit_inbounds(self, inbounds: list[dict[str, Any]], *, preserve_clients: bool | None = None) -> dict[str, Any]:
+        for inbound in inbounds:
+            tag = inbound.get("tag")
+            existing = next((i for i in self._inbounds if i.get("tag") == tag), None)
+            row = deepcopy(inbound)
+            if preserve_clients and existing is not None:
+                settings = row.setdefault("settings", {})
+                if "clients" not in settings and "users" not in settings:
+                    settings["clients"] = deepcopy((existing.get("settings") or {}).get("clients") or [])
+            self._inbounds = [i for i in self._inbounds if i.get("tag") != tag]
+            self._inbounds.append(row)
+        return {"status": "ok", "preserve_clients": bool(preserve_clients)}
 
     def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
         tagset = set(tags)
@@ -60,7 +71,7 @@ class FakeXrayHttpClient:
         for inbound in self._inbounds:
             if inbound.get("tag") == tag:
                 inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
-                return {"added_users": len(clients)}
+                return {"succeeded": len(clients), "failed": 0, "added_users": len(clients)}
         raise RuntimeError(f"inbound {tag} missing")
 
     def edit_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
@@ -75,17 +86,20 @@ class FakeXrayHttpClient:
                     existing[by_email[email]] = deepcopy(client)
                 else:
                     existing.append(deepcopy(client))
-            return {"updated_users": len(clients)}
+            return {"succeeded": len(clients), "failed": 0, "updated_users": len(clients)}
         raise RuntimeError(f"inbound {tag} missing")
 
-    def remove_users(self, tag: str, emails: list[str]) -> dict[str, Any]:
+    def upsert_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        return self.edit_users(tag, clients, **kwargs)
+
+    def remove_users(self, tag: str, emails: list[str], **kwargs: Any) -> dict[str, Any]:
         email_set = set(emails)
         for inbound in self._inbounds:
             if inbound.get("tag") != tag:
                 continue
             clients = inbound.setdefault("settings", {}).setdefault("clients", [])
             inbound["settings"]["clients"] = [c for c in clients if str(c.get("email")) not in email_set]
-            return {"removed_users": len(emails)}
+            return {"succeeded": len(emails), "failed": 0, "removed_users": len(emails)}
         raise RuntimeError(f"inbound {tag} missing")
 
     def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
@@ -138,6 +152,11 @@ class FakeXrayHttpClient:
         tagset = set(tags)
         self._rules = [row for row in self._rules if row.get("tag") not in tagset]
         return {"removed": len(tags)}
+
+    def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
+        self._rules = deepcopy(rules)
+        self._routing_extras = {k: v for k, v in routing_extras.items() if v is not None}
+        return {"replaced": len(rules), **self._routing_extras}
 
     def block_source_ips(self, source_ips: list[str], **kwargs) -> dict[str, Any]:
         return {"blocked": source_ips}

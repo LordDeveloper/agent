@@ -163,8 +163,16 @@ class XrayHttpClient:
     def add_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
         return self.post("/api/inbounds/add", {"inbounds": inbounds})
 
-    def edit_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post("/api/inbounds/edit", {"inbounds": inbounds})
+    def edit_inbounds(
+        self,
+        inbounds: list[dict[str, Any]],
+        *,
+        preserve_clients: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"inbounds": inbounds}
+        if preserve_clients is not None:
+            payload["preserve_clients"] = bool(preserve_clients)
+        return self.post("/api/inbounds/edit", payload)
 
     def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
         return self.post("/api/inbounds/remove", {"tags": tags})
@@ -176,6 +184,7 @@ class XrayHttpClient:
         *,
         protocol: str | None = None,
         inbound_settings: dict[str, Any] | None = None,
+        atomic: bool = False,
     ) -> dict[str, Any]:
         from agent.support import xray_users_settings
 
@@ -185,7 +194,10 @@ class XrayHttpClient:
         }
         if protocol:
             inbound["protocol"] = protocol
-        return self.post("/api/inbounds/users/add", {"inbounds": [inbound]})
+        payload: dict[str, Any] = {"inbounds": [inbound]}
+        if atomic:
+            payload["atomic"] = True
+        return self.post("/api/inbounds/users/add", payload)
 
     def edit_users(
         self,
@@ -194,6 +206,7 @@ class XrayHttpClient:
         *,
         protocol: str | None = None,
         inbound_settings: dict[str, Any] | None = None,
+        atomic: bool = False,
     ) -> dict[str, Any]:
         from agent.support import xray_users_settings
 
@@ -203,10 +216,38 @@ class XrayHttpClient:
         }
         if protocol:
             inbound["protocol"] = protocol
-        return self.post("/api/inbounds/users/edit", {"inbounds": [inbound]})
+        payload: dict[str, Any] = {"inbounds": [inbound]}
+        if atomic:
+            payload["atomic"] = True
+        return self.post("/api/inbounds/users/edit", payload)
 
-    def remove_users(self, tag: str, emails: list[str]) -> dict[str, Any]:
-        return self.post("/api/inbounds/users/remove", {"tag": tag, "emails": emails})
+    def upsert_users(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+        *,
+        protocol: str | None = None,
+        inbound_settings: dict[str, Any] | None = None,
+        atomic: bool = False,
+    ) -> dict[str, Any]:
+        from agent.support import xray_users_settings
+
+        inbound: dict[str, Any] = {
+            "tag": tag,
+            "settings": xray_users_settings(protocol or "vless", inbound_settings, clients),
+        }
+        if protocol:
+            inbound["protocol"] = protocol
+        payload: dict[str, Any] = {"inbounds": [inbound]}
+        if atomic:
+            payload["atomic"] = True
+        return self.post("/api/inbounds/users/upsert", payload)
+
+    def remove_users(self, tag: str, emails: list[str], *, atomic: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {"tag": tag, "emails": emails}
+        if atomic:
+            payload["atomic"] = True
+        return self.post("/api/inbounds/users/remove", payload)
 
     def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"tag": tag}
@@ -245,6 +286,12 @@ class XrayHttpClient:
 
     def remove_rules(self, tags: list[str]) -> dict[str, Any]:
         return self.post("/api/rules/remove", {"tags": tags})
+
+    def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
+        """Prefer native Xray replace when available; caller may fall back to config write."""
+        body: dict[str, Any] = {"rules": rules}
+        body.update({k: v for k, v in routing_extras.items() if v is not None})
+        return self.post("/api/rules/replace", body)
 
     def block_source_ips(
         self,

@@ -57,12 +57,18 @@ paths:
     post: { summary: Create inbound (full JSON from bot) }
   /cores/xray/inbounds/{id}:
     get: { summary: Get inbound }
-    put: { summary: Update inbound }
+    put: { summary: Update inbound (preserve_clients default true) }
+    patch: { summary: Patch inbound settings without rewriting clients }
     delete: { summary: Delete inbound }
+  /cores/xray/inbounds/{id}/settings:
+    put: { summary: Patch inbound settings (alias; preserve clients) }
   /cores/xray/inbounds/{id}/refresh:
-    post: { summary: Rebuild inbound (protocol switch) }
+    post: { summary: Rebuild inbound protocol/stream (preserves clients unless reset_clients) }
   /cores/xray/inbounds/{id}/clients:
     post: { summary: Add/update client }
+  /cores/xray/inbounds/{id}/clients/batch:
+    post: { summary: Bulk upsert/add/update clients (max 200) }
+    delete: { summary: Bulk remove clients by email/id }
   /cores/xray/inbounds/{id}/clients/{key}:
     put: { summary: Update client }
     delete: { summary: Delete client }
@@ -79,6 +85,10 @@ paths:
     get: { summary: List routing rules }
     post: { summary: Add rules }
     delete: { summary: Remove rules }
+  /cores/xray/routing/rules:
+    put: { summary: Atomically replace routing.rules }
+  /cores/xray/routing/rules/upsert:
+    post: { summary: Remove rule tags then add rules in one call }
   /cores/xray/sourceip/block:
     post: { summary: Block source IPs }
   /cores/xray/config/import:

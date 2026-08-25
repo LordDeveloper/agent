@@ -34,6 +34,8 @@ class CoreInfo(BaseModel):
 
 
 class InboundPayload(BaseModel):
+    model_config = {"extra": "allow"}
+
     id: Optional[int | str] = None
     tag: Optional[str] = None
     listen: str = "0.0.0.0"
@@ -42,6 +44,9 @@ class InboundPayload(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
     streamSettings: dict[str, Any] = Field(default_factory=dict)
     sniffing: dict[str, Any] = Field(default_factory=dict)
+    allocate: Optional[dict[str, Any]] = None
+    preserve_clients: Optional[bool] = True
+    reset_clients: Optional[bool] = False
     # Deprecated: formats live on the API client; ignored if sent.
     format: Optional[str] = None
 

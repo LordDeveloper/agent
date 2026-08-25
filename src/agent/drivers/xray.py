@@ -4,9 +4,11 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable
 
 from agent.audit import AuditLog
@@ -35,6 +37,7 @@ from agent.xray_service import api_base_from_config, xray_auth_from_config
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
+_CLIENT_BATCH_MAX = 200
 
 
 class XrayDriver(CoreDriver):
@@ -59,6 +62,8 @@ class XrayDriver(CoreDriver):
         self._client_override = client
         self._client: XrayHttpClient | None = None
         self._client_key: tuple[str, str, str] | None = None
+        self._inbound_locks: dict[str, Lock] = {}
+        self._inbound_locks_guard = Lock()
 
     def _resolved_xray_settings(self) -> XraySettings:
         base = self.settings.xray
@@ -182,6 +187,9 @@ class XrayDriver(CoreDriver):
             "x25519",
             "source_ip_block",
             "routing_rules",
+            "routing_replace",
+            "clients_batch",
+            "inbound_preserve_clients",
             "outbounds",
             "xray_console",
             "xray_logs",
@@ -299,24 +307,40 @@ class XrayDriver(CoreDriver):
         inbounds.append(inbound)
 
     def _merge_client_in_config(self, config: dict[str, Any], tag: str, client: dict[str, Any]) -> None:
+        self._merge_clients_in_config(config, tag, [client])
+
+    def _merge_clients_in_config(self, config: dict[str, Any], tag: str, clients: list[dict[str, Any]]) -> None:
         for row in config.setdefault("inbounds", []):
             if str(row.get("tag")) != tag:
                 continue
             settings = row.setdefault("settings", {})
-            clients = list(settings.get("clients") or settings.get("users") or [])
-            replaced = False
-            for idx, current in enumerate(clients):
-                if str(current.get("id")) == str(client.get("id")) or str(current.get("email")) == str(
-                    client.get("email")
-                ):
-                    clients[idx] = client
-                    replaced = True
-                    break
-            if not replaced:
-                clients.append(client)
-            settings["clients"] = clients
+            existing = list(settings.get("clients") or settings.get("users") or [])
+            by_key: dict[str, int] = {}
+            for idx, current in enumerate(existing):
+                email = str(current.get("email") or "").strip()
+                cid = str(current.get("id") or "").strip()
+                if email:
+                    by_key[f"e:{email}"] = idx
+                if cid:
+                    by_key[f"i:{cid}"] = idx
+            for client in clients:
+                email = str(client.get("email") or "").strip()
+                cid = str(client.get("id") or "").strip()
+                idx = by_key.get(f"e:{email}") if email else None
+                if idx is None and cid:
+                    idx = by_key.get(f"i:{cid}")
+                if idx is None:
+                    existing.append(client)
+                    idx = len(existing) - 1
+                else:
+                    existing[idx] = client
+                if email:
+                    by_key[f"e:{email}"] = idx
+                if cid:
+                    by_key[f"i:{cid}"] = idx
+            settings["clients"] = existing
             if str(row.get("protocol") or "").lower() == "vless":
-                settings["users"] = clients
+                settings["users"] = existing
                 settings.setdefault("decryption", "none")
             if str(row.get("protocol") or "").lower() in {"shadowsocks", "ss"}:
                 method = str(settings.get("method") or "").strip()
@@ -331,6 +355,105 @@ class XrayDriver(CoreDriver):
 
     def _protocol_of(self, inbound: dict[str, Any]) -> str:
         return str(inbound.get("protocol") or "vless").strip().lower()
+
+    def _inbound_lock(self, tag: str) -> Lock:
+        with self._inbound_locks_guard:
+            lock = self._inbound_locks.get(tag)
+            if lock is None:
+                lock = Lock()
+                self._inbound_locks[tag] = lock
+            return lock
+
+    @staticmethod
+    def _clients_of(inbound: dict[str, Any]) -> list[dict[str, Any]]:
+        settings = inbound.get("settings") or {}
+        rows = settings.get("clients") or settings.get("users") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    @classmethod
+    def _clients_count(cls, inbound: dict[str, Any]) -> int:
+        return len(cls._clients_of(inbound))
+
+    def _inbound_summary(self, inbound: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": inbound.get("id"),
+            "tag": inbound.get("tag"),
+            "port": inbound.get("port"),
+            "protocol": inbound.get("protocol"),
+            "clients_count": self._clients_count(inbound),
+        }
+
+    @staticmethod
+    def _strip_client_lists(settings: dict[str, Any] | None) -> dict[str, Any]:
+        cleaned = dict(settings or {})
+        cleaned.pop("clients", None)
+        cleaned.pop("users", None)
+        return cleaned
+
+    def _apply_inbound_patch(
+        self,
+        existing: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        preserve_clients: bool,
+        reset_clients: bool = False,
+    ) -> dict[str, Any]:
+        """Merge inbound fields; keep existing clients unless explicitly replaced/reset."""
+        inbound = deepcopy(existing)
+        for key, value in payload.items():
+            if key in {"id", "tag", "format", "preserve_clients", "reset_clients", "clients"}:
+                continue
+            if key == "settings" and isinstance(value, dict):
+                continue
+            inbound[key] = deepcopy(value)
+
+        inbound["id"] = existing.get("id")
+        inbound["tag"] = existing.get("tag") or inbound.get("tag")
+        inbound.setdefault("listen", existing.get("listen", "0.0.0.0"))
+        inbound.setdefault("streamSettings", existing.get("streamSettings") or {})
+        inbound.setdefault("sniffing", existing.get("sniffing") or {})
+
+        existing_clients = self._clients_of(existing)
+        incoming_settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else None
+        settings = deepcopy(inbound.get("settings") or {})
+        if incoming_settings is not None:
+            settings.update(self._strip_client_lists(incoming_settings))
+            if reset_clients:
+                settings["clients"] = [
+                    normalize_xray_client(c) for c in (incoming_settings.get("clients") or incoming_settings.get("users") or [])
+                ]
+            elif "clients" in incoming_settings or "users" in incoming_settings:
+                if preserve_clients:
+                    settings["clients"] = [normalize_xray_client(c) for c in existing_clients]
+                else:
+                    settings["clients"] = [
+                        normalize_xray_client(c)
+                        for c in (incoming_settings.get("clients") or incoming_settings.get("users") or [])
+                    ]
+            elif preserve_clients:
+                settings["clients"] = [normalize_xray_client(c) for c in existing_clients]
+        elif preserve_clients or not reset_clients:
+            settings["clients"] = [normalize_xray_client(c) for c in existing_clients]
+        inbound["settings"] = settings
+        return inbound
+
+    def _edit_inbound_preserving(self, inbound: dict[str, Any], *, preserve_clients: bool) -> None:
+        api_payload = self._wire_inbound(inbound)
+        self._validate_config_mutation(
+            lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
+            inbound=api_payload,
+        )
+        if preserve_clients:
+            # Xray-core preserve_clients merges runtime/disk users; omit client lists so
+            # format updates stay fast even with thousands of clients.
+            slim = deepcopy(api_payload)
+            settings = dict(slim.get("settings") or {})
+            settings.pop("clients", None)
+            settings.pop("users", None)
+            slim["settings"] = settings
+            self._api().edit_inbounds([slim], preserve_clients=True)
+            return
+        self._api().edit_inbounds([api_payload], preserve_clients=False)
 
     def _wire_clients(self, inbound: dict[str, Any], clients: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         protocol = self._protocol_of(inbound)
@@ -388,7 +511,11 @@ class XrayDriver(CoreDriver):
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound_id}] not found", 404)
 
     def create_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
-        payload = {k: v for k, v in payload.items() if k != "format"}
+        payload = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"format", "preserve_clients", "reset_clients"}
+        }
         if not payload.get("protocol"):
             raise AgentError("VALIDATION_ERROR", "protocol is required; send full inbound config from the client")
         if not payload.get("port"):
@@ -424,49 +551,58 @@ class XrayDriver(CoreDriver):
         return self.get_inbound(inbound_id)
 
     def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        inbound = self.get_inbound(inbound_id)
-        payload = {k: v for k, v in payload.items() if k not in ("id", "tag", "format")}
-        inbound.update(payload)
-        if "settings" in payload and isinstance(payload["settings"], dict):
-            clients = payload["settings"].get("clients")
-            if clients is not None:
-                inbound["settings"]["clients"] = [normalize_xray_client(c) for c in clients]
-        api_payload = self._wire_inbound(inbound)
-        self._validate_config_mutation(
-            lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
-            inbound=api_payload,
-        )
-        self._api().edit_inbounds([api_payload])
-        self.audit.record("update", f"xray/inbound/{inbound_id}")
-        return self.get_inbound(inbound_id)
+        existing = self.get_inbound(inbound_id)
+        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
+        preserve_clients = bool(payload.get("preserve_clients", True))
+        reset_clients = bool(payload.get("reset_clients", False))
+        if reset_clients:
+            preserve_clients = False
+
+        with self._inbound_lock(tag):
+            existing = self.get_inbound(inbound_id)
+            inbound = self._apply_inbound_patch(
+                existing,
+                payload,
+                preserve_clients=preserve_clients,
+                reset_clients=reset_clients,
+            )
+            self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
+            self.audit.record("update", f"xray/inbound/{inbound_id}")
+            return self.get_inbound(inbound_id)
 
     def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild protocol/stream for an inbound without delete+create when possible."""
         existing = self.get_inbound(inbound_id)
-        clients = existing.get("settings", {}).get("clients", [])
+        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         reset_clients = bool(payload.pop("reset_clients", False))
+        preserve_clients = not reset_clients
         payload = {k: v for k, v in payload.items() if k != "format"}
-        payload["id"] = inbound_id
         payload.setdefault("port", existing.get("port"))
-        if not reset_clients:
-            settings = deepcopy(payload.get("settings") or {})
-            settings.setdefault("clients", clients)
-            payload["settings"] = settings
 
-        inbound = deepcopy(payload)
-        inbound["id"] = inbound_id
-        inbound["tag"] = inbound.get("tag") or self.inbound_tag(inbound_id)
-        inbound.setdefault("listen", existing.get("listen", "0.0.0.0"))
-        inbound.setdefault("settings", {})
-        inbound.setdefault("streamSettings", existing.get("streamSettings") or {})
-        inbound.setdefault("sniffing", existing.get("sniffing") or {})
-        api_payload = self._wire_inbound(inbound)
-        self._validate_config_mutation(
-            lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
-            inbound=api_payload,
-        )
+        with self._inbound_lock(tag):
+            existing = self.get_inbound(inbound_id)
+            inbound = self._apply_inbound_patch(
+                existing,
+                payload,
+                preserve_clients=preserve_clients,
+                reset_clients=reset_clients,
+            )
+            # Prefer in-place edit so clients stay attached and we avoid remove+add churn.
+            self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
+            self.audit.record("update", f"xray/inbound/{inbound_id}/refresh")
+            return self.get_inbound(inbound_id)
 
-        self.delete_inbound(inbound_id)
-        return self.create_inbound(payload)
+    def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Update port/stream/sniffing/settings without rewriting client lists."""
+        payload = dict(payload or {})
+        payload["preserve_clients"] = True
+        payload.pop("reset_clients", None)
+        started = time.perf_counter()
+        inbound = self.update_inbound(inbound_id, payload)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        summary = self._inbound_summary(inbound)
+        self.audit.record("update", f"xray/inbound/{inbound_id}/settings", detail=f"ms={elapsed_ms};clients={summary.get('clients_count')}")
+        return summary
 
     def delete_inbound(self, inbound_id: int | str) -> bool:
         inbound = self.get_inbound(inbound_id)
@@ -475,53 +611,331 @@ class XrayDriver(CoreDriver):
         return True
 
     def _find_client(self, inbound: dict[str, Any], client_key: str) -> dict[str, Any] | None:
-        for client in inbound.get("settings", {}).get("clients", []):
+        for client in self._clients_of(inbound):
             if str(client.get("id")) == client_key or str(client.get("email")) == client_key:
                 return client
         return None
 
+    def _index_clients(self, inbound: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        by_email: dict[str, dict[str, Any]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
+        for client in self._clients_of(inbound):
+            email = str(client.get("email") or "").strip()
+            cid = str(client.get("id") or "").strip()
+            if email:
+                by_email[email] = client
+            if cid:
+                by_id[cid] = client
+        return by_email, by_id
+
     def add_client(self, inbound_id: int | str, client: dict[str, Any]) -> dict[str, Any]:
+        result = self.batch_clients(inbound_id, [client], mode="upsert")
+        if result.get("failed"):
+            errors = result.get("errors") or []
+            message = errors[0].get("message") if errors else "client upsert failed"
+            raise AgentError("VALIDATION_ERROR", str(message), 422)
+        rows = result.get("clients") or []
+        return rows[0] if rows else normalize_xray_client(client)
+
+    def batch_clients(
+        self,
+        inbound_id: int | str,
+        clients: list[dict[str, Any]],
+        *,
+        mode: str = "upsert",
+    ) -> dict[str, Any]:
+        mode_key = str(mode or "upsert").strip().lower()
+        if mode_key not in {"upsert", "add", "update"}:
+            raise AgentError("VALIDATION_ERROR", "mode must be upsert|add|update", 422)
+        if len(clients) > _CLIENT_BATCH_MAX:
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"client batch limit is {_CLIENT_BATCH_MAX} per request",
+                413,
+            )
+
         inbound = self.get_inbound(inbound_id)
         inbound = self._ensure_shadowsocks_method(inbound)
-        client = normalize_xray_client(client)
-        client.setdefault("id", str(uuid.uuid4()))
-        if not client.get("email"):
-            client["email"] = str(client["id"])[:8]
-
-        existing = self._find_client(inbound, str(client["id"])) or self._find_client(
-            inbound, str(client.get("email"))
-        )
         tag = str(inbound["tag"])
         protocol = self._protocol_of(inbound)
-        native = xray_protocol_user(protocol, client)
-        if not record_is_enabled(client):
-            if existing:
-                self.delete_client(inbound_id, str(existing.get("email") or existing.get("id")))
-            return client
+        started = time.perf_counter()
+        succeeded = 0
+        failed = 0
+        errors: list[dict[str, str]] = []
+        applied: list[dict[str, Any]] = []
 
-        if existing:
-            self._validate_config_mutation(
-                lambda cfg: self._merge_client_in_config(cfg, tag, native),
+        with self._inbound_lock(tag):
+            inbound = self.get_inbound(inbound_id)
+            inbound = self._ensure_shadowsocks_method(inbound)
+            by_email, by_id = self._index_clients(inbound)
+
+            to_add: list[dict[str, Any]] = []
+            to_edit: list[dict[str, Any]] = []
+            add_meta: list[dict[str, Any]] = []
+            edit_meta: list[dict[str, Any]] = []
+
+            for raw in clients:
+                if not isinstance(raw, dict):
+                    failed += 1
+                    errors.append({"email": "", "message": "client must be an object"})
+                    continue
+                try:
+                    client = normalize_xray_client(raw)
+                    client.setdefault("id", str(uuid.uuid4()))
+                    if not client.get("email"):
+                        client["email"] = str(client["id"])[:8]
+                    email = str(client.get("email") or "").strip()
+                    cid = str(client.get("id") or "").strip()
+                    existing = by_email.get(email) if email else None
+                    if existing is None and cid:
+                        existing = by_id.get(cid)
+
+                    if mode_key == "add" and existing is not None:
+                        failed += 1
+                        errors.append({"email": email, "message": "client already exists"})
+                        continue
+                    if mode_key == "update" and existing is None:
+                        failed += 1
+                        errors.append({"email": email, "message": "client not found"})
+                        continue
+
+                    if not record_is_enabled(client):
+                        if existing is not None:
+                            try:
+                                self._api().remove_users(tag, [str(existing.get("email") or email)])
+                                succeeded += 1
+                                applied.append(client)
+                            except AgentError as exc:
+                                failed += 1
+                                errors.append({"email": email, "message": exc.message})
+                        else:
+                            succeeded += 1
+                            applied.append(client)
+                        continue
+
+                    native = xray_protocol_user(protocol, client)
+                    if existing is not None:
+                        to_edit.append(native)
+                        edit_meta.append(client)
+                    else:
+                        to_add.append(native)
+                        add_meta.append(client)
+                except Exception as exc:  # noqa: BLE001 — partial success per row
+                    failed += 1
+                    errors.append(
+                        {
+                            "email": str((raw or {}).get("email") or ""),
+                            "message": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+
+            def _flush(op: str, rows: list[dict[str, Any]], meta: list[dict[str, Any]]) -> None:
+                nonlocal succeeded, failed
+                if not rows:
+                    return
+                try:
+                    self._validate_config_mutation(
+                        lambda cfg, _rows=rows: self._merge_clients_in_config(cfg, tag, _rows),
+                    )
+                    if op == "add":
+                        result = self._api().add_users(
+                            tag,
+                            rows,
+                            protocol=protocol,
+                            inbound_settings=inbound.get("settings"),
+                        )
+                    elif op == "upsert":
+                        result = self._api().upsert_users(
+                            tag,
+                            rows,
+                            protocol=protocol,
+                            inbound_settings=inbound.get("settings"),
+                        )
+                    else:
+                        result = self._api().edit_users(
+                            tag,
+                            rows,
+                            protocol=protocol,
+                            inbound_settings=inbound.get("settings"),
+                        )
+                    if isinstance(result, dict) and ("failed" in result or "errors" in result):
+                        batch_ok = int(result.get("succeeded") or 0)
+                        batch_fail = int(result.get("failed") or 0)
+                        succeeded += batch_ok
+                        failed += batch_fail
+                        for err in result.get("errors") or []:
+                            if isinstance(err, dict):
+                                errors.append(
+                                    {
+                                        "email": str(err.get("email") or ""),
+                                        "message": str(err.get("message") or "failed"),
+                                    }
+                                )
+                        if batch_ok:
+                            # Best-effort: keep metas whose email is not in error list.
+                            failed_emails = {
+                                str(err.get("email") or "")
+                                for err in (result.get("errors") or [])
+                                if isinstance(err, dict)
+                            }
+                            applied.extend(
+                                [row for row in meta if str(row.get("email") or "") not in failed_emails]
+                            )
+                        return
+                    succeeded += len(meta)
+                    applied.extend(meta)
+                except AgentError as exc:
+                    if exc.status == 413:
+                        failed += len(meta)
+                        for client in meta:
+                            errors.append({"email": str(client.get("email") or ""), "message": exc.message})
+                        return
+                    # Fall back to per-user so one bad row does not fail the chunk.
+                    for row, client in zip(rows, meta):
+                        email = str(client.get("email") or "")
+                        try:
+                            self._validate_config_mutation(
+                                lambda cfg, _row=row: self._merge_client_in_config(cfg, tag, _row),
+                            )
+                            if op == "add":
+                                self._api().add_users(
+                                    tag,
+                                    [row],
+                                    protocol=protocol,
+                                    inbound_settings=inbound.get("settings"),
+                                )
+                            elif op == "upsert":
+                                self._api().upsert_users(
+                                    tag,
+                                    [row],
+                                    protocol=protocol,
+                                    inbound_settings=inbound.get("settings"),
+                                )
+                            else:
+                                self._api().edit_users(
+                                    tag,
+                                    [row],
+                                    protocol=protocol,
+                                    inbound_settings=inbound.get("settings"),
+                                )
+                            succeeded += 1
+                            applied.append(client)
+                        except AgentError as row_exc:
+                            failed += 1
+                            errors.append({"email": email, "message": row_exc.message})
+                        except Exception as row_exc:  # noqa: BLE001
+                            failed += 1
+                            errors.append({"email": email, "message": f"{type(row_exc).__name__}: {row_exc}"})
+                except Exception as exc:  # noqa: BLE001
+                    for client in meta:
+                        failed += 1
+                        errors.append(
+                            {
+                                "email": str(client.get("email") or ""),
+                                "message": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+
+            if mode_key == "upsert":
+                _flush("upsert", to_add + to_edit, add_meta + edit_meta)
+            else:
+                _flush("edit", to_edit, edit_meta)
+                _flush("add", to_add, add_meta)
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.audit.record(
+            "update",
+            f"xray/inbound/{inbound_id}/clients/batch",
+            f"mode={mode_key} succeeded={succeeded} failed={failed} ms={elapsed_ms}",
+        )
+        return {
+            "ok": failed == 0,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+            "clients": applied,
+            "ms": elapsed_ms,
+        }
+
+    def batch_remove_clients(
+        self,
+        inbound_id: int | str,
+        *,
+        emails: list[str] | None = None,
+        ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        email_keys = [str(e).strip() for e in (emails or []) if str(e).strip()]
+        id_keys = [str(i).strip() for i in (ids or []) if str(i).strip()]
+        if not email_keys and not id_keys:
+            raise AgentError("VALIDATION_ERROR", "emails or ids required", 422)
+        if len(email_keys) + len(id_keys) > _CLIENT_BATCH_MAX:
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"client batch limit is {_CLIENT_BATCH_MAX} per request",
+                413,
             )
-            self._api().edit_users(
-                tag,
-                [native],
-                protocol=protocol,
-                inbound_settings=inbound.get("settings"),
-            )
-            self.audit.record("update", f"xray/client/{client['id']}")
-        else:
-            self._validate_config_mutation(
-                lambda cfg: self._merge_client_in_config(cfg, tag, native),
-            )
-            self._api().add_users(
-                tag,
-                [native],
-                protocol=protocol,
-                inbound_settings=inbound.get("settings"),
-            )
-            self.audit.record("create", f"xray/client/{client['id']}")
-        return client
+
+        inbound = self.get_inbound(inbound_id)
+        tag = str(inbound["tag"])
+        started = time.perf_counter()
+        remove_emails: list[str] = []
+        errors: list[dict[str, str]] = []
+        succeeded = 0
+        failed = 0
+
+        with self._inbound_lock(tag):
+            inbound = self.get_inbound(inbound_id)
+            by_email, by_id = self._index_clients(inbound)
+            seen: set[str] = set()
+            for email in email_keys:
+                row = by_email.get(email)
+                if row is None:
+                    failed += 1
+                    errors.append({"email": email, "message": "client not found"})
+                    continue
+                target = str(row.get("email") or email)
+                if target not in seen:
+                    seen.add(target)
+                    remove_emails.append(target)
+            for cid in id_keys:
+                row = by_id.get(cid)
+                if row is None:
+                    failed += 1
+                    errors.append({"email": cid, "message": "client not found"})
+                    continue
+                target = str(row.get("email") or cid)
+                if target not in seen:
+                    seen.add(target)
+                    remove_emails.append(target)
+
+            if remove_emails:
+                try:
+                    self._api().remove_users(tag, remove_emails)
+                    succeeded = len(remove_emails)
+                except AgentError as exc:
+                    for email in remove_emails:
+                        try:
+                            self._api().remove_users(tag, [email])
+                            succeeded += 1
+                        except AgentError as row_exc:
+                            failed += 1
+                            errors.append({"email": email, "message": row_exc.message})
+                    if succeeded == 0 and not errors:
+                        raise exc
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.audit.record(
+            "delete",
+            f"xray/inbound/{inbound_id}/clients/batch",
+            f"succeeded={succeeded} failed={failed} ms={elapsed_ms}",
+        )
+        return {
+            "ok": failed == 0,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+            "ms": elapsed_ms,
+        }
 
     def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
         """Repair blank Shadowsocks method keys left by legacy broken inbounds."""
@@ -549,7 +963,7 @@ class XrayDriver(CoreDriver):
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
         )
-        self._api().edit_inbounds([api_payload])
+        self._api().edit_inbounds([api_payload], preserve_clients=True)
         inbound_id = inbound.get("id") or self.id_from_tag(str(inbound.get("tag") or ""))
         if inbound_id is None:
             return inbound
@@ -561,21 +975,13 @@ class XrayDriver(CoreDriver):
         if current is None:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
         merged = normalize_xray_client({**current, **payload})
-        if not record_is_enabled(merged):
-            self.delete_client(inbound_id, client_key)
-            return merged
-        native = xray_protocol_user(self._protocol_of(inbound), merged)
-        self._validate_config_mutation(
-            lambda cfg: self._merge_client_in_config(cfg, str(inbound["tag"]), native),
-        )
-        self._api().edit_users(
-            str(inbound["tag"]),
-            [native],
-            protocol=self._protocol_of(inbound),
-            inbound_settings=inbound.get("settings"),
-        )
-        self.audit.record("update", f"xray/client/{client_key}")
-        return merged
+        result = self.batch_clients(inbound_id, [merged], mode="update")
+        if result.get("failed"):
+            errors = result.get("errors") or []
+            message = errors[0].get("message") if errors else "client update failed"
+            raise AgentError("VALIDATION_ERROR", str(message), 422)
+        rows = result.get("clients") or []
+        return rows[0] if rows else merged
 
     def delete_client(self, inbound_id: int | str, client_key: str) -> bool:
         inbound = self.get_inbound(inbound_id)
@@ -583,8 +989,11 @@ class XrayDriver(CoreDriver):
         if current is None:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
         email = str(current.get("email") or client_key)
-        self._api().remove_users(str(inbound["tag"]), [email])
-        self.audit.record("delete", f"xray/client/{client_key}")
+        result = self.batch_remove_clients(inbound_id, emails=[email])
+        if result.get("failed") and result.get("succeeded", 0) == 0:
+            errors = result.get("errors") or []
+            message = errors[0].get("message") if errors else "client delete failed"
+            raise AgentError("VALIDATION_ERROR", str(message), 422)
         return True
 
     def reset_client_traffic(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
@@ -844,6 +1253,60 @@ class XrayDriver(CoreDriver):
 
     def remove_rules(self, tags: list[str]) -> dict[str, Any]:
         return self._api().remove_rules(tags)
+
+    def replace_rules(self, rules: list[dict[str, Any]], routing_extras: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Atomically replace routing.rules (native API when available, else config section)."""
+        extras = dict(routing_extras or {})
+        started = time.perf_counter()
+        try:
+            result = self._api().replace_rules(list(rules), **extras)
+        except AgentError as exc:
+            # Older Xray builds lack /api/rules/replace — fall back to config section write.
+            if exc.status not in {404, 405, 501}:
+                # Also treat "unknown path" style validation as missing endpoint.
+                message = (exc.message or "").lower()
+                if "not found" not in message and "unknown" not in message and exc.status != 422:
+                    raise
+            routing = dict(extras)
+            routing["rules"] = list(rules)
+            result = self.replace_section("routing", routing)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.audit.record(
+            "update",
+            "xray/rules/replace",
+            f"rules_count={len(rules)} ms={elapsed_ms}",
+        )
+        return {
+            "ok": True,
+            "rules_count": len(rules),
+            "ms": elapsed_ms,
+            "result": result if isinstance(result, dict) else {"ok": True},
+        }
+
+    def upsert_rules(
+        self,
+        *,
+        remove_tags: list[str] | None = None,
+        add: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        tags = [str(t).strip() for t in (remove_tags or []) if str(t).strip()]
+        rows = [row for row in (add or []) if isinstance(row, dict)]
+        started = time.perf_counter()
+        removed = 0
+        if tags:
+            self._api().remove_rules(tags)
+            removed = len(tags)
+        added = 0
+        if rows:
+            self._api().add_rules(rows, should_append=True)
+            added = len(rows)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.audit.record(
+            "update",
+            "xray/rules/upsert",
+            f"removed={removed} added={added} ms={elapsed_ms}",
+        )
+        return {"ok": True, "removed": removed, "added": added, "ms": elapsed_ms}
 
     def block_source_ips(self, source_ips: list[str], **kwargs: Any) -> dict[str, Any]:
         return self._api().block_source_ips(source_ips, **kwargs)

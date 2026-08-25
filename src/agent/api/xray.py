@@ -72,6 +72,16 @@ def update_inbound(inbound_id: str, payload: InboundPayload, xray: XrayDriver = 
     return {"success": True, "inbound": inbound}
 
 
+@router.patch("/inbounds/{inbound_id}")
+@router.put("/inbounds/{inbound_id}/settings")
+def patch_inbound_settings(inbound_id: str, body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    try:
+        inbound = xray.patch_inbound_settings(inbound_id, body)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "ok": True, "inbound": inbound}
+
+
 @router.post("/inbounds/{inbound_id}/refresh")
 def refresh_inbound(inbound_id: str, body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     if not body.get("protocol") and not body.get("streamSettings"):
@@ -102,6 +112,34 @@ def add_client(inbound_id: str, payload: ClientPayload, xray: XrayDriver = Depen
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "client": client}
+
+
+@router.post("/inbounds/{inbound_id}/clients/batch")
+@router.post("/inbounds/{inbound_id}/clients:batch")
+def batch_clients(inbound_id: str, body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    clients = body.get("clients") or []
+    if not isinstance(clients, list):
+        raise_agent_error("VALIDATION_ERROR", "clients must be a list", 422)
+    mode = str(body.get("mode") or "upsert")
+    try:
+        result = xray.batch_clients(inbound_id, [row for row in clients if isinstance(row, dict)], mode=mode)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
+@router.delete("/inbounds/{inbound_id}/clients/batch")
+@router.delete("/inbounds/{inbound_id}/clients:batch")
+def batch_remove_clients(inbound_id: str, body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    try:
+        result = xray.batch_remove_clients(
+            inbound_id,
+            emails=list(body.get("emails") or []),
+            ids=list(body.get("ids") or []),
+        )
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
 
 
 @router.put("/inbounds/{inbound_id}/clients/{client_key}")
@@ -277,6 +315,36 @@ def remove_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "result": result}
+
+
+@router.put("/routing/rules")
+def replace_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    rules = body.get("rules") or body.get("routing", {}).get("rules") or []
+    extras = {k: v for k, v in body.items() if k not in {"rules", "routing"} and v is not None}
+    if isinstance(body.get("routing"), dict):
+        for key, value in body["routing"].items():
+            if key != "rules" and key not in extras:
+                extras[key] = value
+    try:
+        result = xray.replace_rules([row for row in rules if isinstance(row, dict)], routing_extras=extras)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
+@router.post("/routing/rules/upsert")
+@router.post("/routing/rules:upsert")
+def upsert_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    remove_tags = body.get("remove_tags") or body.get("tags") or []
+    add = body.get("add") or body.get("rules") or []
+    try:
+        result = xray.upsert_rules(
+            remove_tags=[str(tag) for tag in remove_tags if str(tag).strip()],
+            add=[row for row in add if isinstance(row, dict)],
+        )
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
 
 
 @router.post("/sourceip/block")
