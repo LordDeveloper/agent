@@ -42,6 +42,8 @@ class XrayHttpClient:
         data: Any = None,
     ) -> Any:
         headers = {"Content-Type": "application/json"} if files is None and json_body is not None else None
+        method_u = method.upper()
+        route = f"{method_u} {path}"
         try:
             with self._lock:
                 response = self._client.request(
@@ -54,10 +56,24 @@ class XrayHttpClient:
                     headers=headers,
                 )
         except httpx.HTTPError as exc:
-            raise AgentError("CONFIG_NOT_FOUND", f"Xray HTTP API unreachable: {exc}", 502) from exc
+            raise AgentError(
+                "CONFIG_NOT_FOUND",
+                f"Xray HTTP API unreachable [{route}]: {exc}",
+                502,
+            ) from exc
+
+        # Prefer the concrete URL httpx resolved (includes query).
+        try:
+            resolved = f"{method_u} {response.request.url}"
+        except Exception:
+            resolved = route
 
         if response.status_code == 401:
-            raise AgentError("INVALID_CREDENTIALS", "Xray HTTP API unauthorized", 401)
+            raise AgentError(
+                "INVALID_CREDENTIALS",
+                f"Xray HTTP API unauthorized [{resolved}]",
+                401,
+            )
 
         if response.status_code >= 400:
             code_hint = ""
@@ -67,7 +83,7 @@ class XrayHttpClient:
                 code_hint = str(body.get("code") or "").strip().lower()
             except Exception:
                 message = response.text or "unknown"
-            detail = f"Xray HTTP API error ({response.status_code}): {message}"
+            detail = f"Xray HTTP API error ({response.status_code}) [{resolved}]: {message}"
             # Bare Go mux 404s mean the custom HTTP API routes are missing (stock Xray).
             if response.status_code == 404 or "page not found" in message.lower():
                 raise AgentError("CONFIG_NOT_FOUND", detail, 404)
@@ -283,7 +299,7 @@ class XrayHttpClient:
         body = self.get("/api/rules/list")
         return list(body.get("rules") or body.get("items") or [])
 
-    def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = True) -> dict[str, Any]:
+    def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = False) -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/rules/add",

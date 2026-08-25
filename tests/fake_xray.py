@@ -139,7 +139,7 @@ class FakeXrayHttpClient:
     def list_rules(self) -> list[dict[str, Any]]:
         return deepcopy(self._rules)
 
-    def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = True) -> dict[str, Any]:
+    def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = False) -> dict[str, Any]:
         if not should_append:
             self._rules = []
         self._rules.extend(deepcopy(rules))
