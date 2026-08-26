@@ -42,7 +42,7 @@ _STATE_KIND = "egress_state"
 _STATE_ID = "applied"
 _IFACE_KIND = "interface"
 _NFT_CHAIN = "postrouting"
-_MASQ_COMMENT_PREFIX = "netinja-egress:"
+_MASQ_COMMENT_PREFIX = "netinja-egress-"
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
 _EGRESS_CORES = ("wireguard", "amnezia")
@@ -193,7 +193,7 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         lines.append("fi")
 
     lines.append("")
-    # Prefer nft at apply-time; fall back to iptables inside the script.
+    # Install on both nft and iptables when present (mixed nft/legacy hosts).
     lines.extend(
         [
             "if command -v nft >/dev/null 2>&1; then",
@@ -220,7 +220,9 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
             f'  nft add rule inet netinja_egress forward iifname "{iface}" '
             f'ct state related,established accept comment "{comment}-fwd-in" 2>/dev/null || true'
         )
-    lines.append("elif command -v iptables >/dev/null 2>&1; then")
+    lines.append("fi")
+    lines.append("")
+    lines.append("if command -v iptables >/dev/null 2>&1; then")
     for iface in sorted(masq):
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
         lines.append(
@@ -237,6 +239,15 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
             f'-m comment --comment "{comment}-fwd-in" -j ACCEPT 2>/dev/null || '
             f'iptables -I FORWARD 1 -i "{iface}" -m state --state RELATED,ESTABLISHED '
             f'-m comment --comment "{comment}-fwd-in" -j ACCEPT'
+        )
+    lines.append("fi")
+    lines.append("if command -v iptables-legacy >/dev/null 2>&1; then")
+    for iface in sorted(masq):
+        comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+        lines.append(
+            f'  iptables-legacy -t nat -C POSTROUTING -o "{iface}" -m comment --comment "{comment}" '
+            f"-j MASQUERADE 2>/dev/null || "
+            f'iptables-legacy -t nat -A POSTROUTING -o "{iface}" -m comment --comment "{comment}" -j MASQUERADE'
         )
     lines.append("fi")
     lines.append("")
@@ -291,8 +302,11 @@ def ensure_peer_egress_unit(script_path: Path, *, runner: Runner | None = None) 
         return {"ok": False, "skipped": False, "reason": str(exc)}
 
     enable = execute(["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
+    # Apply immediately so hosts are not left with empty NAT until next reboot.
+    start = execute(["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
     return {
         "ok": getattr(enable, "returncode", 1) == 0,
+        "started": getattr(start, "returncode", 1) == 0,
         "unit": str(_UNIT_PATH),
         "script": str(script_path),
     }
@@ -416,6 +430,12 @@ def reconcile_core_egress(
             _ip(execute, ["route", "flush", "table", str(table)])
 
     masq_ifaces = sorted({str(row["iface"]) for row in applied})
+    # Keep MASQUERADE on recently-used exits too (switch italy→deutch must not
+    # briefly leave the new exit without SNAT if apply races).
+    for iface in previous.get("masq") or []:
+        name = str(iface or "").strip()
+        if name and _iface_exists(execute, name):
+            masq_ifaces = sorted(set(masq_ifaces) | {name})
     # Merge masq with other cores so we don't drop shared exits while reconciling one core.
     other_masq: set[str] = set()
     for other in _EGRESS_CORES:
@@ -601,23 +621,44 @@ def _ensure_ip_forward(runner: Runner) -> None:
 
 
 def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
-    backend = "nft" if shutil.which("nft") else ("iptables" if shutil.which("iptables") else "")
-    if backend == "nft":
+    """Install SNAT/MASQUERADE on every exit NIC.
+
+    Many hosts mix nft + iptables-legacy; preferring only nft left empty chains while
+    legacy still had a lone ``-o uk`` rule. Always apply both backends when present.
+    """
+    if shutil.which("nft"):
         _sync_masquerade_nft(ifaces, runner=runner)
-        return
-    if backend == "iptables":
+    if shutil.which("iptables"):
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner)
+    if shutil.which("iptables-legacy"):
+        _sync_masquerade_iptables(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            binary="iptables-legacy",
+        )
 
 
 def _sync_forward(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
-    # nft FORWARD rules are installed inside _sync_masquerade_nft; only iptables needs a separate pass.
-    if shutil.which("nft"):
-        return
+    # nft FORWARD rules are installed inside _sync_masquerade_nft; iptables needs a separate pass.
     if shutil.which("iptables"):
         _sync_forward_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner)
+    if shutil.which("iptables-legacy"):
+        _sync_forward_iptables(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            binary="iptables-legacy",
+        )
 
 
-def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+def _sync_forward_iptables(
+    ifaces: list[str],
+    *,
+    previous_ifaces: list[str],
+    runner: Runner,
+    binary: str = "iptables",
+) -> None:
     wanted = set(ifaces)
     for iface in previous_ifaces:
         if iface in wanted:
@@ -629,6 +670,7 @@ def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], run
             _iptables(
                 runner,
                 ["-D", "FORWARD", *args, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+                binary=binary,
             )
     for iface in ifaces:
         out_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out"
@@ -637,10 +679,12 @@ def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], run
             runner,
             ["-C", "FORWARD", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
             quiet=True,
+            binary=binary,
         ):
             _iptables(
                 runner,
                 ["-I", "FORWARD", "1", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
+                binary=binary,
             )
         if not _iptables(
             runner,
@@ -661,6 +705,7 @@ def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], run
                 "ACCEPT",
             ],
             quiet=True,
+            binary=binary,
         ):
             _iptables(
                 runner,
@@ -681,6 +726,7 @@ def _sync_forward_iptables(ifaces: list[str], *, previous_ifaces: list[str], run
                     "-j",
                     "ACCEPT",
                 ],
+                binary=binary,
             )
 
 
@@ -761,7 +807,13 @@ def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
         )
 
 
-def _sync_masquerade_iptables(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+def _sync_masquerade_iptables(
+    ifaces: list[str],
+    *,
+    previous_ifaces: list[str],
+    runner: Runner,
+    binary: str = "iptables",
+) -> None:
     wanted = set(ifaces)
     for iface in previous_ifaces:
         if iface in wanted:
@@ -770,6 +822,14 @@ def _sync_masquerade_iptables(ifaces: list[str], *, previous_ifaces: list[str], 
         _iptables(
             runner,
             ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
+            binary=binary,
+        )
+        # Also drop un-commented legacy rules we may have installed manually.
+        _iptables(
+            runner,
+            ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+            quiet=True,
+            binary=binary,
         )
     for iface in ifaces:
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
@@ -777,38 +837,50 @@ def _sync_masquerade_iptables(ifaces: list[str], *, previous_ifaces: list[str], 
             runner,
             ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             quiet=True,
+            binary=binary,
         )
         if check:
+            continue
+        # Prefer commented rule; if an uncommented twin exists, keep one path working.
+        if _iptables(
+            runner,
+            ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+            quiet=True,
+            binary=binary,
+        ):
             continue
         _iptables(
             runner,
             ["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
+            binary=binary,
         )
 
 
-def _nft(runner: Runner, args: list[str]) -> None:
+def _nft(runner: Runner, args: list[str]) -> bool:
     try:
         result = runner(["nft", *args], check=False, timeout=10)
     except Exception as exc:
         log.warning("nft %s failed: %s", " ".join(args), exc)
-        return
+        return False
     if getattr(result, "returncode", 1) != 0:
         stderr = (getattr(result, "stderr", None) or "").strip().lower()
         if "exist" in stderr:
-            return
+            return True
         log.warning("nft %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
+        return False
+    return True
 
 
-def _iptables(runner: Runner, args: list[str], *, quiet: bool = False) -> bool:
+def _iptables(runner: Runner, args: list[str], *, quiet: bool = False, binary: str = "iptables") -> bool:
     try:
-        result = runner(["iptables", *args], check=False, timeout=10)
+        result = runner([binary, *args], check=False, timeout=10)
     except Exception as exc:
         if not quiet:
-            log.warning("iptables %s failed: %s", " ".join(args), exc)
+            log.warning("%s %s failed: %s", binary, " ".join(args), exc)
         return False
     ok = getattr(result, "returncode", 1) == 0
     if not ok and not quiet:
         stderr = (getattr(result, "stderr", None) or "").strip()
         if "does a matching rule exist" not in stderr.lower():
-            log.warning("iptables %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
+            log.warning("%s %s rc=%s %s", binary, " ".join(args), getattr(result, "returncode", "?"), stderr)
     return ok

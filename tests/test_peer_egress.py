@@ -319,7 +319,48 @@ def test_render_apply_script_is_idempotent_shell():
     assert script.startswith("#!/bin/sh")
     assert "ip_forward=1" in script
     assert f"lookup {table}" in script
-    assert 'oifname "eth1"' in script or ' -o "eth1"' in script
+    assert 'oifname "eth1"' in script
+    assert ' -o "eth1"' in script
+    assert "iptables-legacy" in script
     assert "_iface_ready" in script
     assert "_soften_rp_filter" in script
+    assert "netinja-egress-eth1" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
+
+
+def test_reconcile_installs_masq_on_nft_and_iptables(tmp_path, monkeypatch):
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None: {"ok": True, "skipped": True},
+    )
+
+    result = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.90.68.3", "exit_interface": "deutch", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert result["ok"] is True
+    assert any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
+    assert any(
+        cmd[:1] == ["iptables"] and "-t" in cmd and "MASQUERADE" in cmd and "deutch" in cmd
+        for cmd in commands
+    )
+    assert any(
+        cmd[:1] == ["iptables-legacy"] and "MASQUERADE" in cmd and "deutch" in cmd
+        for cmd in commands
+    )
+    store.close()
