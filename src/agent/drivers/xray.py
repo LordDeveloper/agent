@@ -103,6 +103,7 @@ class XrayDriver(CoreDriver):
         self._client_key = None
 
     def _ensure_api_ready(self) -> None:
+        """Ensure HTTP API is reachable without restarting a live xray.service (keep connections)."""
         try:
             self.client.system()
             return
@@ -111,14 +112,14 @@ class XrayDriver(CoreDriver):
 
         from agent.xray_service import (
             ensure_xray_httpapi_config,
-            ensure_xray_runtime,
-            restart_xray_service,
+            ensure_xray_running,
             wait_xray_http_api,
         )
 
         base = self.settings.xray
         config_path = Path(base.config)
-        changed = ensure_xray_httpapi_config(
+        # Sync httpapi block on disk if needed — never restart solely for that drift.
+        ensure_xray_httpapi_config(
             config_path,
             api_base=base.api_base,
             username=base.username,
@@ -127,50 +128,22 @@ class XrayDriver(CoreDriver):
         self._reset_client()
         resolved = self._resolved_xray_settings()
 
-        if changed:
-            if service_is_active(_XRAY_UNIT):
-                restart_xray_service(
-                    binary=base.binary,
-                    config_path=base.config,
-                    api_base=base.api_base,
-                    username=base.username,
-                    password=base.password,
-                )
-            else:
-                ensure_xray_runtime(
-                    binary=base.binary,
-                    config_path=base.config,
-                    api_base=base.api_base,
-                    username=base.username,
-                    password=base.password,
-                    start=True,
-                )
+        if service_is_active(_XRAY_UNIT):
+            wait_xray_http_api(
+                api_base=resolved.api_base,
+                username=resolved.username,
+                password=resolved.password,
+                attempts=40,
+                delay=0.3,
+            )
         else:
-            try:
-                wait_xray_http_api(
-                    api_base=resolved.api_base,
-                    username=resolved.username,
-                    password=resolved.password,
-                    attempts=4,
-                )
-            except AgentError:
-                if service_is_active(_XRAY_UNIT):
-                    restart_xray_service(
-                        binary=base.binary,
-                        config_path=base.config,
-                        api_base=base.api_base,
-                        username=base.username,
-                        password=base.password,
-                    )
-                else:
-                    ensure_xray_runtime(
-                        binary=base.binary,
-                        config_path=base.config,
-                        api_base=base.api_base,
-                        username=base.username,
-                        password=base.password,
-                        start=True,
-                    )
+            ensure_xray_running(
+                binary=base.binary,
+                config_path=base.config,
+                api_base=base.api_base,
+                username=base.username,
+                password=base.password,
+            )
 
         self._reset_client()
         self.client.system()
@@ -228,20 +201,20 @@ class XrayDriver(CoreDriver):
 
     def enable(self) -> dict[str, Any]:
         from agent.ops import install_xray
-        from agent.xray_service import binary_has_httpapi, ensure_xray_runtime
+        from agent.xray_service import binary_has_httpapi, ensure_xray_running
 
         xray = self.settings.xray
         binary = self._binary()
         if not binary or not binary_has_httpapi(binary):
             install_xray(force=True)
 
-        return ensure_xray_runtime(
+        # Keep-alive: start only when down; never bounce an already-running unit.
+        return ensure_xray_running(
             binary=xray.binary,
             config_path=xray.config,
             api_base=xray.api_base,
             username=xray.username,
             password=xray.password,
-            start=True,
         )
 
     def disable(self) -> dict[str, Any]:
@@ -1138,6 +1111,10 @@ class XrayDriver(CoreDriver):
         if not isinstance(payload, dict):
             raise AgentError("VALIDATION_ERROR", "Xray config must be a JSON object", 422)
 
+        from agent.support.config_validate import normalize_xray_config_shapes
+
+        normalize_xray_config_shapes(payload)
+
         binary = self._binary()
         if binary:
             validate_xray_config(binary, payload)
@@ -1151,16 +1128,26 @@ class XrayDriver(CoreDriver):
         try:
             result = self._api().import_config(payload, path=str(path))
         except AgentError:
-            from agent.xray_service import restart_xray_service
+            from agent.xray_service import ensure_xray_running
 
             xray = self.settings.xray
-            result = restart_xray_service(
+            # Prefer keep-alive: if the unit is already up, do not restart (drops connections).
+            # When down, start loads the config we just wrote to disk.
+            if service_is_active(_XRAY_UNIT):
+                raise
+            result = ensure_xray_running(
                 binary=xray.binary,
                 config_path=xray.config,
                 api_base=xray.api_base,
                 username=xray.username,
                 password=xray.password,
             )
+            result = {
+                "ok": True,
+                "started": True,
+                "import": "skipped_loaded_on_start",
+                "service": result,
+            }
         self.audit.record("update", "xray/config")
         return result if isinstance(result, dict) else {"ok": True}
 

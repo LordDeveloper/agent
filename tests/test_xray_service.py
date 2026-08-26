@@ -113,6 +113,85 @@ def test_ensure_start_rejects_stock_binary(tmp_path, monkeypatch):
         assert "HTTP API" in exc.message
 
 
+def test_ensure_start_skips_restart_when_already_active(tmp_path, monkeypatch):
+    """Keep-alive: httpapi drift must not bounce a live unit (sync must not drop connections)."""
+    from agent.xray_service import ensure_xray_running
+
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"xray httpapi /api/stats/sys /api/inbounds/list")
+    config = tmp_path / "config.json"
+    unit = tmp_path / "xray.service"
+    actions: list[str] = []
+
+    monkeypatch.setattr(
+        "agent.xray_service.which",
+        lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None,
+    )
+    monkeypatch.setattr("agent.xray_service.service_is_active", lambda unit_name: True)
+    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", lambda **kwargs: None)
+
+    def fake_systemctl(action, unit_name):
+        actions.append(action)
+        return {"ok": True, "action": action, "unit": unit_name, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("agent.xray_service.systemctl", fake_systemctl)
+    monkeypatch.setattr(
+        "agent.xray_service.run_cmd",
+        lambda *args, **kwargs: type("P", (), {"stdout": "", "stderr": "", "returncode": 0})(),
+    )
+
+    result = ensure_xray_running(
+        binary=str(binary),
+        config_path=str(config),
+        api_base="http://127.0.0.1:8080",
+        unit_path=str(unit),
+    )
+    assert result["already_running"] is True
+    assert result["started"] is False
+    assert "restart" not in actions
+    assert "start" not in actions
+
+
+def test_ensure_start_starts_only_when_inactive(tmp_path, monkeypatch):
+    binary = tmp_path / "xray"
+    binary.write_bytes(b"xray httpapi /api/stats/sys /api/inbounds/list")
+    config = tmp_path / "config.json"
+    unit = tmp_path / "xray.service"
+    actions: list[str] = []
+    active = {"value": False}
+
+    monkeypatch.setattr(
+        "agent.xray_service.which",
+        lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None,
+    )
+    monkeypatch.setattr("agent.xray_service.service_is_active", lambda unit_name: active["value"])
+    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", lambda **kwargs: None)
+
+    def fake_systemctl(action, unit_name):
+        actions.append(action)
+        if action == "start":
+            active["value"] = True
+        return {"ok": True, "action": action, "unit": unit_name, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("agent.xray_service.systemctl", fake_systemctl)
+    monkeypatch.setattr(
+        "agent.xray_service.run_cmd",
+        lambda *args, **kwargs: type("P", (), {"stdout": "", "stderr": "", "returncode": 0})(),
+    )
+
+    result = ensure_xray_runtime(
+        binary=str(binary),
+        config_path=str(config),
+        api_base="http://127.0.0.1:8080",
+        unit_path=str(unit),
+        start=True,
+    )
+    assert result["started"] is True
+    assert result.get("already_running") is False
+    assert "start" in actions
+    assert "restart" not in actions
+
+
 def test_install_xray_skips_customized_binary(tmp_path, monkeypatch):
     from agent.ops import install_xray
 

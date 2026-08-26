@@ -36,12 +36,12 @@ def run_cmd(
 
 def _prepare_xray_service(result: dict) -> dict:
     try:
-        from agent.xray_service import ensure_xray_runtime
+        from agent.xray_service import ensure_xray_running
 
-        result["service"] = ensure_xray_runtime(
+        # Keep-alive semantics: start only when inactive (never bounce a live unit).
+        result["service"] = ensure_xray_running(
             binary=str(result.get("binary") or os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")),
             api_base=str(result.get("api_base") or os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080")),
-            start=False,
         )
     except AgentError as exc:
         result["service_error"] = exc.message
@@ -101,17 +101,6 @@ def install_xray(
             "(not stock XTLS), and GITHUB_TOKEN can read that repo if private.",
         )
     result = _prepare_xray_service(result)
-    if result.get("downloaded") or force or tag:
-        try:
-            from agent.xray_service import ensure_xray_runtime
-
-            result["service"] = ensure_xray_runtime(
-                binary=str(dest),
-                api_base=os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080"),
-                start=True,
-            )
-        except AgentError as exc:
-            result["service_error"] = exc.message
     return result
 
 

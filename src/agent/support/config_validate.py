@@ -147,9 +147,45 @@ def validate_xray_inbound(inbound: dict[str, Any]) -> None:
         raise _validation_error("Xray inbound streamSettings must be an object")
 
 
+def normalize_xray_policy(policy: Any) -> Any:
+    """
+    Xray expects policy.levels as a map keyed by level id (e.g. {"0": {...}}).
+    PHP json_decode(..., true) and some editors turn that into a JSON array.
+    """
+    if not isinstance(policy, dict):
+        return policy
+
+    levels = policy.get("levels")
+    if isinstance(levels, list):
+        fixed = dict(policy)
+        mapped: dict[str, Any] = {}
+        for index, row in enumerate(levels):
+            if isinstance(row, dict):
+                mapped[str(index)] = row
+        fixed["levels"] = mapped
+        return fixed
+
+    if isinstance(levels, dict):
+        # Ensure keys stay strings after round-trips.
+        fixed = dict(policy)
+        fixed["levels"] = {str(key): value for key, value in levels.items() if isinstance(value, dict)}
+        return fixed
+
+    return policy
+
+
+def normalize_xray_config_shapes(config: dict[str, Any]) -> dict[str, Any]:
+    policy = config.get("policy")
+    if policy is not None:
+        config["policy"] = normalize_xray_policy(policy)
+    return config
+
+
 def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
     if not binary:
         raise _validation_error("Xray binary not found for config validation")
+
+    normalize_xray_config_shapes(config)
 
     # Repair blank Shadowsocks ciphers before xray -test (legacy broken inbounds).
     for inbound in config.get("inbounds") or []:

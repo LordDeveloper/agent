@@ -367,6 +367,27 @@ def ensure_xray_runtime(
     if not start:
         return result
 
+    return _start_xray_if_needed(
+        result,
+        resolved_binary=resolved_binary,
+        reachable_api=reachable_api,
+        auth_user=auth_user,
+        auth_pass=auth_pass,
+    )
+
+
+def _start_xray_if_needed(
+    result: dict[str, Any],
+    *,
+    resolved_binary: str,
+    reachable_api: str,
+    auth_user: str,
+    auth_pass: str,
+) -> dict[str, Any]:
+    """
+    Keep-alive first: if xray.service is already active, never restart it.
+    Only start when the unit is down. Explicit restarts go through restart_xray_service().
+    """
     if not binary_has_httpapi(resolved_binary):
         raise AgentError(
             "UNSUPPORTED_CAPABILITY",
@@ -376,14 +397,28 @@ def ensure_xray_runtime(
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found; cannot start xray.service")
 
+    if service_is_active(XRAY_UNIT):
+        try:
+            wait_xray_http_api(
+                api_base=reachable_api,
+                username=auth_user,
+                password=auth_pass,
+                attempts=40,
+                delay=0.3,
+            )
+        except AgentError as exc:
+            raise AgentError(
+                "VALIDATION_ERROR",
+                _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+            ) from exc
+        result["started"] = False
+        result["already_running"] = True
+        return result
+
     run_cmd(["systemctl", "reset-failed", XRAY_UNIT], check=False)
     run_cmd(["systemctl", "daemon-reload"], check=False)
     enabled = systemctl("enable", XRAY_UNIT)
-    if httpapi_changed and service_is_active(XRAY_UNIT):
-        systemctl("restart", XRAY_UNIT)
-        started = {"ok": True}
-    else:
-        started = systemctl("start", XRAY_UNIT)
+    started = systemctl("start", XRAY_UNIT)
 
     for _ in range(20):
         if service_is_active(XRAY_UNIT):
@@ -401,6 +436,7 @@ def ensure_xray_runtime(
                     _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
                 ) from exc
             result["started"] = True
+            result["already_running"] = False
             result["enable"] = enabled
             result["start"] = started
             return result
@@ -411,6 +447,27 @@ def ensure_xray_runtime(
     raise AgentError(
         "VALIDATION_ERROR",
         _unreachable_detail(f"Failed to start xray.service: {detail}", logs),
+    )
+
+
+def ensure_xray_running(
+    *,
+    binary: str,
+    config_path: str = DEFAULT_CONFIG_PATH,
+    api_base: str = "http://127.0.0.1:8080",
+    username: str = "",
+    password: str = "",
+    unit_path: str = DEFAULT_UNIT_PATH,
+) -> dict[str, Any]:
+    """Prepare config/unit and start only when inactive — never restarts a live service."""
+    return ensure_xray_runtime(
+        binary=binary,
+        config_path=config_path,
+        api_base=api_base,
+        username=username,
+        password=password,
+        unit_path=unit_path,
+        start=True,
     )
 
 
