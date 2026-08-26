@@ -1,5 +1,26 @@
 from __future__ import annotations
 
+"""
+Peer egress policy routing (WireGuard / Amnezia region exits).
+
+Clean server-change scenario
+----------------------------
+Client peers stay on a fixed inbound interface. Changing country/server only
+rewrites host policy routing:
+
+  from <peer_ip>/32  →  lookup table(N)  →  default dev <exit_iface>
+
+Switch order is atomic (no blackhole window):
+
+  1) warm exit table + rp_filter=0
+  2) ip rule add  from peer → new table
+  3) ip rule del  from peer → old table
+  4) conntrack flush for that peer IP
+
+Exit tunnels should use ``Table = off`` so wg-quick does not fight these tables.
+"""
+
+import json
 import os
 import re
 import shutil
@@ -130,6 +151,11 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         '  ip link show "$1" >/dev/null 2>&1',
         '}',
         "",
+        '_soften_rp_filter() {',
+        '  iface="$1"',
+        '  sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true',
+        '}',
+        "",
         '_default_for_iface() {',
         '  iface="$1"',
         '  table="$2"',
@@ -137,6 +163,7 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         '    echo "peer-egress: exit interface missing: $iface (table $table)" >&2',
         '    return 1',
         '  fi',
+        '  _soften_rp_filter "$iface"',
         '  via="$(ip -4 route show default 2>/dev/null | awk -v d="$iface" \'{for(i=1;i<=NF;i++) if($i=="dev" && $(i+1)==d){for(j=1;j<=NF;j++) if($j=="via"){print $(j+1); exit}}}\')"',
         '  if [ -n "$via" ]; then',
         '    ip route replace default via "$via" dev "$iface" table "$table" 2>/dev/null || return 1',
@@ -147,16 +174,14 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         "",
     ]
 
-    tables: dict[int, str] = {}
     masq: set[str] = set()
     for row in rules:
         addr = str(row["addr"])
         cidr = str(row.get("cidr") or f"{addr}/32")
         table = int(row["table"])
         iface = str(row["iface"])
-        tables[table] = iface
         masq.add(iface)
-        # Only install the policy rule when the exit NIC exists and default route lands.
+        # Cold boot / PostUp: install table then rule (del+add is fine — traffic not live yet).
         lines.append(f'if _default_for_iface "{iface}" {table}; then')
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
         lines.append(f'  ip rule add from "{cidr}" lookup {table} 2>/dev/null || true')
@@ -288,6 +313,12 @@ def reconcile_core_egress(
     runner: Runner | None = None,
     data_dir: str | Path | None = None,
 ) -> dict[str, Any]:
+    """
+    Apply peer→exit policy routing.
+
+    Server change (same peer IP, new exit_interface) is atomic:
+    warm new table → add new rule → delete old rule → flush conntrack.
+    """
     execute = runner or run
     if not shutil.which("ip"):
         return {"ok": False, "skipped": True, "reason": "ip not found"}
@@ -295,37 +326,83 @@ def reconcile_core_egress(
     desired = desired_rules_from_interfaces(interfaces)
     previous = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
     prev_rules = [row for row in (previous.get("rules") or []) if isinstance(row, dict)]
-
-    desired_keys = {(str(row["addr"]), int(row["table"]), str(row["iface"])) for row in desired}
+    prev_by_addr = {
+        str(row.get("addr") or ""): {
+            "table": int(row.get("table") or 0),
+            "iface": str(row.get("iface") or ""),
+            "cidr": peer_source_cidr(row.get("addr")) or f"{row.get('addr')}/32",
+        }
+        for row in prev_rules
+        if str(row.get("addr") or "").strip() and int(row.get("table") or 0) > 0
+    }
 
     _ensure_ip_forward(execute)
 
-    # Drop stale rules that are no longer desired.
-    for row in prev_rules:
-        key = (str(row.get("addr") or ""), int(row.get("table") or 0), str(row.get("iface") or ""))
-        if key in desired_keys:
-            continue
-        cidr = peer_source_cidr(row.get("addr")) or f"{row.get('addr')}/32"
-        table = int(row.get("table") or 0)
-        if table:
-            _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
-
     applied: list[dict[str, str | int]] = []
-    # Always re-apply desired rules (SQLite may say "applied" while OS lost them after reboot).
-    # Skip peers whose exit NIC is missing — orphan rules + empty tables cause unreachable.
+    switched: list[str] = []
+
+    # 1) Warm every desired exit table first (shared by many peers).
+    warmed: set[tuple[str, int]] = set()
     for row in desired:
+        iface = str(row["iface"])
+        table = int(row["table"])
+        key = (iface, table)
+        if key in warmed:
+            continue
+        if not _iface_exists(execute, iface):
+            continue
+        _soften_rp_filter(execute, iface)
+        if _install_default_route(execute, iface=iface, table=table):
+            warmed.add(key)
+
+    # 2) Install desired rules BEFORE removing stale ones (atomic switch).
+    for row in desired:
+        addr = str(row["addr"])
         cidr = str(row["cidr"])
         table = int(row["table"])
         iface = str(row["iface"])
-        _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
-        if not _iface_exists(execute, iface):
-            log.warning("peer egress skipped %s: exit interface [%s] missing", cidr, iface)
+        if (iface, table) not in warmed:
+            log.warning("peer egress skipped %s: exit interface [%s] missing or route failed", cidr, iface)
             continue
-        if not _install_default_route(execute, iface=iface, table=table):
-            log.warning("peer egress skipped %s: default route on [%s] failed", cidr, iface)
-            continue
-        _ip(execute, ["rule", "add", "from", cidr, "lookup", str(table)])
+
+        old = prev_by_addr.get(addr)
+        already = _has_from_lookup_rule(execute, cidr=cidr, table=table)
+        if not already:
+            if not _ip(execute, ["rule", "add", "from", cidr, "lookup", str(table)]):
+                log.warning("peer egress skipped %s: failed to add rule → %s", cidr, iface)
+                continue
+
+        # Drop previous exit for this peer only after the new rule is live.
+        if old and (int(old["table"]) != table or str(old["iface"]) != iface):
+            old_table = int(old["table"])
+            if old_table > 0:
+                _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+            switched.append(addr)
+
         applied.append(row)
+
+    desired_keys = {(str(row["addr"]), int(row["table"]), str(row["iface"])) for row in applied}
+    desired_addrs = {str(row["addr"]) for row in applied}
+
+    # 3) Remove rules for peers that left egress entirely (not a switch).
+    for row in prev_rules:
+        addr = str(row.get("addr") or "")
+        table = int(row.get("table") or 0)
+        iface = str(row.get("iface") or "")
+        key = (addr, table, iface)
+        if key in desired_keys:
+            continue
+        if addr in desired_addrs:
+            # Already handled as atomic switch above.
+            continue
+        cidr = peer_source_cidr(addr) or f"{addr}/32"
+        if table:
+            _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
+            switched.append(addr)
+
+    # 4) Flush conntrack so old NAT paths do not stick after exit change/removal.
+    for addr in dict.fromkeys(switched):
+        _flush_conntrack(execute, addr)
 
     desired_tables = {int(row["table"]): str(row["iface"]) for row in applied}
     prev_tables = {
@@ -373,6 +450,7 @@ def reconcile_core_egress(
         "skipped": False,
         "rules": len(applied),
         "desired": len(desired),
+        "switched": len(dict.fromkeys(switched)),
         "masq": masq_ifaces,
         "persist": persist,
     }
@@ -396,6 +474,80 @@ def _ip(runner: Runner, args: list[str]) -> bool:
 
 def _iface_exists(runner: Runner, iface: str) -> bool:
     return _ip(runner, ["link", "show", iface])
+
+
+def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
+    """True when an identical from/lookup policy rule already exists."""
+    try:
+        result = runner(["ip", "-j", "rule", "show"], check=False, timeout=5)
+    except Exception:
+        result = None
+    if result is not None and getattr(result, "returncode", 1) == 0:
+        raw = str(getattr(result, "stdout", "") or "").strip()
+        if raw:
+            try:
+                rows = json.loads(raw)
+                if isinstance(rows, list):
+                    host = cidr.split("/", 1)[0]
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        src = str(row.get("src") or "").strip()
+                        if src not in (host, cidr):
+                            continue
+                        tbl = row.get("table")
+                        if tbl is None:
+                            continue
+                        if str(tbl) == str(table) or str(tbl) == f"table{table}":
+                            return True
+                        try:
+                            if int(tbl) == int(table):
+                                return True
+                        except (TypeError, ValueError):
+                            pass
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+    # Fallback: plain-text show filtered by src.
+    try:
+        result = runner(["ip", "rule", "show", "from", cidr], check=False, timeout=5)
+    except Exception:
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    text = str(getattr(result, "stdout", "") or "")
+    needle_a = f"lookup {table}"
+    needle_b = f"table {table}"
+    return needle_a in text or needle_b in text
+
+
+def _soften_rp_filter(runner: Runner, iface: str) -> None:
+    """Strict rp_filter breaks multi-exit WG tunnels that share similar addressing."""
+    if not shutil.which("sysctl"):
+        return
+    try:
+        runner(
+            ["sysctl", "-w", f"net.ipv4.conf.{iface}.rp_filter=0"],
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _flush_conntrack(runner: Runner, addr: str) -> None:
+    """Drop sticky NAT/forward states so the peer immediately uses the new exit."""
+    host = str(addr or "").split("/", 1)[0].strip()
+    if not host:
+        return
+    if shutil.which("conntrack"):
+        for direction in ("-s", "-d"):
+            try:
+                runner(["conntrack", "-D", direction, host], check=False, timeout=5)
+            except Exception:
+                pass
+        return
+    # nft / iptables cannot easily wipe by IP here; conntrack-tools is preferred.
 
 
 def _install_default_route(runner: Runner, *, iface: str, table: int) -> bool:

@@ -88,6 +88,8 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
         commands.append(list(args))
         if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
             return _Result(stdout="default via 10.0.0.1 dev eth1 proto dhcp metric 100\n")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
@@ -129,13 +131,14 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
         "table",
         str(table),
     ] in commands
+    assert ["sysctl", "-w", "net.ipv4.conf.eth1.rp_filter=0"] in commands
     script = tmp_path / "peer-egress-apply.sh"
     assert script.is_file()
     text = script.read_text(encoding="utf-8")
     assert f'lookup {table}' in text
     assert f'_default_for_iface "eth1" {table}' in text
     assert "_iface_ready" in text
-    assert "peer-egress: skipped" in text or "interface missing" in text or "_iface_ready" in text
+    assert "_soften_rp_filter" in text
 
     # Stale SQLite state must not skip re-apply (reboot scenario).
     commands.clear()
@@ -171,6 +174,74 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert second["rules"] == 0
     assert ["ip", "rule", "del", "from", "10.80.0.2/32", "lookup", str(table)] in commands
     assert ["ip", "route", "flush", "table", str(table)] in commands
+    assert ["conntrack", "-D", "-s", "10.80.0.2"] in commands
+    store.close()
+
+
+def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
+    """Server change: add new exit rule before deleting the old one."""
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+    live_rules: set[tuple[str, int]] = set()
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "rule", "add"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.add((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "rule", "del"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.discard((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "-j", "rule"]:
+            rows = [{"src": cidr.split("/", 1)[0], "table": table} for cidr, table in live_rules]
+            return _Result(stdout=json.dumps(rows))
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None: {"ok": True, "skipped": True},
+    )
+
+    poland = table_id_for_interface("poland")
+    sweden = table_id_for_interface("sweden")
+
+    first = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.72.174.10", "exit_interface": "poland", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert first["ok"] is True
+    assert first["rules"] == 1
+    assert ("10.72.174.10/32", poland) in live_rules
+
+    commands.clear()
+    switched = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.72.174.10", "exit_interface": "sweden", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert switched["ok"] is True
+    assert switched["switched"] == 1
+
+    add_new = ["ip", "rule", "add", "from", "10.72.174.10/32", "lookup", str(sweden)]
+    del_old = ["ip", "rule", "del", "from", "10.72.174.10/32", "lookup", str(poland)]
+    assert add_new in commands
+    assert del_old in commands
+    assert commands.index(add_new) < commands.index(del_old)
+    assert ["conntrack", "-D", "-s", "10.72.174.10"] in commands
+    assert ("10.72.174.10/32", sweden) in live_rules
+    assert ("10.72.174.10/32", poland) not in live_rules
     store.close()
 
 
@@ -182,6 +253,8 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
         commands.append(list(args))
         if args[:3] == ["ip", "link", "show"] and args[3:] == ["usa"]:
             return _Result(returncode=1, stderr="Device \"usa\" does not exist.\n")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
@@ -213,6 +286,8 @@ def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeyp
         if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
             # Main default is on eth0; exit iface `uk` is a tunnel without main default.
             return _Result(stdout="default via 203.0.113.1 dev eth0\n")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
@@ -246,4 +321,5 @@ def test_render_apply_script_is_idempotent_shell():
     assert f"lookup {table}" in script
     assert 'oifname "eth1"' in script or ' -o "eth1"' in script
     assert "_iface_ready" in script
+    assert "_soften_rp_filter" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
