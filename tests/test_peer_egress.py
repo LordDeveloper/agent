@@ -83,19 +83,48 @@ def test_list_host_interfaces_filters_loopback(monkeypatch):
 def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
     commands: list[list[str]] = []
+    live_rules: set[tuple[str, int]] = set()
 
     def fake_run(args, **kwargs):
         commands.append(list(args))
+        if args[:3] == ["ip", "rule", "add"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.add((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "rule", "del"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.discard((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "-j", "rule"]:
+            rows = [{"src": cidr.split("/", 1)[0], "table": table} for cidr, table in live_rules]
+            return _Result(stdout=json.dumps(rows))
         if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
             return _Result(stdout="default via 10.0.0.1 dev eth1 proto dhcp metric 100\n")
-        if args[:3] == ["ip", "-j", "rule"]:
-            return _Result(stdout="[]")
+        if args[:2] == ["nft", "-j"] and "postrouting" in args:
+            return _Result(
+                stdout=json.dumps(
+                    {
+                        "nftables": [
+                            {
+                                "rule": {
+                                    "expr": [
+                                        {"match": {"left": {"meta": {"key": "oifname"}}, "right": "eth1"}},
+                                        {"masquerade": None},
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+            )
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None: {"ok": True, "skipped": True},
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
     )
 
     first = reconcile_core_egress(
@@ -143,7 +172,7 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert "_iface_ready" in text
     assert "_soften_rp_filter" in text
 
-    # Stale SQLite state must not skip re-apply (reboot scenario).
+    # Idempotent re-reconcile: do not churn rules or rebuild NAT when already healthy.
     commands.clear()
     again = reconcile_core_egress(
         store,
@@ -163,10 +192,9 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
         data_dir=tmp_path,
     )
     assert again["ok"] is True
-    assert any(
-        cmd[:5] == ["ip", "rule", "add", "from", "10.80.0.2/32"] and str(table) in cmd
-        for cmd in commands
-    )
+    assert again.get("nat_rebuilt") is False
+    assert not any(cmd[:5] == ["ip", "rule", "add", "from", "10.80.0.2/32"] for cmd in commands)
+    assert not any(cmd[:1] == ["nft"] and "flush" in cmd for cmd in commands)
 
     commands.clear()
     second = reconcile_core_egress(
@@ -212,7 +240,7 @@ def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None: {"ok": True, "skipped": True},
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
     )
 
     poland = table_id_for_interface("poland")
@@ -272,7 +300,7 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None: {"ok": True, "skipped": True},
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
     )
 
     table = table_id_for_interface("usa")
@@ -305,7 +333,7 @@ def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeyp
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None: {"ok": True, "skipped": True},
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
     )
 
     table = table_id_for_interface("uk")
@@ -372,7 +400,7 @@ def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None: {"ok": True, "skipped": True},
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
     )
 
     result = reconcile_core_egress(
@@ -383,6 +411,7 @@ def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
         data_dir=tmp_path,
     )
     assert result["ok"] is True
+    assert result.get("nat_rebuilt") is True
     assert any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
     # Must purge duplicate iptables MASQUERADE when nft owns NAT.
     assert any(cmd[:1] == ["iptables"] and "-D" in cmd and "MASQUERADE" in cmd and "deutch" in cmd for cmd in commands)

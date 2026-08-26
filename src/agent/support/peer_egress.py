@@ -3,21 +3,23 @@ from __future__ import annotations
 """
 Peer egress policy routing (WireGuard / Amnezia region exits).
 
-Clean server-change scenario
-----------------------------
-Client peers stay on a fixed inbound interface. Changing country/server only
-rewrites host policy routing:
+Server-change scenario (per user, dynamic exits)
+----------------------------------------------
+Inbound WG/Amnezia peers stay on a fixed listen interface. Selecting a region
+node only rewrites host policy routing — never the client peer keys:
 
   from <peer_ip>/32  →  lookup table(N)  →  default dev <exit_iface>
 
-Switch order is atomic (no blackhole window):
+Exit interface names are dynamic (poland, ukrine, deutch, …): each name maps
+to a stable table id. No country whitelist.
 
-  1) warm exit table + rp_filter=0
-  2) ip rule add  from peer → new table
-  3) ip rule del  from peer → old table
-  4) conntrack flush for that peer IP
+Live apply must be idempotent:
+  • ip rules: add/switch only when needed (stable pref per peer IP)
+  • NAT/MSS: rebuild only when the exit set changes (never flush on no-op)
+  • systemd oneshot: rewrite/start only when the apply script content changes
 
-Exit tunnels should use ``Table = off`` so wg-quick does not fight these tables.
+Blind nft flush + systemctl start on every peer update caused multi-second
+packet loss every time the panel/API touched a peer.
 """
 
 import json
@@ -188,10 +190,13 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         table = int(row["table"])
         iface = str(row["iface"])
         masq.add(iface)
-        # Cold boot / PostUp: install table then rule (del+add is fine — traffic not live yet).
+        # Cold boot / PostUp: install table then rule with stable preference.
+        pref = rule_pref_for_addr(addr)
         lines.append(f'if _default_for_iface "{iface}" {table}; then')
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
-        lines.append(f'  ip rule add from "{cidr}" lookup {table} 2>/dev/null || true')
+        lines.append(
+            f'  ip rule add from "{cidr}" lookup {table} pref {pref} 2>/dev/null || true'
+        )
         lines.append("else")
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
         lines.append(
@@ -304,8 +309,17 @@ def write_apply_script(rules: list[dict[str, str | int]], *, data_dir: str | Pat
     return path
 
 
-def ensure_peer_egress_unit(script_path: Path, *, runner: Runner | None = None) -> dict[str, Any]:
-    """Install/enable a oneshot systemd unit that restores egress after reboot."""
+def ensure_peer_egress_unit(
+    script_path: Path,
+    *,
+    runner: Runner | None = None,
+    start: bool = False,
+) -> dict[str, Any]:
+    """Install/enable a oneshot systemd unit that restores egress after reboot.
+
+    ``start`` should be true only when the apply script content actually changed;
+    starting on every reconcile flushed nft NAT and caused periodic packet loss.
+    """
     execute = runner or run
     if not shutil.which("systemctl"):
         return {"ok": False, "skipped": True, "reason": "systemctl not found"}
@@ -339,11 +353,13 @@ def ensure_peer_egress_unit(script_path: Path, *, runner: Runner | None = None) 
         return {"ok": False, "skipped": False, "reason": str(exc)}
 
     enable = execute(["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
-    # Apply immediately so hosts are not left with empty NAT until next reboot.
-    start = execute(["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
+    started = False
+    if start:
+        start_result = execute(["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
+        started = getattr(start_result, "returncode", 1) == 0
     return {
         "ok": getattr(enable, "returncode", 1) == 0,
-        "started": getattr(start, "returncode", 1) == 0,
+        "started": started,
         "unit": str(_UNIT_PATH),
         "script": str(script_path),
     }
@@ -351,9 +367,19 @@ def ensure_peer_egress_unit(script_path: Path, *, runner: Runner | None = None) 
 
 def persist_peer_egress(store: Store, *, data_dir: str | Path | None = None, runner: Runner | None = None) -> dict[str, Any]:
     rules = all_desired_rules_from_store(store)
-    script = write_apply_script(rules, data_dir=data_dir)
-    unit = ensure_peer_egress_unit(script, runner=runner)
-    return {"script": str(script), "rules": len(rules), "unit": unit}
+    path = apply_script_path(data_dir)
+    new_text = render_apply_script(rules)
+    previous = path.read_text(encoding="utf-8") if path.is_file() else None
+    changed = previous != new_text
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding="utf-8")
+        try:
+            path.chmod(0o755)
+        except OSError:
+            pass
+    unit = ensure_peer_egress_unit(path, runner=runner, start=changed)
+    return {"script": str(path), "rules": len(rules), "changed": changed, "unit": unit}
 
 
 def reconcile_core_egress(
@@ -510,8 +536,15 @@ def reconcile_core_egress(
     for iface in other_masq:
         if iface not in previous_masq:
             previous_masq.append(iface)
-    _sync_masquerade(effective_masq, previous_ifaces=previous_masq, runner=execute)
-    _sync_forward(effective_masq, previous_ifaces=previous_masq, runner=execute)
+
+    prev_masq_set = {str(x).strip() for x in previous_masq if str(x).strip()}
+    new_masq_set = set(effective_masq)
+    nat_ok = _nat_already_healthy(effective_masq, runner=execute)
+    nat_rebuilt = False
+    if new_masq_set != prev_masq_set or not nat_ok:
+        _sync_masquerade(effective_masq, previous_ifaces=previous_masq, runner=execute)
+        _sync_forward(effective_masq, previous_ifaces=previous_masq, runner=execute)
+        nat_rebuilt = True
 
     state = {
         "rules": [
@@ -531,6 +564,7 @@ def reconcile_core_egress(
         "desired": len(desired),
         "switched": len(dict.fromkeys(switched)),
         "masq": masq_ifaces,
+        "nat_rebuilt": nat_rebuilt,
         "persist": persist,
     }
 
@@ -677,6 +711,71 @@ def _ensure_ip_forward(runner: Runner) -> None:
             runner(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
         except Exception:
             pass
+
+
+def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
+    """True when the preferred NAT backend already covers every exit iface."""
+    if not ifaces:
+        return True
+    if shutil.which("nft"):
+        return _nft_has_masquerade_for(ifaces, runner=runner)
+    if shutil.which("iptables-legacy"):
+        return all(
+            _iptables(
+                runner,
+                ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+                quiet=True,
+                binary="iptables-legacy",
+            )
+            or _iptables(
+                runner,
+                [
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    iface,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    f"{_MASQ_COMMENT_PREFIX}{iface}",
+                    "-j",
+                    "MASQUERADE",
+                ],
+                quiet=True,
+                binary="iptables-legacy",
+            )
+            for iface in ifaces
+        )
+    if shutil.which("iptables"):
+        return all(
+            _iptables(
+                runner,
+                ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+                quiet=True,
+            )
+            or _iptables(
+                runner,
+                [
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    iface,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    f"{_MASQ_COMMENT_PREFIX}{iface}",
+                    "-j",
+                    "MASQUERADE",
+                ],
+                quiet=True,
+            )
+            for iface in ifaces
+        )
+    return False
 
 
 def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:

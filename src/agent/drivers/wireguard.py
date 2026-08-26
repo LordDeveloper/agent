@@ -114,6 +114,24 @@ def _next_ip(subnet: str, used: set[str]) -> str:
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")
 
 
+def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """True when live WireGuard peer config must change (not just egress metadata)."""
+    wg_keys = (
+        "public_key",
+        "allowed_ips",
+        "persistent_keepalive",
+        "address",
+        "private_key",
+        "preshared_key",
+    )
+    for key in wg_keys:
+        if before.get(key) != after.get(key):
+            return True
+    if record_is_enabled(before) != record_is_enabled(after):
+        return True
+    return False
+
+
 def accumulate_transfer(
     peer: dict[str, Any],
     incoming: int,
@@ -409,6 +427,7 @@ class WireGuardDriver(CoreDriver):
         iface = self.get_interface(interface_id)
         for idx, peer in enumerate(iface.get("peers", [])):
             if str(peer.get("id")) == peer_id or str(peer.get("email")) == peer_id:
+                before = deepcopy(peer)
                 merged = deepcopy(peer)
                 normalized = normalize_peer(payload)
                 # Preserve traffic counters unless explicitly reset in payload.
@@ -420,7 +439,13 @@ class WireGuardDriver(CoreDriver):
                     else:
                         merged.pop("exit_interface", None)
                 iface["peers"][idx] = merged
-                self.update_interface(interface_id, iface)
+
+                # exit_interface / metadata-only updates must not wg syncconf + nft flush.
+                if _peer_change_needs_wg_apply(before, merged):
+                    self.update_interface(interface_id, iface)
+                else:
+                    self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                    self._sync_peer_egress()
                 return merged
         raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
