@@ -127,7 +127,18 @@ class XrayHttpClient:
         return users
 
     def online_ips(self, email: str) -> list[str]:
-        body = self.get("/api/stats/online/iplist", params={"email": email})
+        """Return currently-online client IPs.
+
+        Xray returns 404 ``...>>>online not found`` when the user is offline.
+        That is a normal empty result, not a missing config.
+        """
+        try:
+            body = self.get("/api/stats/online/iplist", params={"email": email})
+        except AgentError as exc:
+            message = str(exc.message or "").lower()
+            if exc.status == 404 or "online not found" in message or "not found" in message:
+                return []
+            raise
         ips = body.get("ips") or {}
         if isinstance(ips, dict):
             return list(ips.keys())

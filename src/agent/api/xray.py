@@ -185,7 +185,15 @@ def reset_traffic(inbound_id: str, client_key: str, xray: XrayDriver = Depends(g
 
 @router.get("/clients/{email}/ips")
 def client_ips(email: str, xray: XrayDriver = Depends(get_xray)):
-    return {"success": True, "ips": xray.client_ips(email)}
+    try:
+        ips = xray.client_ips(email)
+    except AgentError as exc:
+        # Offline users are reported as 404 by Xray online/iplist — treat as [].
+        message = str(exc.message or "").lower()
+        if exc.status == 404 or "online not found" in message:
+            return {"success": True, "ips": []}
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "ips": ips}
 
 
 @router.delete("/clients/{email}/ips")
