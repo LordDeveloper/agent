@@ -118,7 +118,10 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert first["ok"] is True
     assert first["rules"] == 1
     table = table_id_for_interface("eth1")
-    assert ["ip", "rule", "add", "from", "10.80.0.2/32", "lookup", str(table)] in commands
+    assert any(
+        cmd[:5] == ["ip", "rule", "add", "from", "10.80.0.2/32"] and str(table) in cmd
+        for cmd in commands
+    )
     assert [
         "ip",
         "route",
@@ -160,7 +163,10 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
         data_dir=tmp_path,
     )
     assert again["ok"] is True
-    assert ["ip", "rule", "add", "from", "10.80.0.2/32", "lookup", str(table)] in commands
+    assert any(
+        cmd[:5] == ["ip", "rule", "add", "from", "10.80.0.2/32"] and str(table) in cmd
+        for cmd in commands
+    )
 
     commands.clear()
     second = reconcile_core_egress(
@@ -235,10 +241,16 @@ def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     assert switched["switched"] == 1
 
     add_new = ["ip", "rule", "add", "from", "10.72.174.10/32", "lookup", str(sweden)]
+    # Cutover uses pref; accept any add that targets sweden lookup.
+    add_idxs = [
+        i
+        for i, cmd in enumerate(commands)
+        if cmd[:5] == ["ip", "rule", "add", "from", "10.72.174.10/32"] and str(sweden) in cmd
+    ]
     del_old = ["ip", "rule", "del", "from", "10.72.174.10/32", "lookup", str(poland)]
-    assert add_new in commands
+    assert add_idxs, f"missing sweden add in {commands}"
     assert del_old in commands
-    assert commands.index(add_new) < commands.index(del_old)
+    assert min(add_idxs) < commands.index(del_old)
     assert ["conntrack", "-D", "-s", "10.72.174.10"] in commands
     assert ("10.72.174.10/32", sweden) in live_rules
     assert ("10.72.174.10/32", poland) not in live_rules
@@ -320,15 +332,15 @@ def test_render_apply_script_is_idempotent_shell():
     assert "ip_forward=1" in script
     assert f"lookup {table}" in script
     assert 'oifname "eth1"' in script
-    assert ' -o "eth1"' in script
-    assert "iptables-legacy" in script
+    assert "maxseg size set rt mtu" in script
+    assert "while iptables -t nat -D POSTROUTING" in script
     assert "_iface_ready" in script
     assert "_soften_rp_filter" in script
     assert "netinja-egress-eth1" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
 
 
-def test_reconcile_installs_masq_on_nft_and_iptables(tmp_path, monkeypatch):
+def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
     commands: list[list[str]] = []
 
@@ -338,6 +350,23 @@ def test_reconcile_installs_masq_on_nft_and_iptables(tmp_path, monkeypatch):
             return _Result(stdout="[]")
         if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
             return _Result(stdout="")
+        if args[:2] == ["nft", "-j"] and "postrouting" in args:
+            return _Result(
+                stdout=json.dumps(
+                    {
+                        "nftables": [
+                            {
+                                "rule": {
+                                    "expr": [
+                                        {"match": {"left": {"meta": {"key": "oifname"}}, "right": "deutch"}},
+                                        {"masquerade": None},
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+            )
         return _Result()
 
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
@@ -355,12 +384,11 @@ def test_reconcile_installs_masq_on_nft_and_iptables(tmp_path, monkeypatch):
     )
     assert result["ok"] is True
     assert any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
+    # Must purge duplicate iptables MASQUERADE when nft owns NAT.
+    assert any(cmd[:1] == ["iptables"] and "-D" in cmd and "MASQUERADE" in cmd and "deutch" in cmd for cmd in commands)
     assert any(
-        cmd[:1] == ["iptables"] and "-t" in cmd and "MASQUERADE" in cmd and "deutch" in cmd
-        for cmd in commands
+        cmd[:1] == ["iptables-legacy"] and "-D" in cmd and "MASQUERADE" in cmd and "deutch" in cmd for cmd in commands
     )
-    assert any(
-        cmd[:1] == ["iptables-legacy"] and "MASQUERADE" in cmd and "deutch" in cmd
-        for cmd in commands
-    )
+    # Must NOT keep installing MASQUERADE on iptables while nft is healthy.
+    assert not any(cmd[:1] == ["iptables"] and "-A" in cmd and "MASQUERADE" in cmd for cmd in commands)
     store.close()
