@@ -84,8 +84,12 @@ class XrayHttpClient:
             except Exception:
                 message = response.text or "unknown"
             detail = f"Xray HTTP API error ({response.status_code}) [{resolved}]: {message}"
+            message_lower = message.lower()
+            # Offline users: Xray iplist returns 404 "...>>>online not found" — not missing config.
+            if response.status_code == 404 and "online not found" in message_lower:
+                raise AgentError("USER_OFFLINE", detail, 404)
             # Bare Go mux 404s mean the custom HTTP API routes are missing (stock Xray).
-            if response.status_code == 404 or "page not found" in message.lower():
+            if response.status_code == 404 or "page not found" in message_lower:
                 raise AgentError("CONFIG_NOT_FOUND", detail, 404)
             if response.status_code in {401, 403}:
                 raise AgentError("INVALID_CREDENTIALS", detail, response.status_code)
@@ -136,7 +140,11 @@ class XrayHttpClient:
             body = self.get("/api/stats/online/iplist", params={"email": email})
         except AgentError as exc:
             message = str(exc.message or "").lower()
-            if exc.status == 404 or "online not found" in message or "not found" in message:
+            if (
+                exc.status == 404
+                or exc.code == "USER_OFFLINE"
+                or "online not found" in message
+            ):
                 return []
             raise
         ips = body.get("ips") or {}

@@ -190,7 +190,7 @@ def client_ips(email: str, xray: XrayDriver = Depends(get_xray)):
     except AgentError as exc:
         # Offline users are reported as 404 by Xray online/iplist — treat as [].
         message = str(exc.message or "").lower()
-        if exc.status == 404 or "online not found" in message:
+        if exc.status == 404 or exc.code == "USER_OFFLINE" or "online not found" in message:
             return {"success": True, "ips": []}
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "ips": ips}
