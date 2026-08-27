@@ -165,6 +165,115 @@ def ensure_xray_httpapi_config(
     return True
 
 
+def ensure_traffic_stats_in_config(data: dict[str, Any]) -> bool:
+    """Ensure Stats module + per-user counters are enabled in an Xray config dict."""
+    if not isinstance(data, dict):
+        return False
+
+    changed = False
+
+    if not isinstance(data.get("stats"), dict):
+        data["stats"] = {}
+        changed = True
+
+    policy = data.get("policy") if isinstance(data.get("policy"), dict) else {}
+    levels = policy.get("levels") if isinstance(policy.get("levels"), dict) else {}
+    level0 = levels.get("0") if isinstance(levels.get("0"), dict) else {}
+    for flag in ("statsUserUplink", "statsUserDownlink", "statsUserOnline"):
+        if level0.get(flag) is not True:
+            level0[flag] = True
+            changed = True
+    levels["0"] = level0
+    policy["levels"] = levels
+
+    system = policy.get("system") if isinstance(policy.get("system"), dict) else {}
+    for flag in (
+        "statsInboundUplink",
+        "statsInboundDownlink",
+        "statsOutboundUplink",
+        "statsOutboundDownlink",
+    ):
+        if system.get(flag) is not True:
+            system[flag] = True
+            changed = True
+    policy["system"] = system
+    data["policy"] = policy
+
+    api = data.get("api") if isinstance(data.get("api"), dict) else None
+    if api is None:
+        data["api"] = {
+            "tag": "api",
+            "services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"],
+        }
+        changed = True
+    else:
+        services = api.get("services") if isinstance(api.get("services"), list) else []
+        services = [str(item) for item in services]
+        if "StatsService" not in services:
+            services.append("StatsService")
+            api["services"] = services
+            data["api"] = api
+            changed = True
+        if not str(api.get("tag") or "").strip():
+            api["tag"] = "api"
+            data["api"] = api
+            changed = True
+
+    inbounds = data.get("inbounds") if isinstance(data.get("inbounds"), list) else []
+    has_api_inbound = any(
+        isinstance(row, dict) and str(row.get("tag") or "") == "api" for row in inbounds
+    )
+    if not has_api_inbound:
+        inbounds = list(inbounds)
+        inbounds.insert(
+            0,
+            {
+                "tag": "api",
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            },
+        )
+        data["inbounds"] = inbounds
+        changed = True
+
+    routing = data.get("routing") if isinstance(data.get("routing"), dict) else {}
+    rules = routing.get("rules") if isinstance(routing.get("rules"), list) else []
+    has_api_rule = any(
+        isinstance(row, dict)
+        and row.get("outboundTag") == "api"
+        and "api" in (row.get("inboundTag") or [])
+        for row in rules
+    )
+    if not has_api_rule:
+        rules = list(rules)
+        rules.insert(0, {"type": "field", "inboundTag": ["api"], "outboundTag": "api"})
+        routing["rules"] = rules
+        if "domainStrategy" not in routing:
+            routing["domainStrategy"] = "AsIs"
+        data["routing"] = routing
+        changed = True
+
+    # Freedom/blackhole outbounds are usually present; api outbound is not required for httpapi stats.
+    return changed
+
+
+def ensure_xray_traffic_stats_config(config_path: Path) -> bool:
+    if not config_path.is_file():
+        return False
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if not ensure_traffic_stats_in_config(data):
+        return False
+    config_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
+
+
 def wait_xray_http_api(
     *,
     api_base: str,
@@ -348,7 +457,8 @@ def ensure_xray_runtime(
         username=username,
         password=password,
     )
-    wrote_config = httpapi_changed
+    stats_changed = ensure_xray_traffic_stats_config(cfg)
+    wrote_config = httpapi_changed or stats_changed
     write_xray_unit(unit, resolved_binary, str(cfg))
     reachable_api = api_base_from_config(cfg, api_base)
     auth_user, auth_pass = xray_auth_from_config(cfg, username, password)
@@ -359,6 +469,7 @@ def ensure_xray_runtime(
         "unit": str(unit),
         "wrote_config": wrote_config,
         "httpapi_synced": httpapi_changed,
+        "traffic_stats_synced": stats_changed,
         "started": False,
         "httpapi": reachable_api,
         "httpapi_capable": binary_has_httpapi(resolved_binary),

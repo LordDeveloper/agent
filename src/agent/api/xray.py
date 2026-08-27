@@ -243,6 +243,36 @@ def put_config(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     return {"success": True, "result": result}
 
 
+@router.post("/ensure-traffic-stats")
+def ensure_traffic_stats(xray: XrayDriver = Depends(get_xray)):
+    """Enable stats/policy/StatsService on disk without a full config round-trip."""
+    try:
+        from pathlib import Path
+
+        from agent.xray_service import ensure_xray_traffic_stats_config
+
+        path = Path(xray.settings.xray.config)
+        changed = ensure_xray_traffic_stats_config(path)
+        config = xray.read_config()
+        # Hot-reload into running core when possible (keeps connections if import works).
+        try:
+            reload_result = xray._api().import_config(config, path=str(path))
+        except AgentError as exc:
+            reload_result = {"ok": False, "error": exc.message}
+        return {
+            "success": True,
+            "changed": changed,
+            "config_path": str(path),
+            "stats": config.get("stats") if isinstance(config.get("stats"), dict) else {},
+            "policy": config.get("policy") if isinstance(config.get("policy"), dict) else {},
+            "api": config.get("api") if isinstance(config.get("api"), dict) else {},
+            "reload": reload_result if isinstance(reload_result, dict) else {"ok": True, "result": reload_result},
+        }
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+
+
+
 @router.get("/logs")
 def xray_logs(kind: str = "error", lines: int = 200, xray: XrayDriver = Depends(get_xray)):
     try:

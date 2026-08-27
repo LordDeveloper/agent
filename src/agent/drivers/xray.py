@@ -1111,9 +1111,16 @@ class XrayDriver(CoreDriver):
         if not isinstance(payload, dict):
             raise AgentError("VALIDATION_ERROR", "Xray config must be a JSON object", 422)
 
+        # Panel/API dumps can omit critical top-level keys. Keep disk values when omitted.
+        for key in ("api", "httpapi", "inbounds", "outbounds", "routing"):
+            if key not in config and key in current:
+                payload[key] = current[key]
+
         from agent.support.config_validate import normalize_xray_config_shapes
+        from agent.xray_service import ensure_traffic_stats_in_config
 
         normalize_xray_config_shapes(payload)
+        ensure_traffic_stats_in_config(payload)
 
         binary = self._binary()
         if binary:
@@ -1156,7 +1163,12 @@ class XrayDriver(CoreDriver):
         if name not in MANAGED_SECTIONS:
             raise AgentError("VALIDATION_ERROR", f"Unsupported Xray section [{name}]", 422)
         config = self.read_config()
-        if value in (None, {}, []):
+        if value is None:
+            config.pop(name, None)
+        elif name == "stats":
+            # Empty object enables the Stats module; never treat {} / [] as "delete".
+            config["stats"] = value if isinstance(value, dict) else {}
+        elif value in ({}, []):
             config.pop(name, None)
         elif name == "routing" and isinstance(value, dict):
             current = dict(config.get("routing") or {})
@@ -1396,4 +1408,11 @@ class XrayDriver(CoreDriver):
                 if key in row and row[key] is not None:
                     entry[key] = int(row[key])
             out[str(email)] = entry
+        # Xray /api/stats/online/traffic may return session presence without
+        # uplink/downlink; fall back to QueryStats snapshot counters.
+        if out and not any(
+            int(row.get("uplink") or 0) > 0 or int(row.get("downlink") or 0) > 0
+            for row in out.values()
+        ):
+            return online_traffic_from_snapshot(self)
         return out
