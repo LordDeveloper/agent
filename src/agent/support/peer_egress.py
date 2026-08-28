@@ -71,6 +71,26 @@ def normalize_exit_interface(value: Any) -> str | None:
     return name
 
 
+def tunnel_interface_names(interfaces: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        {
+            str(row.get("name") or "").strip()
+            for row in interfaces
+            if str(row.get("name") or "").strip()
+        }
+    )
+
+
+def all_tunnel_interface_names(store: Store) -> list[str]:
+    names: set[str] = set()
+    for core in _EGRESS_CORES:
+        for row in store.list_docs(core, _IFACE_KIND):
+            name = str(row.get("name") or "").strip()
+            if name:
+                names.add(name)
+    return sorted(names)
+
+
 def peer_source_cidr(address: Any) -> str | None:
     text = str(address or "").strip()
     if not text:
@@ -148,7 +168,10 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
     return merged
 
 
-def render_apply_script(rules: list[dict[str, str | int]]) -> str:
+def render_apply_script(
+    rules: list[dict[str, str | int]],
+    tunnel_ifaces: list[str] | None = None,
+) -> str:
     """Self-contained shell script so egress survives reboot (wg-quick PostUp / systemd)."""
     lines = [
         "#!/bin/sh",
@@ -205,6 +228,12 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         lines.append("fi")
 
     lines.append("")
+    tunnels = sorted({str(name).strip() for name in (tunnel_ifaces or []) if str(name).strip()})
+    for tunnel in tunnels:
+        lines.append(f'_soften_rp_filter "{tunnel}"')
+    if tunnels:
+        lines.append("")
+
     # Prefer a SINGLE NAT backend to avoid double MASQUERADE (causes packet loss).
     lines.extend(
         [
@@ -236,6 +265,21 @@ def render_apply_script(rules: list[dict[str, str | int]]) -> str:
         lines.append(
             f'  nft add rule inet netinja_egress forward iifname "{iface}" '
             f'ct state related,established accept comment "{comment}-fwd-in" 2>/dev/null || true'
+        )
+    for tunnel in tunnels:
+        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        lines.append(
+            f'  nft add rule inet netinja_egress forward iifname "{tunnel}" '
+            f'tcp flags syn / syn,rst tcp option maxseg size set rt mtu '
+            f'comment "{tunnel_comment}-mss" 2>/dev/null || true'
+        )
+        lines.append(
+            f'  nft add rule inet netinja_egress forward iifname "{tunnel}" '
+            f'accept comment "{tunnel_comment}-in" 2>/dev/null || true'
+        )
+        lines.append(
+            f'  nft add rule inet netinja_egress forward oifname "{tunnel}" '
+            f'accept comment "{tunnel_comment}-out" 2>/dev/null || true'
         )
     lines.append("  if command -v iptables >/dev/null 2>&1; then")
     for iface in sorted(masq):
@@ -367,8 +411,9 @@ def ensure_peer_egress_unit(
 
 def persist_peer_egress(store: Store, *, data_dir: str | Path | None = None, runner: Runner | None = None) -> dict[str, Any]:
     rules = all_desired_rules_from_store(store)
+    tunnels = all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
-    new_text = render_apply_script(rules)
+    new_text = render_apply_script(rules, tunnels)
     previous = path.read_text(encoding="utf-8") if path.is_file() else None
     changed = previous != new_text
     if changed:
@@ -539,11 +584,17 @@ def reconcile_core_egress(
 
     prev_masq_set = {str(x).strip() for x in previous_masq if str(x).strip()}
     new_masq_set = set(effective_masq)
+    tunnel_ifaces = sorted(set(tunnel_interface_names(interfaces)) | set(all_tunnel_interface_names(store)))
     nat_ok = _nat_already_healthy(effective_masq, runner=execute)
+    forward_ok = _forward_already_healthy(tunnel_ifaces, runner=execute)
     nat_rebuilt = False
-    if new_masq_set != prev_masq_set or not nat_ok:
-        _sync_masquerade(effective_masq, previous_ifaces=previous_masq, runner=execute)
-        _sync_forward(effective_masq, previous_ifaces=previous_masq, runner=execute)
+    if new_masq_set != prev_masq_set or not nat_ok or (tunnel_ifaces and not forward_ok):
+        _sync_masquerade(
+            effective_masq,
+            previous_ifaces=previous_masq,
+            runner=execute,
+            tunnel_ifaces=tunnel_ifaces,
+        )
         nat_rebuilt = True
 
     state = {
@@ -778,7 +829,13 @@ def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
     return False
 
 
-def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+def _sync_masquerade(
+    ifaces: list[str],
+    *,
+    previous_ifaces: list[str],
+    runner: Runner,
+    tunnel_ifaces: list[str] | None = None,
+) -> None:
     """Install SNAT/MASQUERADE on every exit NIC using a single backend.
 
     Installing the same MASQUERADE on nft + iptables + iptables-legacy at once
@@ -787,7 +844,7 @@ def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: R
     targets = sorted({*ifaces, *[str(x) for x in previous_ifaces if str(x).strip()]})
     nft_ok = False
     if shutil.which("nft"):
-        _sync_masquerade_nft(ifaces, runner=runner)
+        _sync_masquerade_nft(ifaces, runner=runner, tunnel_ifaces=tunnel_ifaces or [])
         nft_ok = _nft_has_masquerade_for(ifaces, runner=runner)
 
     if nft_ok:
@@ -798,12 +855,14 @@ def _sync_masquerade(ifaces: list[str], *, previous_ifaces: list[str], runner: R
 
     if shutil.which("iptables-legacy"):
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
+        _sync_forward(ifaces, previous_ifaces=previous_ifaces, runner=runner)
         if shutil.which("iptables") and _iptables_is_nft(runner):
             _purge_iptables_exit_masq(targets, runner=runner, binary="iptables")
         return
 
     if shutil.which("iptables"):
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
+        _sync_forward(ifaces, previous_ifaces=previous_ifaces, runner=runner)
 
 
 def _sync_forward(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
@@ -999,7 +1058,31 @@ def _sync_forward_iptables(
             )
 
 
-def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
+def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> bool:
+    if not tunnel_ifaces:
+        return True
+    if not shutil.which("nft"):
+        return False
+    try:
+        result = runner(
+            ["nft", "list", "chain", "inet", "netinja_egress", "forward"],
+            check=False,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    text = str(getattr(result, "stdout", "") or "")
+    return all(f'tunnel-{tunnel}-in' in text or f'tunnel-{tunnel}-mss' in text for tunnel in tunnel_ifaces)
+
+
+def _sync_masquerade_nft(
+    ifaces: list[str],
+    *,
+    runner: Runner,
+    tunnel_ifaces: list[str] | None = None,
+) -> None:
     _nft(runner, ["add", "table", "inet", "netinja_egress"])
     _nft(
         runner,
@@ -1099,6 +1182,67 @@ def _sync_masquerade_nft(ifaces: list[str], *, runner: Runner) -> None:
                 "accept",
                 "comment",
                 f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in",
+            ],
+        )
+    for tunnel in tunnel_ifaces or []:
+        if not tunnel:
+            continue
+        _soften_rp_filter(runner, tunnel)
+        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                "forward",
+                "iifname",
+                tunnel,
+                "tcp",
+                "flags",
+                "syn",
+                "/",
+                "syn,rst",
+                "tcp",
+                "option",
+                "maxseg",
+                "size",
+                "set",
+                "rt",
+                "mtu",
+                "comment",
+                f"{tunnel_comment}-mss",
+            ],
+        )
+        _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                "forward",
+                "iifname",
+                tunnel,
+                "accept",
+                "comment",
+                f"{tunnel_comment}-in",
+            ],
+        )
+        _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                "forward",
+                "oifname",
+                tunnel,
+                "accept",
+                "comment",
+                f"{tunnel_comment}-out",
             ],
         )
 

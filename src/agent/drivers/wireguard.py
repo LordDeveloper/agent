@@ -23,6 +23,8 @@ from agent.support.process import run
 _ONLINE_HANDSHAKE_SECONDS = 180
 _IP_WINDOW_SECONDS = 600
 _IP_LOG_LIMIT = 50
+_WG_MTU = 1420
+_AWG_MTU = 1280
 
 
 def endpoint_host(endpoint: str | None) -> str | None:
@@ -487,6 +489,7 @@ class WireGuardDriver(CoreDriver):
             "[Interface]",
             f"PrivateKey = {peer.get('private_key')}",
             f"Address = {peer.get('address')}/32",
+            f"MTU = {self._client_mtu(peer)}",
             "DNS = 1.1.1.1",
             "",
             "[Peer]",
@@ -590,6 +593,18 @@ class WireGuardDriver(CoreDriver):
             if changed:
                 self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
 
+    def _client_mtu(self, peer: dict[str, Any] | None = None) -> int:
+        custom = (peer or {}).get("mtu")
+        try:
+            if custom is not None and int(custom) > 0:
+                return int(custom)
+        except (TypeError, ValueError):
+            pass
+        return _AWG_MTU if self.key == "amnezia" else _WG_MTU
+
+    def _server_mtu(self) -> int:
+        return _AWG_MTU if self.key == "amnezia" else _WG_MTU
+
     def _cli_bin(self) -> str | None:
         if self.key == "amnezia":
             return shutil.which("awg") or shutil.which("wg")
@@ -669,6 +684,7 @@ class WireGuardDriver(CoreDriver):
             f"Address = {address}",
             f"ListenPort = {iface['listen_port']}",
             f"PrivateKey = {iface['private_key']}",
+            f"MTU = {self._server_mtu()}",
         ]
         obf = iface.get("obfuscation") or {}
         for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):

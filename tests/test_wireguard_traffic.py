@@ -1,4 +1,13 @@
-from agent.drivers.wireguard import accumulate_transfer
+from agent.drivers.wireguard import WireGuardDriver, accumulate_transfer
+
+
+def test_peer_config_includes_default_mtu(monkeypatch):
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    driver.key = "wireguard"
+    assert driver._client_mtu() == 1420
+    driver.key = "amnezia"
+    assert driver._client_mtu() == 1280
+    assert driver._client_mtu({"mtu": 1360}) == 1360
 
 
 def test_accumulate_transfer_delta():

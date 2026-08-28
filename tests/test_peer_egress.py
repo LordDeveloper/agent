@@ -8,6 +8,7 @@ from agent.support.host_interfaces import list_host_interfaces
 from agent.support.peer_egress import (
     desired_rules_from_interfaces,
     reconcile_core_egress,
+    render_apply_script,
     table_id_for_interface,
 )
 
@@ -421,3 +422,15 @@ def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     # Must NOT keep installing MASQUERADE on iptables while nft is healthy.
     assert not any(cmd[:1] == ["iptables"] and "-A" in cmd and "MASQUERADE" in cmd for cmd in commands)
     store.close()
+
+
+def test_render_apply_script_includes_tunnel_forward_and_mss_rules():
+    script = render_apply_script(
+        [{"addr": "10.80.0.2", "cidr": "10.80.0.2/32", "iface": "eth1", "table": 12345}],
+        ["wg0"],
+    )
+    assert '_soften_rp_filter "wg0"' in script
+    assert 'iifname "wg0"' in script
+    assert "tunnel-wg0-mss" in script
+    assert "tunnel-wg0-in" in script
+    assert "tunnel-wg0-out" in script
