@@ -235,6 +235,19 @@ class WireGuardDriver(CoreDriver):
                     return recent_peer_ips(peer)
         return []
 
+    def diagnose_address(self, address: str) -> dict[str, Any]:
+        """Full interface/peer/routing diagnostic for a peer AllowedIP address."""
+        from agent.support.peer_diagnose import diagnose_peer_address
+
+        self.sync_peer_stats()
+        return diagnose_peer_address(
+            self.store,
+            self.key,
+            address,
+            peer_dump_fn=self._peer_dump,
+            interface_is_up_fn=self._interface_is_up,
+        )
+
     def clear_peer_ips(self, email: str) -> bool:
         changed = False
         for iface in self.list_interfaces():
@@ -617,6 +630,7 @@ class WireGuardDriver(CoreDriver):
                 continue
             public_key = parts[0]
             endpoint = parts[2] if len(parts) > 2 else ""
+            allowed_ips = parts[3] if len(parts) > 3 else ""
             try:
                 handshake_at = int(parts[4] or 0)
                 transfer_rx = int(parts[5] or 0)
@@ -628,6 +642,8 @@ class WireGuardDriver(CoreDriver):
                 "outgoing": transfer_rx,
                 "handshake_at": handshake_at,
                 "endpoint": endpoint,
+                "allowed_ips": allowed_ips,
+                "public_key": public_key,
             }
         return peers
 

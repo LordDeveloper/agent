@@ -129,6 +129,15 @@ def peer_ips(email: str, wg: WireGuardDriver = Depends(get_wg)):
     return {"success": True, "ips": wg.peer_ips(email)}
 
 
+@router.get("/diagnose")
+def diagnose_peer(address: str, wg: WireGuardDriver = Depends(get_wg)):
+    try:
+        report = wg.diagnose_address(address)
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return report
+
+
 @router.delete("/peers/{email}/ips")
 def clear_peer_ips(email: str, wg: WireGuardDriver = Depends(get_wg)):
     wg.clear_peer_ips(email)

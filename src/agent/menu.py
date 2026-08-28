@@ -767,6 +767,40 @@ def _show_dns_leak_remove() -> None:
     _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
 
 
+def _peer_diagnose_menu() -> None:
+    while True:
+        render_header("Peer diagnose")
+        picked = select(
+            [
+                Choice("wireguard", "WireGuard peer", CYAN, "1"),
+                Choice("amnezia", "Amnezia peer", BLUE, "2"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        address = prompt_text("Peer address (e.g. 10.80.0.5)")
+        if not str(address or "").strip():
+            continue
+        core = "amnezia" if picked == "amnezia" else "wireguard"
+        _run_action(
+            f"Diagnose {core} peer",
+            lambda addr=str(address).strip(), selected_core=core: _show_peer_diagnose(selected_core, addr),
+        )
+
+
+def _show_peer_diagnose(core: str, address: str) -> None:
+    from agent.cli import cmd_peer_diagnose
+
+    code = cmd_peer_diagnose(SimpleNamespace(env_file=None, core=core, address=address))
+    if code == 0:
+        _print(paint("  healthy: yes", GREEN))
+    elif code == 2:
+        _print(paint("  peer not found", YELLOW))
+    else:
+        _print(paint("  issues detected — see JSON above", RED))
+
+
 def _token_menu() -> None:
     while True:
         render_header("Token")
@@ -811,10 +845,11 @@ def run_interactive() -> int:
                     Choice("tls", "TLS Certificates", YELLOW, "4"),
                     Choice("bbr", "BBR", MAGENTA, "5"),
                     Choice("dns_leak", "DNS leak protection", MAGENTA, "6"),
-                    Choice("status", "Check status", WHITE, "7"),
-                    Choice("stats", "Stats", WHITE, "8"),
-                    Choice("update", "Update agent", WHITE, "9"),
-                    Choice("token", "Auth token", WHITE, "10"),
+                    Choice("peer_diagnose", "Peer diagnose", CYAN, "7"),
+                    Choice("status", "Check status", WHITE, "8"),
+                    Choice("stats", "Stats", WHITE, "9"),
+                    Choice("update", "Update agent", WHITE, "10"),
+                    Choice("token", "Auth token", WHITE, "11"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]
             )
@@ -837,6 +872,8 @@ def run_interactive() -> int:
                 _bbr_menu()
             elif picked == "dns_leak":
                 _dns_leak_menu()
+            elif picked == "peer_diagnose":
+                _peer_diagnose_menu()
             elif picked == "status":
                 _status()
             elif picked == "stats":

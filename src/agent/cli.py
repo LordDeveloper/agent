@@ -362,6 +362,23 @@ def cmd_dns_leak_remove(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_peer_diagnose(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        core = (args.core or "wireguard").strip().lower()
+        driver = runtime.registry.get(core)
+        if not hasattr(driver, "diagnose_address"):
+            raise AgentError("UNSUPPORTED_CAPABILITY", f"Core [{core}] does not support peer diagnose")
+        report = driver.diagnose_address(args.address)
+        _print_json(report)
+        healthy = bool((report.get("summary") or {}).get("healthy"))
+        if report.get("found") is False:
+            return 2
+        return 0 if healthy else 1
+    finally:
+        runtime.close()
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -593,6 +610,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dns_remove = dns_sub.add_parser("remove", help="Remove DNS leak protection rules")
     p_dns_remove.set_defaults(func=cmd_dns_leak_remove)
+
+    p_peer = sub.add_parser("peer", help="WireGuard / Amnezia peer diagnostics")
+    peer_sub = p_peer.add_subparsers(dest="peer_command", required=True)
+
+    p_peer_diag = peer_sub.add_parser(
+        "diagnose",
+        help="Full routing/interface diagnostic for a peer AllowedIP address",
+    )
+    _env_flag(p_peer_diag)
+    p_peer_diag.add_argument("address", help="Peer address (e.g. 10.80.0.5 or 10.80.0.5/32)")
+    p_peer_diag.add_argument(
+        "--core",
+        default="wireguard",
+        choices=["wireguard", "amnezia"],
+        help="VPN core to inspect (default: wireguard)",
+    )
+    p_peer_diag.set_defaults(func=cmd_peer_diagnose)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)

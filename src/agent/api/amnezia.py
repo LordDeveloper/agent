@@ -141,6 +141,15 @@ def peer_ips(email: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
     return {"success": True, "ips": amnezia.peer_ips(email)}
 
 
+@router.get("/diagnose")
+def diagnose_peer(address: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
+    try:
+        report = amnezia.diagnose_address(address)
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return report
+
+
 @router.delete("/peers/{email}/ips")
 def clear_peer_ips(email: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
     amnezia.clear_peer_ips(email)
