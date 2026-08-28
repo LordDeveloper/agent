@@ -899,6 +899,38 @@ class WireGuardDriver(CoreDriver):
         self.audit.record("repair", f"{self.key}/peer/{peer_id}/keys")
         return repaired
 
+    def reset_peer_keys(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
+        """Regenerate key material when store/DB no longer match live wg (keeps id/email/address)."""
+        iface = deepcopy(self.get_interface(interface_id))
+        previous = deepcopy(iface)
+        peer = None
+        idx = None
+        for i, row in enumerate(iface.get("peers", [])):
+            if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
+                peer = row
+                idx = i
+                break
+        if peer is None or idx is None:
+            raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        cli = self._cli_bin() or "wg"
+        priv, pub = _wg_keypair(cli)
+        reset = deepcopy(peer)
+        reset["private_key"] = priv
+        reset["public_key"] = pub
+
+        iface["peers"][idx] = reset
+        self._validate_before_apply(iface)
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        try:
+            self._apply_live(iface)
+        except AgentError:
+            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            raise
+
+        self.audit.record("reset_keys", f"{self.key}/peer/{peer_id}")
+        return reset
+
     def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
         iface = self.get_interface(interface_id)
         peer = None

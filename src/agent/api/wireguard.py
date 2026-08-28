@@ -172,6 +172,15 @@ def repair_peer_keys(
     return {"success": True, "peer": peer}
 
 
+@router.post("/interfaces/{interface_id}/peers/{peer_id}/reset-keys")
+def reset_peer_keys(interface_id: str, peer_id: str, wg: WireGuardDriver = Depends(get_wg)):
+    try:
+        peer = wg.reset_peer_keys(interface_id, peer_id)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "peer": peer}
+
+
 @router.get("/peers/{email}/ips")
 def peer_ips(email: str, wg: WireGuardDriver = Depends(get_wg)):
     return {"success": True, "ips": wg.peer_ips(email)}
