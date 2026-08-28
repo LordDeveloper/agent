@@ -96,6 +96,21 @@ def recent_peer_ips(
     return ips
 
 
+def _wg_pubkey(cli: str, private_key: str) -> str:
+    try:
+        result = subprocess.run(
+            [cli, "pubkey"],
+            input=private_key,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
 def _wg_keypair(cli: str = "wg") -> tuple[str, str]:
     try:
         priv = subprocess.run([cli, "genkey"], capture_output=True, text=True, timeout=5, check=True)
@@ -408,12 +423,27 @@ class WireGuardDriver(CoreDriver):
         peer = normalize_peer(payload)
         peer.setdefault("id", str(uuid.uuid4()))
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
+
+        # Existing peer: never invent new keys/address. Sync/upsert must stay identity-stable.
+        # Key rotation is delete + create (panel "change connection link").
+        for existing in iface.get("peers", []):
+            if str(existing.get("id")) == str(peer["id"]) or str(existing.get("email")) == str(peer.get("email")):
+                return self.update_peer(interface_id, str(existing.get("id") or peer["id"]), payload)
+
         used_ips = {p.get("address") for p in iface.get("peers", [])}
         peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
         cli = self._cli_bin() or "wg"
-        priv, pub = _wg_keypair(cli)
-        peer.setdefault("private_key", priv)
-        peer.setdefault("public_key", payload.get("public_key") or pub)
+        if peer.get("private_key"):
+            derived = _wg_pubkey(cli, str(peer["private_key"]))
+            if derived:
+                peer["public_key"] = derived
+            elif not peer.get("public_key"):
+                _, pub = _wg_keypair(cli)
+                peer["public_key"] = pub
+        else:
+            priv, pub = _wg_keypair(cli)
+            peer.setdefault("private_key", priv)
+            peer.setdefault("public_key", pub)
         peer.setdefault("allowed_ips", f"{peer['address']}/32")
         peer.setdefault("incoming", 0)
         peer.setdefault("outgoing", 0)
@@ -429,10 +459,6 @@ class WireGuardDriver(CoreDriver):
             # Keep record disabled without applying to live interface.
             pass
 
-        for existing in iface.get("peers", []):
-            if str(existing.get("id")) == str(peer["id"]) or str(existing.get("email")) == str(peer.get("email")):
-                return self.update_peer(interface_id, str(existing.get("id") or peer["id"]), peer)
-
         iface.setdefault("peers", []).append(peer)
         self.update_interface(interface_id, iface)
         self.audit.record("create", f"{self.key}/peer/{peer['id']}")
@@ -445,9 +471,14 @@ class WireGuardDriver(CoreDriver):
                 before = deepcopy(peer)
                 merged = deepcopy(peer)
                 normalized = normalize_peer(payload)
-                # Preserve traffic counters unless explicitly reset in payload.
+                # Peer keys are immutable after create. Rotation = delete + create.
                 for key, value in normalized.items():
+                    if key in ("private_key", "public_key"):
+                        continue
                     merged[key] = value
+                # Keep live key material even if caller sent blank/stale keys.
+                merged["private_key"] = before.get("private_key")
+                merged["public_key"] = before.get("public_key")
                 if "exit_interface" in payload:
                     if "exit_interface" in normalized:
                         merged["exit_interface"] = normalized["exit_interface"]

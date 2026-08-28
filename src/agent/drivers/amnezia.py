@@ -42,8 +42,13 @@ class AmneziaDriver(WireGuardDriver):
     def add_peer(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         peer = super().add_peer(interface_id, payload)
         if payload.get("obfuscation"):
+            # Never re-push the full peer (would risk key churn); only attach obfuscation.
             peer["obfuscation"] = deepcopy(payload["obfuscation"])
-            self.update_peer(interface_id, str(peer["id"]), peer)
+            self.update_peer(
+                interface_id,
+                str(peer["id"]),
+                {"obfuscation": deepcopy(payload["obfuscation"])},
+            )
         return peer
 
     def _ensure_obfuscation(self, iface: dict[str, Any], *, apply: bool) -> dict[str, Any]:
