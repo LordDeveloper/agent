@@ -83,6 +83,40 @@ def add_peer(interface_id: str, payload: WgPeerPayload, wg: WireGuardDriver = De
     return {"success": True, "peer": peer}
 
 
+@router.post("/interfaces/{interface_id}/peers/batch")
+@router.post("/interfaces/{interface_id}/peers:batch")
+def batch_peers(interface_id: str, body: dict[str, Any], wg: WireGuardDriver = Depends(get_wg)):
+    peers = body.get("peers") or []
+    if not isinstance(peers, list):
+        raise_agent_error("VALIDATION_ERROR", "peers must be a list", 422)
+    mode = str(body.get("mode") or "upsert")
+    atomic = bool(body.get("atomic", False))
+    try:
+        result = wg.batch_peers(
+            interface_id,
+            [row for row in peers if isinstance(row, dict)],
+            mode=mode,
+            atomic=atomic,
+        )
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
+@router.delete("/interfaces/{interface_id}/peers/batch")
+@router.delete("/interfaces/{interface_id}/peers:batch")
+def batch_remove_peers(interface_id: str, body: dict[str, Any], wg: WireGuardDriver = Depends(get_wg)):
+    try:
+        result = wg.batch_remove_peers(
+            interface_id,
+            emails=list(body.get("emails") or []),
+            ids=list(body.get("ids") or []),
+        )
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
 @router.put("/interfaces/{interface_id}/peers/{peer_id}")
 def update_peer(interface_id: str, peer_id: str, payload: WgPeerPayload, wg: WireGuardDriver = Depends(get_wg)):
     try:
@@ -122,6 +156,20 @@ def peer_config(
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config}
+
+
+@router.post("/interfaces/{interface_id}/peers/{peer_id}/repair-keys")
+def repair_peer_keys(
+    interface_id: str,
+    peer_id: str,
+    payload: dict[str, Any],
+    wg: WireGuardDriver = Depends(get_wg),
+):
+    try:
+        peer = wg.repair_peer_private_key(interface_id, peer_id, str(payload.get("private_key") or ""))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "peer": peer}
 
 
 @router.get("/peers/{email}/ips")

@@ -25,6 +25,7 @@ _IP_WINDOW_SECONDS = 600
 _IP_LOG_LIMIT = 50
 _WG_MTU = 1420
 _AWG_MTU = 1280
+_PEER_BATCH_MAX = 200
 
 
 def endpoint_host(endpoint: str | None) -> str | None:
@@ -506,15 +507,409 @@ class WireGuardDriver(CoreDriver):
         self.audit.record("delete", f"{self.key}/peer/{peer_id}")
         return True
 
+    def _peer_index(self, iface: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        by_id: dict[str, dict[str, Any]] = {}
+        by_email: dict[str, dict[str, Any]] = {}
+        for row in iface.get("peers", []):
+            peer_id = str(row.get("id") or "").strip()
+            email = str(row.get("email") or "").strip()
+            if peer_id:
+                by_id[peer_id] = row
+            if email:
+                by_email[email] = row
+        return by_id, by_email
+
+    def _find_existing_peer(
+        self,
+        by_id: dict[str, dict[str, Any]],
+        by_email: dict[str, dict[str, Any]],
+        peer: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        peer_id = str(peer.get("id") or "").strip()
+        email = str(peer.get("email") or "").strip()
+        if peer_id and peer_id in by_id:
+            return by_id[peer_id]
+        if email and email in by_email:
+            return by_email[email]
+        return None
+
+    def _spawn_peer(self, iface: dict[str, Any], payload: dict[str, Any], used_ips: set[str]) -> dict[str, Any]:
+        peer = normalize_peer(payload)
+        peer.setdefault("id", str(uuid.uuid4()))
+        peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
+        peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
+        used_ips.add(str(peer["address"]))
+        cli = self._cli_bin() or "wg"
+        if peer.get("private_key"):
+            derived = _wg_pubkey(cli, str(peer["private_key"]))
+            if derived:
+                peer["public_key"] = derived
+            elif not peer.get("public_key"):
+                _, pub = _wg_keypair(cli)
+                peer["public_key"] = pub
+        else:
+            priv, pub = _wg_keypair(cli)
+            peer.setdefault("private_key", priv)
+            peer.setdefault("public_key", pub)
+        peer.setdefault("allowed_ips", f"{peer['address']}/32")
+        peer.setdefault("incoming", 0)
+        peer.setdefault("outgoing", 0)
+        peer.setdefault("_incoming", 0)
+        peer.setdefault("_outgoing", 0)
+        peer.setdefault("handshake_at", None)
+        peer.setdefault("online", False)
+        peer.setdefault("ip_logs", [])
+        peer.setdefault("max_connection", 0)
+        peer.setdefault("persistent_keepalive", 25)
+        return peer
+
+    def _merge_peer_row(self, before: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        merged = deepcopy(before)
+        normalized = normalize_peer(payload)
+        for key, value in normalized.items():
+            if key in ("private_key", "public_key"):
+                continue
+            merged[key] = value
+        merged["private_key"] = before.get("private_key")
+        merged["public_key"] = before.get("public_key")
+        if "exit_interface" in payload:
+            if "exit_interface" in normalized:
+                merged["exit_interface"] = normalized["exit_interface"]
+            else:
+                merged.pop("exit_interface", None)
+        return merged
+
+    def batch_peers(
+        self,
+        interface_id: int | str,
+        peers: list[dict[str, Any]],
+        *,
+        mode: str = "upsert",
+        atomic: bool = False,
+    ) -> dict[str, Any]:
+        mode_key = str(mode or "upsert").strip().lower()
+        if mode_key == "edit":
+            mode_key = "update"
+        if mode_key not in {"upsert", "add", "update"}:
+            raise AgentError("VALIDATION_ERROR", "mode must be upsert|add|edit|update", 422)
+        if len(peers) > _PEER_BATCH_MAX:
+            raise AgentError(
+                "PAYLOAD_TOO_LARGE",
+                f"peer batch limit is {_PEER_BATCH_MAX} per request",
+                413,
+            )
+
+        started = time.perf_counter()
+        iface = deepcopy(self.get_interface(interface_id))
+        previous = deepcopy(iface)
+        by_id, by_email = self._peer_index(iface)
+        rows: list[dict[str, Any]] = list(iface.get("peers", []))
+        used_ips = {str(p.get("address") or "") for p in rows if p.get("address")}
+
+        succeeded = 0
+        failed = 0
+        errors: list[dict[str, str]] = []
+        applied: list[dict[str, Any]] = []
+        wg_apply = False
+        egress_only = False
+
+        for raw in peers:
+            if not isinstance(raw, dict):
+                failed += 1
+                errors.append({"email": "", "message": "peer must be an object"})
+                continue
+            email = str(raw.get("email") or raw.get("name") or "")
+            try:
+                probe = normalize_peer(raw)
+                probe.setdefault("id", str(raw.get("id") or uuid.uuid4()))
+                if not probe.get("email"):
+                    probe["email"] = probe.get("name") or str(probe["id"])[:8]
+                email = str(probe.get("email") or email)
+                existing = self._find_existing_peer(by_id, by_email, probe)
+
+                if mode_key == "add" and existing is not None:
+                    failed += 1
+                    errors.append({"email": email, "message": "peer already exists"})
+                    continue
+                if mode_key == "update" and existing is None:
+                    failed += 1
+                    errors.append({"email": email, "message": "peer not found"})
+                    continue
+
+                if existing is not None:
+                    before = deepcopy(existing)
+                    merged = self._merge_peer_row(before, raw)
+                    if _peer_change_needs_wg_apply(before, merged):
+                        wg_apply = True
+                    else:
+                        egress_only = True
+                    for idx, row in enumerate(rows):
+                        if str(row.get("id")) == str(existing.get("id")) or str(row.get("email")) == str(existing.get("email")):
+                            rows[idx] = merged
+                            break
+                    peer_id = str(merged.get("id") or "")
+                    if peer_id:
+                        by_id[peer_id] = merged
+                    merged_email = str(merged.get("email") or "")
+                    if merged_email:
+                        by_email[merged_email] = merged
+                    applied.append(merged)
+                else:
+                    created = self._spawn_peer(iface, raw, used_ips)
+                    rows.append(created)
+                    by_id[str(created.get("id") or "")] = created
+                    if created.get("email"):
+                        by_email[str(created["email"])] = created
+                    wg_apply = True
+                    applied.append(created)
+
+                succeeded += 1
+            except Exception as exc:  # noqa: BLE001 — partial success per row
+                failed += 1
+                errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if atomic and failed:
+            return {
+                "ok": False,
+                "succeeded": 0,
+                "failed": failed,
+                "errors": errors,
+                "peers": [],
+                "ms": elapsed_ms,
+            }
+
+        if succeeded == 0:
+            return {
+                "ok": failed == 0,
+                "succeeded": 0,
+                "failed": failed,
+                "errors": errors,
+                "peers": [],
+                "ms": elapsed_ms,
+            }
+
+        iface["peers"] = rows
+        self._validate_before_apply(iface)
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        try:
+            if wg_apply:
+                self._apply_live(iface)
+            elif egress_only:
+                self._sync_peer_egress()
+        except AgentError:
+            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            raise
+
+        self.audit.record(
+            "update",
+            f"{self.key}/interface/{interface_id}/peers/batch",
+            f"mode={mode_key} succeeded={succeeded} failed={failed} ms={elapsed_ms}",
+        )
+        return {
+            "ok": failed == 0,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+            "peers": applied,
+            "ms": elapsed_ms,
+        }
+
+    def batch_remove_peers(
+        self,
+        interface_id: int | str,
+        *,
+        emails: list[str] | None = None,
+        ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        email_keys = [str(value).strip() for value in (emails or []) if str(value).strip()]
+        id_keys = [str(value).strip() for value in (ids or []) if str(value).strip()]
+        if not email_keys and not id_keys:
+            raise AgentError("VALIDATION_ERROR", "emails or ids required", 422)
+        if len(email_keys) + len(id_keys) > _PEER_BATCH_MAX:
+            raise AgentError(
+                "PAYLOAD_TOO_LARGE",
+                f"peer batch limit is {_PEER_BATCH_MAX} per request",
+                413,
+            )
+
+        started = time.perf_counter()
+        iface = deepcopy(self.get_interface(interface_id))
+        previous = deepcopy(iface)
+        remove_keys = set(email_keys + id_keys)
+        errors: list[dict[str, str]] = []
+        succeeded = 0
+        failed = 0
+        matched: set[str] = set()
+
+        filtered: list[dict[str, Any]] = []
+        for peer in iface.get("peers", []):
+            peer_id = str(peer.get("id") or "")
+            email = str(peer.get("email") or "")
+            if peer_id in remove_keys or email in remove_keys:
+                if peer_id:
+                    matched.add(peer_id)
+                if email:
+                    matched.add(email)
+                succeeded += 1
+                continue
+            filtered.append(peer)
+
+        for key in remove_keys:
+            if key not in matched:
+                failed += 1
+                errors.append({"email": key, "message": "peer not found"})
+
+        if succeeded == 0:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "ok": failed == 0,
+                "succeeded": 0,
+                "failed": failed,
+                "errors": errors,
+                "ms": elapsed_ms,
+            }
+
+        iface["peers"] = filtered
+        self._validate_before_apply(iface)
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        try:
+            self._apply_live(iface)
+        except AgentError:
+            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            raise
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.audit.record(
+            "delete",
+            f"{self.key}/interface/{interface_id}/peers/batch",
+            f"removed={succeeded} failed={failed} ms={elapsed_ms}",
+        )
+        return {
+            "ok": failed == 0,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+            "ms": elapsed_ms,
+        }
+
+    def _live_public_key_for_peer(self, iface: dict[str, Any], peer: dict[str, Any]) -> str:
+        name = str(iface.get("name") or "")
+        if not name:
+            return ""
+
+        live = self._peer_dump(name)
+        stored_pub = str(peer.get("public_key") or "").strip()
+        if stored_pub and stored_pub in live:
+            return stored_pub
+
+        address = str(peer.get("address") or "").strip()
+        if not address:
+            return ""
+
+        want = f"{address}/32"
+        for pub, stats in live.items():
+            allowed = str(stats.get("allowed_ips") or "")
+            parts = [part.strip() for part in allowed.split(",") if part.strip()]
+            if want in parts:
+                return pub
+
+        return ""
+
+    def _save_peer_row(self, iface: dict[str, Any], peer: dict[str, Any]) -> None:
+        peer_id = str(peer.get("id") or "")
+        email = str(peer.get("email") or "")
+        for idx, row in enumerate(iface.get("peers", [])):
+            if str(row.get("id")) == peer_id or (email and str(row.get("email")) == email):
+                iface["peers"][idx] = peer
+                self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                return
+
+    def _prepare_peer_config_material(self, iface: dict[str, Any], peer: dict[str, Any]) -> dict[str, Any]:
+        """Ensure exported client config matches live WireGuard peer identity."""
+        cli = self._cli_bin() or "wg"
+        priv = str(peer.get("private_key") or "").strip()
+        stored_pub = str(peer.get("public_key") or "").strip()
+        live_pub = self._live_public_key_for_peer(iface, peer)
+        derived = _wg_pubkey(cli, priv) if priv else ""
+
+        authoritative_pub = live_pub or stored_pub or derived
+        changed = False
+
+        if live_pub and stored_pub != live_pub:
+            peer["public_key"] = live_pub
+            stored_pub = live_pub
+            changed = True
+        elif derived and not stored_pub:
+            peer["public_key"] = derived
+            changed = True
+        elif derived and stored_pub != derived and not live_pub:
+            peer["public_key"] = derived
+            changed = True
+
+        if authoritative_pub and derived and derived != authoritative_pub:
+            raise AgentError(
+                "PEER_KEY_MISMATCH",
+                "Peer private key does not match the live WireGuard public key; rotate the connection link.",
+                409,
+            )
+
+        if not priv:
+            raise AgentError("PEER_KEY_MISSING", "Peer private key is missing on the node.", 500)
+
+        if changed:
+            self._save_peer_row(iface, peer)
+
+        return peer
+
+    def repair_peer_private_key(self, interface_id: int | str, peer_id: str, private_key: str) -> dict[str, Any]:
+        """One-time store repair when panel still has the private key matching live wg public key."""
+        iface = self.get_interface(interface_id)
+        peer = None
+        idx = None
+        for i, row in enumerate(iface.get("peers", [])):
+            if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
+                peer = row
+                idx = i
+                break
+        if peer is None or idx is None:
+            raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        cli = self._cli_bin() or "wg"
+        candidate = str(private_key or "").strip()
+        derived = _wg_pubkey(cli, candidate) if candidate else ""
+        if not derived:
+            raise AgentError("VALIDATION_ERROR", "Invalid private key", 422)
+
+        live_pub = self._live_public_key_for_peer(iface, peer)
+        stored_pub = str(peer.get("public_key") or "").strip()
+        expected = live_pub or stored_pub
+        if not expected or derived != expected:
+            raise AgentError(
+                "PEER_KEY_MISMATCH",
+                "Private key does not match live peer public key",
+                409,
+            )
+
+        repaired = deepcopy(peer)
+        repaired["private_key"] = candidate
+        repaired["public_key"] = derived
+        iface["peers"][idx] = repaired
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        self.audit.record("repair", f"{self.key}/peer/{peer_id}/keys")
+        return repaired
+
     def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
         iface = self.get_interface(interface_id)
         peer = None
         for row in iface.get("peers", []):
             if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
-                peer = row
+                peer = deepcopy(row)
                 break
         if peer is None:
             raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        peer = self._prepare_peer_config_material(iface, peer)
 
         lines = [
             "[Interface]",
