@@ -152,10 +152,10 @@ def peer_config(
     wg: WireGuardDriver = Depends(get_wg),
 ):
     try:
-        config = wg.peer_config(interface_id, peer_id, endpoint_host=endpoint or "127.0.0.1")
+        bundle = wg.peer_config_bundle(interface_id, peer_id, endpoint_host=endpoint or "127.0.0.1")
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "config": config}
+    return {"success": True, **bundle}
 
 
 @router.post("/interfaces/{interface_id}/peers/{peer_id}/repair-keys")

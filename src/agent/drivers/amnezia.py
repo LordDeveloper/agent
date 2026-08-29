@@ -69,23 +69,32 @@ class AmneziaDriver(WireGuardDriver):
         self._ensure_obfuscation(iface, apply=False)
         return super()._render_conf(iface)
 
-    def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
+    def peer_config_bundle(
+        self,
+        interface_id: int | str,
+        peer_id: str,
+        endpoint_host: str = "127.0.0.1",
+    ) -> dict[str, str]:
         iface = self.get_interface(interface_id)
         incomplete = not obfuscation_is_complete(iface.get("obfuscation"))
         self._ensure_obfuscation(iface, apply=incomplete)
-        base = super().peer_config(interface_id, peer_id, endpoint_host)
+        bundle = super().peer_config_bundle(interface_id, peer_id, endpoint_host)
         peer = next(
             (p for p in iface.get("peers", []) if str(p.get("id")) == peer_id or str(p.get("email")) == peer_id),
             {},
         )
         obf = {**(iface.get("obfuscation") or {}), **(peer.get("obfuscation") or {})}
         extra = obfuscation_conf_lines(obf)
+        base = bundle["config"]
         needle = "DNS = 1.1.1.1\n"
         if extra and needle in base:
-            return base.replace(needle, needle + "\n".join(extra) + "\n", 1)
-        if extra and "[Interface]" in base:
+            bundle["config"] = base.replace(needle, needle + "\n".join(extra) + "\n", 1)
+        elif extra and "[Interface]" in base:
             head, tail = base.split("[Interface]", 1)
             iface_block, rest = tail.split("\n\n", 1) if "\n\n" in tail else (tail, "")
             iface_block = iface_block.rstrip() + "\n" + "\n".join(extra) + "\n"
-            return head + "[Interface]" + iface_block + ("\n" + rest if rest else "")
-        return base
+            bundle["config"] = head + "[Interface]" + iface_block + ("\n" + rest if rest else "")
+        return bundle
+
+    def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
+        return self.peer_config_bundle(interface_id, peer_id, endpoint_host)["config"]

@@ -117,10 +117,36 @@ def _wg_keypair(cli: str = "wg") -> tuple[str, str]:
         priv = subprocess.run([cli, "genkey"], capture_output=True, text=True, timeout=5, check=True)
         private = priv.stdout.strip()
         pub = subprocess.run([cli, "pubkey"], input=private, capture_output=True, text=True, timeout=5, check=True)
-        return private, pub.stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        token = uuid.uuid4().hex
-        return token, uuid.uuid4().hex
+        public = pub.stdout.strip()
+        if not private or not public:
+            raise subprocess.CalledProcessError(1, cli)
+        return private, public
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise AgentError(
+            "VALIDATION_ERROR",
+            "WireGuard key generation failed (is wg installed?)",
+            500,
+        ) from exc
+
+
+def _require_wg_pubkey(cli: str, private_key: str) -> str:
+    public = _wg_pubkey(cli, private_key)
+    if not public:
+        raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
+    return public
+
+
+def _materialize_peer_keypair(peer: dict[str, Any], cli: str) -> None:
+    """Ensure peer document always carries a matching private/public key pair."""
+    private = str(peer.get("private_key") or "").strip()
+    if private:
+        peer["private_key"] = private
+        peer["public_key"] = _require_wg_pubkey(cli, private)
+        return
+
+    generated_private, generated_public = _wg_keypair(cli)
+    peer["private_key"] = generated_private
+    peer["public_key"] = _require_wg_pubkey(cli, generated_private) or generated_public
 
 
 def _next_ip(subnet: str, used: set[str]) -> str:
@@ -343,20 +369,7 @@ class WireGuardDriver(CoreDriver):
         if not private_key:
             private_key, public_key = _wg_keypair(cli)
         else:
-            public_key = payload.get("public_key") or ""
-            if not public_key:
-                try:
-                    pub = subprocess.run(
-                        [cli, "pubkey"],
-                        input=private_key,
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        check=True,
-                    )
-                    public_key = pub.stdout.strip()
-                except Exception:
-                    public_key = ""
+            public_key = _require_wg_pubkey(cli, str(private_key))
 
         iface = {
             "id": iface_id,
@@ -434,17 +447,7 @@ class WireGuardDriver(CoreDriver):
         used_ips = {p.get("address") for p in iface.get("peers", [])}
         peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
         cli = self._cli_bin() or "wg"
-        if peer.get("private_key"):
-            derived = _wg_pubkey(cli, str(peer["private_key"]))
-            if derived:
-                peer["public_key"] = derived
-            elif not peer.get("public_key"):
-                _, pub = _wg_keypair(cli)
-                peer["public_key"] = pub
-        else:
-            priv, pub = _wg_keypair(cli)
-            peer.setdefault("private_key", priv)
-            peer.setdefault("public_key", pub)
+        _materialize_peer_keypair(peer, cli)
         peer.setdefault("allowed_ips", f"{peer['address']}/32")
         peer.setdefault("incoming", 0)
         peer.setdefault("outgoing", 0)
@@ -540,17 +543,7 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
         used_ips.add(str(peer["address"]))
         cli = self._cli_bin() or "wg"
-        if peer.get("private_key"):
-            derived = _wg_pubkey(cli, str(peer["private_key"]))
-            if derived:
-                peer["public_key"] = derived
-            elif not peer.get("public_key"):
-                _, pub = _wg_keypair(cli)
-                peer["public_key"] = pub
-        else:
-            priv, pub = _wg_keypair(cli)
-            peer.setdefault("private_key", priv)
-            peer.setdefault("public_key", pub)
+        _materialize_peer_keypair(peer, cli)
         peer.setdefault("allowed_ips", f"{peer['address']}/32")
         peer.setdefault("incoming", 0)
         peer.setdefault("outgoing", 0)
@@ -799,20 +792,18 @@ class WireGuardDriver(CoreDriver):
             return ""
 
         live = self._peer_dump(name)
+        address = str(peer.get("address") or "").strip()
+        if address:
+            want = f"{address}/32"
+            for pub, stats in live.items():
+                allowed = str(stats.get("allowed_ips") or "")
+                parts = [part.strip() for part in allowed.split(",") if part.strip()]
+                if want in parts:
+                    return pub
+
         stored_pub = str(peer.get("public_key") or "").strip()
         if stored_pub and stored_pub in live:
             return stored_pub
-
-        address = str(peer.get("address") or "").strip()
-        if not address:
-            return ""
-
-        want = f"{address}/32"
-        for pub, stats in live.items():
-            allowed = str(stats.get("allowed_ips") or "")
-            parts = [part.strip() for part in allowed.split(",") if part.strip()]
-            if want in parts:
-                return pub
 
         return ""
 
@@ -825,37 +816,54 @@ class WireGuardDriver(CoreDriver):
                 self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                 return
 
-    def _prepare_peer_config_material(self, iface: dict[str, Any], peer: dict[str, Any]) -> dict[str, Any]:
-        """Ensure exported client config matches live WireGuard peer identity."""
-        cli = self._cli_bin() or "wg"
-        priv = str(peer.get("private_key") or "").strip()
-        stored_pub = str(peer.get("public_key") or "").strip()
+    def _assert_peer_keys_match_live(
+        self,
+        iface: dict[str, Any],
+        peer: dict[str, Any],
+        derived: str,
+        *,
+        retry_apply: bool = False,
+    ) -> str:
         live_pub = self._live_public_key_for_peer(iface, peer)
-        derived = _wg_pubkey(cli, priv) if priv else ""
+        if retry_apply and record_is_enabled(peer) and not live_pub:
+            try:
+                self._apply_live(iface)
+            except AgentError:
+                pass
+            live_pub = self._live_public_key_for_peer(iface, peer)
 
-        authoritative_pub = live_pub or stored_pub or derived
-        changed = False
-
-        if live_pub and stored_pub != live_pub:
-            peer["public_key"] = live_pub
-            stored_pub = live_pub
-            changed = True
-        elif derived and not stored_pub:
-            peer["public_key"] = derived
-            changed = True
-        elif derived and stored_pub != derived and not live_pub:
-            peer["public_key"] = derived
-            changed = True
-
-        if authoritative_pub and derived and derived != authoritative_pub:
+        if record_is_enabled(peer):
+            if not live_pub or live_pub != derived:
+                raise AgentError(
+                    "PEER_KEY_MISMATCH",
+                    "Peer private key does not match the live WireGuard public key; rotate the connection link.",
+                    409,
+                )
+        elif live_pub and live_pub != derived:
             raise AgentError(
                 "PEER_KEY_MISMATCH",
                 "Peer private key does not match the live WireGuard public key; rotate the connection link.",
                 409,
             )
 
+        return live_pub
+
+    def _prepare_peer_config_material(self, iface: dict[str, Any], peer: dict[str, Any]) -> dict[str, Any]:
+        """Ensure exported client config matches live WireGuard peer identity."""
+        cli = self._cli_bin() or "wg"
+        priv = str(peer.get("private_key") or "").strip()
         if not priv:
             raise AgentError("PEER_KEY_MISSING", "Peer private key is missing on the node.", 500)
+
+        derived = _require_wg_pubkey(cli, priv)
+        stored_pub = str(peer.get("public_key") or "").strip()
+        changed = False
+
+        if stored_pub != derived:
+            peer["public_key"] = derived
+            changed = True
+
+        self._assert_peer_keys_match_live(iface, peer, derived, retry_apply=True)
 
         if changed:
             self._save_peer_row(iface, peer)
@@ -877,9 +885,7 @@ class WireGuardDriver(CoreDriver):
 
         cli = self._cli_bin() or "wg"
         candidate = str(private_key or "").strip()
-        derived = _wg_pubkey(cli, candidate) if candidate else ""
-        if not derived:
-            raise AgentError("VALIDATION_ERROR", "Invalid private key", 422)
+        derived = _require_wg_pubkey(cli, candidate)
 
         live_pub = self._live_public_key_for_peer(iface, peer)
         stored_pub = str(peer.get("public_key") or "").strip()
@@ -895,7 +901,13 @@ class WireGuardDriver(CoreDriver):
         repaired["private_key"] = candidate
         repaired["public_key"] = derived
         iface["peers"][idx] = repaired
+        self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        if stored_pub != derived or (live_pub and live_pub != stored_pub):
+            try:
+                self._apply_live(iface)
+            except AgentError:
+                pass
         self.audit.record("repair", f"{self.key}/peer/{peer_id}/keys")
         return repaired
 
@@ -914,10 +926,10 @@ class WireGuardDriver(CoreDriver):
             raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
         cli = self._cli_bin() or "wg"
-        priv, pub = _wg_keypair(cli)
         reset = deepcopy(peer)
-        reset["private_key"] = priv
-        reset["public_key"] = pub
+        reset.pop("private_key", None)
+        reset.pop("public_key", None)
+        _materialize_peer_keypair(reset, cli)
 
         iface["peers"][idx] = reset
         self._validate_before_apply(iface)
@@ -928,21 +940,24 @@ class WireGuardDriver(CoreDriver):
             self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
 
+        # Verify live kernel reflects the regenerated pair for this client slot.
+        live_pub = self._live_public_key_for_peer(iface, reset)
+        if live_pub and live_pub != reset.get("public_key"):
+            raise AgentError(
+                "PEER_KEY_MISMATCH",
+                "WireGuard live peer public key did not update after key reset",
+                500,
+            )
+
         self.audit.record("reset_keys", f"{self.key}/peer/{peer_id}")
         return reset
 
-    def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
-        iface = self.get_interface(interface_id)
-        peer = None
-        for row in iface.get("peers", []):
-            if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
-                peer = deepcopy(row)
-                break
-        if peer is None:
-            raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
-
-        peer = self._prepare_peer_config_material(iface, peer)
-
+    def _format_client_config(
+        self,
+        iface: dict[str, Any],
+        peer: dict[str, Any],
+        endpoint_host: str = "127.0.0.1",
+    ) -> str:
         lines = [
             "[Interface]",
             f"PrivateKey = {peer.get('private_key')}",
@@ -958,6 +973,30 @@ class WireGuardDriver(CoreDriver):
             "",
         ]
         return "\n".join(lines)
+
+    def peer_config_bundle(
+        self,
+        interface_id: int | str,
+        peer_id: str,
+        endpoint_host: str = "127.0.0.1",
+    ) -> dict[str, str]:
+        iface = self.get_interface(interface_id)
+        peer = None
+        for row in iface.get("peers", []):
+            if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
+                peer = deepcopy(row)
+                break
+        if peer is None:
+            raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        peer = self._prepare_peer_config_material(iface, peer)
+        return {
+            "config": self._format_client_config(iface, peer, endpoint_host),
+            "client_public_key": str(peer.get("public_key") or ""),
+        }
+
+    def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
+        return self.peer_config_bundle(interface_id, peer_id, endpoint_host)["config"]
 
     def usage_snapshot(self) -> UsageSnapshotModel:
         self.sync_peer_stats()
