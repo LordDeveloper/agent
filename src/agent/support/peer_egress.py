@@ -13,6 +13,17 @@ node only rewrites host policy routing — never the client peer keys:
 Exit interface names are dynamic (poland, ukrine, deutch, …): each name maps
 to a stable table id. No country whitelist.
 
+Firewall ownership
+------------------
+All forwarding/NAT/sysctl for peer egress is applied by the agent
+(nft preferred, else iptables / iptables-legacy) for both exit NICs and
+tunnel ifaces (wg*/awg*). Do not rely on manual ``iptables -P FORWARD ACCEPT``.
+
+Repair scenario (handshake OK, RX≈0)
+------------------------------------
+POST /api/v1/network/egress/repair  →  repair_peer_egress()
+force-reconciles routing + firewall and restarts the oneshot apply unit.
+
 Live apply must be idempotent:
   • ip rules: add/switch only when needed (stable pref per peer IP)
   • NAT/MSS: rebuild only when the exit set changes (never flush on no-op)
@@ -47,6 +58,7 @@ _NFT_CHAIN = "postrouting"
 _MASQ_COMMENT_PREFIX = "netinja-egress-"
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
+_SYSCTL_DROPIN = Path("/etc/sysctl.d/99-netinja-peer-egress.conf")
 _EGRESS_CORES = ("wireguard", "amnezia")
 
 
@@ -281,6 +293,7 @@ def render_apply_script(
             f'  nft add rule inet netinja_egress forward oifname "{tunnel}" '
             f'accept comment "{tunnel_comment}-out" 2>/dev/null || true'
         )
+    # When nft owns NAT, strip duplicate iptables MASQUERADE (double SNAT = packet loss).
     lines.append("  if command -v iptables >/dev/null 2>&1; then")
     for iface in sorted(masq):
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
@@ -304,37 +317,9 @@ def render_apply_script(
         )
     lines.append("  fi")
     lines.append("elif command -v iptables >/dev/null 2>&1; then")
-    for iface in sorted(masq):
-        comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
-        lines.append(
-            f'  iptables -t nat -C POSTROUTING -o "{iface}" -m comment --comment "{comment}" '
-            f"-j MASQUERADE 2>/dev/null || "
-            f'iptables -t nat -A POSTROUTING -o "{iface}" -m comment --comment "{comment}" -j MASQUERADE'
-        )
-        lines.append(
-            f'  iptables -C FORWARD -o "{iface}" -p tcp --tcp-flags SYN,RST SYN '
-            f'-m comment --comment "{comment}-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || '
-            f'iptables -I FORWARD 1 -o "{iface}" -p tcp --tcp-flags SYN,RST SYN '
-            f'-m comment --comment "{comment}-mss" -j TCPMSS --clamp-mss-to-pmtu'
-        )
-        lines.append(
-            f'  iptables -C FORWARD -o "{iface}" -m comment --comment "{comment}-fwd-out" -j ACCEPT 2>/dev/null || '
-            f'iptables -I FORWARD 1 -o "{iface}" -m comment --comment "{comment}-fwd-out" -j ACCEPT'
-        )
-        lines.append(
-            f'  iptables -C FORWARD -i "{iface}" -m state --state RELATED,ESTABLISHED '
-            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT 2>/dev/null || '
-            f'iptables -I FORWARD 1 -i "{iface}" -m state --state RELATED,ESTABLISHED '
-            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT'
-        )
+    _append_iptables_firewall_shell(lines, binary="iptables", masq=masq, tunnels=tunnels, indent="  ")
     lines.append("elif command -v iptables-legacy >/dev/null 2>&1; then")
-    for iface in sorted(masq):
-        comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
-        lines.append(
-            f'  iptables-legacy -t nat -C POSTROUTING -o "{iface}" -m comment --comment "{comment}" '
-            f"-j MASQUERADE 2>/dev/null || "
-            f'iptables-legacy -t nat -A POSTROUTING -o "{iface}" -m comment --comment "{comment}" -j MASQUERADE'
-        )
+    _append_iptables_firewall_shell(lines, binary="iptables-legacy", masq=masq, tunnels=tunnels, indent="  ")
     lines.append("fi")
     lines.append("")
 
@@ -342,10 +327,68 @@ def render_apply_script(
     return "\n".join(lines) + "\n"
 
 
-def write_apply_script(rules: list[dict[str, str | int]], *, data_dir: str | Path | None = None) -> Path:
+def _append_iptables_firewall_shell(
+    lines: list[str],
+    *,
+    binary: str,
+    masq: set[str],
+    tunnels: list[str],
+    indent: str = "  ",
+) -> None:
+    """Idempotent MASQUERADE + FORWARD (+ MSS) for exit NICs and WG/Amnezia tunnels."""
+    for iface in sorted(masq):
+        comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+        lines.append(
+            f'{indent}{binary} -t nat -C POSTROUTING -o "{iface}" -m comment --comment "{comment}" '
+            f"-j MASQUERADE 2>/dev/null || "
+            f'{binary} -t nat -A POSTROUTING -o "{iface}" -m comment --comment "{comment}" -j MASQUERADE'
+        )
+        lines.append(
+            f'{indent}{binary} -C FORWARD -o "{iface}" -p tcp --tcp-flags SYN,RST SYN '
+            f'-m comment --comment "{comment}-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || '
+            f'{binary} -I FORWARD 1 -o "{iface}" -p tcp --tcp-flags SYN,RST SYN '
+            f'-m comment --comment "{comment}-mss" -j TCPMSS --clamp-mss-to-pmtu'
+        )
+        lines.append(
+            f'{indent}{binary} -C FORWARD -o "{iface}" -m comment --comment "{comment}-fwd-out" '
+            f"-j ACCEPT 2>/dev/null || "
+            f'{binary} -I FORWARD 1 -o "{iface}" -m comment --comment "{comment}-fwd-out" -j ACCEPT'
+        )
+        lines.append(
+            f'{indent}{binary} -C FORWARD -i "{iface}" -m state --state RELATED,ESTABLISHED '
+            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT 2>/dev/null || '
+            f'{binary} -I FORWARD 1 -i "{iface}" -m state --state RELATED,ESTABLISHED '
+            f'-m comment --comment "{comment}-fwd-in" -j ACCEPT'
+        )
+    for tunnel in tunnels:
+        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        lines.append(
+            f'{indent}{binary} -C FORWARD -i "{tunnel}" -p tcp --tcp-flags SYN,RST SYN '
+            f'-m comment --comment "{tunnel_comment}-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || '
+            f'{binary} -I FORWARD 1 -i "{tunnel}" -p tcp --tcp-flags SYN,RST SYN '
+            f'-m comment --comment "{tunnel_comment}-mss" -j TCPMSS --clamp-mss-to-pmtu'
+        )
+        lines.append(
+            f'{indent}{binary} -C FORWARD -i "{tunnel}" -m comment --comment "{tunnel_comment}-in" '
+            f"-j ACCEPT 2>/dev/null || "
+            f'{binary} -I FORWARD 1 -i "{tunnel}" -m comment --comment "{tunnel_comment}-in" -j ACCEPT'
+        )
+        lines.append(
+            f'{indent}{binary} -C FORWARD -o "{tunnel}" -m comment --comment "{tunnel_comment}-out" '
+            f"-j ACCEPT 2>/dev/null || "
+            f'{binary} -I FORWARD 1 -o "{tunnel}" -m comment --comment "{tunnel_comment}-out" -j ACCEPT'
+        )
+
+
+def write_apply_script(
+    rules: list[dict[str, str | int]],
+    *,
+    data_dir: str | Path | None = None,
+    tunnel_ifaces: list[str] | None = None,
+) -> Path:
     path = apply_script_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_apply_script(rules), encoding="utf-8")
+    path.write_text(render_apply_script(rules, tunnel_ifaces), encoding="utf-8")
     try:
         path.chmod(0o755)
     except OSError:
@@ -409,7 +452,13 @@ def ensure_peer_egress_unit(
     }
 
 
-def persist_peer_egress(store: Store, *, data_dir: str | Path | None = None, runner: Runner | None = None) -> dict[str, Any]:
+def persist_peer_egress(
+    store: Store,
+    *,
+    data_dir: str | Path | None = None,
+    runner: Runner | None = None,
+    force_start: bool = False,
+) -> dict[str, Any]:
     rules = all_desired_rules_from_store(store)
     tunnels = all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
@@ -423,8 +472,55 @@ def persist_peer_egress(store: Store, *, data_dir: str | Path | None = None, run
             path.chmod(0o755)
         except OSError:
             pass
-    unit = ensure_peer_egress_unit(path, runner=runner, start=changed)
+    unit = ensure_peer_egress_unit(path, runner=runner, start=changed or force_start)
     return {"script": str(path), "rules": len(rules), "changed": changed, "unit": unit}
+
+
+def repair_peer_egress(
+    store: Store,
+    *,
+    data_dir: str | Path | None = None,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """
+    Full repair scenario owned by the agent:
+
+      1) ip_forward + persist sysctl drop-in
+      2) soften rp_filter on all / default
+      3) force-reconcile policy routing + NAT/FORWARD for every WG/Amnezia core
+      4) rewrite PostUp script and (re)start systemd oneshot
+
+    Use after RX≈0 with healthy handshake, or after manual iptables experiments.
+    """
+    execute = runner or run
+    _ensure_ip_forward(execute)
+    sysctl_ok = _persist_sysctl_forward()
+
+    cores: dict[str, Any] = {}
+    for core in _EGRESS_CORES:
+        ifaces = store.list_docs(core, _IFACE_KIND)
+        state = store.get_doc(core, _STATE_KIND, _STATE_ID)
+        if not ifaces and not state:
+            continue
+        cores[core] = reconcile_core_egress(
+            store,
+            core,
+            ifaces,
+            runner=execute,
+            data_dir=data_dir,
+            force=True,
+        )
+
+    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=True)
+    ok = all(bool(row.get("ok")) for row in cores.values()) if cores else True
+    return {
+        "ok": ok,
+        "sysctl_persist": sysctl_ok,
+        "cores": cores,
+        "persist": persist,
+        "tunnels": all_tunnel_interface_names(store),
+        "rules": len(all_desired_rules_from_store(store)),
+    }
 
 
 def reconcile_core_egress(
@@ -434,12 +530,16 @@ def reconcile_core_egress(
     *,
     runner: Runner | None = None,
     data_dir: str | Path | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """
     Apply peer→exit policy routing.
 
     Server change (same peer IP, new exit_interface) is atomic:
     warm new table → add new rule → delete old rule → flush conntrack.
+
+    ``force=True`` rebuilds NAT/FORWARD even when health checks look green
+    (repair scenario after manual firewall edits).
     """
     execute = runner or run
     if not shutil.which("ip"):
@@ -588,7 +688,7 @@ def reconcile_core_egress(
     nat_ok = _nat_already_healthy(effective_masq, runner=execute)
     forward_ok = _forward_already_healthy(tunnel_ifaces, runner=execute)
     nat_rebuilt = False
-    if new_masq_set != prev_masq_set or not nat_ok or (tunnel_ifaces and not forward_ok):
+    if force or new_masq_set != prev_masq_set or not nat_ok or (tunnel_ifaces and not forward_ok):
         _sync_masquerade(
             effective_masq,
             previous_ifaces=previous_masq,
@@ -607,7 +707,7 @@ def reconcile_core_egress(
     }
     store.put_doc(core, _STATE_KIND, _STATE_ID, state)
 
-    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute)
+    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=force)
     return {
         "ok": True,
         "skipped": False,
@@ -616,6 +716,7 @@ def reconcile_core_egress(
         "switched": len(dict.fromkeys(switched)),
         "masq": masq_ifaces,
         "nat_rebuilt": nat_rebuilt,
+        "forced": force,
         "persist": persist,
     }
 
@@ -754,14 +855,45 @@ def _ensure_ip_forward(runner: Runner) -> None:
         path = "/proc/sys/net/ipv4/ip_forward"
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("1\n")
-        return
     except OSError:
-        pass
+        if shutil.which("sysctl"):
+            try:
+                runner(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
+            except Exception:
+                pass
+
+    # Strict all/default rp_filter breaks multi-exit peer egress after region switch.
     if shutil.which("sysctl"):
-        try:
-            runner(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
-        except Exception:
-            pass
+        for key in ("all", "default"):
+            try:
+                runner(
+                    ["sysctl", "-w", f"net.ipv4.conf.{key}.rp_filter=0"],
+                    check=False,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+    _persist_sysctl_forward()
+
+
+def _persist_sysctl_forward() -> bool:
+    """Survive reboot without relying on manual host firewall edits."""
+    content = (
+        "# Managed by Netinja agent peer egress — do not edit.\n"
+        "net.ipv4.ip_forward=1\n"
+        "net.ipv4.conf.all.rp_filter=0\n"
+        "net.ipv4.conf.default.rp_filter=0\n"
+    )
+    try:
+        _SYSCTL_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+        previous = _SYSCTL_DROPIN.read_text(encoding="utf-8") if _SYSCTL_DROPIN.is_file() else ""
+        if previous != content:
+            _SYSCTL_DROPIN.write_text(content, encoding="utf-8")
+        return True
+    except OSError as exc:
+        log.warning("peer egress sysctl drop-in failed: %s", exc)
+        return False
 
 
 def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
@@ -855,26 +987,54 @@ def _sync_masquerade(
 
     if shutil.which("iptables-legacy"):
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
-        _sync_forward(ifaces, previous_ifaces=previous_ifaces, runner=runner)
+        _sync_forward(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            tunnel_ifaces=tunnel_ifaces or [],
+            binary="iptables-legacy",
+        )
         if shutil.which("iptables") and _iptables_is_nft(runner):
             _purge_iptables_exit_masq(targets, runner=runner, binary="iptables")
         return
 
     if shutil.which("iptables"):
         _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
-        _sync_forward(ifaces, previous_ifaces=previous_ifaces, runner=runner)
+        _sync_forward(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            tunnel_ifaces=tunnel_ifaces or [],
+            binary="iptables",
+        )
 
 
-def _sync_forward(ifaces: list[str], *, previous_ifaces: list[str], runner: Runner) -> None:
+def _sync_forward(
+    ifaces: list[str],
+    *,
+    previous_ifaces: list[str],
+    runner: Runner,
+    tunnel_ifaces: list[str] | None = None,
+    binary: str | None = None,
+) -> None:
     # nft FORWARD (+ MSS clamp) lives in _sync_masquerade_nft.
     if shutil.which("nft") and _nft_has_masquerade_for(ifaces, runner=runner):
         return
-    if shutil.which("iptables-legacy"):
-        _sync_forward_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
-        return
-    if shutil.which("iptables"):
-        _sync_forward_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
-
+    chosen = binary
+    if not chosen:
+        if shutil.which("iptables-legacy"):
+            chosen = "iptables-legacy"
+        elif shutil.which("iptables"):
+            chosen = "iptables"
+        else:
+            return
+    _sync_forward_iptables(
+        ifaces,
+        previous_ifaces=previous_ifaces,
+        runner=runner,
+        binary=chosen,
+        tunnel_ifaces=tunnel_ifaces or [],
+    )
 
 def _iptables_is_nft(runner: Runner) -> bool:
     try:
@@ -986,23 +1146,76 @@ def _sync_forward_iptables(
     previous_ifaces: list[str],
     runner: Runner,
     binary: str = "iptables",
+    tunnel_ifaces: list[str] | None = None,
 ) -> None:
+    tunnels = [str(name).strip() for name in (tunnel_ifaces or []) if str(name).strip()]
     wanted = set(ifaces)
     for iface in previous_ifaces:
         if iface in wanted:
             continue
         for comment, args in (
+            (f"{_MASQ_COMMENT_PREFIX}{iface}-mss", ["-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN"]),
             (f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out", ["-o", iface]),
             (f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in", ["-i", iface, "-m", "state", "--state", "RELATED,ESTABLISHED"]),
         ):
+            jump = "TCPMSS" if comment.endswith("-mss") else "ACCEPT"
+            extra = ["--clamp-mss-to-pmtu"] if jump == "TCPMSS" else []
             _iptables(
                 runner,
-                ["-D", "FORWARD", *args, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+                ["-D", "FORWARD", *args, "-m", "comment", "--comment", comment, "-j", jump, *extra],
                 binary=binary,
             )
+
     for iface in ifaces:
+        mss_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-mss"
         out_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out"
         in_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in"
+        if not _iptables(
+            runner,
+            [
+                "-C",
+                "FORWARD",
+                "-o",
+                iface,
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-m",
+                "comment",
+                "--comment",
+                mss_comment,
+                "-j",
+                "TCPMSS",
+                "--clamp-mss-to-pmtu",
+            ],
+            quiet=True,
+            binary=binary,
+        ):
+            _iptables(
+                runner,
+                [
+                    "-I",
+                    "FORWARD",
+                    "1",
+                    "-o",
+                    iface,
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    mss_comment,
+                    "-j",
+                    "TCPMSS",
+                    "--clamp-mss-to-pmtu",
+                ],
+                binary=binary,
+            )
         if not _iptables(
             runner,
             ["-C", "FORWARD", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
@@ -1057,25 +1270,109 @@ def _sync_forward_iptables(
                 binary=binary,
             )
 
+    for tunnel in tunnels:
+        _soften_rp_filter(runner, tunnel)
+        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        if not _iptables(
+            runner,
+            [
+                "-C",
+                "FORWARD",
+                "-i",
+                tunnel,
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-m",
+                "comment",
+                "--comment",
+                f"{tunnel_comment}-mss",
+                "-j",
+                "TCPMSS",
+                "--clamp-mss-to-pmtu",
+            ],
+            quiet=True,
+            binary=binary,
+        ):
+            _iptables(
+                runner,
+                [
+                    "-I",
+                    "FORWARD",
+                    "1",
+                    "-i",
+                    tunnel,
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    f"{tunnel_comment}-mss",
+                    "-j",
+                    "TCPMSS",
+                    "--clamp-mss-to-pmtu",
+                ],
+                binary=binary,
+            )
+        if not _iptables(
+            runner,
+            ["-C", "FORWARD", "-i", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-in", "-j", "ACCEPT"],
+            quiet=True,
+            binary=binary,
+        ):
+            _iptables(
+                runner,
+                ["-I", "FORWARD", "1", "-i", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-in", "-j", "ACCEPT"],
+                binary=binary,
+            )
+        if not _iptables(
+            runner,
+            ["-C", "FORWARD", "-o", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-out", "-j", "ACCEPT"],
+            quiet=True,
+            binary=binary,
+        ):
+            _iptables(
+                runner,
+                ["-I", "FORWARD", "1", "-o", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-out", "-j", "ACCEPT"],
+                binary=binary,
+            )
+
 
 def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> bool:
     if not tunnel_ifaces:
         return True
-    if not shutil.which("nft"):
-        return False
-    try:
-        result = runner(
-            ["nft", "list", "chain", "inet", "netinja_egress", "forward"],
-            check=False,
-            timeout=10,
-        )
-    except Exception:
-        return False
-    if getattr(result, "returncode", 1) != 0:
-        return False
-    text = str(getattr(result, "stdout", "") or "")
-    return all(f'tunnel-{tunnel}-in' in text or f'tunnel-{tunnel}-mss' in text for tunnel in tunnel_ifaces)
+    if shutil.which("nft"):
+        try:
+            result = runner(
+                ["nft", "list", "chain", "inet", "netinja_egress", "forward"],
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return False
+        if getattr(result, "returncode", 1) != 0:
+            return False
+        text = str(getattr(result, "stdout", "") or "")
+        return all(f"tunnel-{tunnel}-in" in text or f"tunnel-{tunnel}-mss" in text for tunnel in tunnel_ifaces)
 
+    binary = "iptables-legacy" if shutil.which("iptables-legacy") else ("iptables" if shutil.which("iptables") else None)
+    if not binary:
+        return False
+    for tunnel in tunnel_ifaces:
+        comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}-in"
+        if not _iptables(
+            runner,
+            ["-C", "FORWARD", "-i", tunnel, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+            quiet=True,
+            binary=binary,
+        ):
+            return False
+    return True
 
 def _sync_masquerade_nft(
     ifaces: list[str],

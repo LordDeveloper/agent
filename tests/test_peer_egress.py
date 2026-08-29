@@ -434,3 +434,62 @@ def test_render_apply_script_includes_tunnel_forward_and_mss_rules():
     assert "tunnel-wg0-mss" in script
     assert "tunnel-wg0-in" in script
     assert "tunnel-wg0-out" in script
+    # iptables / legacy fallbacks must also cover tunnel FORWARD (not only nft).
+    assert 'iptables -C FORWARD -i "wg0"' in script
+    assert 'iptables-legacy -C FORWARD -i "wg0"' in script
+    assert "tunnel-wg0-in" in script
+
+
+def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
+    from agent.support.peer_egress import repair_peer_egress
+
+    store = Store(tmp_path / "agent.db")
+    store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {
+            "id": 1,
+            "name": "wg0",
+            "peers": [
+                {
+                    "address": "10.90.68.1",
+                    "exit_interface": "deutch",
+                    "is_enabled": True,
+                }
+            ],
+        },
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="")
+        if args[:1] == ["nft"]:
+            return _Result(returncode=1, stderr="no")
+        return _Result()
+
+    monkeypatch.setattr(
+        "agent.support.peer_egress.shutil.which",
+        lambda cmd: None if cmd == "nft" else f"/usr/sbin/{cmd}",
+    )
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+    )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", lambda: True)
+    monkeypatch.setattr("agent.support.peer_egress._iface_exists", lambda runner, iface: True)
+    monkeypatch.setattr("agent.support.peer_egress._install_default_route", lambda runner, iface, table: True)
+
+    result = repair_peer_egress(store, data_dir=tmp_path, runner=fake_run)
+    assert result["ok"] is True
+    assert "wireguard" in result["cores"]
+    assert result["cores"]["wireguard"].get("forced") is True
+    assert result["cores"]["wireguard"].get("nat_rebuilt") is True
+    script = (tmp_path / "peer-egress-apply.sh").read_text(encoding="utf-8")
+    assert 'iptables -C FORWARD -i "wg0"' in script
+    assert "tunnel-wg0-in" in script
+    store.close()
