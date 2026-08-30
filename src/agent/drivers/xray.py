@@ -161,6 +161,7 @@ class XrayDriver(CoreDriver):
             "source_ip_block",
             "routing_rules",
             "routing_replace",
+            "routing_test",
             "clients_batch",
             "inbound_preserve_clients",
             "outbounds",
@@ -982,9 +983,15 @@ class XrayDriver(CoreDriver):
         inbound = self.get_inbound(inbound_id)
         current = self._find_client(inbound, client_key)
         if current is None:
-            raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
-        merged = normalize_xray_client({**current, **payload})
-        result = self.batch_clients(inbound_id, [merged], mode="update")
+            merged = normalize_xray_client(payload)
+            merged.setdefault("id", client_key)
+            if not merged.get("email"):
+                merged["email"] = client_key
+            mode = "upsert"
+        else:
+            merged = normalize_xray_client({**current, **payload})
+            mode = "update"
+        result = self.batch_clients(inbound_id, [merged], mode=mode)
         if result.get("failed"):
             errors = result.get("errors") or []
             message = errors[0].get("message") if errors else "client update failed"
@@ -1342,6 +1349,29 @@ class XrayDriver(CoreDriver):
             f"removed={removed} added={added} ms={elapsed_ms}",
         )
         return {"ok": True, "removed": removed, "added": added, "ms": elapsed_ms}
+
+    def test_routing(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        from agent.support.routing_test import test_routing_rules
+
+        rules = self.list_rules()
+        if not rules:
+            try:
+                config = self.read_config()
+                routing = config.get("routing") if isinstance(config, dict) else None
+                raw = routing.get("rules") if isinstance(routing, dict) else None
+                if isinstance(raw, list):
+                    rules = [row for row in raw if isinstance(row, dict)]
+            except Exception:  # noqa: BLE001
+                rules = []
+
+        result = test_routing_rules(
+            rules,
+            attrs,
+            config_path=self.settings.xray.config,
+            binary_path=self.settings.xray.binary,
+        )
+        result["rules_count"] = len(rules)
+        return result
 
     def block_source_ips(self, source_ips: list[str], **kwargs: Any) -> dict[str, Any]:
         return self._api().block_source_ips(source_ips, **kwargs)

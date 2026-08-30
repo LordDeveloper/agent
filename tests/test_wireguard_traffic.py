@@ -1,4 +1,24 @@
-from agent.drivers.wireguard import WireGuardDriver, accumulate_transfer
+from agent.drivers.wireguard import (
+    WireGuardDriver,
+    _next_ip,
+    _reserved_peer_addresses,
+    _server_address,
+    accumulate_transfer,
+)
+
+
+def test_server_address_is_first_host():
+    assert _server_address("10.80.0.0/24") == "10.80.0.1"
+
+
+def test_reserved_peer_addresses_skip_gateway_and_broadcast():
+    reserved = _reserved_peer_addresses("10.80.0.0/24")
+    assert reserved == {"10.80.0.0", "10.80.0.1", "10.80.0.254", "10.80.0.255"}
+
+
+def test_next_ip_skips_gateway_broadcast_and_last_host():
+    assert _next_ip("10.80.0.0/24", set()) == "10.80.0.2"
+    assert _next_ip("10.80.0.0/24", {"10.80.0.2"}) == "10.80.0.3"
 
 
 def test_peer_config_includes_default_mtu(monkeypatch):

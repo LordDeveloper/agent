@@ -395,6 +395,25 @@ def upsert_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xr
     return {"success": True, **result}
 
 
+@router.post("/routing/test")
+def test_routing(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    attrs = {
+        "domain": body.get("domain"),
+        "ip": body.get("ip"),
+        "user": body.get("user") or body.get("email"),
+        "inboundTag": body.get("inboundTag") or body.get("inbound"),
+        "protocol": body.get("protocol"),
+        "port": body.get("port"),
+        "network": body.get("network"),
+        "source": body.get("source"),
+    }
+    try:
+        result = xray.test_routing(attrs)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
 @router.post("/sourceip/block")
 def block_source_ips(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     ips = list(body.get("source_ips") or body.get("ips") or [])

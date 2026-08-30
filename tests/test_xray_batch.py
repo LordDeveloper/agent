@@ -203,6 +203,26 @@ def test_client_batch_accepts_edit_mode_alias(client: TestClient):
     assert clients[0]["id"] == "dddddddd-dddd-dddd-dddd-dddddddddddd"
 
 
+def test_update_missing_client_upserts_instead_of_404(client: TestClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(25, 2843)).status_code == 200
+
+    updated = client.put(
+        "/api/v1/cores/xray/inbounds/inbound-25/clients/KJODDyxE",
+        headers=headers,
+        json={
+            "id": "6a8a151e-cad6-4953-a638-c69d9345fba4",
+            "email": "KJODDyxE",
+            "is_enabled": False,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+
+    listed = client.get("/api/v1/cores/xray/inbounds/25", headers=headers)
+    clients = listed.json()["inbound"]["settings"]["clients"]
+    assert clients == []
+
+
 def test_replace_routing_rules(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     fake_xray._rules = [{"tag": "old", "outboundTag": "direct"}]

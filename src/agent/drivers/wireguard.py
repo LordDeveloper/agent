@@ -149,12 +149,33 @@ def _materialize_peer_keypair(peer: dict[str, Any], cli: str) -> None:
     peer["public_key"] = _require_wg_pubkey(cli, generated_private) or generated_public
 
 
+def _server_address(subnet: str) -> str:
+    """First usable host in the subnet — WireGuard interface gateway."""
+    network = ipaddress.ip_network(subnet, strict=False)
+    return str(next(network.hosts()))
+
+
+def _reserved_peer_addresses(subnet: str) -> set[str]:
+    """Network, broadcast, gateway, and last host must not be assigned to peers."""
+    network = ipaddress.ip_network(subnet, strict=False)
+    hosts = list(network.hosts())
+    reserved = {str(network.network_address), str(network.broadcast_address)}
+    if not hosts:
+        return reserved
+    reserved.add(str(hosts[0]))
+    if len(hosts) > 1:
+        reserved.add(str(hosts[-1]))
+    return reserved
+
+
 def _next_ip(subnet: str, used: set[str]) -> str:
+    reserved = _reserved_peer_addresses(subnet)
     network = ipaddress.ip_network(subnet, strict=False)
     for host in network.hosts():
         ip = str(host)
-        if ip not in used:
-            return ip
+        if ip in reserved or ip in used:
+            continue
+        return ip
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")
 
 
@@ -1168,10 +1189,9 @@ class WireGuardDriver(CoreDriver):
         address = iface["subnet"]
         if "/" not in str(address):
             address = f"{address}/16"
-        # Prefer host .1 in subnet for server address.
         try:
             network = ipaddress.ip_network(address, strict=False)
-            host = str(next(network.hosts()))
+            host = _server_address(str(network))
             address = f"{host}/{network.prefixlen}"
         except ValueError:
             pass

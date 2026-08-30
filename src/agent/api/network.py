@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request
 
 from agent.db import Store
+from agent.errors import AgentError, raise_agent_error
 from agent.support.peer_egress import all_desired_rules_from_store, all_tunnel_interface_names, repair_peer_egress
 from agent.support.host_interfaces import list_host_interfaces
 
@@ -11,6 +12,34 @@ router = APIRouter(prefix="/network", tags=["network"])
 def network_interfaces():
     return {"success": True, "interfaces": list_host_interfaces()}
 
+
+@router.get("/ads-block")
+def ads_block_status():
+    from agent.ads_block import ads_block_status as status_fn
+
+    return {"success": True, **status_fn()}
+
+
+@router.post("/ads-block/ensure")
+def ads_block_ensure():
+    from agent.ads_block import ads_block_ensure as ensure_fn
+
+    try:
+        result = ensure_fn()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
+@router.post("/ads-block/disable")
+def ads_block_disable():
+    from agent.ads_block import ads_block_disable as disable_fn
+
+    try:
+        result = disable_fn()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
 
 @router.post("/egress/repair")
 def egress_repair(request: Request):

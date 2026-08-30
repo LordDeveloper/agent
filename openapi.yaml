@@ -89,6 +89,8 @@ paths:
     put: { summary: Atomically replace routing.rules }
   /cores/xray/routing/rules/upsert:
     post: { summary: Remove rule tags then add rules in one call }
+  /cores/xray/routing/test:
+    post: { summary: Simulate first-match routing against sample attributes }
   /cores/xray/sourceip/block:
     post: { summary: Block source IPs }
   /cores/xray/config/import:
@@ -102,6 +104,12 @@ paths:
 
   /network/interfaces:
     get: { summary: List host network interfaces (for exit routing) }
+  /network/ads-block:
+    get: { summary: Ads DNS filter status (dnsmasq) }
+  /network/ads-block/ensure:
+    post: { summary: Ensure ads dnsmasq drop-in is installed }
+  /network/ads-block/disable:
+    post: { summary: Remove ads dnsmasq drop-in }
 
   /cores/wireguard/interfaces:
     get: { summary: List interfaces }
