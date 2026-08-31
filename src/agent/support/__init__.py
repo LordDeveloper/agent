@@ -95,9 +95,19 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
     # Keep opaque per-client bag (e.g. Shadowsocks AEAD method) for round-trips.
     extra = client.get("extra")
     if isinstance(extra, dict):
-        client["extra"] = {k: v for k, v in extra.items() if v is not None and v != ""}
+        client["extra"] = {
+            k: v for k, v in extra.items()
+            if v is not None and str(v).strip() != ""
+        }
     elif "extra" in client:
         client.pop("extra", None)
+
+    method = str(client.get("method") or client.get("cipher") or "").strip()
+    if method:
+        client["method"] = method
+    else:
+        client.pop("method", None)
+        client.pop("cipher", None)
 
     client["is_enabled"] = record_is_enabled(client)
 
@@ -224,8 +234,10 @@ def xray_protocol_user(protocol: str, client: dict[str, Any]) -> dict[str, Any]:
             extra = row.get("extra")
             if isinstance(extra, dict):
                 method = extra.get("method") or extra.get("cipher")
+        method = str(method or "").strip()
+        # Never emit blank cipher — Xray fails with "unsupported cipher method:".
         if method:
-            user["method"] = str(method).strip()
+            user["method"] = method
         return user
 
     cleaned = {k: v for k, v in row.items() if k not in _NETINJA_CLIENT_KEYS and v is not None and v != ""}
@@ -244,8 +256,18 @@ def xray_users_settings(
         for key, value in inbound_settings.items():
             if key not in {"clients", "users"}:
                 settings[key] = deepcopy(value)
-    if str(protocol or "").strip().lower() == "vless":
+    protocol_key = str(protocol or "").strip().lower()
+    if protocol_key == "vless":
         settings.setdefault("decryption", "none")
+    if protocol_key in {"shadowsocks", "ss"}:
+        method = str(settings.get("method") or "").strip()
+        if method == "":
+            settings.pop("method", None)
+            if str(settings.get("password") or "").strip() == "":
+                settings.pop("password", None)
+        else:
+            settings["method"] = method
+        settings.setdefault("network", "tcp,udp")
     native = [xray_protocol_user(protocol, client) for client in clients]
     settings["clients"] = native
     settings["users"] = native
