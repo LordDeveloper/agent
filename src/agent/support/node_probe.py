@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from agent.errors import AgentError
@@ -18,7 +19,9 @@ PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = (
     ('http://1.1.1.1/cdn-cgi/trace', frozenset({200})),
     ('http://cp.cloudflare.com/cdn-cgi/trace', frozenset({200})),
 )
-PROBE_TIMEOUT = 8
+PROBE_TIMEOUT = 5
+CONNECT_TIMEOUT = 3
+BIND_ERROR_CODES = frozenset({45, 55})
 
 
 def _runner(runner: Runner | None) -> Runner:
@@ -119,6 +122,8 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
         cmd = [
             'curl',
             '-4',
+            '--connect-timeout',
+            str(CONNECT_TIMEOUT),
             '--max-time',
             str(PROBE_TIMEOUT),
             '-sS',
@@ -131,7 +136,7 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
         if bind:
             cmd[1:1] = ['--interface', bind]
 
-        result = execute(cmd, check=False, timeout=PROBE_TIMEOUT + 4)
+        result = execute(cmd, check=False, timeout=PROBE_TIMEOUT + CONNECT_TIMEOUT + 2)
         raw_code = getattr(result, 'returncode', 1)
         code = int(raw_code if raw_code is not None else 1)
         body = (getattr(result, 'stdout', '') or '').strip()
@@ -148,6 +153,8 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
             continue
 
         errors.append(stderr or f'curl exit {code}')
+        if code in BIND_ERROR_CODES or 'bind' in stderr.lower() or 'interface' in stderr.lower():
+            break
 
     detail = errors[-1] if errors else 'اتصال برقرار نشد'
     return False, detail
@@ -373,30 +380,42 @@ def probe_region_nodes(
     if not isinstance(nodes, list) or not nodes:
         raise AgentError('VALIDATION_ERROR', 'nodes list is required')
 
-    rows: list[dict[str, Any]] = []
-    for item in nodes:
-        if not isinstance(item, dict):
-            continue
-        node_id = item.get('id')
-        if node_id is None:
-            continue
-        rows.append(
-            probe_region_node(
-                node_id=node_id,
-                outbound_tag=item.get('outbound_tag'),
-                exit_interface=item.get('exit_interface'),
-                outbounds=outbounds,
-                runner=runner,
-            )
+    valid_nodes = [item for item in nodes if isinstance(item, dict) and item.get('id') is not None]
+    if not valid_nodes:
+        return {
+            'ok': True,
+            'nodes': [],
+            'summary': {'total': 0, 'passed': 0, 'failed': 0},
+        }
+
+    def _probe_item(item: dict[str, Any]) -> dict[str, Any]:
+        return probe_region_node(
+            node_id=item.get('id'),
+            outbound_tag=item.get('outbound_tag'),
+            exit_interface=item.get('exit_interface'),
+            outbounds=outbounds,
+            runner=runner,
         )
 
-    passed = sum(1 for row in rows if row.get('ok'))
+    max_workers = min(8, len(valid_nodes))
+    rows: list[dict[str, Any] | None] = [None] * len(valid_nodes)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(_probe_item, item): index
+            for index, item in enumerate(valid_nodes)
+        }
+        for future, index in future_map.items():
+            rows[index] = future.result()
+
+    resolved = [row for row in rows if isinstance(row, dict)]
+    passed = sum(1 for row in resolved if row.get('ok'))
     return {
         'ok': True,
-        'nodes': rows,
+        'nodes': resolved,
         'summary': {
-            'total': len(rows),
+            'total': len(resolved),
             'passed': passed,
-            'failed': len(rows) - passed,
+            'failed': len(resolved) - passed,
         },
     }
