@@ -110,6 +110,8 @@ paths:
     post: { summary: Ensure ads dnsmasq drop-in is installed }
   /network/ads-block/disable:
     post: { summary: Remove ads dnsmasq drop-in }
+  /network/nodes/probe:
+    post: { summary: Probe region node egress connectivity }
 
   /cores/wireguard/interfaces:
     get: { summary: List interfaces }

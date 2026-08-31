@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import APIRouter, Request
 
 from agent.db import Store
@@ -40,6 +42,34 @@ def ads_block_disable():
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **result}
+
+
+@router.post("/nodes/probe")
+def probe_region_nodes(body: dict[str, Any], request: Request):
+    from agent.drivers.xray import XrayDriver
+    from agent.support.node_probe import probe_region_nodes as run_probe
+
+    nodes = body.get("nodes") or []
+    if not isinstance(nodes, list):
+        raise_agent_error("VALIDATION_ERROR", "nodes must be an array", 422)
+
+    outbounds: list[dict[str, Any]] = []
+    registry = request.app.state.registry
+    try:
+        driver = registry.get("xray")
+        if isinstance(driver, XrayDriver):
+            listed = driver.list_outbounds()
+            if isinstance(listed, list):
+                outbounds = [row for row in listed if isinstance(row, dict)]
+    except Exception:
+        outbounds = []
+
+    try:
+        result = run_probe(nodes, outbounds)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
 
 @router.post("/egress/repair")
 def egress_repair(request: Request):
