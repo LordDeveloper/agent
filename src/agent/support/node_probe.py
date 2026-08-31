@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -110,10 +111,30 @@ def _bind_targets_equivalent(left: str | None, right: str | None, *, runner: Run
     return False
 
 
-def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -> tuple[bool, str]:
+def _parse_curl_write_out(body: str) -> tuple[int, int | None]:
+    parts = (body or '').strip().split()
+    if not parts:
+        return 0, None
+
+    try:
+        http_code = int(parts[0])
+    except ValueError:
+        http_code = 0
+
+    latency_ms: int | None = None
+    if len(parts) >= 2:
+        try:
+            latency_ms = max(1, int(round(float(parts[1]) * 1000)))
+        except ValueError:
+            latency_ms = None
+
+    return http_code, latency_ms
+
+
+def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -> tuple[bool, str, int | None]:
     execute = _runner(runner)
     if not shutil.which('curl'):
-        return False, 'curl در Agent موجود نیست'
+        return False, 'curl در Agent موجود نیست', None
 
     bind = _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
@@ -130,7 +151,7 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
             '-o',
             '/dev/null',
             '-w',
-            '%{http_code}',
+            '%{http_code} %{time_total}',
             url,
         ]
         if bind:
@@ -143,12 +164,9 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
         stderr = (getattr(result, 'stderr', '') or '').strip()
 
         if code == 0:
-            try:
-                http_code = int(body or '0')
-            except ValueError:
-                http_code = 0
+            http_code, latency_ms = _parse_curl_write_out(body)
             if http_code in ok_codes:
-                return True, 'اتصال برقرار شد'
+                return True, 'اتصال برقرار شد', latency_ms
             errors.append(f'HTTP {http_code or "?"}')
             continue
 
@@ -157,20 +175,22 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
             break
 
     detail = errors[-1] if errors else 'اتصال برقرار نشد'
-    return False, detail
+    return False, detail, None
 
 
-def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str]:
+def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str, int | None]:
     import socket
 
     host = str(host or '').strip()
     if not host or port <= 0:
-        return False, 'آدرس/پورت نامعتبر'
+        return False, 'آدرس/پورت نامعتبر', None
+    started = time.perf_counter()
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True, 'TCP متصل شد'
+            latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
+            return True, 'TCP متصل شد', latency_ms
     except OSError as exc:
-        return False, str(exc) or 'TCP ناموفق'
+        return False, str(exc) or 'TCP ناموفق', None
 
 
 def _find_outbound(tag: str, outbounds: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -255,8 +275,11 @@ def probe_exit_interface(name: str, *, runner: Runner | None = None) -> dict[str
     if row.get('is_up') is False:
         return {'ok': False, 'message': f'اینترفیس {iface} down است'}
 
-    ok, message = _curl_probe(interface=iface, runner=runner)
-    return {'ok': ok, 'message': message, 'interface': iface}
+    ok, message, latency_ms = _curl_probe(interface=iface, runner=runner)
+    result: dict[str, Any] = {'ok': ok, 'message': message, 'interface': iface}
+    if latency_ms is not None:
+        result['latency_ms'] = latency_ms
+    return result
 
 
 def probe_outbound_tag(
@@ -283,13 +306,16 @@ def probe_outbound_tag(
     if protocol == 'freedom':
         if not bind_iface:
             return {'ok': False, 'message': 'اوتباند freedom بدون sendThrough/interface قابل تست نیست'}
-        ok, message = _curl_probe(interface=bind_iface, runner=runner)
-        return {
+        ok, message, latency_ms = _curl_probe(interface=bind_iface, runner=runner)
+        result: dict[str, Any] = {
             'ok': ok,
             'message': message,
             'protocol': protocol,
             'interface': bind_iface,
         }
+        if latency_ms is not None:
+            result['latency_ms'] = latency_ms
+        return result
 
     if protocol in {'dns', 'loopback'}:
         return {'ok': True, 'message': f'اوتباند {protocol} — بدون تست egress', 'protocol': protocol}
@@ -297,13 +323,16 @@ def probe_outbound_tag(
     endpoint = _outbound_server(outbound)
     if endpoint is not None:
         host, port = endpoint
-        ok, message = _tcp_probe(host, port)
-        return {
+        ok, message, latency_ms = _tcp_probe(host, port)
+        result = {
             'ok': ok,
             'message': message,
             'protocol': protocol,
             'endpoint': f'{host}:{port}',
         }
+        if latency_ms is not None:
+            result['latency_ms'] = latency_ms
+        return result
 
     return {'ok': False, 'message': f'اوتباند {protocol} قابل تست نیست', 'protocol': protocol}
 
@@ -362,13 +391,22 @@ def probe_region_node(
         for check in checks.values()
         if isinstance(check, dict) and not check.get('ok')
     ]
+    latency_values = [
+        int(check['latency_ms'])
+        for check in checks.values()
+        if isinstance(check, dict) and check.get('ok') and isinstance(check.get('latency_ms'), int)
+    ]
 
-    return {
+    result: dict[str, Any] = {
         'id': node_id,
         'ok': ok,
         'message': 'ترافیک از این نود عبور می‌کند' if ok else (failure_messages[0] if failure_messages else 'ناموفق'),
         'checks': checks,
     }
+    if latency_values:
+        result['latency_ms'] = min(latency_values)
+
+    return result
 
 
 def probe_region_nodes(

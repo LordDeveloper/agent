@@ -35,7 +35,7 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
 
         class Result:
             returncode = 0
-            stdout = '204'
+            stdout = '204 0.256'
             stderr = ''
 
         calls.append(iface)
@@ -62,6 +62,8 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
     assert result['ok'] is True
     assert 'exit_interface' in result['checks']
     assert 'outbound' in result['checks']
+    assert result.get('latency_ms') == 256
+    assert result['checks']['exit_interface'].get('latency_ms') == 256
 
 
 @patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
@@ -71,7 +73,7 @@ def test_probe_region_node_skips_duplicate_exit_interface_check(_which):
     def fake_runner(cmd, **_kwargs):
         class Result:
             returncode = 0
-            stdout = '204'
+            stdout = '204 0.12'
             stderr = ''
 
         if '--interface' in cmd:
