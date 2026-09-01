@@ -30,11 +30,17 @@ Runner = Callable[..., Any]
 
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 RESOLVED_STUB_DROPIN = Path('/etc/systemd/resolved.conf.d/netinja-dnsmasq.conf')
-ADS_BLOCK_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
+AGENT_DNSMASQ_CONF_DIR = Path('/var/lib/agent/dnsmasq.conf.d')
+AGENT_DNSMASQ_VPN_CONF = AGENT_DNSMASQ_CONF_DIR / '10-vpn-dns.conf'
+AGENT_DNSMASQ_ADS_CONF = AGENT_DNSMASQ_CONF_DIR / '20-ads-block.conf'
+DNSMASQ_DROPIN = AGENT_DNSMASQ_VPN_CONF
+LEGACY_DNSMASQ_VPN_DROPIN = Path('/etc/dnsmasq.d/netinja-vpn-dns.conf')
+LEGACY_DNSMASQ_ADS_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
+ADS_BLOCK_DROPIN = AGENT_DNSMASQ_ADS_CONF
 AGENT_DNSMASQ_UNIT = 'agent-dnsmasq'
 AGENT_DNSMASQ_UNIT_PATH = Path('/etc/systemd/system/agent-dnsmasq.service')
 DNSMASQ_UNIT_MARKER = Path('/var/lib/agent/dnsmasq-systemd-unit')
-DNSMASQ_UNIT_CANDIDATES = ('dnsmasq', AGENT_DNSMASQ_UNIT)
+DNSMASQ_UNIT_CANDIDATES = (AGENT_DNSMASQ_UNIT, 'dnsmasq')
 
 
 def _dnsmasq_unit_file(name: str) -> Path | None:
@@ -58,29 +64,30 @@ def dnsmasq_systemd_unit(*, runner: Runner | None = None) -> str | None:
 
 
 def _resolve_dnsmasq_unit(*, runner: Runner | None = None) -> str:
+    if AGENT_DNSMASQ_UNIT_PATH.is_file() or DNSMASQ_UNIT_MARKER.is_file():
+        return AGENT_DNSMASQ_UNIT
     return dnsmasq_systemd_unit(runner=runner) or AGENT_DNSMASQ_UNIT
 
 
-def ensure_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> dict[str, Any]:
-    """Ensure a systemd unit exists for dnsmasq (distro package or agent-managed)."""
+def _install_dnsmasq_binary(*, runner: Runner | None = None) -> bool:
+    """Install dnsmasq binary without necessarily enabling the distro service unit."""
     execute = runner or run
-    existing = dnsmasq_systemd_unit(runner=runner)
-    if existing:
-        return {'ok': True, 'unit': existing, 'created': False, 'installed': False}
-
+    if shutil.which('dnsmasq'):
+        return True
     apt = shutil.which('apt-get')
-    if apt:
-        execute([apt, 'update', '-qq'], check=False, timeout=120)
-        proc = execute([apt, 'install', '-y', '-qq', 'dnsmasq'], check=False, timeout=300)
-        existing = dnsmasq_systemd_unit(runner=runner)
-        if existing:
-            return {'ok': True, 'unit': existing, 'created': False, 'installed': proc.returncode == 0}
+    if not apt:
+        return False
+    execute([apt, 'update', '-qq'], check=False, timeout=120)
+    for package in ('dnsmasq-base', 'dnsmasq'):
+        proc = execute([apt, 'install', '-y', '-qq', package, 'dnsutils'], check=False, timeout=300)
+        if proc.returncode == 0 and shutil.which('dnsmasq'):
+            return True
+    return bool(shutil.which('dnsmasq'))
 
-    binary = shutil.which('dnsmasq')
-    if not binary:
-        return {'ok': False, 'unit': None, 'message': 'dnsmasq binary not found'}
 
-    unit_content = (
+def _render_agent_dnsmasq_unit(binary: str) -> str:
+    conf_dir = str(AGENT_DNSMASQ_CONF_DIR)
+    return (
         '[Unit]\n'
         'Description=Netinja VPN DNS resolver (dnsmasq)\n'
         'After=network-online.target\n'
@@ -88,7 +95,7 @@ def ensure_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> dict[str, An
         '\n'
         '[Service]\n'
         'Type=simple\n'
-        f'ExecStart={binary} -k\n'
+        f'ExecStart={binary} -k --conf-file=/dev/null --conf-dir={conf_dir}\n'
         'ExecReload=/bin/kill -HUP $MAINPID\n'
         'Restart=on-failure\n'
         'RestartSec=3\n'
@@ -96,13 +103,44 @@ def ensure_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> dict[str, An
         '[Install]\n'
         'WantedBy=multi-user.target\n'
     )
-    AGENT_DNSMASQ_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    AGENT_DNSMASQ_UNIT_PATH.write_text(unit_content, encoding='utf-8')
+
+
+def _cleanup_legacy_dnsmasq_dropins() -> list[str]:
+    removed: list[str] = []
+    for path in (LEGACY_DNSMASQ_VPN_DROPIN, LEGACY_DNSMASQ_ADS_DROPIN):
+        if path.is_file():
+            path.unlink()
+            removed.append(str(path))
+    return removed
+
+
+def ensure_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> dict[str, Any]:
+    """Ensure agent-managed dnsmasq unit with isolated config directory."""
+    execute = runner or run
+    installed = _install_dnsmasq_binary(runner=runner)
+    binary = shutil.which('dnsmasq')
+    if not binary:
+        return {'ok': False, 'unit': None, 'message': 'dnsmasq binary not found'}
+
+    AGENT_DNSMASQ_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    unit_content = _render_agent_dnsmasq_unit(binary)
+    created = False
+    previous = AGENT_DNSMASQ_UNIT_PATH.read_text(encoding='utf-8') if AGENT_DNSMASQ_UNIT_PATH.is_file() else ''
+    if previous != unit_content:
+        AGENT_DNSMASQ_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AGENT_DNSMASQ_UNIT_PATH.write_text(unit_content, encoding='utf-8')
+        created = True
     DNSMASQ_UNIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
     DNSMASQ_UNIT_MARKER.write_text(AGENT_DNSMASQ_UNIT, encoding='utf-8')
     if shutil.which('systemctl'):
         execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
-    return {'ok': True, 'unit': AGENT_DNSMASQ_UNIT, 'created': True, 'installed': False}
+    return {
+        'ok': True,
+        'unit': AGENT_DNSMASQ_UNIT,
+        'created': created,
+        'installed': installed,
+        'conf_dir': str(AGENT_DNSMASQ_CONF_DIR),
+    }
 
 
 def remove_agent_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> bool:
@@ -121,8 +159,8 @@ def remove_agent_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> bool:
 
 def dnsmasq_service_active(*, runner: Runner | None = None) -> bool:
     execute = runner or run
-    unit = dnsmasq_systemd_unit(runner=runner)
-    if not unit or not shutil.which('systemctl'):
+    unit = _resolve_dnsmasq_unit(runner=runner)
+    if not shutil.which('systemctl'):
         return False
     proc = execute(['systemctl', 'is-active', unit], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() == 'active'
@@ -132,7 +170,10 @@ def dnsmasq_config_test(*, runner: Runner | None = None) -> tuple[bool, str]:
     execute = runner or run
     if not shutil.which('dnsmasq'):
         return False, 'dnsmasq binary not found'
-    proc = execute(['dnsmasq', '--test'], check=False, timeout=15)
+    args = ['dnsmasq', '--test']
+    if AGENT_DNSMASQ_CONF_DIR.is_dir() and any(AGENT_DNSMASQ_CONF_DIR.glob('*.conf')):
+        args.extend(['--conf-file=/dev/null', f'--conf-dir={AGENT_DNSMASQ_CONF_DIR}'])
+    proc = execute(args, check=False, timeout=15)
     message = (getattr(proc, 'stderr', '') or getattr(proc, 'stdout', '') or '').strip()
     return proc.returncode == 0, message
 
@@ -152,9 +193,7 @@ def dnsmasq_unit_enabled(*, runner: Runner | None = None) -> str:
     execute = runner or run
     if not shutil.which('systemctl'):
         return 'unknown'
-    unit = dnsmasq_systemd_unit(runner=runner)
-    if not unit:
-        return 'not-found'
+    unit = _resolve_dnsmasq_unit(runner=runner)
     proc = execute(['systemctl', 'is-enabled', unit], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() or 'unknown'
 
@@ -182,8 +221,9 @@ def dnsmasq_service_journal(*, runner: Runner | None = None, lines: int = 8) -> 
 
 
 def dnsmasq_service_diagnostic(*, runner: Runner | None = None) -> str:
-    if dnsmasq_systemd_unit(runner=runner) is None:
-        return 'dnsmasq systemd unit not found (install dnsmasq package or run: agent ads-block install)'
+    unit = _resolve_dnsmasq_unit(runner=runner)
+    if not AGENT_DNSMASQ_UNIT_PATH.is_file() and unit == 'dnsmasq' and not _dnsmasq_unit_file('dnsmasq'):
+        return 'dnsmasq systemd unit not found (run: agent ads-block install)'
     journal = dnsmasq_service_journal(runner=runner, lines=15)
     if journal and journal != '-- No entries --':
         return journal
@@ -614,6 +654,10 @@ def _ensure_dnsmasq(
     lines.append('except-interface=lo')
     lines.append('no-resolv')
     lines.append('no-poll')
+    for row in interfaces:
+        name = str(row.get('name') or '').strip()
+        if name:
+            lines.append(f'interface={name}')
     for address in listen_addresses:
         lines.append(f'listen-address={address}')
     for server in upstream:
@@ -622,35 +666,33 @@ def _ensure_dnsmasq(
             lines.append(f'server={server}')
     content = '\n'.join(lines) + '\n'
 
-    previous = DNSMASQ_DROPIN.read_text(encoding='utf-8') if DNSMASQ_DROPIN.is_file() else ''
+    AGENT_DNSMASQ_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    previous = AGENT_DNSMASQ_VPN_CONF.read_text(encoding='utf-8') if AGENT_DNSMASQ_VPN_CONF.is_file() else ''
     written = False
     if previous != content:
-        DNSMASQ_DROPIN.parent.mkdir(parents=True, exist_ok=True)
-        DNSMASQ_DROPIN.write_text(content, encoding='utf-8')
+        AGENT_DNSMASQ_VPN_CONF.write_text(content, encoding='utf-8')
         written = True
+    legacy_removed = _cleanup_legacy_dnsmasq_dropins()
 
-    installed = False
+    installed = _install_dnsmasq_binary()
     restarted = False
     service: dict[str, Any] | None = None
-    apt = shutil.which('apt-get')
-    if not shutil.which('dnsmasq') and apt:
-        run([apt, 'update', '-qq'], check=False, timeout=120)
-        proc = run([apt, 'install', '-y', '-qq', 'dnsmasq'], check=False, timeout=300)
-        installed = proc.returncode == 0 and shutil.which('dnsmasq') is not None
 
-    if shutil.which('systemctl') and shutil.which('dnsmasq'):
+    if shutil.which('dnsmasq'):
         service = ensure_dnsmasq_service()
         restarted = bool(service.get('active'))
         installed = installed or bool(shutil.which('dnsmasq'))
 
     return {
-        'dropin': str(DNSMASQ_DROPIN),
+        'dropin': str(AGENT_DNSMASQ_VPN_CONF),
         'written': written,
         'listen_addresses': listen_addresses,
         'upstream': list(upstream),
-        'installed': installed or bool(shutil.which('dnsmasq')),
+        'installed': installed,
         'restarted': restarted,
         'service': service if shutil.which('dnsmasq') else None,
+        'legacy_removed': legacy_removed,
+        'conf_dir': str(AGENT_DNSMASQ_CONF_DIR),
     }
 
 
@@ -833,17 +875,16 @@ def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any
             'skipped': True,
         }
 
-    if DNSMASQ_DROPIN.is_file():
-        DNSMASQ_DROPIN.unlink()
-        removed_files.append(str(DNSMASQ_DROPIN))
+    if AGENT_DNSMASQ_VPN_CONF.is_file():
+        AGENT_DNSMASQ_VPN_CONF.unlink()
+        removed_files.append(str(AGENT_DNSMASQ_VPN_CONF))
+    if AGENT_DNSMASQ_ADS_CONF.is_file():
+        AGENT_DNSMASQ_ADS_CONF.unlink()
+        removed_files.append(str(AGENT_DNSMASQ_ADS_CONF))
+    removed_files.extend(_cleanup_legacy_dnsmasq_dropins())
 
     resolved_restored = restore_resolved_stub_listener(runner=runner)
     agent_unit_removed = remove_agent_dnsmasq_systemd_unit(runner=runner)
-
-    if shutil.which('systemctl') and (removed_files or agent_unit_removed):
-        unit = dnsmasq_systemd_unit(runner=runner)
-        if unit:
-            execute(['systemctl', 'try-restart', unit], check=False, timeout=30)
 
     return {
         'removed_files': removed_files,

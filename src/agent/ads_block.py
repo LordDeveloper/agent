@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.dns_leak import (
+    AGENT_DNSMASQ_ADS_CONF,
     DNSMASQ_DROPIN,
     discover_vpn_interfaces,
     dns_leak_status,
@@ -24,7 +25,7 @@ from agent.support.process import run
 
 log = get_logger("ads_block")
 
-ADS_DROPIN = Path("/etc/dnsmasq.d/netinja-ads-block.conf")
+ADS_DROPIN = AGENT_DNSMASQ_ADS_CONF
 ADS_LIST_PATH = Path("/var/lib/agent/ads-blocklist.txt")
 
 Runner = Callable[..., Any]
@@ -241,7 +242,9 @@ def ads_block_install_prerequisites(*, runner: Runner | None = None) -> dict[str
                 "dnsmasq is not installed and apt-get is unavailable; install dnsmasq manually",
             )
         execute([apt, "update", "-qq"], check=False, timeout=120)
-        proc = execute([apt, "install", "-y", "-qq", "dnsmasq", "dnsutils"], check=False, timeout=300)
+        proc = execute([apt, "install", "-y", "-qq", "dnsmasq-base", "dnsutils"], check=False, timeout=300)
+        if proc.returncode != 0 or not shutil.which("dnsmasq"):
+            proc = execute([apt, "install", "-y", "-qq", "dnsmasq", "dnsutils"], check=False, timeout=300)
         if proc.returncode != 0 or not shutil.which("dnsmasq"):
             raise AgentError("VALIDATION_ERROR", "Installing dnsmasq failed")
         installed.append("dnsmasq")
