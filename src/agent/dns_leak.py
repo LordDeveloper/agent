@@ -56,11 +56,11 @@ def _interface_ipv4(addresses: list[str]) -> str | None:
         if not text:
             continue
         try:
-            network = ipaddress.ip_network(text, strict=False)
+            iface = ipaddress.ip_interface(text)
         except ValueError:
             continue
-        if isinstance(network, ipaddress.IPv4Network):
-            return str(network.network_address)
+        if isinstance(iface.ip, ipaddress.IPv4Address):
+            return str(iface.ip)
     return None
 
 
@@ -318,6 +318,57 @@ def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> 
         'ok': getattr(enable, 'returncode', 1) == 0 and getattr(start, 'returncode', 1) == 0,
         'unit': str(UNIT_PATH),
         'script': str(script_path),
+    }
+
+
+def ensure_vpn_dns_resolver(
+    *,
+    interfaces: list[dict[str, Any]] | None = None,
+    block_ipv6: bool = True,
+    upstream_dns: list[str] | None = None,
+    with_dnat: bool = True,
+    data_dir: str | Path | None = None,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Run dnsmasq on VPN gateway IP(s) and optionally DNAT client DNS to it."""
+    _require_linux()
+    _require_root()
+
+    if interfaces is None:
+        targets = _resolve_targets(None, runner=runner)
+    else:
+        targets = [row for row in interfaces if str(row.get('gateway') or '').strip()]
+        if not targets:
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'VPN interface list has no IPv4 gateway addresses',
+            )
+
+    upstream = tuple(upstream_dns or DEFAULT_UPSTREAM_DNS)
+    resolver = _ensure_dnsmasq(targets, upstream=upstream)
+
+    dnat: dict[str, Any] | None = None
+    if with_dnat:
+        if _firewall_backend() is None:
+            log.warning('ensure_vpn_dns_resolver: nft/iptables missing; skipping DNS DNAT')
+        else:
+            script = _write_apply_script(targets, data_dir=data_dir, block_ipv6=block_ipv6)
+            execute = runner or run
+            proc = execute(['/bin/sh', str(script)], check=False, timeout=120)
+            unit = ensure_dns_leak_unit(script, runner=runner)
+            dnat = {
+                'applied': proc.returncode == 0,
+                'script': str(script),
+                'unit': unit,
+                'backend': _firewall_backend(),
+            }
+
+    return {
+        'ok': True,
+        'interfaces': targets,
+        'resolver': resolver,
+        'dnat': dnat,
+        'block_ipv6': block_ipv6,
     }
 
 

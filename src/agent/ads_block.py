@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from agent.dns_leak import discover_vpn_interfaces
+from agent.dns_leak import (
+    DNSMASQ_DROPIN,
+    discover_vpn_interfaces,
+    dns_leak_status,
+    ensure_vpn_dns_resolver,
+)
 from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.support.process import run
@@ -114,16 +118,9 @@ def _vpn_dns_addresses(*, runner: Runner | None = None) -> list[str]:
     except AgentError:
         interfaces = []
     for row in interfaces:
-        for item in row.get("addresses") or []:
-            text = str(item).strip()
-            if not text:
-                continue
-            try:
-                network = ipaddress.ip_network(text, strict=False)
-            except ValueError:
-                continue
-            if isinstance(network, ipaddress.IPv4Network):
-                addrs.append(str(network.network_address))
+        gateway = str(row.get("gateway") or "").strip()
+        if gateway:
+            addrs.append(gateway)
     return list(dict.fromkeys(addrs))
 
 
@@ -138,8 +135,158 @@ def render_dnsmasq_ads_conf(domains: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _firewall_backend() -> str | None:
+    if shutil.which("nft"):
+        return "nft"
+    if shutil.which("iptables"):
+        return "iptables"
+    return None
+
+
+def _dnsmasq_service_active(*, runner: Runner | None = None) -> bool:
+    execute = runner or run
+    if not shutil.which("systemctl"):
+        return False
+    proc = execute(["systemctl", "is-active", "dnsmasq"], check=False, timeout=10)
+    return (getattr(proc, "stdout", "") or "").strip() == "active"
+
+
+def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
+    if not sys.platform.startswith("linux"):
+        return {
+            "linux": False,
+            "root": False,
+            "dnsmasq_installed": False,
+            "dnsmasq_active": False,
+            "dnsmasq_dropin": False,
+            "ads_dropin": ADS_DROPIN.is_file(),
+            "firewall_backend": None,
+            "nft": False,
+            "iptables": False,
+            "dig": bool(shutil.which("dig")),
+            "apt": bool(shutil.which("apt-get")),
+            "vpn_interfaces": [],
+            "vpn_interface_count": 0,
+            "dns_leak_active": False,
+            "ready": False,
+        }
+
+    vpn_ifaces = discover_vpn_interfaces(runner=runner)
+    backend = _firewall_backend()
+    dnsmasq_bin = bool(shutil.which("dnsmasq"))
+    geteuid = getattr(os, "geteuid", None)
+    is_root = geteuid is not None and geteuid() == 0
+
+    dns_leak: dict[str, Any] = {}
+    try:
+        dns_leak = dns_leak_status(runner=runner)
+    except AgentError:
+        pass
+
+    return {
+        "linux": True,
+        "root": is_root,
+        "dnsmasq_installed": dnsmasq_bin,
+        "dnsmasq_active": _dnsmasq_service_active(runner=runner) if dnsmasq_bin else False,
+        "dnsmasq_dropin": DNSMASQ_DROPIN.is_file(),
+        "ads_dropin": ADS_DROPIN.is_file(),
+        "firewall_backend": backend,
+        "nft": bool(shutil.which("nft")),
+        "iptables": bool(shutil.which("iptables")),
+        "dig": bool(shutil.which("dig")),
+        "apt": bool(shutil.which("apt-get")),
+        "vpn_interfaces": vpn_ifaces,
+        "vpn_interface_count": len(vpn_ifaces),
+        "dns_leak_active": bool(dns_leak.get("active")),
+        "ready": dnsmasq_bin and backend is not None and len(vpn_ifaces) > 0,
+    }
+
+
+def ads_block_install_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
+    """Install dnsmasq (and ensure data dir) required for WireGuard ads blocking."""
+    _require_linux()
+    _require_root()
+    execute = runner or run
+
+    installed: list[str] = []
+    if not shutil.which("dnsmasq"):
+        apt = shutil.which("apt-get")
+        if apt is None:
+            raise AgentError(
+                "UNSUPPORTED_CAPABILITY",
+                "dnsmasq is not installed and apt-get is unavailable; install dnsmasq manually",
+            )
+        execute([apt, "update", "-qq"], check=False, timeout=120)
+        proc = execute([apt, "install", "-y", "-qq", "dnsmasq", "dnsutils"], check=False, timeout=300)
+        if proc.returncode != 0 or not shutil.which("dnsmasq"):
+            raise AgentError("VALIDATION_ERROR", "Installing dnsmasq failed")
+        installed.append("dnsmasq")
+
+    try:
+        ADS_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not ADS_LIST_PATH.is_file():
+            ADS_LIST_PATH.write_text("# Extra ads domains (one per line)\n", encoding="utf-8")
+    except OSError as exc:
+        raise AgentError("VALIDATION_ERROR", f"Cannot prepare ads list path: {exc}") from exc
+
+    restarted = False
+    if shutil.which("dnsmasq") and shutil.which("systemctl"):
+        execute(["systemctl", "enable", "dnsmasq"], check=False, timeout=30)
+        proc = execute(["systemctl", "restart", "dnsmasq"], check=False, timeout=60)
+        restarted = proc.returncode == 0
+
+    payload = ads_block_prerequisites(runner=runner)
+    payload.update(
+        {
+            "ok": True,
+            "installed": installed,
+            "dnsmasq_restarted": restarted,
+        }
+    )
+    return payload
+
+
+def ads_block_test(
+    domain: str = "doubleclick.net",
+    *,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Resolve a known ad domain via the suggested VPN DNS address."""
+    _require_linux()
+    execute = runner or run
+    host = str(domain or "").strip().lower().rstrip(".")
+    if host == "":
+        raise AgentError("VALIDATION_ERROR", "domain is required")
+
+    status = ads_block_status(runner=runner)
+    dns = str(status.get("dns") or "").strip()
+    if dns == "":
+        raise AgentError(
+            "VALIDATION_ERROR",
+            "No VPN gateway DNS address detected; start WireGuard/Amnezia and retry",
+        )
+
+    if not shutil.which("dig"):
+        raise AgentError("UNSUPPORTED_CAPABILITY", "dig is required (install dnsutils)")
+
+    proc = execute(["dig", "+time=2", "+tries=1", "+short", f"@{dns}", host], check=False, timeout=15)
+    answer = (getattr(proc, "stdout", "") or "").strip().splitlines()
+    first = answer[0].strip() if answer else ""
+    blocked = first in {"", "0.0.0.0"}
+
+    return {
+        "ok": True,
+        "domain": host,
+        "dns": dns,
+        "answer": first or None,
+        "blocked": blocked,
+        "exit_code": getattr(proc, "returncode", 1),
+    }
+
+
 def ads_block_status(*, runner: Runner | None = None) -> dict[str, Any]:
     dns_list = _vpn_dns_addresses(runner=runner)
+    prereq = ads_block_prerequisites(runner=runner)
     return {
         "enabled": ADS_DROPIN.is_file(),
         "dropin": str(ADS_DROPIN),
@@ -149,6 +296,12 @@ def ads_block_status(*, runner: Runner | None = None) -> dict[str, Any]:
         "listen_dns": dns_list[0] if dns_list else None,
         "dns_candidates": dns_list,
         "dnsmasq": bool(shutil.which("dnsmasq")),
+        "dnsmasq_active": prereq.get("dnsmasq_active"),
+        "dnsmasq_dropin": prereq.get("dnsmasq_dropin"),
+        "firewall_backend": prereq.get("firewall_backend"),
+        "vpn_interface_count": prereq.get("vpn_interface_count"),
+        "ready": prereq.get("ready"),
+        "prerequisites": prereq,
     }
 
 
@@ -177,8 +330,20 @@ def ads_block_ensure(*, runner: Runner | None = None) -> dict[str, Any]:
         except OSError:
             pass
 
+    vpn_ifaces = discover_vpn_interfaces(runner=runner)
+    resolver: dict[str, Any] | None = None
     restarted = False
-    if shutil.which("systemctl"):
+
+    if vpn_ifaces:
+        try:
+            resolver = ensure_vpn_dns_resolver(interfaces=vpn_ifaces, runner=runner)
+            restarted = bool((resolver.get("resolver") or {}).get("restarted"))
+        except AgentError as exc:
+            log.warning("ads_block ensure: VPN DNS resolver setup failed: %s", exc)
+        except Exception as exc:
+            log.warning("ads_block ensure: VPN DNS resolver setup failed: %s", exc)
+
+    if not restarted and shutil.which("systemctl"):
         result = execute(["systemctl", "try-reload-or-restart", "dnsmasq"], check=False, timeout=30)
         restarted = getattr(result, "returncode", 1) == 0
 
@@ -189,10 +354,17 @@ def ads_block_ensure(*, runner: Runner | None = None) -> dict[str, Any]:
             "written": True,
             "domains": len(domains),
             "restarted": restarted,
+            "resolver": resolver,
         }
     )
     if not status.get("dns"):
         log.warning("ads_block ensure: no VPN interface DNS address detected yet")
+    elif not resolver:
+        log.warning(
+            "ads_block ensure: ads list written but VPN DNS resolver was not configured; "
+            "clients may not reach dnsmasq on %s",
+            status.get("dns"),
+        )
     return status
 
 

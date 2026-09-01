@@ -716,25 +716,51 @@ def _show_bbr_disable(*, remove_persistence: bool) -> None:
 
 def _dns_leak_menu() -> None:
     while True:
-        render_header("DNS leak protection")
+        render_header("DNS leak & ads blocker")
         picked = select(
             [
-                Choice("status", "Status", CYAN, "1"),
-                Choice("apply", "Apply protection", GREEN, "2"),
-                Choice("remove", "Remove protection", RED, "3"),
+                Choice("dns_status", "DNS leak — status", CYAN, "1"),
+                Choice("dns_apply", "DNS leak — apply", GREEN, "2"),
+                Choice("dns_remove", "DNS leak — remove", RED, "3"),
+                Choice("ads_prereq", "Ads blocker — prerequisites", CYAN, "4"),
+                Choice("ads_install", "Ads blocker — install packages", GREEN, "5"),
+                Choice("ads_status", "Ads blocker — status", CYAN, "6"),
+                Choice("ads_enable", "Ads blocker — enable", GREEN, "7"),
+                Choice("ads_disable", "Ads blocker — disable", RED, "8"),
+                Choice("ads_test", "Ads blocker — test query", YELLOW, "9"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
-        if picked == "status":
+        if picked == "dns_status":
             _run_action("DNS leak status", _show_dns_leak_status)
-        elif picked == "apply":
+        elif picked == "dns_apply":
             if confirm("Apply DNS leak protection for VPN interfaces?", default=True):
                 _run_action("Apply DNS leak protection", _show_dns_leak_apply)
-        elif picked == "remove":
+        elif picked == "dns_remove":
             if confirm("Remove DNS leak protection rules?", default=False):
                 _run_action("Remove DNS leak protection", _show_dns_leak_remove)
+        elif picked == "ads_prereq":
+            _run_action("Ads blocker prerequisites", _show_ads_block_prerequisites)
+        elif picked == "ads_install":
+            if confirm("Install dnsmasq and dnsutils (apt)?", default=True):
+                _run_action("Install ads blocker prerequisites", _show_ads_block_install)
+        elif picked == "ads_status":
+            _run_action("Ads blocker status", _show_ads_block_status)
+        elif picked == "ads_enable":
+            if confirm("Enable ads DNS filter for WireGuard/Amnezia clients?", default=True):
+                _run_action("Enable ads blocker", _show_ads_block_enable)
+        elif picked == "ads_disable":
+            if confirm("Disable ads DNS filter?", default=False):
+                _run_action("Disable ads blocker", _show_ads_block_disable)
+        elif picked == "ads_test":
+            domain = prompt_text("Domain to test", default="doubleclick.net")
+            if str(domain or "").strip():
+                _run_action(
+                    "Ads blocker test",
+                    lambda host=str(domain).strip(): _show_ads_block_test(host),
+                )
 
 
 def _show_dns_leak_status() -> None:
@@ -765,6 +791,79 @@ def _show_dns_leak_remove() -> None:
 
     result = dns_leak_remove()
     _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
+
+
+def _show_ads_block_prerequisites() -> None:
+    from agent.ads_block import ads_block_prerequisites
+
+    payload = ads_block_prerequisites()
+    _print(kv("Linux", "yes" if payload.get("linux") else "no", GREEN if payload.get("linux") else RED))
+    _print(kv("Root", "yes" if payload.get("root") else "no", GREEN if payload.get("root") else YELLOW))
+    _print(kv("dnsmasq installed", "yes" if payload.get("dnsmasq_installed") else "no", GREEN if payload.get("dnsmasq_installed") else RED))
+    _print(kv("dnsmasq active", "yes" if payload.get("dnsmasq_active") else "no", GREEN if payload.get("dnsmasq_active") else YELLOW))
+    _print(kv("Firewall backend", str(payload.get("firewall_backend") or "-"), CYAN))
+    _print(kv("VPN resolver drop-in", "yes" if payload.get("dnsmasq_dropin") else "no", GREEN if payload.get("dnsmasq_dropin") else YELLOW))
+    _print(kv("Ads drop-in", "yes" if payload.get("ads_dropin") else "no", GREEN if payload.get("ads_dropin") else YELLOW))
+    _print(kv("VPN interfaces", str(payload.get("vpn_interface_count") or 0), WHITE))
+    _print(kv("Ready", "yes" if payload.get("ready") else "no", GREEN if payload.get("ready") else RED))
+
+
+def _show_ads_block_install() -> None:
+    from agent.ads_block import ads_block_install_prerequisites
+
+    result = ads_block_install_prerequisites()
+    installed = result.get("installed") or []
+    _print(kv("Installed", ", ".join(installed) if installed else "already present", GREEN))
+    _print(kv("dnsmasq active", "yes" if result.get("dnsmasq_active") else "no", GREEN if result.get("dnsmasq_active") else YELLOW))
+    _print(kv("Ready", "yes" if result.get("ready") else "no", GREEN if result.get("ready") else RED))
+
+
+def _show_ads_block_status() -> None:
+    from agent.ads_block import ads_block_status
+
+    payload = ads_block_status()
+    enabled = bool(payload.get("enabled"))
+    _print(kv("Enabled", "yes" if enabled else "no", GREEN if enabled else YELLOW))
+    _print(kv("Blocked domains", str(payload.get("domains") or 0), WHITE))
+    _print(kv("Client DNS", str(payload.get("dns") or "-"), CYAN))
+    _print(kv("dnsmasq", "yes" if payload.get("dnsmasq") else "no", GREEN if payload.get("dnsmasq") else RED))
+    _print(kv("dnsmasq active", "yes" if payload.get("dnsmasq_active") else "no", GREEN if payload.get("dnsmasq_active") else YELLOW))
+    _print(kv("VPN resolver drop-in", "yes" if payload.get("dnsmasq_dropin") else "no", GREEN if payload.get("dnsmasq_dropin") else YELLOW))
+    _print(kv("Ready", "yes" if payload.get("ready") else "no", GREEN if payload.get("ready") else RED))
+    for row in payload.get("dns_candidates") or []:
+        _print(paint(f"  • candidate DNS {row}", DIM))
+
+
+def _show_ads_block_enable() -> None:
+    from agent.ads_block import ads_block_ensure
+
+    result = ads_block_ensure()
+    _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
+    _print(kv("Domains", str(result.get("domains") or 0), WHITE))
+    _print(kv("Client DNS", str(result.get("dns") or "-"), CYAN))
+    resolver = result.get("resolver") or {}
+    if resolver:
+        listen = ((resolver.get("resolver") or {}).get("listen_addresses") or [])
+        if listen:
+            _print(kv("Resolver listen", ", ".join(str(item) for item in listen), WHITE))
+
+
+def _show_ads_block_disable() -> None:
+    from agent.ads_block import ads_block_disable
+
+    result = ads_block_disable()
+    _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
+
+
+def _show_ads_block_test(domain: str) -> None:
+    from agent.ads_block import ads_block_test
+
+    result = ads_block_test(domain)
+    blocked = bool(result.get("blocked"))
+    _print(kv("Domain", str(result.get("domain") or domain), WHITE))
+    _print(kv("DNS", str(result.get("dns") or "-"), CYAN))
+    _print(kv("Answer", str(result.get("answer") or "-"), WHITE))
+    _print(kv("Blocked", "yes" if blocked else "no", GREEN if blocked else RED))
 
 
 def _peer_diagnose_menu() -> None:
@@ -844,7 +943,7 @@ def run_interactive() -> int:
                     Choice("service", "Service", CYAN, "3"),
                     Choice("tls", "TLS Certificates", YELLOW, "4"),
                     Choice("bbr", "BBR", MAGENTA, "5"),
-                    Choice("dns_leak", "DNS leak protection", MAGENTA, "6"),
+                    Choice("dns_leak", "DNS leak & ads blocker", MAGENTA, "6"),
                     Choice("peer_diagnose", "Peer diagnose", CYAN, "7"),
                     Choice("status", "Check status", WHITE, "8"),
                     Choice("stats", "Stats", WHITE, "9"),

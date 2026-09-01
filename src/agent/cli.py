@@ -362,6 +362,43 @@ def cmd_dns_leak_remove(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ads_block_status(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_status
+    _print_json({'success': True, **ads_block_status()})
+    return 0
+
+
+def cmd_ads_block_prerequisites(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_prerequisites
+    _print_json({'success': True, **ads_block_prerequisites()})
+    return 0
+
+
+def cmd_ads_block_install(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_install_prerequisites
+    _print_json({'success': True, **ads_block_install_prerequisites()})
+    return 0
+
+
+def cmd_ads_block_ensure(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_ensure
+    _print_json({'success': True, **ads_block_ensure()})
+    return 0
+
+
+def cmd_ads_block_disable(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_disable
+    _print_json({'success': True, **ads_block_disable()})
+    return 0
+
+
+def cmd_ads_block_test(args: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_test
+    result = ads_block_test(str(getattr(args, 'domain', '') or 'doubleclick.net'))
+    _print_json({'success': bool(result.get('blocked')), **result})
+    return 0 if result.get('blocked') else 1
+
+
 def cmd_peer_diagnose(args: argparse.Namespace) -> int:
     runtime = open_runtime(args.env_file)
     try:
@@ -610,6 +647,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dns_remove = dns_sub.add_parser("remove", help="Remove DNS leak protection rules")
     p_dns_remove.set_defaults(func=cmd_dns_leak_remove)
+
+    p_ads_block = sub.add_parser("ads-block", help="WireGuard / Amnezia ads DNS filter")
+    ads_sub = p_ads_block.add_subparsers(dest="ads_block_command", required=True)
+
+    p_ads_status = ads_sub.add_parser("status", help="Ads blocker status and prerequisites")
+    p_ads_status.set_defaults(func=cmd_ads_block_status)
+
+    p_ads_prereq = ads_sub.add_parser("prerequisites", help="Show ads blocker prerequisites")
+    p_ads_prereq.set_defaults(func=cmd_ads_block_prerequisites)
+
+    p_ads_install = ads_sub.add_parser("install", help="Install dnsmasq/dnsutils prerequisites")
+    p_ads_install.set_defaults(func=cmd_ads_block_install)
+
+    p_ads_ensure = ads_sub.add_parser("ensure", help="Enable ads DNS filter on VPN resolver")
+    p_ads_ensure.set_defaults(func=cmd_ads_block_ensure)
+
+    p_ads_disable = ads_sub.add_parser("disable", help="Remove ads DNS filter drop-in")
+    p_ads_disable.set_defaults(func=cmd_ads_block_disable)
+
+    p_ads_test = ads_sub.add_parser("test", help="Query a known ad domain via VPN DNS")
+    p_ads_test.add_argument(
+        "--domain",
+        default="doubleclick.net",
+        help="Domain to resolve (default: doubleclick.net)",
+    )
+    p_ads_test.set_defaults(func=cmd_ads_block_test)
 
     p_peer = sub.add_parser("peer", help="WireGuard / Amnezia peer diagnostics")
     peer_sub = p_peer.add_subparsers(dest="peer_command", required=True)
