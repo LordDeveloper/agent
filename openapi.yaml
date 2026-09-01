@@ -105,11 +105,11 @@ paths:
   /network/interfaces:
     get: { summary: List host network interfaces (for exit routing) }
   /network/ads-block:
-    get: { summary: Ads DNS filter status (dnsmasq) }
+    get: { summary: Ads DNS filter status (AdGuard Home) }
   /network/ads-block/ensure:
-    post: { summary: Ensure ads dnsmasq drop-in is installed }
+    post: { summary: Ensure AdGuard Home ads filter is enabled }
   /network/ads-block/disable:
-    post: { summary: Remove ads dnsmasq drop-in }
+    post: { summary: Disable AdGuard Home ads filter }
   /network/nodes/probe:
     post: { summary: Probe region node egress connectivity }
 

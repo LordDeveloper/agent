@@ -726,7 +726,7 @@ def _dns_leak_menu() -> None:
                 Choice("ads_install", "Ads blocker — install packages", GREEN, "5"),
                 Choice("ads_status", "Ads blocker — status", CYAN, "6"),
                 Choice("ads_enable", "Ads blocker — enable", GREEN, "7"),
-                Choice("ads_repair", "Ads blocker — start dnsmasq", YELLOW, "8"),
+                Choice("ads_repair", "Ads blocker — start AdGuard", YELLOW, "8"),
                 Choice("ads_disable", "Ads blocker — disable", RED, "9"),
                 Choice("ads_test", "Ads blocker — test query", YELLOW, "10"),
                 Choice("back", "Back", WHITE, "0"),
@@ -745,7 +745,7 @@ def _dns_leak_menu() -> None:
         elif picked == "ads_prereq":
             _run_action("Ads blocker prerequisites", _show_ads_block_prerequisites)
         elif picked == "ads_install":
-            if confirm("Install dnsmasq and dnsutils (apt)?", default=True):
+            if confirm("Install AdGuard Home and dnsutils (apt)?", default=True):
                 _run_action("Install ads blocker prerequisites", _show_ads_block_install)
         elif picked == "ads_status":
             _run_action("Ads blocker status", _show_ads_block_status)
@@ -753,8 +753,8 @@ def _dns_leak_menu() -> None:
             if confirm("Enable ads DNS filter for WireGuard/Amnezia clients?", default=True):
                 _run_action("Enable ads blocker", _show_ads_block_enable)
         elif picked == "ads_repair":
-            if confirm("Start dnsmasq and fix port-53 conflicts?", default=True):
-                _run_action("Repair ads blocker dnsmasq", _show_ads_block_repair)
+            if confirm("Start AdGuard Home and fix port-53 conflicts?", default=True):
+                _run_action("Repair ads blocker AdGuard", _show_ads_block_repair)
         elif picked == "ads_disable":
             if confirm("Disable ads DNS filter?", default=False):
                 _run_action("Disable ads blocker", _show_ads_block_disable)
@@ -803,16 +803,16 @@ def _show_ads_block_prerequisites() -> None:
     payload = ads_block_prerequisites()
     _print(kv("Linux", "yes" if payload.get("linux") else "no", GREEN if payload.get("linux") else RED))
     _print(kv("Root", "yes" if payload.get("root") else "no", GREEN if payload.get("root") else YELLOW))
-    _print(kv("dnsmasq installed", "yes" if payload.get("dnsmasq_installed") else "no", GREEN if payload.get("dnsmasq_installed") else RED))
-    _print(kv("dnsmasq active", "yes" if payload.get("dnsmasq_active") else "no", GREEN if payload.get("dnsmasq_active") else YELLOW))
+    _print(kv("AdGuard installed", "yes" if payload.get("adguard_installed") else "no", GREEN if payload.get("adguard_installed") else RED))
+    _print(kv("AdGuard active", "yes" if payload.get("adguard_active") else "no", GREEN if payload.get("adguard_active") else YELLOW))
     _print(kv("Firewall backend", str(payload.get("firewall_backend") or "-"), CYAN))
-    _print(kv("VPN resolver drop-in", "yes" if payload.get("dnsmasq_dropin") else "no", GREEN if payload.get("dnsmasq_dropin") else YELLOW))
-    _print(kv("Ads drop-in", "yes" if payload.get("ads_dropin") else "no", GREEN if payload.get("ads_dropin") else YELLOW))
+    _print(kv("AdGuard configured", "yes" if payload.get("adguard_configured") else "no", GREEN if payload.get("adguard_configured") else YELLOW))
+    _print(kv("Ads enabled", "yes" if payload.get("ads_enabled") else "no", GREEN if payload.get("ads_enabled") else YELLOW))
     _print(kv("VPN interfaces", str(payload.get("vpn_interface_count") or 0), WHITE))
     _print(kv("Ready", "yes" if payload.get("ready") else "no", GREEN if payload.get("ready") else RED))
-    error = str(payload.get("dnsmasq_error") or "").strip()
+    error = str(payload.get("adguard_error") or "").strip()
     if error:
-        _print(paint("  dnsmasq: " + error.splitlines()[0], RED))
+        _print(paint("  AdGuard: " + error.splitlines()[0], RED))
 
 
 def _show_ads_block_repair() -> None:
@@ -820,7 +820,7 @@ def _show_ads_block_repair() -> None:
 
     result = ads_block_repair_service()
     service = result.get("service") or {}
-    _print(kv("dnsmasq active", "yes" if result.get("dnsmasq_active") else "no", GREEN if result.get("dnsmasq_active") else RED))
+    _print(kv("AdGuard active", "yes" if result.get("adguard_active") else "no", GREEN if result.get("adguard_active") else RED))
     actions = service.get("actions") or []
     if actions:
         _print(kv("Actions", ", ".join(str(item) for item in actions), CYAN))
@@ -833,7 +833,7 @@ def _show_ads_block_install() -> None:
     result = ads_block_install_prerequisites()
     installed = result.get("installed") or []
     _print(kv("Installed", ", ".join(installed) if installed else "already present", GREEN))
-    _print(kv("dnsmasq active", "yes" if result.get("dnsmasq_active") else "no", GREEN if result.get("dnsmasq_active") else YELLOW))
+    _print(kv("AdGuard active", "yes" if result.get("adguard_active") else "no", GREEN if result.get("adguard_active") else YELLOW))
     _print(kv("Ready", "yes" if result.get("ready") else "no", GREEN if result.get("ready") else RED))
 
 
@@ -843,11 +843,11 @@ def _show_ads_block_status() -> None:
     payload = ads_block_status()
     enabled = bool(payload.get("enabled"))
     _print(kv("Enabled", "yes" if enabled else "no", GREEN if enabled else YELLOW))
-    _print(kv("Blocked domains", str(payload.get("domains") or 0), WHITE))
+    _print(kv("Custom rules", str(payload.get("custom_rules") or 0), WHITE))
     _print(kv("Client DNS", str(payload.get("dns") or "-"), CYAN))
-    _print(kv("dnsmasq", "yes" if payload.get("dnsmasq") else "no", GREEN if payload.get("dnsmasq") else RED))
-    _print(kv("dnsmasq active", "yes" if payload.get("dnsmasq_active") else "no", GREEN if payload.get("dnsmasq_active") else YELLOW))
-    _print(kv("VPN resolver drop-in", "yes" if payload.get("dnsmasq_dropin") else "no", GREEN if payload.get("dnsmasq_dropin") else YELLOW))
+    _print(kv("AdGuard", "yes" if payload.get("adguard") else "no", GREEN if payload.get("adguard") else RED))
+    _print(kv("AdGuard active", "yes" if payload.get("adguard_active") else "no", GREEN if payload.get("adguard_active") else YELLOW))
+    _print(kv("AdGuard configured", "yes" if payload.get("adguard_configured") else "no", GREEN if payload.get("adguard_configured") else YELLOW))
     _print(kv("Ready", "yes" if payload.get("ready") else "no", GREEN if payload.get("ready") else RED))
     for row in payload.get("dns_candidates") or []:
         _print(paint(f"  • candidate DNS {row}", DIM))
@@ -858,7 +858,7 @@ def _show_ads_block_enable() -> None:
 
     result = ads_block_ensure()
     _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
-    _print(kv("Domains", str(result.get("domains") or 0), WHITE))
+    _print(kv("Custom rules", str(result.get("custom_rules") or 0), WHITE))
     _print(kv("Client DNS", str(result.get("dns") or "-"), CYAN))
     resolver = result.get("resolver") or {}
     if resolver:

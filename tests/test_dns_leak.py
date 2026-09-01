@@ -74,7 +74,7 @@ def test_render_apply_script_can_block_ipv6(monkeypatch):
     assert 'no-v6' in script
 
 
-def test_ensure_vpn_dns_resolver_configures_dnsmasq_and_dnat(tmp_path, monkeypatch):
+def test_ensure_vpn_dns_resolver_configures_adguard_and_dnat(tmp_path, monkeypatch):
     data_dir = tmp_path / 'data'
     monkeypatch.setenv('DATA_DIR', str(data_dir))
     monkeypatch.setattr('agent.dns_leak._require_linux', lambda: None)
@@ -87,7 +87,7 @@ def test_ensure_vpn_dns_resolver_configures_dnsmasq_and_dnat(tmp_path, monkeypat
 
     monkeypatch.setattr('agent.dns_leak.run', fake_run)
     monkeypatch.setattr('agent.dns_leak.ensure_dns_leak_unit', lambda script_path, runner=None: {'ok': True})
-    monkeypatch.setattr('agent.dns_leak._ensure_dnsmasq', lambda interfaces, upstream=(): {'restarted': True})
+    monkeypatch.setattr('agent.dns_leak._ensure_adguard', lambda interfaces, **kwargs: {'restarted': True})
 
     targets = [{'name': 'wg0', 'gateway': '10.80.0.1', 'addresses': ['10.80.0.1/24']}]
     result = ensure_vpn_dns_resolver(interfaces=targets, runner=fake_run, data_dir=data_dir)
@@ -118,9 +118,9 @@ def test_dns_leak_apply_writes_script_and_runs(tmp_path, monkeypatch):
     monkeypatch.setattr('agent.dns_leak.run', fake_run)
     monkeypatch.setattr('agent.dns_leak.shutil.which', lambda cmd: '/usr/bin/' + cmd)
     monkeypatch.setattr('agent.dns_leak.ensure_dns_leak_unit', lambda script_path, runner=None: {'ok': True})
-    monkeypatch.setattr('agent.dns_leak._ensure_dnsmasq', lambda interfaces, upstream=(): {'installed': True})
+    monkeypatch.setattr('agent.dns_leak._ensure_adguard', lambda interfaces, **kwargs: {'installed': True})
 
-    result = dns_leak_apply(with_dnsmasq=True, runner=fake_run)
+    result = dns_leak_apply(with_resolver=True, runner=fake_run)
     assert result['applied'] is True
     assert apply_script_path(data_dir).is_file()
     assert result['backend'] == 'nft'
@@ -151,7 +151,7 @@ def test_dns_leak_remove_cleans_files(tmp_path, monkeypatch):
     monkeypatch.setattr('agent.dns_leak._require_linux', lambda: None)
     monkeypatch.setattr('agent.dns_leak._require_root', lambda: None)
     monkeypatch.setattr('agent.dns_leak.UNIT_PATH', tmp_path / 'agent-dns-leak.service')
-    monkeypatch.setattr('agent.dns_leak.DNSMASQ_DROPIN', tmp_path / 'dnsmasq.conf')
+    monkeypatch.setattr('agent.dns_leak.ADGUARD_CONFIG', tmp_path / 'AdGuardHome.yaml')
     monkeypatch.setattr('agent.dns_leak.shutil.which', lambda cmd: '/usr/bin/' + cmd)
 
     def fake_run(args, **kwargs):

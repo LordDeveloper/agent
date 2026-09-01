@@ -349,7 +349,7 @@ def cmd_dns_leak_apply(args: argparse.Namespace) -> int:
     result = dns_leak_apply(
         interfaces=list(args.interface or []),
         block_ipv6=bool(getattr(args, 'block_ipv6', False)),
-        with_dnsmasq=not bool(getattr(args, 'no_dnsmasq', False)),
+        with_resolver=not bool(getattr(args, 'no_resolver', False)),
         upstream_dns=list(args.upstream or []) or None,
     )
     _print_json({'success': bool(result.get('applied', True)), **result})
@@ -639,15 +639,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop IPv6 traffic on VPN interfaces (may break dual-stack sites)",
     )
     p_dns_apply.add_argument(
-        "--no-dnsmasq",
+        "--no-resolver",
         action="store_true",
-        help="Skip dnsmasq resolver setup",
+        help="Skip AdGuard Home resolver setup",
     )
     p_dns_apply.add_argument(
         "--upstream",
         action="append",
         default=[],
-        help="Upstream DNS for dnsmasq (repeatable; default: 1.1.1.1 and 8.8.8.8)",
+        help="Upstream DNS for AdGuard Home (repeatable; default: 1.1.1.1 and 8.8.8.8)",
     )
     p_dns_apply.set_defaults(func=cmd_dns_leak_apply)
 
@@ -663,16 +663,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ads_prereq = ads_sub.add_parser("prerequisites", help="Show ads blocker prerequisites")
     p_ads_prereq.set_defaults(func=cmd_ads_block_prerequisites)
 
-    p_ads_install = ads_sub.add_parser("install", help="Install dnsmasq/dnsutils prerequisites")
+    p_ads_install = ads_sub.add_parser("install", help="Install AdGuard Home and dnsutils")
     p_ads_install.set_defaults(func=cmd_ads_block_install)
 
     p_ads_ensure = ads_sub.add_parser("ensure", help="Enable ads DNS filter on VPN resolver")
     p_ads_ensure.set_defaults(func=cmd_ads_block_ensure)
 
-    p_ads_disable = ads_sub.add_parser("disable", help="Remove ads DNS filter drop-in")
+    p_ads_disable = ads_sub.add_parser("disable", help="Disable ads DNS filter")
     p_ads_disable.set_defaults(func=cmd_ads_block_disable)
 
-    p_ads_repair = ads_sub.add_parser("repair", help="Start dnsmasq and fix port-53 conflicts")
+    p_ads_repair = ads_sub.add_parser("repair", help="Start AdGuard Home and fix port-53 conflicts")
     p_ads_repair.set_defaults(func=cmd_ads_block_repair)
 
     p_ads_test = ads_sub.add_parser("test", help="Query a known ad domain via VPN DNS")
