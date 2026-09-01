@@ -1,6 +1,8 @@
 from agent.drivers.wireguard import (
     WireGuardDriver,
+    _assign_peer_address,
     _next_ip,
+    _repair_reserved_peer_addresses,
     _reserved_peer_addresses,
     _server_address,
     accumulate_transfer,
@@ -19,6 +21,62 @@ def test_reserved_peer_addresses_skip_gateway_and_broadcast():
 def test_next_ip_skips_gateway_broadcast_and_last_host():
     assert _next_ip("10.80.0.0/24", set()) == "10.80.0.2"
     assert _next_ip("10.80.0.0/24", {"10.80.0.2"}) == "10.80.0.3"
+
+
+def test_assign_peer_address_rejects_gateway():
+    peer: dict = {"address": "10.90.68.1"}
+    _assign_peer_address(peer, "10.90.68.0/24", set())
+    assert peer["address"] == "10.90.68.2"
+    assert peer["allowed_ips"] == "10.90.68.2/32"
+
+
+def test_assign_peer_address_keeps_valid_requested():
+    peer: dict = {"address": "10.90.68.5"}
+    _assign_peer_address(peer, "10.90.68.0/24", set())
+    assert peer["address"] == "10.90.68.5"
+    assert peer["allowed_ips"] == "10.90.68.5/32"
+
+
+def test_repair_reserved_peer_addresses():
+    iface = {
+        "subnet": "10.90.68.0/24",
+        "peers": [
+            {"id": "a", "address": "10.90.68.1", "allowed_ips": "10.90.68.1/32"},
+            {"id": "b", "address": "10.90.68.5", "allowed_ips": "10.90.68.5/32"},
+        ],
+    }
+    assert _repair_reserved_peer_addresses(iface) is True
+    assert iface["peers"][0]["address"] == "10.90.68.2"
+    assert iface["peers"][0]["allowed_ips"] == "10.90.68.2/32"
+    assert iface["peers"][1]["address"] == "10.90.68.5"
+
+
+def test_merge_peer_row_keeps_address_and_allowed_ips():
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    before = {
+        "id": "S66SZo",
+        "email": "S66SZo",
+        "address": "10.90.68.5",
+        "allowed_ips": "10.90.68.5/32",
+        "private_key": "priv",
+        "public_key": "pub",
+        "volume": 10,
+    }
+    merged = driver._merge_peer_row(
+        before,
+        {
+            "address": "10.90.68.1",
+            "allowed_ips": "10.90.68.1/32",
+            "volume": 999,
+            "private_key": "other",
+            "public_key": "other-pub",
+        },
+    )
+    assert merged["address"] == "10.90.68.5"
+    assert merged["allowed_ips"] == "10.90.68.5/32"
+    assert merged["volume"] == 999
+    assert merged["private_key"] == "priv"
+    assert merged["public_key"] == "pub"
 
 
 def test_peer_config_includes_default_mtu(monkeypatch):

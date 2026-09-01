@@ -179,6 +179,46 @@ def _next_ip(subnet: str, used: set[str]) -> str:
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")
 
 
+_IMMUTABLE_PEER_KEYS = frozenset({"private_key", "public_key", "address", "allowed_ips"})
+
+
+def _assign_peer_address(peer: dict[str, Any], subnet: str, used_ips: set[str]) -> None:
+    """Pick a peer tunnel address; never assign gateway/broadcast/reserved hosts."""
+    reserved = _reserved_peer_addresses(subnet)
+    requested = str(peer.get("address") or "").strip()
+    if requested and requested not in reserved and requested not in used_ips:
+        peer["address"] = requested
+    else:
+        peer["address"] = _next_ip(subnet, used_ips)
+    peer["allowed_ips"] = f"{peer['address']}/32"
+
+
+def _repair_reserved_peer_addresses(iface: dict[str, Any]) -> bool:
+    """Re-home peers that were assigned gateway (.1) or other reserved addresses."""
+    subnet = str(iface.get("subnet") or "").strip()
+    if not subnet:
+        return False
+
+    reserved = _reserved_peer_addresses(subnet)
+    used: set[str] = set()
+    for row in iface.get("peers", []):
+        addr = str(row.get("address") or "").strip()
+        if addr and addr not in reserved:
+            used.add(addr)
+
+    changed = False
+    for row in iface.get("peers", []):
+        addr = str(row.get("address") or "").strip()
+        if addr and addr not in reserved:
+            continue
+        new_addr = _next_ip(subnet, used)
+        used.add(new_addr)
+        row["address"] = new_addr
+        row["allowed_ips"] = f"{new_addr}/32"
+        changed = True
+    return changed
+
+
 def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -> bool:
     """True when live WireGuard peer config must change (not just egress metadata)."""
     wg_keys = (
@@ -465,11 +505,10 @@ class WireGuardDriver(CoreDriver):
             if str(existing.get("id")) == str(peer["id"]) or str(existing.get("email")) == str(peer.get("email")):
                 return self.update_peer(interface_id, str(existing.get("id") or peer["id"]), payload)
 
-        used_ips = {p.get("address") for p in iface.get("peers", [])}
-        peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
+        used_ips = {str(p.get("address") or "") for p in iface.get("peers", []) if p.get("address")}
+        _assign_peer_address(peer, str(iface["subnet"]), used_ips)
         cli = self._cli_bin() or "wg"
         _materialize_peer_keypair(peer, cli)
-        peer.setdefault("allowed_ips", f"{peer['address']}/32")
         peer.setdefault("incoming", 0)
         peer.setdefault("outgoing", 0)
         peer.setdefault("_incoming", 0)
@@ -496,14 +535,18 @@ class WireGuardDriver(CoreDriver):
                 before = deepcopy(peer)
                 merged = deepcopy(peer)
                 normalized = normalize_peer(payload)
-                # Peer keys are immutable after create. Rotation = delete + create.
+                # Peer keys and tunnel slot (address/allowed_ips) are immutable after create.
                 for key, value in normalized.items():
-                    if key in ("private_key", "public_key"):
+                    if key in _IMMUTABLE_PEER_KEYS:
                         continue
                     merged[key] = value
-                # Keep live key material even if caller sent blank/stale keys.
+                # Keep live identity material even if caller sent blank/stale values.
                 merged["private_key"] = before.get("private_key")
                 merged["public_key"] = before.get("public_key")
+                merged["address"] = before.get("address")
+                merged["allowed_ips"] = before.get("allowed_ips") or (
+                    f"{before.get('address')}/32" if before.get("address") else None
+                )
                 if "exit_interface" in payload:
                     if "exit_interface" in normalized:
                         merged["exit_interface"] = normalized["exit_interface"]
@@ -561,11 +604,10 @@ class WireGuardDriver(CoreDriver):
         peer = normalize_peer(payload)
         peer.setdefault("id", str(uuid.uuid4()))
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
-        peer.setdefault("address", _next_ip(iface["subnet"], used_ips))
+        _assign_peer_address(peer, str(iface["subnet"]), used_ips)
         used_ips.add(str(peer["address"]))
         cli = self._cli_bin() or "wg"
         _materialize_peer_keypair(peer, cli)
-        peer.setdefault("allowed_ips", f"{peer['address']}/32")
         peer.setdefault("incoming", 0)
         peer.setdefault("outgoing", 0)
         peer.setdefault("_incoming", 0)
@@ -581,11 +623,15 @@ class WireGuardDriver(CoreDriver):
         merged = deepcopy(before)
         normalized = normalize_peer(payload)
         for key, value in normalized.items():
-            if key in ("private_key", "public_key"):
+            if key in _IMMUTABLE_PEER_KEYS:
                 continue
             merged[key] = value
         merged["private_key"] = before.get("private_key")
         merged["public_key"] = before.get("public_key")
+        merged["address"] = before.get("address")
+        merged["allowed_ips"] = before.get("allowed_ips") or (
+            f"{before.get('address')}/32" if before.get("address") else None
+        )
         if "exit_interface" in payload:
             if "exit_interface" in normalized:
                 merged["exit_interface"] = normalized["exit_interface"]
@@ -1233,6 +1279,7 @@ class WireGuardDriver(CoreDriver):
         return "\n".join(lines)
 
     def _validate_before_apply(self, iface: dict[str, Any]) -> None:
+        _repair_reserved_peer_addresses(iface)
         validate_wg_iface(iface)
         quick = self._quick_bin()
         if not quick:
