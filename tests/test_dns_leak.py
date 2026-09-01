@@ -61,6 +61,7 @@ def test_render_apply_script_contains_redirect_rules(monkeypatch):
     )
     assert 'wg0' in script
     assert '10.80.0.1:53' in script
+    assert 'resolvectl dns "wg0" off' in script
     assert NFT_TABLE in script
     assert 'no-v6' in script
 

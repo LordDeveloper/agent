@@ -16,6 +16,7 @@ from agent.dns_leak import (
     dnsmasq_service_diagnostic,
     ensure_dnsmasq_service,
     ensure_vpn_dns_resolver,
+    teardown_vpn_dns_if_unused,
 )
 from agent.errors import AgentError
 from agent.logutil import get_logger
@@ -403,7 +404,14 @@ def ads_block_disable(*, runner: Runner | None = None) -> dict[str, Any]:
         ADS_DROPIN.unlink()
         removed = True
 
-    if shutil.which("systemctl") and removed:
+    cleanup = teardown_vpn_dns_if_unused(runner=runner)
+
+    if shutil.which("systemctl") and (removed or cleanup.get("removed_files")):
         execute(["systemctl", "try-reload-or-restart", "dnsmasq"], check=False, timeout=30)
 
-    return {"ok": True, "removed": removed, **ads_block_status(runner=runner)}
+    return {
+        "ok": True,
+        "removed": removed,
+        "cleanup": cleanup,
+        **ads_block_status(runner=runner),
+    }

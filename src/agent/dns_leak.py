@@ -30,6 +30,7 @@ Runner = Callable[..., Any]
 
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 RESOLVED_STUB_DROPIN = Path('/etc/systemd/resolved.conf.d/netinja-dnsmasq.conf')
+ADS_BLOCK_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
 
 
 def dnsmasq_service_active(*, runner: Runner | None = None) -> bool:
@@ -137,6 +138,7 @@ def resolved_stub_listener_disabled(*, runner: Runner | None = None) -> bool:
 
 
 def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
+    """Last resort when dnsmasq cannot bind port 53. VPN DNS normally does not need this."""
     execute = runner or run
     content = '[Resolve]\nDNSStubListener=no\n'
     changed = False
@@ -147,6 +149,38 @@ def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
     if shutil.which('systemctl'):
         execute(['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
     return changed or resolved_stub_listener_disabled(runner=runner)
+
+
+def restore_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
+    """Remove agent-managed resolved drop-in and restart systemd-resolved."""
+    execute = runner or run
+    if not RESOLVED_STUB_DROPIN.is_file():
+        return False
+    RESOLVED_STUB_DROPIN.unlink(missing_ok=True)
+    if shutil.which('systemctl'):
+        execute(['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
+    return True
+
+
+def isolate_vpn_interfaces_from_host_dns(
+    interfaces: list[dict[str, Any]],
+    *,
+    runner: Runner | None = None,
+) -> list[str]:
+    """Keep VPN server gateway IPs out of the host resolver (systemd-resolved)."""
+    execute = runner or run
+    if not shutil.which('resolvectl'):
+        return []
+    actions: list[str] = []
+    for row in interfaces:
+        name = str(row.get('name') or '').strip()
+        if not name:
+            continue
+        dns_proc = execute(['resolvectl', 'dns', name, 'off'], check=False, timeout=10)
+        execute(['resolvectl', 'domain', name, 'off'], check=False, timeout=10)
+        if getattr(dns_proc, 'returncode', 1) == 0:
+            actions.append(f'resolvectl_dns_off:{name}')
+    return actions
 
 
 def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool = True) -> dict[str, Any]:
@@ -202,11 +236,10 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
                 'failed to create listening socket',
                 'failed to bind',
                 'port 53',
-                'masked',
             )
         )
-        stub_listening = resolved_stub_listener_listening(runner=runner)
-        if port_conflict or stub_listening or not resolved_stub_listener_disabled(runner=runner):
+        # VPN dnsmasq listens only on tunnel gateway IPs; do not touch host stub unless bind fails.
+        if port_conflict:
             if disable_resolved_stub_listener(runner=runner):
                 actions.append('disabled_resolved_stub_listener')
             execute(['systemctl', 'restart', 'dnsmasq'], check=False, timeout=60)
@@ -346,6 +379,12 @@ def render_apply_script(
                     f'  nft add rule inet {NFT_TABLE} {NFT_CHAIN_FORWARD} oifname "{name}" '
                     f'ip6 daddr != :: drop comment "{comment}-no-v6-out" 2>/dev/null || true'
                 )
+            lines.append(
+                f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl dns "{name}" off 2>/dev/null || true; fi'
+            )
+            lines.append(
+                f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl domain "{name}" off 2>/dev/null || true; fi'
+            )
             lines.append('fi')
         lines.append('fi')
         lines.append('')
@@ -372,6 +411,12 @@ def render_apply_script(
                 f'  ip6tables -C FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP '
                 f'2>/dev/null || ip6tables -A FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP'
             )
+        lines.append(
+            f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl dns "{name}" off 2>/dev/null || true; fi'
+        )
+        lines.append(
+            f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl domain "{name}" off 2>/dev/null || true; fi'
+        )
         lines.append('fi')
     lines.append('fi')
     lines.append('')
@@ -444,6 +489,8 @@ def _ensure_dnsmasq(
     lines = ['# Managed by Netinja agent — VPN DNS resolver']
     lines.append('bind-dynamic')
     lines.append('except-interface=lo')
+    lines.append('no-resolv')
+    lines.append('no-poll')
     for address in listen_addresses:
         lines.append(f'listen-address={address}')
     for server in upstream:
@@ -546,6 +593,9 @@ def ensure_vpn_dns_resolver(
 
     upstream = tuple(upstream_dns or DEFAULT_UPSTREAM_DNS)
     resolver = _ensure_dnsmasq(targets, upstream=upstream)
+    host_dns = isolate_vpn_interfaces_from_host_dns(targets, runner=runner)
+    if host_dns:
+        resolver['host_dns_isolated'] = host_dns
 
     dnat: dict[str, Any] | None = None
     if with_dnat:
@@ -641,6 +691,41 @@ def dns_leak_status(*, runner: Runner | None = None) -> dict[str, Any]:
     }
 
 
+def _vpn_dns_still_needed(*, runner: Runner | None = None) -> bool:
+    if ADS_BLOCK_DROPIN.is_file():
+        return True
+    return _nft_table_exists(runner=runner) or UNIT_PATH.is_file()
+
+
+def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any]:
+    """Remove VPN dnsmasq drop-in and restore host DNS when leak/ads are both off."""
+    execute = runner or run
+    removed_files: list[str] = []
+    resolved_restored = False
+
+    if _vpn_dns_still_needed(runner=runner):
+        return {
+            'removed_files': removed_files,
+            'resolved_restored': resolved_restored,
+            'skipped': True,
+        }
+
+    if DNSMASQ_DROPIN.is_file():
+        DNSMASQ_DROPIN.unlink()
+        removed_files.append(str(DNSMASQ_DROPIN))
+
+    resolved_restored = restore_resolved_stub_listener(runner=runner)
+
+    if shutil.which('systemctl') and removed_files:
+        execute(['systemctl', 'try-restart', 'dnsmasq'], check=False, timeout=30)
+
+    return {
+        'removed_files': removed_files,
+        'resolved_restored': resolved_restored,
+        'skipped': False,
+    }
+
+
 def render_remove_script() -> str:
     lines = [
         '#!/bin/sh',
@@ -689,16 +774,18 @@ def dns_leak_remove(*, runner: Runner | None = None) -> dict[str, Any]:
         stopped = True
 
     removed_files: list[str] = []
-    for path in (apply_script_path(), remove_script, DNSMASQ_DROPIN):
+    for path in (apply_script_path(), remove_script):
         if path.is_file():
             path.unlink()
             removed_files.append(str(path))
 
-    if DNSMASQ_DROPIN not in {Path(p) for p in removed_files} and shutil.which('systemctl'):
-        execute(['systemctl', 'try-restart', 'dnsmasq'], check=False, timeout=30)
+    cleanup = teardown_vpn_dns_if_unused(runner=runner)
+    removed_files.extend(cleanup.get('removed_files') or [])
 
     return {
         'removed': True,
         'stopped_unit': stopped,
         'removed_files': removed_files,
+        'resolved_restored': cleanup.get('resolved_restored'),
+        'cleanup': cleanup,
     }
