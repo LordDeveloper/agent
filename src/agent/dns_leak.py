@@ -31,13 +31,100 @@ Runner = Callable[..., Any]
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 RESOLVED_STUB_DROPIN = Path('/etc/systemd/resolved.conf.d/netinja-dnsmasq.conf')
 ADS_BLOCK_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
+AGENT_DNSMASQ_UNIT = 'agent-dnsmasq'
+AGENT_DNSMASQ_UNIT_PATH = Path('/etc/systemd/system/agent-dnsmasq.service')
+DNSMASQ_UNIT_MARKER = Path('/var/lib/agent/dnsmasq-systemd-unit')
+DNSMASQ_UNIT_CANDIDATES = ('dnsmasq', AGENT_DNSMASQ_UNIT)
+
+
+def _dnsmasq_unit_file(name: str) -> Path | None:
+    for base in (
+        Path('/etc/systemd/system'),
+        Path('/lib/systemd/system'),
+        Path('/usr/lib/systemd/system'),
+    ):
+        path = base / f'{name}.service'
+        if path.is_file():
+            return path
+    return None
+
+
+def dnsmasq_systemd_unit(*, runner: Runner | None = None) -> str | None:
+    del runner
+    for name in DNSMASQ_UNIT_CANDIDATES:
+        if _dnsmasq_unit_file(name):
+            return name
+    return None
+
+
+def _resolve_dnsmasq_unit(*, runner: Runner | None = None) -> str:
+    return dnsmasq_systemd_unit(runner=runner) or AGENT_DNSMASQ_UNIT
+
+
+def ensure_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> dict[str, Any]:
+    """Ensure a systemd unit exists for dnsmasq (distro package or agent-managed)."""
+    execute = runner or run
+    existing = dnsmasq_systemd_unit(runner=runner)
+    if existing:
+        return {'ok': True, 'unit': existing, 'created': False, 'installed': False}
+
+    apt = shutil.which('apt-get')
+    if apt:
+        execute([apt, 'update', '-qq'], check=False, timeout=120)
+        proc = execute([apt, 'install', '-y', '-qq', 'dnsmasq'], check=False, timeout=300)
+        existing = dnsmasq_systemd_unit(runner=runner)
+        if existing:
+            return {'ok': True, 'unit': existing, 'created': False, 'installed': proc.returncode == 0}
+
+    binary = shutil.which('dnsmasq')
+    if not binary:
+        return {'ok': False, 'unit': None, 'message': 'dnsmasq binary not found'}
+
+    unit_content = (
+        '[Unit]\n'
+        'Description=Netinja VPN DNS resolver (dnsmasq)\n'
+        'After=network-online.target\n'
+        'Wants=network-online.target\n'
+        '\n'
+        '[Service]\n'
+        'Type=simple\n'
+        f'ExecStart={binary} -k\n'
+        'ExecReload=/bin/kill -HUP $MAINPID\n'
+        'Restart=on-failure\n'
+        'RestartSec=3\n'
+        '\n'
+        '[Install]\n'
+        'WantedBy=multi-user.target\n'
+    )
+    AGENT_DNSMASQ_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AGENT_DNSMASQ_UNIT_PATH.write_text(unit_content, encoding='utf-8')
+    DNSMASQ_UNIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    DNSMASQ_UNIT_MARKER.write_text(AGENT_DNSMASQ_UNIT, encoding='utf-8')
+    if shutil.which('systemctl'):
+        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+    return {'ok': True, 'unit': AGENT_DNSMASQ_UNIT, 'created': True, 'installed': False}
+
+
+def remove_agent_dnsmasq_systemd_unit(*, runner: Runner | None = None) -> bool:
+    """Remove agent-managed dnsmasq unit when VPN DNS is fully disabled."""
+    execute = runner or run
+    if not DNSMASQ_UNIT_MARKER.is_file():
+        return False
+    if shutil.which('systemctl'):
+        execute(['systemctl', 'stop', AGENT_DNSMASQ_UNIT], check=False, timeout=30)
+        execute(['systemctl', 'disable', AGENT_DNSMASQ_UNIT], check=False, timeout=30)
+        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+    AGENT_DNSMASQ_UNIT_PATH.unlink(missing_ok=True)
+    DNSMASQ_UNIT_MARKER.unlink(missing_ok=True)
+    return True
 
 
 def dnsmasq_service_active(*, runner: Runner | None = None) -> bool:
     execute = runner or run
-    if not shutil.which('systemctl'):
+    unit = dnsmasq_systemd_unit(runner=runner)
+    if not unit or not shutil.which('systemctl'):
         return False
-    proc = execute(['systemctl', 'is-active', 'dnsmasq'], check=False, timeout=10)
+    proc = execute(['systemctl', 'is-active', unit], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() == 'active'
 
 
@@ -65,7 +152,10 @@ def dnsmasq_unit_enabled(*, runner: Runner | None = None) -> str:
     execute = runner or run
     if not shutil.which('systemctl'):
         return 'unknown'
-    proc = execute(['systemctl', 'is-enabled', 'dnsmasq'], check=False, timeout=10)
+    unit = dnsmasq_systemd_unit(runner=runner)
+    if not unit:
+        return 'not-found'
+    proc = execute(['systemctl', 'is-enabled', unit], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() or 'unknown'
 
 
@@ -73,7 +163,8 @@ def dnsmasq_service_status(*, runner: Runner | None = None) -> str:
     execute = runner or run
     if not shutil.which('systemctl'):
         return ''
-    proc = execute(['systemctl', 'status', 'dnsmasq', '-n', '15', '--no-pager'], check=False, timeout=15)
+    unit = _resolve_dnsmasq_unit(runner=runner)
+    proc = execute(['systemctl', 'status', unit, '-n', '15', '--no-pager'], check=False, timeout=15)
     return _command_output(proc)
 
 
@@ -81,8 +172,9 @@ def dnsmasq_service_journal(*, runner: Runner | None = None, lines: int = 8) -> 
     execute = runner or run
     if not shutil.which('journalctl'):
         return ''
+    unit = _resolve_dnsmasq_unit(runner=runner)
     proc = execute(
-        ['journalctl', '-u', 'dnsmasq', '-n', str(max(1, lines)), '--no-pager'],
+        ['journalctl', '-u', unit, '-n', str(max(1, lines)), '--no-pager'],
         check=False,
         timeout=15,
     )
@@ -90,13 +182,19 @@ def dnsmasq_service_journal(*, runner: Runner | None = None, lines: int = 8) -> 
 
 
 def dnsmasq_service_diagnostic(*, runner: Runner | None = None) -> str:
+    if dnsmasq_systemd_unit(runner=runner) is None:
+        return 'dnsmasq systemd unit not found (install dnsmasq package or run: agent ads-block install)'
     journal = dnsmasq_service_journal(runner=runner, lines=15)
     if journal and journal != '-- No entries --':
         return journal
     status = dnsmasq_service_status(runner=runner)
     if status:
+        if 'could not be found' in status.lower():
+            return 'dnsmasq systemd unit not found (install dnsmasq package or run: agent ads-block install)'
         return status
     enabled = dnsmasq_unit_enabled(runner=runner)
+    if enabled == 'not-found':
+        return 'dnsmasq systemd unit not found (install dnsmasq package or run: agent ads-block install)'
     if enabled == 'masked':
         return 'dnsmasq service is masked'
     if enabled == 'disabled':
@@ -187,6 +285,25 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
     """Start dnsmasq and repair common port-53 / systemd-resolved conflicts."""
     execute = runner or run
     actions: list[str] = []
+    unit_setup = ensure_dnsmasq_systemd_unit(runner=runner)
+    unit = str(unit_setup.get('unit') or _resolve_dnsmasq_unit(runner=runner))
+    if unit_setup.get('installed'):
+        actions.append('installed_dnsmasq_package')
+    if unit_setup.get('created'):
+        actions.append('created_dnsmasq_unit')
+    if not unit_setup.get('ok'):
+        message = str(unit_setup.get('message') or 'dnsmasq systemd unit is unavailable')
+        return {
+            'active': False,
+            'config_ok': False,
+            'config_message': message,
+            'journal': message,
+            'diagnostic': message,
+            'unit': unit,
+            'unit_enabled': 'not-found',
+            'actions': actions,
+        }
+
     unit_enabled = dnsmasq_unit_enabled(runner=runner)
 
     if not shutil.which('dnsmasq'):
@@ -196,8 +313,10 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
             'config_message': 'dnsmasq binary not found',
             'journal': None,
             'diagnostic': 'dnsmasq binary not found',
+            'unit': unit,
             'unit_enabled': unit_enabled,
             'actions': actions,
+            'unit_setup': unit_setup,
         }
 
     config_ok, config_message = dnsmasq_config_test(runner=runner)
@@ -209,19 +328,21 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
             'config_message': config_message,
             'journal': diagnostic or None,
             'diagnostic': diagnostic or config_message,
+            'unit': unit,
             'unit_enabled': unit_enabled,
             'actions': actions,
+            'unit_setup': unit_setup,
         }
 
     if shutil.which('systemctl'):
         if unit_enabled == 'masked':
-            execute(['systemctl', 'unmask', 'dnsmasq'], check=False, timeout=30)
+            execute(['systemctl', 'unmask', unit], check=False, timeout=30)
             actions.append('unmasked_dnsmasq')
             unit_enabled = dnsmasq_unit_enabled(runner=runner)
-        execute(['systemctl', 'enable', 'dnsmasq'], check=False, timeout=30)
-        execute(['systemctl', 'restart', 'dnsmasq'], check=False, timeout=60)
+        execute(['systemctl', 'enable', unit], check=False, timeout=30)
+        execute(['systemctl', 'restart', unit], check=False, timeout=60)
         if not dnsmasq_service_active(runner=runner):
-            execute(['systemctl', 'start', 'dnsmasq'], check=False, timeout=60)
+            execute(['systemctl', 'start', unit], check=False, timeout=60)
 
     active = dnsmasq_service_active(runner=runner)
     diagnostic = ''
@@ -242,9 +363,9 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
         if port_conflict:
             if disable_resolved_stub_listener(runner=runner):
                 actions.append('disabled_resolved_stub_listener')
-            execute(['systemctl', 'restart', 'dnsmasq'], check=False, timeout=60)
+            execute(['systemctl', 'restart', unit], check=False, timeout=60)
             if not dnsmasq_service_active(runner=runner):
-                execute(['systemctl', 'start', 'dnsmasq'], check=False, timeout=60)
+                execute(['systemctl', 'start', unit], check=False, timeout=60)
             active = dnsmasq_service_active(runner=runner)
             if not active:
                 diagnostic = dnsmasq_service_diagnostic(runner=runner)
@@ -255,10 +376,12 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
         'config_message': config_message,
         'journal': diagnostic or None,
         'diagnostic': diagnostic or None,
+        'unit': unit,
         'unit_enabled': unit_enabled,
         'resolved_stub_disabled': resolved_stub_listener_disabled(runner=runner),
         'resolved_stub_listening': resolved_stub_listener_listening(runner=runner),
         'actions': actions,
+        'unit_setup': unit_setup,
     }
 
 
@@ -715,13 +838,17 @@ def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any
         removed_files.append(str(DNSMASQ_DROPIN))
 
     resolved_restored = restore_resolved_stub_listener(runner=runner)
+    agent_unit_removed = remove_agent_dnsmasq_systemd_unit(runner=runner)
 
-    if shutil.which('systemctl') and removed_files:
-        execute(['systemctl', 'try-restart', 'dnsmasq'], check=False, timeout=30)
+    if shutil.which('systemctl') and (removed_files or agent_unit_removed):
+        unit = dnsmasq_systemd_unit(runner=runner)
+        if unit:
+            execute(['systemctl', 'try-restart', unit], check=False, timeout=30)
 
     return {
         'removed_files': removed_files,
         'resolved_restored': resolved_restored,
+        'agent_unit_removed': agent_unit_removed,
         'skipped': False,
     }
 
