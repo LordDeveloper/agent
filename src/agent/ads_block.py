@@ -13,7 +13,7 @@ from agent.dns_leak import (
     discover_vpn_interfaces,
     dns_leak_status,
     dnsmasq_service_active,
-    dnsmasq_service_journal,
+    dnsmasq_service_diagnostic,
     ensure_dnsmasq_service,
     ensure_vpn_dns_resolver,
 )
@@ -175,7 +175,7 @@ def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
     dnsmasq_active = dnsmasq_service_active(runner=runner) if dnsmasq_bin else False
     dnsmasq_error = None
     if dnsmasq_bin and not dnsmasq_active:
-        dnsmasq_error = dnsmasq_service_journal(runner=runner) or "dnsmasq service is not active"
+        dnsmasq_error = dnsmasq_service_diagnostic(runner=runner)
 
     dns_leak: dict[str, Any] = {}
     try:
@@ -217,7 +217,10 @@ def ads_block_repair_service(*, runner: Runner | None = None) -> dict[str, Any]:
     payload = ads_block_prerequisites(runner=runner)
     payload.update({"ok": bool(service.get("active")), "service": service})
     if not service.get("active"):
-        message = str(service.get("config_message") or service.get("journal") or "dnsmasq failed to start")
+        message = str(service.get("diagnostic") or service.get("journal") or "").strip()
+        if not message or message == str(service.get("config_message") or "").strip():
+            unit = str(service.get("unit_enabled") or "unknown")
+            message = f"dnsmasq failed to start (unit: {unit})"
         raise AgentError("VALIDATION_ERROR", message)
     return payload
 

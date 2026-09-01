@@ -49,6 +49,33 @@ def dnsmasq_config_test(*, runner: Runner | None = None) -> tuple[bool, str]:
     return proc.returncode == 0, message
 
 
+def _command_output(proc: Any) -> str:
+    return '\n'.join(
+        part.strip()
+        for part in (
+            getattr(proc, 'stdout', '') or '',
+            getattr(proc, 'stderr', '') or '',
+        )
+        if part and str(part).strip()
+    ).strip()
+
+
+def dnsmasq_unit_enabled(*, runner: Runner | None = None) -> str:
+    execute = runner or run
+    if not shutil.which('systemctl'):
+        return 'unknown'
+    proc = execute(['systemctl', 'is-enabled', 'dnsmasq'], check=False, timeout=10)
+    return (getattr(proc, 'stdout', '') or '').strip() or 'unknown'
+
+
+def dnsmasq_service_status(*, runner: Runner | None = None) -> str:
+    execute = runner or run
+    if not shutil.which('systemctl'):
+        return ''
+    proc = execute(['systemctl', 'status', 'dnsmasq', '-n', '15', '--no-pager'], check=False, timeout=15)
+    return _command_output(proc)
+
+
 def dnsmasq_service_journal(*, runner: Runner | None = None, lines: int = 8) -> str:
     execute = runner or run
     if not shutil.which('journalctl'):
@@ -61,18 +88,52 @@ def dnsmasq_service_journal(*, runner: Runner | None = None, lines: int = 8) -> 
     return (getattr(proc, 'stdout', '') or '').strip()
 
 
-def resolved_stub_listener_disabled() -> bool:
+def dnsmasq_service_diagnostic(*, runner: Runner | None = None) -> str:
+    journal = dnsmasq_service_journal(runner=runner, lines=15)
+    if journal and journal != '-- No entries --':
+        return journal
+    status = dnsmasq_service_status(runner=runner)
+    if status:
+        return status
+    enabled = dnsmasq_unit_enabled(runner=runner)
+    if enabled == 'masked':
+        return 'dnsmasq service is masked'
+    if enabled == 'disabled':
+        return 'dnsmasq service is disabled'
+    return journal or 'dnsmasq service is not active'
+
+
+def _resolved_stub_config_disabled() -> bool:
     if RESOLVED_STUB_DROPIN.is_file():
         text = RESOLVED_STUB_DROPIN.read_text(encoding='utf-8', errors='ignore')
-        if 'DNSStubListener=no' in text.replace(' ', '').lower():
+        if 'dnsstublistener=no' in text.replace(' ', '').lower():
             return True
-    for path in (Path('/etc/systemd/resolved.conf'), Path('/run/systemd/resolve/stub-resolv.conf')):
-        if not path.is_file():
-            continue
-        text = path.read_text(encoding='utf-8', errors='ignore')
+    resolved_conf = Path('/etc/systemd/resolved.conf')
+    if resolved_conf.is_file():
+        text = resolved_conf.read_text(encoding='utf-8', errors='ignore')
         if re.search(r'^\s*DNSStubListener\s*=\s*no\s*$', text, flags=re.MULTILINE | re.IGNORECASE):
             return True
     return False
+
+
+def resolved_stub_listener_listening(*, runner: Runner | None = None) -> bool:
+    execute = runner or run
+    if not shutil.which('ss'):
+        return False
+    proc = execute(['ss', '-H', '-lun'], check=False, timeout=10)
+    text = _command_output(proc).lower()
+    for line in text.splitlines():
+        if ':53' not in line:
+            continue
+        if '127.0.0.53' in line or 'systemd-resolve' in line:
+            return True
+    return False
+
+
+def resolved_stub_listener_disabled(*, runner: Runner | None = None) -> bool:
+    if resolved_stub_listener_listening(runner=runner):
+        return False
+    return _resolved_stub_config_disabled()
 
 
 def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
@@ -85,13 +146,14 @@ def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
         changed = True
     if shutil.which('systemctl'):
         execute(['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
-    return changed or resolved_stub_listener_disabled()
+    return changed or resolved_stub_listener_disabled(runner=runner)
 
 
 def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool = True) -> dict[str, Any]:
     """Start dnsmasq and repair common port-53 / systemd-resolved conflicts."""
     execute = runner or run
     actions: list[str] = []
+    unit_enabled = dnsmasq_unit_enabled(runner=runner)
 
     if not shutil.which('dnsmasq'):
         return {
@@ -99,29 +161,40 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
             'config_ok': False,
             'config_message': 'dnsmasq binary not found',
             'journal': None,
+            'diagnostic': 'dnsmasq binary not found',
+            'unit_enabled': unit_enabled,
             'actions': actions,
         }
 
     config_ok, config_message = dnsmasq_config_test(runner=runner)
     if not config_ok:
+        diagnostic = dnsmasq_service_diagnostic(runner=runner)
         return {
             'active': False,
             'config_ok': False,
             'config_message': config_message,
-            'journal': dnsmasq_service_journal(runner=runner) or None,
+            'journal': diagnostic or None,
+            'diagnostic': diagnostic or config_message,
+            'unit_enabled': unit_enabled,
             'actions': actions,
         }
 
     if shutil.which('systemctl'):
+        if unit_enabled == 'masked':
+            execute(['systemctl', 'unmask', 'dnsmasq'], check=False, timeout=30)
+            actions.append('unmasked_dnsmasq')
+            unit_enabled = dnsmasq_unit_enabled(runner=runner)
         execute(['systemctl', 'enable', 'dnsmasq'], check=False, timeout=30)
         execute(['systemctl', 'restart', 'dnsmasq'], check=False, timeout=60)
+        if not dnsmasq_service_active(runner=runner):
+            execute(['systemctl', 'start', 'dnsmasq'], check=False, timeout=60)
 
     active = dnsmasq_service_active(runner=runner)
-    journal = ''
+    diagnostic = ''
 
     if not active and fix_resolved:
-        journal = dnsmasq_service_journal(runner=runner)
-        lowered = journal.lower()
+        diagnostic = dnsmasq_service_diagnostic(runner=runner)
+        lowered = diagnostic.lower()
         port_conflict = any(
             token in lowered
             for token in (
@@ -129,22 +202,29 @@ def ensure_dnsmasq_service(*, runner: Runner | None = None, fix_resolved: bool =
                 'failed to create listening socket',
                 'failed to bind',
                 'port 53',
+                'masked',
             )
         )
-        if port_conflict or not resolved_stub_listener_disabled():
+        stub_listening = resolved_stub_listener_listening(runner=runner)
+        if port_conflict or stub_listening or not resolved_stub_listener_disabled(runner=runner):
             if disable_resolved_stub_listener(runner=runner):
                 actions.append('disabled_resolved_stub_listener')
             execute(['systemctl', 'restart', 'dnsmasq'], check=False, timeout=60)
+            if not dnsmasq_service_active(runner=runner):
+                execute(['systemctl', 'start', 'dnsmasq'], check=False, timeout=60)
             active = dnsmasq_service_active(runner=runner)
             if not active:
-                journal = dnsmasq_service_journal(runner=runner)
+                diagnostic = dnsmasq_service_diagnostic(runner=runner)
 
     return {
         'active': active,
         'config_ok': config_ok,
         'config_message': config_message,
-        'journal': journal or None,
-        'resolved_stub_disabled': resolved_stub_listener_disabled(),
+        'journal': diagnostic or None,
+        'diagnostic': diagnostic or None,
+        'unit_enabled': unit_enabled,
+        'resolved_stub_disabled': resolved_stub_listener_disabled(runner=runner),
+        'resolved_stub_listening': resolved_stub_listener_listening(runner=runner),
         'actions': actions,
     }
 
@@ -362,7 +442,7 @@ def _ensure_dnsmasq(
 ) -> dict[str, Any]:
     listen_addresses = sorted({str(row['gateway']) for row in interfaces})
     lines = ['# Managed by Netinja agent — VPN DNS resolver']
-    lines.append('bind-interfaces')
+    lines.append('bind-dynamic')
     lines.append('except-interface=lo')
     for address in listen_addresses:
         lines.append(f'listen-address={address}')
