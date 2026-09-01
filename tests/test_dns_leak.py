@@ -57,12 +57,20 @@ def test_render_apply_script_contains_redirect_rules(monkeypatch):
     monkeypatch.setattr('agent.dns_leak.shutil.which', lambda cmd: f'/usr/bin/{cmd}')
     script = render_apply_script(
         [{'name': 'wg0', 'gateway': '10.80.0.1', 'addresses': ['10.80.0.1/24']}],
-        block_ipv6=True,
     )
     assert 'wg0' in script
     assert '10.80.0.1:53' in script
     assert 'resolvectl dns "wg0" off' in script
     assert NFT_TABLE in script
+    assert 'no-v6' not in script
+
+
+def test_render_apply_script_can_block_ipv6(monkeypatch):
+    monkeypatch.setattr('agent.dns_leak.shutil.which', lambda cmd: f'/usr/bin/{cmd}')
+    script = render_apply_script(
+        [{'name': 'wg0', 'gateway': '10.80.0.1', 'addresses': ['10.80.0.1/24']}],
+        block_ipv6=True,
+    )
     assert 'no-v6' in script
 
 

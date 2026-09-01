@@ -348,7 +348,7 @@ def cmd_dns_leak_apply(args: argparse.Namespace) -> int:
     from agent.dns_leak import dns_leak_apply
     result = dns_leak_apply(
         interfaces=list(args.interface or []),
-        block_ipv6=not bool(getattr(args, 'allow_ipv6', False)),
+        block_ipv6=bool(getattr(args, 'block_ipv6', False)),
         with_dnsmasq=not bool(getattr(args, 'no_dnsmasq', False)),
         upstream_dns=list(args.upstream or []) or None,
     )
@@ -626,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dns_status = dns_sub.add_parser("status", help="Show DNS leak protection status")
     p_dns_status.set_defaults(func=cmd_dns_leak_status)
 
-    p_dns_apply = dns_sub.add_parser("apply", help="Apply DNS redirect + IPv6 leak blocks")
+    p_dns_apply = dns_sub.add_parser("apply", help="Apply DNS redirect rules for VPN clients")
     p_dns_apply.add_argument(
         "--interface",
         action="append",
@@ -634,9 +634,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="VPN interface to protect (repeatable; auto-detect WireGuard/Amnezia when omitted)",
     )
     p_dns_apply.add_argument(
-        "--allow-ipv6",
+        "--block-ipv6",
         action="store_true",
-        help="Do not block IPv6 on VPN interfaces",
+        help="Drop IPv6 traffic on VPN interfaces (may break dual-stack sites)",
     )
     p_dns_apply.add_argument(
         "--no-dnsmasq",

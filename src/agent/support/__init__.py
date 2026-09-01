@@ -151,6 +151,7 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 _VLESS_FLOWS = {"", "xtls-rprx-vision"}
+_DEFAULT_SHADOWSOCKS_AEAD_METHOD = "chacha20-ietf-poly1305"
 _NETINJA_CLIENT_KEYS = {
     "is_enabled",
     "enable",
@@ -183,7 +184,64 @@ def _copy_if_present(src: dict[str, Any], dest: dict[str, Any], key: str) -> Non
     dest[key] = value
 
 
-def xray_protocol_user(protocol: str, client: dict[str, Any]) -> dict[str, Any]:
+def _shadowsocks_inbound_is_2022(inbound_settings: dict[str, Any] | None) -> bool:
+    if not isinstance(inbound_settings, dict):
+        return False
+    method = str(inbound_settings.get("method") or "").strip()
+    return method.startswith("2022-")
+
+
+def repair_shadowsocks_settings(settings: dict[str, Any]) -> bool:
+    """Strip blank inbound cipher keys and backfill missing AEAD client methods."""
+    if not isinstance(settings, dict):
+        return False
+
+    changed = False
+    method = str(settings.get("method") or "").strip()
+    clients = settings.get("clients") or settings.get("users") or []
+    is_2022 = method.startswith("2022-")
+
+    if method == "" and "method" in settings:
+        if clients:
+            settings.pop("method", None)
+            changed = True
+            if str(settings.get("password") or "").strip() == "":
+                settings.pop("password", None)
+        else:
+            settings["method"] = _DEFAULT_SHADOWSOCKS_AEAD_METHOD
+            changed = True
+
+    if not is_2022:
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            client_method = str(client.get("method") or client.get("cipher") or "").strip()
+            if not client_method:
+                extra = client.get("extra")
+                if isinstance(extra, dict):
+                    client_method = str(extra.get("method") or extra.get("cipher") or "").strip()
+            if client_method:
+                if client.get("method") != client_method:
+                    client["method"] = client_method
+                    changed = True
+                client.pop("cipher", None)
+                continue
+            client.pop("method", None)
+            client.pop("cipher", None)
+            client["method"] = _DEFAULT_SHADOWSOCKS_AEAD_METHOD
+            changed = True
+
+    settings.setdefault("network", "tcp,udp")
+
+    return changed
+
+
+def xray_protocol_user(
+    protocol: str,
+    client: dict[str, Any],
+    *,
+    inbound_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fields Xray infra/conf accepts for an inbound user (no Netinja metadata)."""
     protocol = str(protocol or "").strip().lower()
     row = deepcopy(client)
@@ -238,6 +296,8 @@ def xray_protocol_user(protocol: str, client: dict[str, Any]) -> dict[str, Any]:
         # Never emit blank cipher — Xray fails with "unsupported cipher method:".
         if method:
             user["method"] = method
+        elif password and not _shadowsocks_inbound_is_2022(inbound_settings):
+            user["method"] = _DEFAULT_SHADOWSOCKS_AEAD_METHOD
         return user
 
     cleaned = {k: v for k, v in row.items() if k not in _NETINJA_CLIENT_KEYS and v is not None and v != ""}
@@ -259,18 +319,14 @@ def xray_users_settings(
     protocol_key = str(protocol or "").strip().lower()
     if protocol_key == "vless":
         settings.setdefault("decryption", "none")
-    if protocol_key in {"shadowsocks", "ss"}:
-        method = str(settings.get("method") or "").strip()
-        if method == "":
-            settings.pop("method", None)
-            if str(settings.get("password") or "").strip() == "":
-                settings.pop("password", None)
-        else:
-            settings["method"] = method
-        settings.setdefault("network", "tcp,udp")
-    native = [xray_protocol_user(protocol, client) for client in clients]
+    native = [
+        xray_protocol_user(protocol, client, inbound_settings=settings)
+        for client in clients
+    ]
     settings["clients"] = native
     settings["users"] = native
+    if protocol_key in {"shadowsocks", "ss"}:
+        repair_shadowsocks_settings(settings)
     return settings
 
 

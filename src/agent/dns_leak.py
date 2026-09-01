@@ -494,7 +494,7 @@ def apply_script_path(data_dir: str | Path | None = None) -> Path:
 def render_apply_script(
     interfaces: list[dict[str, Any]],
     *,
-    block_ipv6: bool = True,
+    block_ipv6: bool = False,
 ) -> str:
     lines = [
         '#!/bin/sh',
@@ -631,7 +631,7 @@ def _write_apply_script(
     interfaces: list[dict[str, Any]],
     *,
     data_dir: str | Path | None = None,
-    block_ipv6: bool = True,
+    block_ipv6: bool = False,
 ) -> Path:
     path = apply_script_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -736,7 +736,7 @@ def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> 
 def ensure_vpn_dns_resolver(
     *,
     interfaces: list[dict[str, Any]] | None = None,
-    block_ipv6: bool = True,
+    block_ipv6: bool = False,
     upstream_dns: list[str] | None = None,
     with_dnat: bool = True,
     data_dir: str | Path | None = None,
@@ -790,7 +790,7 @@ def ensure_vpn_dns_resolver(
 def dns_leak_apply(
     *,
     interfaces: list[str] | None = None,
-    block_ipv6: bool = True,
+    block_ipv6: bool = False,
     with_dnsmasq: bool = True,
     upstream_dns: list[str] | None = None,
     data_dir: str | Path | None = None,

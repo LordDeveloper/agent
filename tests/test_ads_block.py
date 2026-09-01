@@ -9,7 +9,10 @@ from agent.ads_block import (
     ads_block_prerequisites,
     ads_block_status,
     ads_block_test,
+    parse_hosts_blocklist,
+    refresh_ads_hosts_file,
     render_dnsmasq_ads_conf,
+    write_ads_hosts_file,
 )
 
 
@@ -18,10 +21,37 @@ class _Result(SimpleNamespace):
         super().__init__(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-def test_render_dnsmasq_ads_conf_blocks_suffix_domains():
-    conf = render_dnsmasq_ads_conf(['doubleclick.net', 'ads.example.com'])
+def test_render_dnsmasq_ads_conf_blocks_suffix_domains(tmp_path):
+    hosts_file = tmp_path / 'hosts'
+    hosts_file.write_text('0.0.0.0 ads.example.net\n', encoding='utf-8')
+    conf = render_dnsmasq_ads_conf(['doubleclick.net', 'ads.example.com'], hosts_file=hosts_file)
+    assert f'addn-hosts={hosts_file}' in conf
     assert 'address=/doubleclick.net/0.0.0.0' in conf
     assert 'address=/ads.example.com/0.0.0.0' in conf
+
+
+def test_parse_hosts_blocklist_skips_comments_and_localhost():
+    text = '\n'.join(
+        [
+            '# comment',
+            '0.0.0.0 doubleclick.net',
+            '127.0.0.1 localhost',
+            '0.0.0.0 tracker.example.com ads.example.com',
+        ]
+    )
+    hosts = parse_hosts_blocklist(text)
+    assert hosts == ['doubleclick.net', 'tracker.example.com', 'ads.example.com']
+
+
+def test_refresh_ads_hosts_file_uses_cache(tmp_path, monkeypatch):
+    hosts_path = tmp_path / 'ads-block-hosts'
+    monkeypatch.setattr('agent.ads_block.ADS_HOSTS_PATH', hosts_path)
+    write_ads_hosts_file(['cached.example'], path=hosts_path)
+    payload = refresh_ads_hosts_file()
+    assert payload['ok'] is True
+    assert payload['refreshed'] is False
+    assert payload['hosts'] == 1
+    assert payload['source'] == 'cache'
 
 
 def test_ads_block_status_reports_gateway_dns(monkeypatch):
@@ -111,6 +141,10 @@ def test_ads_block_ensure_writes_dropin_and_configures_resolver(tmp_path, monkey
         }
 
     monkeypatch.setattr('agent.ads_block.ensure_vpn_dns_resolver', fake_resolver)
+    monkeypatch.setattr(
+        'agent.ads_block.refresh_ads_hosts_file',
+        lambda **kwargs: {'ok': True, 'refreshed': False, 'hosts': 2, 'path': str(list_path), 'source': 'test'},
+    )
 
     def fake_run(args, **kwargs):
         return _Result()
@@ -120,5 +154,6 @@ def test_ads_block_ensure_writes_dropin_and_configures_resolver(tmp_path, monkey
     assert dropin.is_file()
     assert 'address=/doubleclick.net/0.0.0.0' in dropin.read_text(encoding='utf-8')
     assert resolver_calls
+    assert resolver_calls[0].get('block_ipv6') is False
     assert payload['dns'] == '10.80.0.1'
     assert payload['resolver']['resolver']['listen_addresses'] == ['10.80.0.1']

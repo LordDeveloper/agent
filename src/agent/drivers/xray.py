@@ -433,7 +433,10 @@ class XrayDriver(CoreDriver):
         protocol = self._protocol_of(inbound)
         settings = inbound.get("settings") or {}
         rows = clients if clients is not None else settings.get("clients") or settings.get("users") or []
-        return [xray_protocol_user(protocol, client) for client in rows]
+        return [
+            xray_protocol_user(protocol, client, inbound_settings=settings)
+            for client in rows
+        ]
 
     def _wire_inbound(self, inbound: dict[str, Any]) -> dict[str, Any]:
         payload = deepcopy(inbound)
@@ -717,7 +720,11 @@ class XrayDriver(CoreDriver):
                             applied.append(client)
                         continue
 
-                    native = xray_protocol_user(protocol, client)
+                    native = xray_protocol_user(
+                        protocol,
+                        client,
+                        inbound_settings=inbound.get("settings"),
+                    )
                     if existing is not None:
                         to_edit.append(native)
                         edit_meta.append(client)
@@ -948,24 +955,15 @@ class XrayDriver(CoreDriver):
         }
 
     def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
-        """Repair blank Shadowsocks method keys left by legacy broken inbounds."""
+        """Repair blank Shadowsocks cipher keys left by legacy broken inbounds."""
+        from agent.support import repair_shadowsocks_settings
+
         if self._protocol_of(inbound) not in {"shadowsocks", "ss"}:
             return inbound
 
         settings = inbound.setdefault("settings", {})
-        method = str(settings.get("method") or "").strip()
-        clients = settings.get("clients") or settings.get("users") or []
-        if method != "":
+        if not repair_shadowsocks_settings(settings):
             return inbound
-        if "method" not in settings:
-            return inbound
-
-        if clients:
-            settings.pop("method", None)
-            if str(settings.get("password") or "").strip() == "":
-                settings.pop("password", None)
-        else:
-            settings["method"] = "chacha20-ietf-poly1305"
 
         settings.setdefault("network", "tcp,udp")
         api_payload = self._wire_inbound(inbound)
