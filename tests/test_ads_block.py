@@ -59,7 +59,7 @@ def test_ads_block_prerequisites_ready_when_dnsmasq_firewall_and_vpn(monkeypatch
     )
     monkeypatch.setattr('agent.ads_block.dns_leak_status', lambda runner=None: {'active': True})
     monkeypatch.setattr('agent.ads_block.shutil.which', lambda cmd: f'/usr/bin/{cmd}')
-    monkeypatch.setattr('agent.ads_block._dnsmasq_service_active', lambda runner=None: True)
+    monkeypatch.setattr('agent.ads_block.dnsmasq_service_active', lambda runner=None: True)
     monkeypatch.setattr('agent.ads_block.sys.platform', 'linux')
 
     payload = ads_block_prerequisites()

@@ -726,8 +726,9 @@ def _dns_leak_menu() -> None:
                 Choice("ads_install", "Ads blocker — install packages", GREEN, "5"),
                 Choice("ads_status", "Ads blocker — status", CYAN, "6"),
                 Choice("ads_enable", "Ads blocker — enable", GREEN, "7"),
-                Choice("ads_disable", "Ads blocker — disable", RED, "8"),
-                Choice("ads_test", "Ads blocker — test query", YELLOW, "9"),
+                Choice("ads_repair", "Ads blocker — start dnsmasq", YELLOW, "8"),
+                Choice("ads_disable", "Ads blocker — disable", RED, "9"),
+                Choice("ads_test", "Ads blocker — test query", YELLOW, "10"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -751,6 +752,9 @@ def _dns_leak_menu() -> None:
         elif picked == "ads_enable":
             if confirm("Enable ads DNS filter for WireGuard/Amnezia clients?", default=True):
                 _run_action("Enable ads blocker", _show_ads_block_enable)
+        elif picked == "ads_repair":
+            if confirm("Start dnsmasq and fix port-53 conflicts?", default=True):
+                _run_action("Repair ads blocker dnsmasq", _show_ads_block_repair)
         elif picked == "ads_disable":
             if confirm("Disable ads DNS filter?", default=False):
                 _run_action("Disable ads blocker", _show_ads_block_disable)
@@ -806,6 +810,21 @@ def _show_ads_block_prerequisites() -> None:
     _print(kv("Ads drop-in", "yes" if payload.get("ads_dropin") else "no", GREEN if payload.get("ads_dropin") else YELLOW))
     _print(kv("VPN interfaces", str(payload.get("vpn_interface_count") or 0), WHITE))
     _print(kv("Ready", "yes" if payload.get("ready") else "no", GREEN if payload.get("ready") else RED))
+    error = str(payload.get("dnsmasq_error") or "").strip()
+    if error:
+        _print(paint("  dnsmasq: " + error.splitlines()[0], RED))
+
+
+def _show_ads_block_repair() -> None:
+    from agent.ads_block import ads_block_repair_service
+
+    result = ads_block_repair_service()
+    service = result.get("service") or {}
+    _print(kv("dnsmasq active", "yes" if result.get("dnsmasq_active") else "no", GREEN if result.get("dnsmasq_active") else RED))
+    actions = service.get("actions") or []
+    if actions:
+        _print(kv("Actions", ", ".join(str(item) for item in actions), CYAN))
+    _print(kv("Ready", "yes" if result.get("ready") else "no", GREEN if result.get("ready") else RED))
 
 
 def _show_ads_block_install() -> None:

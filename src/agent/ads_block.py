@@ -12,6 +12,9 @@ from agent.dns_leak import (
     DNSMASQ_DROPIN,
     discover_vpn_interfaces,
     dns_leak_status,
+    dnsmasq_service_active,
+    dnsmasq_service_journal,
+    ensure_dnsmasq_service,
     ensure_vpn_dns_resolver,
 )
 from agent.errors import AgentError
@@ -143,14 +146,6 @@ def _firewall_backend() -> str | None:
     return None
 
 
-def _dnsmasq_service_active(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
-    if not shutil.which("systemctl"):
-        return False
-    proc = execute(["systemctl", "is-active", "dnsmasq"], check=False, timeout=10)
-    return (getattr(proc, "stdout", "") or "").strip() == "active"
-
-
 def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
     if not sys.platform.startswith("linux"):
         return {
@@ -168,6 +163,7 @@ def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
             "vpn_interfaces": [],
             "vpn_interface_count": 0,
             "dns_leak_active": False,
+            "dnsmasq_error": None,
             "ready": False,
         }
 
@@ -176,6 +172,10 @@ def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
     dnsmasq_bin = bool(shutil.which("dnsmasq"))
     geteuid = getattr(os, "geteuid", None)
     is_root = geteuid is not None and geteuid() == 0
+    dnsmasq_active = dnsmasq_service_active(runner=runner) if dnsmasq_bin else False
+    dnsmasq_error = None
+    if dnsmasq_bin and not dnsmasq_active:
+        dnsmasq_error = dnsmasq_service_journal(runner=runner) or "dnsmasq service is not active"
 
     dns_leak: dict[str, Any] = {}
     try:
@@ -187,7 +187,7 @@ def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
         "linux": True,
         "root": is_root,
         "dnsmasq_installed": dnsmasq_bin,
-        "dnsmasq_active": _dnsmasq_service_active(runner=runner) if dnsmasq_bin else False,
+        "dnsmasq_active": dnsmasq_active,
         "dnsmasq_dropin": DNSMASQ_DROPIN.is_file(),
         "ads_dropin": ADS_DROPIN.is_file(),
         "firewall_backend": backend,
@@ -198,8 +198,28 @@ def ads_block_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
         "vpn_interfaces": vpn_ifaces,
         "vpn_interface_count": len(vpn_ifaces),
         "dns_leak_active": bool(dns_leak.get("active")),
-        "ready": dnsmasq_bin and backend is not None and len(vpn_ifaces) > 0,
+        "dnsmasq_error": dnsmasq_error,
+        "ready": (
+            dnsmasq_bin
+            and dnsmasq_active
+            and backend is not None
+            and len(vpn_ifaces) > 0
+        ),
     }
+
+
+def ads_block_repair_service(*, runner: Runner | None = None) -> dict[str, Any]:
+    """Try to start dnsmasq and fix systemd-resolved port-53 conflicts."""
+    _require_linux()
+    _require_root()
+
+    service = ensure_dnsmasq_service(runner=runner)
+    payload = ads_block_prerequisites(runner=runner)
+    payload.update({"ok": bool(service.get("active")), "service": service})
+    if not service.get("active"):
+        message = str(service.get("config_message") or service.get("journal") or "dnsmasq failed to start")
+        raise AgentError("VALIDATION_ERROR", message)
+    return payload
 
 
 def ads_block_install_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
@@ -229,18 +249,15 @@ def ads_block_install_prerequisites(*, runner: Runner | None = None) -> dict[str
     except OSError as exc:
         raise AgentError("VALIDATION_ERROR", f"Cannot prepare ads list path: {exc}") from exc
 
-    restarted = False
-    if shutil.which("dnsmasq") and shutil.which("systemctl"):
-        execute(["systemctl", "enable", "dnsmasq"], check=False, timeout=30)
-        proc = execute(["systemctl", "restart", "dnsmasq"], check=False, timeout=60)
-        restarted = proc.returncode == 0
+    service = ensure_dnsmasq_service(runner=runner) if shutil.which("dnsmasq") else None
 
     payload = ads_block_prerequisites(runner=runner)
     payload.update(
         {
             "ok": True,
             "installed": installed,
-            "dnsmasq_restarted": restarted,
+            "dnsmasq_restarted": bool((service or {}).get("active")),
+            "service": service,
         }
     )
     return payload
@@ -343,20 +360,25 @@ def ads_block_ensure(*, runner: Runner | None = None) -> dict[str, Any]:
         except Exception as exc:
             log.warning("ads_block ensure: VPN DNS resolver setup failed: %s", exc)
 
-    if not restarted and shutil.which("systemctl"):
-        result = execute(["systemctl", "try-reload-or-restart", "dnsmasq"], check=False, timeout=30)
-        restarted = getattr(result, "returncode", 1) == 0
+    service = ensure_dnsmasq_service(runner=runner) if shutil.which("dnsmasq") else None
+    restarted = bool((service or {}).get("active"))
 
     status = ads_block_status(runner=runner)
     status.update(
         {
-            "ok": True,
+            "ok": bool(status.get("ready")),
             "written": True,
             "domains": len(domains),
             "restarted": restarted,
             "resolver": resolver,
+            "service": service,
         }
     )
+    if not status.get("dnsmasq_active"):
+        log.warning(
+            "ads_block ensure: dnsmasq is not active — run: sudo agent ads-block repair (%s)",
+            (service or {}).get("journal") or (service or {}).get("config_message") or "unknown",
+        )
     if not status.get("dns"):
         log.warning("ads_block ensure: no VPN interface DNS address detected yet")
     elif not resolver:

@@ -392,6 +392,12 @@ def cmd_ads_block_disable(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ads_block_repair(_: argparse.Namespace) -> int:
+    from agent.ads_block import ads_block_repair_service
+    _print_json({'success': True, **ads_block_repair_service()})
+    return 0
+
+
 def cmd_ads_block_test(args: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_test
     result = ads_block_test(str(getattr(args, 'domain', '') or 'doubleclick.net'))
@@ -665,6 +671,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ads_disable = ads_sub.add_parser("disable", help="Remove ads DNS filter drop-in")
     p_ads_disable.set_defaults(func=cmd_ads_block_disable)
+
+    p_ads_repair = ads_sub.add_parser("repair", help="Start dnsmasq and fix port-53 conflicts")
+    p_ads_repair.set_defaults(func=cmd_ads_block_repair)
 
     p_ads_test = ads_sub.add_parser("test", help="Query a known ad domain via VPN DNS")
     p_ads_test.add_argument(
