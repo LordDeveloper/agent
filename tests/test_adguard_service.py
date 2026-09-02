@@ -24,6 +24,10 @@ def test_render_adguard_config_binds_vpn_gateway_and_enables_filters():
     assert 'AdGuard DNS filter' in conf
     assert 'http:' in conf
     assert '127.0.0.1:3000' in conf
+    assert 'clients:' in conf
+    assert 'runtime_sources:' in conf
+    assert 'persistent: []' in conf
+    assert 'clients: []' not in conf
 
 
 def test_render_adguard_config_can_disable_filtering():
