@@ -229,6 +229,27 @@ def test_disabled_core_routes_are_hidden(tmp_path, fake_xray):
     _clear_env()
 
 
+def test_stats_clients_traffic_delta_endpoint(client: TestClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    r = client.get("/api/v1/stats/clients/traffic/delta", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["ack"] is False
+    assert "users" in body
+    assert "sampled_at" in body
+    assert "worker_lag_ms" in body
+
+
+def test_stats_clients_traffic_delta_passed_alias(client: TestClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    r = client.get("/api/v1/stats/clients/traffic/delta?passed=true", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["ack"] is True
+
+
 def test_stats_clients_traffic_all_cores(client: TestClient):
     headers = {"Authorization": "Bearer dev-token"}
     r = client.get("/api/v1/stats/clients/traffic", headers=headers)

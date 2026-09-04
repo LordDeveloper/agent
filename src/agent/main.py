@@ -28,6 +28,8 @@ from agent.routing import ROUTE_SLUGS
 from agent.core_supervisor import bootstrap_enabled_cores
 from agent.errors import AgentError
 from agent.quota_enforcer import quota_enforcer_loop
+from agent.traffic.service import TrafficService
+from agent.traffic_worker import traffic_worker_loop
 
 log = get_logger("http")
 
@@ -73,6 +75,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     audit = AuditLog(store)
     errors = CoreErrorLog(resolve_log_path(settings))
     registry = CoreRegistry(settings, audit, store)
+    traffic = TrafficService(store)
     enabled = set(settings.cores())
 
     @asynccontextmanager
@@ -93,8 +96,19 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 quota_enforcer_loop(registry, settings, stop_quota),
             )
 
+        stop_traffic = asyncio.Event()
+        traffic_task = None
+        if float(settings.traffic_sample_interval) > 0:
+            traffic.sample_all(registry)
+            traffic_task = asyncio.create_task(
+                traffic_worker_loop(registry, traffic, settings, stop_traffic),
+            )
+
         yield
 
+        stop_traffic.set()
+        if traffic_task is not None:
+            await traffic_task
         stop_quota.set()
         if quota_task is not None:
             await quota_task
@@ -107,6 +121,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.state.audit = audit
     app.state.errors = errors
     app.state.registry = registry
+    app.state.traffic = traffic
     app.add_middleware(CoreErrorCaptureMiddleware)
     app.add_middleware(RequestLogMiddleware)
 

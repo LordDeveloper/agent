@@ -73,6 +73,8 @@ class AgentSettings(BaseSettings):
     # Seconds between local volume-quota checks (0 disables). Cuts clients on the agent
     # before the Laravel panel polls, so overshoot stays near zero.
     quota_enforce_interval: float = 10.0
+    # Seconds between traffic delta samples for panel billing (0 disables background worker).
+    traffic_sample_interval: float = 30.0
 
     @property
     def xray(self) -> XraySettings:
