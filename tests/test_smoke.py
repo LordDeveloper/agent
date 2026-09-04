@@ -227,3 +227,17 @@ def test_disabled_core_routes_are_hidden(tmp_path, fake_xray):
         assert stats.status_code == 404
         assert "not enabled" in stats.text
     _clear_env()
+
+
+def test_stats_clients_traffic_all_cores(client: TestClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    r = client.get("/api/v1/stats/clients/traffic", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert "online" in body
+    assert "online_users" in body
+    assert "snapshot" in body
+    assert isinstance(body["online"]["users"], dict)
+    assert isinstance(body["online_users"], list)
+    assert isinstance(body["snapshot"]["inbounds"], list)

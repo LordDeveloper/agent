@@ -20,7 +20,7 @@ from agent.support import normalize_peer, record_is_enabled
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.support.process import run
 
-_ONLINE_HANDSHAKE_SECONDS = 180
+_ONLINE_HANDSHAKE_SECONDS = 120
 _IP_WINDOW_SECONDS = 600
 _IP_LOG_LIMIT = 50
 _WG_MTU = 1420

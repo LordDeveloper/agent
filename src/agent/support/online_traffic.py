@@ -9,14 +9,16 @@ from agent.models import UsageSnapshotModel
 def online_traffic_from_snapshot(driver: CoreDriver) -> dict[str, dict[str, int]]:
     """Fallback for cores without Xray /api/stats/online/traffic."""
     online = set(driver.online_users())
-    if not online:
-        return {}
     out: dict[str, dict[str, int]] = {}
     snapshot = driver.usage_snapshot()
     for inbound in snapshot.inbounds:
         for client in inbound.clients:
             label = str(client.email or client.id or "")
-            if not label or label not in online:
+            if not label:
+                continue
+            if online and label not in online:
+                continue
+            if int(client.incoming or 0) <= 0 and int(client.outgoing or 0) <= 0:
                 continue
             out[label] = {
                 "uplink": int(client.outgoing or 0),

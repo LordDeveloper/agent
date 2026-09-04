@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from agent.api.lifecycle import health_payload
 from agent.routing import ROUTE_SLUGS
 from agent.core_supervisor import bootstrap_enabled_cores
 from agent.errors import AgentError
+from agent.quota_enforcer import quota_enforcer_loop
 
 log = get_logger("http")
 
@@ -83,7 +85,19 @@ def create_app(env_file: str | None = None) -> FastAPI:
             resolve_log_path(settings),
         )
         bootstrap_enabled_cores(settings, registry, app_log)
+
+        stop_quota = asyncio.Event()
+        quota_task = None
+        if float(settings.quota_enforce_interval) > 0:
+            quota_task = asyncio.create_task(
+                quota_enforcer_loop(registry, settings, stop_quota),
+            )
+
         yield
+
+        stop_quota.set()
+        if quota_task is not None:
+            await quota_task
         app_log.info("agent stopping")
         store.close()
 

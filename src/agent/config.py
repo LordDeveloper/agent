@@ -70,6 +70,9 @@ class AgentSettings(BaseSettings):
 
     wireguard_config_dir: str = "/etc/wireguard"
     amnezia_config_dir: str = "/etc/amneziawg"
+    # Seconds between local volume-quota checks (0 disables). Cuts clients on the agent
+    # before the Laravel panel polls, so overshoot stays near zero.
+    quota_enforce_interval: float = 10.0
 
     @property
     def xray(self) -> XraySettings:

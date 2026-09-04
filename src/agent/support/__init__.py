@@ -133,6 +133,11 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
     if "outgoing" in client or "up" in client:
         client["outgoing"] = _as_int(client.get("outgoing", client.get("up")))
 
+    if "_incoming" in client:
+        client["_incoming"] = _as_int(client.get("_incoming"))
+    if "_outgoing" in client:
+        client["_outgoing"] = _as_int(client.get("_outgoing"))
+
     for key in _XUI_KEYS:
         client.pop(key, None)
 
@@ -360,6 +365,11 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         peer["incoming"] = _as_int(peer.get("incoming", peer.get("down")))
     if "outgoing" in peer or "up" in peer:
         peer["outgoing"] = _as_int(peer.get("outgoing", peer.get("up")))
+
+    if "_incoming" in peer:
+        peer["_incoming"] = _as_int(peer.get("_incoming"))
+    if "_outgoing" in peer:
+        peer["_outgoing"] = _as_int(peer.get("_outgoing"))
 
     if "exit_interface" in peer:
         exit_iface = str(peer.get("exit_interface") or "").strip()

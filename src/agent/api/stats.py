@@ -46,3 +46,25 @@ def stats_snapshot(
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **snapshot.model_dump()}
+
+
+@router.get("/stats/clients/traffic")
+def stats_clients_traffic(
+    registry: CoreRegistry = Depends(get_registry),
+):
+    """
+    Single-call traffic snapshot for billing sync: all enabled cores (Xray + WireGuard + Amnezia)
+    with online byte counters and full cumulative client snapshot.
+    """
+    try:
+        online = registry.online_traffic(None)
+        online_users = registry.online_users(None)
+        snapshot = registry.usage_snapshot(None)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {
+        "success": True,
+        "online": {"users": online},
+        "online_users": online_users,
+        "snapshot": snapshot.model_dump(),
+    }
