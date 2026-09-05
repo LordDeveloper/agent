@@ -63,6 +63,14 @@ def explain_disabled(row: dict[str, Any]) -> str:
     if reason == "quota_exceeded":
         remaining = int(detail.get("remaining_bytes", row.get("volume") or 0))
         delta = int(detail.get("delta_bytes") or 0)
+        base_in = int(detail.get("baseline_incoming") or 0)
+        base_out = int(detail.get("baseline_outgoing") or 0)
+        if base_in <= 0 and base_out <= 0 and delta > 0:
+            return (
+                "Peer disabled by quota enforcer: baseline (_incoming/_outgoing) is still zero "
+                f"while cumulative traffic exists (delta={delta} bytes). "
+                "Sync from panel or upgrade Agent to v0.3.83+ to auto-seed baseline."
+            )
         if remaining <= 0:
             return (
                 "Peer disabled by quota enforcer: remaining volume is zero "
@@ -86,4 +94,4 @@ def explain_disabled(row: dict[str, Any]) -> str:
     if "volume" in row and remaining <= 0:
         return "Peer disabled in agent store (remaining volume is zero)."
 
-    return "Peer disabled in agent store (reason not recorded — update Agent to v0.3.82+)."
+    return "Peer disabled in agent store (reason not recorded — update Agent to v0.3.83+)."

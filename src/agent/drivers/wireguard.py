@@ -641,6 +641,9 @@ class WireGuardDriver(CoreDriver):
                 merged["exit_interface"] = normalized["exit_interface"]
             else:
                 merged.pop("exit_interface", None)
+        from agent.support.quota import seed_stale_zero_baseline
+
+        seed_stale_zero_baseline(merged)
         if record_is_enabled(merged):
             from agent.support.disable_reason import clear_disabled_metadata
 

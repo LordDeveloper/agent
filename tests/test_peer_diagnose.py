@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 from agent.db import Store
 from agent.support.peer_diagnose import (
+    allowed_ips_cover_host,
+    allowed_ips_lists_match,
     diagnose_peer_address,
     find_peers_by_address,
     normalize_peer_host,
@@ -48,6 +50,12 @@ def _store_with_peer(tmp_path) -> Store:
 def test_normalize_peer_host():
     assert normalize_peer_host("10.80.0.5/32") == "10.80.0.5"
     assert normalize_peer_host("10.80.0.5") == "10.80.0.5"
+
+
+def test_allowed_ips_cover_host_does_not_use_substring_match():
+    assert allowed_ips_cover_host("10.90.68.15/32", "10.90.68.15") is True
+    assert allowed_ips_cover_host("10.90.68.150/32", "10.90.68.15") is False
+    assert allowed_ips_lists_match("10.90.68.15/32", "10.90.68.150/32", "10.90.68.15") is False
 
 
 def test_find_peers_by_address(tmp_path):

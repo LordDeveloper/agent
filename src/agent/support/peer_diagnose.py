@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import shutil
 import time
@@ -24,6 +25,40 @@ def normalize_peer_host(value: Any) -> str:
     if not text:
         return ''
     return text.split('/', 1)[0].strip()
+
+
+def allowed_ips_cover_host(allowed_ips: str, host: str) -> bool:
+    """Return True when host is contained in one of the comma-separated allowed_ips entries."""
+    host = normalize_peer_host(host)
+    if not host:
+        return False
+    try:
+        host_ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    for part in str(allowed_ips or '').split(','):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            if '/' in token:
+                if host_ip in ipaddress.ip_network(token, strict=False):
+                    return True
+            elif ipaddress.ip_address(token) == host_ip:
+                return True
+        except ValueError:
+            continue
+
+    return False
+
+
+def allowed_ips_lists_match(store_allowed: str, live_allowed: str, host: str) -> bool:
+    store_ok = allowed_ips_cover_host(store_allowed, host)
+    live_ok = allowed_ips_cover_host(live_allowed, host)
+    if not store_ok or not live_ok:
+        return False
+    return str(store_allowed or '').strip() == str(live_allowed or '').strip()
 
 
 def find_peers_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
@@ -302,7 +337,7 @@ def diagnose_peer_match(
     if pub and live is None:
         for candidate in live_peers.values():
             allowed = str(candidate.get('allowed_ips') or '')
-            if host in allowed or cidr in allowed:
+            if allowed_ips_cover_host(allowed, host):
                 live = candidate
                 break
 
@@ -319,11 +354,8 @@ def diagnose_peer_match(
     else:
         store_allowed = str(peer.get('allowed_ips') or f'{host}/32')
         live_allowed = str(live.get('allowed_ips') or '')
-        allowed_ok = (
-            host in live_allowed
-            or store_allowed in live_allowed
-            or live_allowed in store_allowed
-        )
+        live_pub = str(live.get('public_key') or '').strip()
+        allowed_ok = allowed_ips_lists_match(store_allowed, live_allowed, host)
         checks.append(
             {
                 'name': 'allowed_ips_match',
@@ -340,6 +372,16 @@ def diagnose_peer_match(
                     'Store allowed_ips differs from live WireGuard peer',
                     store=store_allowed,
                     live=live_allowed,
+                )
+            )
+        if pub and live_pub and live_pub != pub:
+            issues.append(
+                _issue(
+                    'error',
+                    'PEER_KEY_MISMATCH',
+                    'Store public_key differs from live WireGuard peer (stale peer on interface?)',
+                    store_public_key=(pub[:16] + '...') if pub else None,
+                    live_public_key=(live_pub[:16] + '...') if live_pub else None,
                 )
             )
 
