@@ -691,6 +691,9 @@ class WireGuardDriver(CoreDriver):
         for key, value in normalized.items():
             if key in _IMMUTABLE_PEER_KEYS:
                 continue
+            if value is None:
+                merged.pop(key, None)
+                continue
             merged[key] = value
         merged["private_key"] = before.get("private_key")
         merged["public_key"] = before.get("public_key")

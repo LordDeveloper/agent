@@ -8,7 +8,11 @@ from agent.support.disable_reason import baseline_looks_like_raw_kernel, mark_qu
 
 def has_volume_quota(client: dict[str, Any]) -> bool:
     """True when the panel tracks a finite byte quota for this client."""
-    return "volume" in client
+    if "volume" not in client:
+        return False
+
+    # Panel uses volume=0 for unlimited plans; only positive values are enforceable quota.
+    return int(client.get("volume") or 0) > 0
 
 
 def quota_exceeded(client: dict[str, Any], live_incoming: int, live_outgoing: int) -> bool:
@@ -23,9 +27,6 @@ def quota_exceeded(client: dict[str, Any], live_incoming: int, live_outgoing: in
         return False
 
     remaining = int(client.get("volume") or 0)
-    if remaining <= 0:
-        return True
-
     base_in = int(client.get("_incoming") or 0)
     base_out = int(client.get("_outgoing") or 0)
 

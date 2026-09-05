@@ -96,7 +96,7 @@ def explain_disabled(row: dict[str, Any]) -> str:
             )
         if remaining <= 0:
             return (
-                "Peer disabled by quota enforcer: remaining volume is zero "
+                "Peer disabled by quota enforcer: remaining synced quota is zero "
                 f"(delta={delta} bytes since baseline)."
             )
         return (

@@ -12,7 +12,7 @@ def test_unlimited_client_without_volume_field_is_not_enforced():
     assert quota_exceeded(client, 10_000_000_000, 10_000_000_000) is False
 
 
-def test_zero_remaining_disables_immediately():
+def test_zero_volume_means_unlimited_not_enforced():
     client = {
         "is_enabled": True,
         "volume": 0,
@@ -20,7 +20,19 @@ def test_zero_remaining_disables_immediately():
         "_outgoing": 0,
     }
 
-    assert quota_exceeded(client, 1_000, 0) is True
+    assert has_volume_quota(client) is False
+    assert quota_exceeded(client, 1_000, 0) is False
+
+
+def test_zero_remaining_disables_immediately():
+    client = {
+        "is_enabled": True,
+        "volume": 1,
+        "_incoming": 1_000,
+        "_outgoing": 0,
+    }
+
+    assert quota_exceeded(client, 1_001, 0) is True
 
 
 def test_delta_below_remaining_is_allowed():

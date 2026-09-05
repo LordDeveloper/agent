@@ -115,10 +115,16 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
         client["max_connection"] = _as_int(client.get("max_connection", client.get("limitIp")))
 
     if "volume" in client:
-        client["volume"] = _as_int(client.get("volume"))
+        if client.get("volume") is None:
+            client.pop("volume")
+        else:
+            client["volume"] = _as_int(client.get("volume"))
+            if client["volume"] <= 0:
+                client.pop("volume")
     elif "totalGB" in client:
-        # 3x-ui `totalGB` is already bytes (same as Netinja `volume`).
-        client["volume"] = _as_int(client.get("totalGB"))
+        total = _as_int(client.get("totalGB"))
+        if total > 0:
+            client["volume"] = total
 
     expires = client.get("expires_at", client.get("expiryTime"))
     if expires is not None:
@@ -367,9 +373,16 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
             peer["expires_at"] = None
 
     if "volume" in peer:
-        peer["volume"] = _as_int(peer["volume"])
+        if peer.get("volume") is None:
+            peer.pop("volume")
+        else:
+            peer["volume"] = _as_int(peer.get("volume"))
+            if peer["volume"] <= 0:
+                peer.pop("volume")
     elif "totalGB" in peer:
-        peer["volume"] = _as_int(peer.get("totalGB"))
+        total = _as_int(peer.get("totalGB"))
+        if total > 0:
+            peer["volume"] = total
 
     if "incoming" in peer or "down" in peer:
         peer["incoming"] = _as_int(peer.get("incoming", peer.get("down")))
