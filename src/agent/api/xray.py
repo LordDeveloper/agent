@@ -7,12 +7,17 @@ from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import ClientPayload, InboundPayload
 from agent.registry import CoreRegistry
+from agent.traffic.service import TrafficService
 
 router = APIRouter(prefix="/cores/xray", tags=["xray"])
 
 
 def get_registry(request: Request) -> CoreRegistry:
     return request.app.state.registry
+
+
+def get_traffic(request: Request) -> TrafficService:
+    return request.app.state.traffic
 
 
 def get_xray(registry: CoreRegistry = Depends(get_registry)) -> XrayDriver:
@@ -173,13 +178,19 @@ def delete_client(inbound_id: str, client_key: str, xray: XrayDriver = Depends(g
 
 
 @router.post("/inbounds/{inbound_id}/clients/{client_key}/reset-traffic")
-def reset_traffic(inbound_id: str, client_key: str, xray: XrayDriver = Depends(get_xray)):
+def reset_traffic(
+    inbound_id: str,
+    client_key: str,
+    xray: XrayDriver = Depends(get_xray),
+    traffic: TrafficService = Depends(get_traffic),
+):
     try:
         client = xray.reset_client_traffic(inbound_id, client_key)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     except Exception as exc:
         raise_agent_error("INTERNAL_ERROR", f"{type(exc).__name__}: {exc}", 500)
+    traffic.reset_client_record("xray", client, client_key)
     return {"success": True, "client": client}
 
 

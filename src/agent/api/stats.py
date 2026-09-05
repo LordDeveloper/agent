@@ -1,6 +1,7 @@
+from typing import Any
+
 from fastapi import APIRouter, Depends, Query, Request
 
-from agent.auth import verify_auth
 from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
 from agent.routing import resolve_core_key
@@ -15,12 +16,6 @@ def get_registry(request: Request) -> CoreRegistry:
 
 def get_traffic(request: Request) -> TrafficService:
     return request.app.state.traffic
-
-
-def _parse_ack(value: bool | None, passed: bool | None) -> bool:
-    if passed is not None:
-        return passed
-    return bool(value)
 
 
 @router.get("/stats/online")
@@ -59,59 +54,51 @@ def stats_snapshot(
     return {"success": True, **snapshot.model_dump()}
 
 
-@router.get("/stats/clients/traffic")
-def stats_clients_traffic(
-    registry: CoreRegistry = Depends(get_registry),
-):
-    """
-    Single-call traffic snapshot for billing sync: all enabled cores (Xray + WireGuard + Amnezia)
-    with online byte counters and full cumulative client snapshot.
-    """
-    try:
-        online = registry.online_traffic(None)
-        online_users = registry.online_users(None)
-        snapshot = registry.usage_snapshot(None)
-    except AgentError as exc:
-        raise_agent_error(exc.code, exc.message, exc.status)
-    return {
-        "success": True,
-        "online": {"users": online},
-        "online_users": online_users,
-        "snapshot": snapshot.model_dump(),
-    }
-
-
-@router.get("/stats/clients/traffic/delta")
-def stats_clients_traffic_delta(
+@router.get("/stats/clients/traffic/pending")
+def stats_clients_traffic_pending(
     request: Request,
-    ack: bool = Query(False),
-    passed: bool | None = Query(None, description="Alias for ack — panel processed pending deltas"),
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
-    Pending byte deltas since the last ack, sampled by the local traffic worker.
+    Pending byte deltas since the last panel ack.
 
-    Online status is not used. Only clients with new consumption since the last
-    successful panel ack appear in ``users``. When ``ack=true`` (or ``passed=true``),
-    returned clients are removed from the pending queue and their baselines advance.
+    Keys in ``users`` are canonical client ids (panel ``node_id``). The traffic
+    worker keeps updating pending rows until each client is acked via POST.
     """
     registry: CoreRegistry = request.app.state.registry
-
-    if _parse_ack(ack, passed):
-        traffic.sample_all(registry)
-
+    traffic.sample_all(registry)
     payload = traffic.pending_payload()
-    users = dict(payload.get("users") or {})
-    acked = 0
-
-    if _parse_ack(ack, passed) and users:
-        acked = traffic.ack_pending()
 
     return {
         "success": True,
-        "ack": _parse_ack(ack, passed),
-        "acked_clients": acked,
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
-        "users": users,
+        "users": payload.get("users") or {},
+    }
+
+
+@router.post("/stats/clients/traffic/pending/ack")
+def stats_clients_traffic_pending_ack(
+    body: dict[str, Any],
+    traffic: TrafficService = Depends(get_traffic),
+):
+    """
+    Ack clients whose pending volume was applied on the panel.
+
+    Body: ``{"clients": ["node-id-1", "node-id-2"]}`` — canonical ids only.
+    """
+    raw = body.get("clients")
+    if raw is None:
+        raw = body.get("client_keys") or body.get("emails") or []
+
+    if not isinstance(raw, list):
+        raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)
+
+    client_keys = [str(item).strip() for item in raw if str(item or "").strip()]
+    acked, not_found = traffic.ack_clients(client_keys)
+
+    return {
+        "success": True,
+        "acked": acked,
+        "not_found": not_found,
     }

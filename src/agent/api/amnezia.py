@@ -7,12 +7,17 @@ from agent.drivers.amnezia import AmneziaDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import AmneziaInterfacePayload, AmneziaPeerPayload
 from agent.registry import CoreRegistry
+from agent.traffic.service import TrafficService
 
 router = APIRouter(prefix="/cores/amnezia", tags=["amnezia"])
 
 
 def get_registry(request: Request) -> CoreRegistry:
     return request.app.state.registry
+
+
+def get_traffic(request: Request) -> TrafficService:
+    return request.app.state.traffic
 
 
 def get_amnezia(registry: CoreRegistry = Depends(get_registry)) -> AmneziaDriver:
@@ -148,11 +153,17 @@ def delete_peer(interface_id: str, peer_id: str, amnezia: AmneziaDriver = Depend
 
 
 @router.post("/interfaces/{interface_id}/peers/{peer_id}/reset-traffic")
-def reset_peer_traffic(interface_id: str, peer_id: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
+def reset_peer_traffic(
+    interface_id: str,
+    peer_id: str,
+    amnezia: AmneziaDriver = Depends(get_amnezia),
+    traffic: TrafficService = Depends(get_traffic),
+):
     try:
         peer = amnezia.reset_peer_traffic(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    traffic.reset_client_record("amnezia", peer, peer_id)
     return {"success": True, "peer": peer}
 
 

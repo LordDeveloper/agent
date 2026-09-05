@@ -7,12 +7,17 @@ from agent.drivers.wireguard import WireGuardDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import WgInterfacePayload, WgPeerPayload
 from agent.registry import CoreRegistry
+from agent.traffic.service import TrafficService
 
 router = APIRouter(prefix="/cores/wireguard", tags=["wireguard"])
 
 
 def get_registry(request: Request) -> CoreRegistry:
     return request.app.state.registry
+
+
+def get_traffic(request: Request) -> TrafficService:
+    return request.app.state.traffic
 
 
 def get_wg(registry: CoreRegistry = Depends(get_registry)) -> WireGuardDriver:
@@ -136,11 +141,17 @@ def delete_peer(interface_id: str, peer_id: str, wg: WireGuardDriver = Depends(g
 
 
 @router.post("/interfaces/{interface_id}/peers/{peer_id}/reset-traffic")
-def reset_peer_traffic(interface_id: str, peer_id: str, wg: WireGuardDriver = Depends(get_wg)):
+def reset_peer_traffic(
+    interface_id: str,
+    peer_id: str,
+    wg: WireGuardDriver = Depends(get_wg),
+    traffic: TrafficService = Depends(get_traffic),
+):
     try:
         peer = wg.reset_peer_traffic(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    traffic.reset_client_record("wireguard", peer, peer_id)
     return {"success": True, "peer": peer}
 
 

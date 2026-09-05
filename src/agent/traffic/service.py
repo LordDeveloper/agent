@@ -135,13 +135,7 @@ class TrafficService:
         acked = 0
 
         for row in rows:
-            self.store.set_traffic_ack(
-                row["core"],
-                row["client_key"],
-                int(row["current_incoming"]),
-                int(row["current_outgoing"]),
-            )
-            self.store.delete_traffic_pending(row["core"], row["client_key"])
+            self._ack_pending_row(row)
             acked += 1
 
         if acked:
@@ -149,10 +143,65 @@ class TrafficService:
 
         return acked
 
+    def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
+        """Ack only the provided canonical client keys (panel node_id)."""
+        requested = []
+        seen: set[str] = set()
+        for raw in client_keys:
+            label = str(raw or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            requested.append(label)
+
+        rows_by_key: dict[str, list[dict[str, Any]]] = {}
+        for row in self.store.list_traffic_pending():
+            label = str(row["client_key"])
+            rows_by_key.setdefault(label, []).append(row)
+
+        acked: list[str] = []
+        not_found: list[str] = []
+
+        for label in requested:
+            rows = rows_by_key.get(label) or []
+            if not rows:
+                not_found.append(label)
+                continue
+
+            for row in rows:
+                self._ack_pending_row(row)
+
+            acked.append(label)
+            log.info("traffic ack client=%s rows=%s", label, len(rows))
+
+        return acked, not_found
+
+    def _ack_pending_row(self, row: dict[str, Any]) -> None:
+        self.store.set_traffic_ack(
+            row["core"],
+            row["client_key"],
+            int(row["current_incoming"]),
+            int(row["current_outgoing"]),
+        )
+        self.store.delete_traffic_pending(row["core"], row["client_key"])
+
     def reset_client(self, core: str, client_key_label: str) -> None:
         """Drop ack/pending rows after panel delete or renew."""
         self.store.delete_traffic_ack(core, client_key_label)
         self.store.delete_traffic_pending(core, client_key_label)
+
+    def reset_client_record(self, core: str, record: dict[str, Any], *extra_labels: str) -> None:
+        """Clear traffic worker state for every identifier the panel may use."""
+        seen: set[str] = set()
+        for candidate in (
+            record.get("id"),
+            record.get("email"),
+            *extra_labels,
+        ):
+            label = str(candidate or "").strip()
+            if label and label not in seen:
+                seen.add(label)
+                self.reset_client(core, label)
 
     def _worker_lag_ms(self) -> int | None:
         sampled_at = self.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY)
