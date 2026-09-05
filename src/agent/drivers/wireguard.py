@@ -552,6 +552,10 @@ class WireGuardDriver(CoreDriver):
                         merged["exit_interface"] = normalized["exit_interface"]
                     else:
                         merged.pop("exit_interface", None)
+                if record_is_enabled(merged):
+                    from agent.support.disable_reason import clear_disabled_metadata
+
+                    clear_disabled_metadata(merged)
                 iface["peers"][idx] = merged
 
                 # exit_interface / metadata-only updates must not wg syncconf + nft flush.
@@ -637,6 +641,10 @@ class WireGuardDriver(CoreDriver):
                 merged["exit_interface"] = normalized["exit_interface"]
             else:
                 merged.pop("exit_interface", None)
+        if record_is_enabled(merged):
+            from agent.support.disable_reason import clear_disabled_metadata
+
+            clear_disabled_metadata(merged)
         return merged
 
     def batch_peers(

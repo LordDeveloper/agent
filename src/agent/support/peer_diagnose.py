@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from agent.db import Store
 from agent.support import record_is_enabled
+from agent.support.disable_reason import explain_disabled
 from agent.support.peer_egress import peer_source_cidr, rule_pref_for_addr, table_id_for_interface
 from agent.support.process import run
 
@@ -268,7 +269,16 @@ def diagnose_peer_match(
     enabled = record_is_enabled(peer)
     checks.append({'name': 'peer_enabled', 'ok': enabled})
     if not enabled:
-        issues.append(_issue('error', 'PEER_DISABLED', 'Peer is disabled in agent store'))
+        issues.append(
+            _issue(
+                'error',
+                'PEER_DISABLED',
+                explain_disabled(peer),
+                disabled_reason=peer.get('disabled_reason'),
+                disabled_at=peer.get('disabled_at'),
+                disabled_detail=peer.get('disabled_detail'),
+            )
+        )
 
     wg_up = interface_is_up_fn(iface_name) if interface_is_up_fn and iface_name else None
     if wg_up is False:

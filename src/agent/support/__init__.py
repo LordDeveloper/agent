@@ -345,6 +345,16 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
 
     peer["is_enabled"] = record_is_enabled(peer)
 
+    if peer["is_enabled"]:
+        from agent.support.disable_reason import clear_disabled_metadata
+
+        clear_disabled_metadata(peer)
+    elif "is_enabled" in payload or "enable" in payload:
+        from agent.support.disable_reason import mark_panel_disabled
+
+        if not str(peer.get("disabled_reason") or "").strip():
+            mark_panel_disabled(peer)
+
     if "max_connection" in peer or "limitIp" in peer:
         peer["max_connection"] = _as_int(peer.get("max_connection", peer.get("limitIp")))
 

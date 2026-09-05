@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent.support import record_is_enabled
+from agent.support.disable_reason import mark_quota_disabled
 
 
 def has_volume_quota(client: dict[str, Any]) -> bool:
@@ -72,13 +73,16 @@ def _enforce_xray(driver: Any) -> int:
             cid = str(client.get("id") or "")
             live = traffic_by_email.get(email) or traffic_by_id.get(cid)
             if live is None:
-                live = (int(client.get("incoming") or 0), int(client.get("outgoing") or 0))
+                live = (
+                    int(client.get("_incoming") or 0),
+                    int(client.get("_outgoing") or 0),
+                )
 
             if not quota_exceeded(client, live[0], live[1]):
                 continue
 
             row = dict(client)
-            row["is_enabled"] = False
+            mark_quota_disabled(row, live[0], live[1])
             to_disable.append(row)
 
         if not to_disable:
@@ -117,13 +121,16 @@ def _enforce_wireguard(driver: Any) -> int:
             pid = str(peer.get("id") or "")
             live = traffic_by_email.get(email) or traffic_by_id.get(pid)
             if live is None:
-                live = (int(peer.get("incoming") or 0), int(peer.get("outgoing") or 0))
+                live = (
+                    int(peer.get("_incoming") or 0),
+                    int(peer.get("_outgoing") or 0),
+                )
 
             if not quota_exceeded(peer, live[0], live[1]):
                 continue
 
             row = dict(peer)
-            row["is_enabled"] = False
+            mark_quota_disabled(row, live[0], live[1])
             to_disable.append(row)
 
         if not to_disable:
