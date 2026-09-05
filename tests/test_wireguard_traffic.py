@@ -89,24 +89,105 @@ def test_peer_config_includes_default_mtu(monkeypatch):
 
 
 def test_accumulate_transfer_delta():
-    peer = {"incoming": 100, "outgoing": 50, "_incoming": 40, "_outgoing": 20}
+    peer = {"incoming": 100, "outgoing": 50, "_raw_incoming": 40, "_raw_outgoing": 20}
     accumulate_transfer(peer, incoming=70, outgoing=35)
     assert peer["incoming"] == 130  # 100 + (70 - 40)
     assert peer["outgoing"] == 65  # 50 + (35 - 20)
-    assert peer["_incoming"] == 70
-    assert peer["_outgoing"] == 35
+    assert peer["_raw_incoming"] == 70
+    assert peer["_raw_outgoing"] == 35
 
 
 def test_accumulate_transfer_after_reboot_reset():
-    peer = {"incoming": 1000, "outgoing": 800, "_incoming": 900, "_outgoing": 700}
+    peer = {"incoming": 1000, "outgoing": 800, "_raw_incoming": 900, "_raw_outgoing": 700}
     # Kernel counters restarted; new raw is smaller than last snapshot.
     accumulate_transfer(peer, incoming=50, outgoing=30, handshake_at=1_700_000_000)
     assert peer["incoming"] == 1050  # 1000 + 50
     assert peer["outgoing"] == 830  # 800 + 30
-    assert peer["_incoming"] == 50
-    assert peer["_outgoing"] == 30
+    assert peer["_raw_incoming"] == 50
+    assert peer["_raw_outgoing"] == 30
     assert peer["handshake_at"]
     assert peer["online"] is False  # handshake timestamp is old vs now
+
+
+def test_accumulate_transfer_migrates_legacy_raw_baseline():
+    peer = {
+        "incoming": 66_505_328_660,
+        "outgoing": 5_403_803_980,
+        "_incoming": 4204,
+        "_outgoing": 1764,
+    }
+    accumulate_transfer(peer, incoming=4204, outgoing=1764)
+    assert peer["_raw_incoming"] == 4204
+    assert peer["_raw_outgoing"] == 1764
+    assert peer["_incoming"] == 66_505_328_660
+    assert peer["_outgoing"] == 5_403_803_980
+
+
+def test_reset_peer_traffic_removes_and_readds_live_peer(tmp_path, monkeypatch):
+    from agent.audit import AuditLog
+    from agent.config import AgentSettings
+    from agent.db import Store
+
+    store = Store(tmp_path / "agent.db")
+    store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {
+            "id": 1,
+            "name": "wg1",
+            "listen_port": 51820,
+            "subnet": "10.80.0.0/24",
+            "private_key": "iface-priv",
+            "public_key": "iface-pub",
+            "peers": [
+                {
+                    "id": "peer-1",
+                    "email": "user@test",
+                    "address": "10.80.0.5",
+                    "allowed_ips": "10.80.0.5/32",
+                    "public_key": "peer-pub-key",
+                    "is_enabled": True,
+                    "incoming": 50_000_000_000,
+                    "outgoing": 1_000_000_000,
+                    "_incoming": 50_000_000_000,
+                    "_outgoing": 1_000_000_000,
+                    "_raw_incoming": 123456,
+                    "_raw_outgoing": 654321,
+                }
+            ],
+        },
+    )
+
+    settings = AgentSettings()
+    audit = AuditLog(store)
+    driver = WireGuardDriver(settings, audit, store)
+    calls: list[str] = []
+
+    monkeypatch.setattr(driver, "_interface_is_up", lambda _name: True)
+    monkeypatch.setattr(
+        driver,
+        "_remove_live_peer",
+        lambda iface_name, public_key: calls.append(f"remove:{iface_name}:{public_key}") or True,
+    )
+    monkeypatch.setattr(
+        driver,
+        "_add_live_peer",
+        lambda iface_name, peer: calls.append(f"add:{iface_name}:{peer['public_key']}") or True,
+    )
+
+    result = driver.reset_peer_traffic(1, "peer-1")
+
+    assert result["incoming"] == 0
+    assert result["outgoing"] == 0
+    assert result["_incoming"] == 0
+    assert result["_outgoing"] == 0
+    assert result["_raw_incoming"] == 0
+    assert result["_raw_outgoing"] == 0
+    assert calls == ["remove:wg1:peer-pub-key", "add:wg1:peer-pub-key"]
+
+    persisted = store.get_doc("wireguard", "interface", "1")
+    assert persisted["peers"][0]["incoming"] == 0
 
 
 def test_accumulate_transfer_no_handshake_keeps_previous_offline():

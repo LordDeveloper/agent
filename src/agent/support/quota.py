@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent.support import record_is_enabled
-from agent.support.disable_reason import mark_quota_disabled
+from agent.support.disable_reason import baseline_looks_like_raw_kernel, mark_quota_disabled
 
 
 def has_volume_quota(client: dict[str, Any]) -> bool:
@@ -38,16 +38,21 @@ def quota_exceeded(client: dict[str, Any], live_incoming: int, live_outgoing: in
 
 def seed_stale_zero_baseline(client: dict[str, Any]) -> bool:
     """
-    Panel/agent store can carry cumulative counters while _incoming/_outgoing stayed at 0.
-    Treating the full total as post-baseline delta disables healthy peers — seed baseline first.
+    Panel/agent store can carry cumulative counters while _incoming/_outgoing stayed at 0,
+    or legacy WireGuard peers kept kernel raw counters in the quota baseline fields.
     """
-    if int(client.get("_incoming") or 0) > 0 or int(client.get("_outgoing") or 0) > 0:
-        return False
-
     store_in = int(client.get("incoming") or 0)
     store_out = int(client.get("outgoing") or 0)
+    base_in = int(client.get("_incoming") or 0)
+    base_out = int(client.get("_outgoing") or 0)
 
     if store_in <= 0 and store_out <= 0:
+        return False
+
+    zero_baseline = base_in <= 0 and base_out <= 0
+    raw_kernel_baseline = baseline_looks_like_raw_kernel(base_in, base_out, store_in, store_out)
+
+    if not zero_baseline and not raw_kernel_baseline:
         return False
 
     client["_incoming"] = store_in

@@ -6,6 +6,21 @@ from typing import Any
 from agent.support import record_is_enabled
 
 
+def baseline_looks_like_raw_kernel(
+    base_in: int,
+    base_out: int,
+    store_in: int,
+    store_out: int,
+) -> bool:
+    """Detect legacy WG bug where kernel rx/tx lived in _incoming/_outgoing."""
+    if store_in >= 1024 * 1024 and base_in < max(1024 * 1024, store_in // 100):
+        return True
+    if store_out >= 1024 * 1024 and base_out < max(1024 * 1024, store_out // 100):
+        return True
+
+    return False
+
+
 def clear_disabled_metadata(row: dict[str, Any]) -> None:
     row.pop("disabled_reason", None)
     row.pop("disabled_at", None)
@@ -65,11 +80,19 @@ def explain_disabled(row: dict[str, Any]) -> str:
         delta = int(detail.get("delta_bytes") or 0)
         base_in = int(detail.get("baseline_incoming") or 0)
         base_out = int(detail.get("baseline_outgoing") or 0)
+        store_in = int(detail.get("store_incoming") or row.get("incoming") or 0)
+        store_out = int(detail.get("store_outgoing") or row.get("outgoing") or 0)
         if base_in <= 0 and base_out <= 0 and delta > 0:
             return (
                 "Peer disabled by quota enforcer: baseline (_incoming/_outgoing) is still zero "
                 f"while cumulative traffic exists (delta={delta} bytes). "
                 "Sync from panel or upgrade Agent to v0.3.83+ to auto-seed baseline."
+            )
+        if baseline_looks_like_raw_kernel(base_in, base_out, store_in, store_out):
+            return (
+                "Peer disabled by quota enforcer: WireGuard raw kernel counters were stored in "
+                f"_incoming/_outgoing (baseline={base_in}/{base_out}) while cumulative totals are "
+                f"{store_in}/{store_out} bytes. Upgrade Agent to v0.3.84+ and sync from panel."
             )
         if remaining <= 0:
             return (

@@ -237,6 +237,29 @@ def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -
     return False
 
 
+def _migrate_wg_counter_fields(peer: dict[str, Any]) -> None:
+    """
+    Legacy WireGuard peers stored kernel raw counters in _incoming/_outgoing.
+    Quota baselines from the panel must stay cumulative in _incoming/_outgoing.
+    """
+    if "_raw_incoming" in peer or "_raw_outgoing" in peer:
+        peer.setdefault("_raw_incoming", 0)
+        peer.setdefault("_raw_outgoing", 0)
+        return
+
+    base_in = int(peer.get("_incoming") or 0)
+    base_out = int(peer.get("_outgoing") or 0)
+    cum_in = int(peer.get("incoming") or 0)
+    cum_out = int(peer.get("outgoing") or 0)
+
+    peer["_raw_incoming"] = base_in
+    peer["_raw_outgoing"] = base_out
+
+    if (cum_in > 0 and base_in < cum_in) or (cum_out > 0 and base_out < cum_out):
+        peer["_incoming"] = cum_in
+        peer["_outgoing"] = cum_out
+
+
 def accumulate_transfer(
     peer: dict[str, Any],
     incoming: int,
@@ -246,10 +269,13 @@ def accumulate_transfer(
 ) -> dict[str, Any]:
     """
     WireGuard keeps rx/tx in kernel memory; after reboot counters restart at 0.
-    Persist cumulative totals and last-seen raw counters.
+    Persist cumulative totals in incoming/outgoing and raw kernel snapshots in
+    _raw_incoming/_raw_outgoing. Panel quota baselines live in _incoming/_outgoing.
     """
-    prev_in = int(peer.get("_incoming", 0) or 0)
-    prev_out = int(peer.get("_outgoing", 0) or 0)
+    _migrate_wg_counter_fields(peer)
+
+    prev_in = int(peer.get("_raw_incoming", 0) or 0)
+    prev_out = int(peer.get("_raw_outgoing", 0) or 0)
     total_in = int(peer.get("incoming", 0) or 0)
     total_out = int(peer.get("outgoing", 0) or 0)
 
@@ -258,8 +284,8 @@ def accumulate_transfer(
 
     peer["incoming"] = total_in + delta_in
     peer["outgoing"] = total_out + delta_out
-    peer["_incoming"] = int(incoming)
-    peer["_outgoing"] = int(outgoing)
+    peer["_raw_incoming"] = int(incoming)
+    peer["_raw_outgoing"] = int(outgoing)
 
     if endpoint and endpoint not in ("(none)", ""):
         peer["endpoint"] = endpoint
@@ -365,24 +391,56 @@ class WireGuardDriver(CoreDriver):
         return True
 
     def reset_peer_traffic(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
-        """Zero billing totals and re-baseline kernel counters so the next sync delta is 0."""
-        self.sync_peer_stats()
+        """
+        Zero billing totals and reset live WG/AWG kernel transfer counters.
+
+        Kernel rx/tx only reset when the peer is removed and re-added on the live
+        interface; clearing agent store fields alone would re-bill old usage.
+        """
         iface = self.get_interface(interface_id)
-        for peer in iface.get("peers", []):
-            if str(peer.get("id")) != str(peer_id) and str(peer.get("email")) != str(peer_id):
-                continue
-            live = self._peer_dump(str(iface.get("name") or "")).get(str(peer.get("public_key") or ""), {})
-            return self.update_peer(
-                interface_id,
-                peer_id,
-                {
-                    "incoming": 0,
-                    "outgoing": 0,
-                    "_incoming": int(live.get("incoming", peer.get("_incoming", 0)) or 0),
-                    "_outgoing": int(live.get("outgoing", peer.get("_outgoing", 0)) or 0),
-                },
+        iface_name = str(iface.get("name") or "")
+        target_idx: int | None = None
+        target: dict[str, Any] | None = None
+
+        for idx, peer in enumerate(iface.get("peers", [])):
+            if str(peer.get("id")) == str(peer_id) or str(peer.get("email")) == str(peer_id):
+                target_idx = idx
+                target = peer
+                break
+
+        if target is None or target_idx is None:
+            raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        pub = str(target.get("public_key") or "").strip()
+        was_enabled = record_is_enabled(target)
+        live_up = bool(iface_name) and self._interface_is_up(iface_name)
+
+        if was_enabled and pub and live_up:
+            self._remove_live_peer(iface_name, pub)
+
+        from agent.support.disable_reason import clear_disabled_metadata
+
+        reset_peer = deepcopy(target)
+        reset_peer["incoming"] = 0
+        reset_peer["outgoing"] = 0
+        reset_peer["_incoming"] = 0
+        reset_peer["_outgoing"] = 0
+        reset_peer["_raw_incoming"] = 0
+        reset_peer["_raw_outgoing"] = 0
+        clear_disabled_metadata(reset_peer)
+
+        iface["peers"][target_idx] = reset_peer
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+
+        if was_enabled and pub and live_up and not self._add_live_peer(iface_name, reset_peer):
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"Failed to re-add peer [{peer_id}] on live interface [{iface_name}] after traffic reset",
+                422,
             )
-        raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
+
+        self.audit.record("reset_traffic", f"{self.key}/peer/{peer_id}")
+        return reset_peer
 
     def backup(self) -> dict[str, Any]:
         return {"interfaces": self.list_interfaces(), "core": self.key}
@@ -513,6 +571,8 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("outgoing", 0)
         peer.setdefault("_incoming", 0)
         peer.setdefault("_outgoing", 0)
+        peer.setdefault("_raw_incoming", 0)
+        peer.setdefault("_raw_outgoing", 0)
         peer.setdefault("handshake_at", None)
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
@@ -616,6 +676,8 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("outgoing", 0)
         peer.setdefault("_incoming", 0)
         peer.setdefault("_outgoing", 0)
+        peer.setdefault("_raw_incoming", 0)
+        peer.setdefault("_raw_outgoing", 0)
         peer.setdefault("handshake_at", None)
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
@@ -1138,8 +1200,8 @@ class WireGuardDriver(CoreDriver):
                 before = (
                     peer.get("incoming"),
                     peer.get("outgoing"),
-                    peer.get("_incoming"),
-                    peer.get("_outgoing"),
+                    peer.get("_raw_incoming"),
+                    peer.get("_raw_outgoing"),
                     peer.get("handshake_at"),
                     peer.get("online"),
                     peer.get("endpoint"),
@@ -1155,8 +1217,8 @@ class WireGuardDriver(CoreDriver):
                 after = (
                     peer.get("incoming"),
                     peer.get("outgoing"),
-                    peer.get("_incoming"),
-                    peer.get("_outgoing"),
+                    peer.get("_raw_incoming"),
+                    peer.get("_raw_outgoing"),
                     peer.get("handshake_at"),
                     peer.get("online"),
                     peer.get("endpoint"),
@@ -1307,6 +1369,38 @@ class WireGuardDriver(CoreDriver):
         if not cli or not name:
             return False
         result = run([cli, "show", name], check=False, timeout=5)
+        return result.returncode == 0
+
+    def _remove_live_peer(self, iface_name: str, public_key: str) -> bool:
+        cli = self._cli_bin()
+        if not cli or not iface_name or not public_key:
+            return False
+        result = run([cli, "set", iface_name, "peer", public_key, "remove"], check=False, timeout=10)
+        return result.returncode == 0
+
+    def _add_live_peer(self, iface_name: str, peer: dict[str, Any]) -> bool:
+        cli = self._cli_bin()
+        pub = str(peer.get("public_key") or "").strip()
+        allowed = str(peer.get("allowed_ips") or "").strip()
+        if not cli or not iface_name or not pub or not allowed:
+            return False
+
+        args = [
+            cli,
+            "set",
+            iface_name,
+            "peer",
+            pub,
+            "allowed-ips",
+            allowed,
+            "persistent-keepalive",
+            str(int(peer.get("persistent_keepalive") or 25)),
+        ]
+        psk = str(peer.get("preshared_key") or "").strip()
+        if psk:
+            args.extend(["preshared-key", psk])
+
+        result = run(args, check=False, timeout=10)
         return result.returncode == 0
 
     def _sync_conf(self, iface: dict[str, Any]) -> None:

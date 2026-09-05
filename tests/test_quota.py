@@ -1,4 +1,8 @@
-from agent.support.quota import has_volume_quota, quota_exceeded, seed_stale_zero_baseline
+from agent.support.quota import (
+    has_volume_quota,
+    quota_exceeded,
+    seed_stale_zero_baseline,
+)
 
 
 def test_unlimited_client_without_volume_field_is_not_enforced():
@@ -69,3 +73,19 @@ def test_seed_stale_zero_baseline_skips_when_baseline_already_set():
 
     assert seed_stale_zero_baseline(client) is False
     assert client["_incoming"] == 100
+
+
+def test_seed_stale_zero_baseline_heals_legacy_raw_kernel_baseline():
+    client = {
+        "is_enabled": True,
+        "volume": 20_000_000_000,
+        "_incoming": 4204,
+        "_outgoing": 1764,
+        "incoming": 66_505_328_660,
+        "outgoing": 5_403_803_980,
+    }
+
+    assert seed_stale_zero_baseline(client) is True
+    assert client["_incoming"] == 66_505_328_660
+    assert client["_outgoing"] == 5_403_803_980
+    assert quota_exceeded(client, 66_505_328_660, 5_403_803_980) is False
