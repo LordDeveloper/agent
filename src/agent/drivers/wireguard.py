@@ -151,13 +151,36 @@ def _materialize_peer_keypair(peer: dict[str, Any], cli: str) -> None:
 
 def _server_address(subnet: str) -> str:
     """First usable host in the subnet — WireGuard interface gateway."""
-    network = ipaddress.ip_network(subnet, strict=False)
+    network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
     return str(next(network.hosts()))
+
+
+def _normalize_subnet(subnet: str, *, default_prefix: int = 16) -> str:
+    """
+    Canonical CIDR for peer allocation.
+
+    Panel/operators often store bare addresses like 10.90.0.0 meaning a /16 pool.
+    Without an explicit prefix, Python treats 10.90.68.0 as /32 (one host) and
+    peer creation fails with 'No free IPs in subnet'.
+    """
+    text = str(subnet or "").strip()
+    if not text:
+        raise AgentError("VALIDATION_ERROR", "WireGuard subnet is required")
+
+    host = text.split("/", 1)[0].strip()
+    if "/" not in text:
+        return f"{host}/{default_prefix}"
+
+    network = ipaddress.ip_network(text, strict=False)
+    if network.prefixlen >= 31:
+        raise AgentError("VALIDATION_ERROR", f"WireGuard subnet [{text}] is too small for peers")
+
+    return str(network)
 
 
 def _reserved_peer_addresses(subnet: str) -> set[str]:
     """Network, broadcast, gateway, and last host must not be assigned to peers."""
-    network = ipaddress.ip_network(subnet, strict=False)
+    network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
     hosts = list(network.hosts())
     reserved = {str(network.network_address), str(network.broadcast_address)}
     if not hosts:
@@ -170,7 +193,7 @@ def _reserved_peer_addresses(subnet: str) -> set[str]:
 
 def _next_ip(subnet: str, used: set[str]) -> str:
     reserved = _reserved_peer_addresses(subnet)
-    network = ipaddress.ip_network(subnet, strict=False)
+    network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
     for host in network.hosts():
         ip = str(host)
         if ip in reserved or ip in used:
@@ -519,6 +542,8 @@ class WireGuardDriver(CoreDriver):
             if exclude_id is None or str(row.get("id")) != str(exclude_id)
         }
         wanted = str(requested or "").strip()
+        if wanted:
+            wanted = _normalize_subnet(wanted)
         if wanted and wanted not in used:
             return wanted
         base = 112 if self.key == "amnezia" else 80
@@ -532,7 +557,10 @@ class WireGuardDriver(CoreDriver):
     def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         iface = self.get_interface(interface_id)
         previous = deepcopy(iface)
-        iface.update({k: v for k, v in payload.items() if k not in ("id",)})
+        updates = {k: v for k, v in payload.items() if k not in ("id",)}
+        if "subnet" in updates and updates["subnet"] is not None:
+            updates["subnet"] = _normalize_subnet(str(updates["subnet"]))
+        iface.update(updates)
         self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
@@ -1308,9 +1336,7 @@ class WireGuardDriver(CoreDriver):
         return Path(self.settings.wireguard.config_dir)
 
     def _interface_lines(self, iface: dict[str, Any]) -> list[str]:
-        address = iface["subnet"]
-        if "/" not in str(address):
-            address = f"{address}/16"
+        address = _normalize_subnet(str(iface["subnet"]))
         try:
             network = ipaddress.ip_network(address, strict=False)
             host = _server_address(str(network))

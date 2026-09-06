@@ -2,11 +2,23 @@ from agent.drivers.wireguard import (
     WireGuardDriver,
     _assign_peer_address,
     _next_ip,
+    _normalize_subnet,
     _repair_reserved_peer_addresses,
     _reserved_peer_addresses,
     _server_address,
     accumulate_transfer,
 )
+
+
+def test_normalize_subnet_defaults_bare_address_to_slash_16():
+    assert _normalize_subnet('10.90.0.0') == '10.90.0.0/16'
+    assert _normalize_subnet('10.90.68.0/24') == '10.90.68.0/24'
+
+
+def test_next_ip_supports_slash_16_after_slash_24_fill():
+    used = {f'10.90.68.{host}' for host in range(2, 255)}
+    assert _next_ip('10.90.0.0/16', used) == '10.90.0.2'
+    assert _next_ip('10.90.0.0/16', set()) == '10.90.0.2'
 
 
 def test_server_address_is_first_host():
