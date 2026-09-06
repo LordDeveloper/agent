@@ -1,7 +1,10 @@
 from agent.drivers.wireguard import (
     WireGuardDriver,
     _assign_peer_address,
+    _assign_peer_address_with_expand,
     _enabled_peers_sorted_by_ip,
+    _ensure_interface_address,
+    _interface_address_cidr,
     _next_ip,
     _normalize_subnet,
     _peer_lines_for_conf,
@@ -32,14 +35,51 @@ def test_expand_subnet_if_exhausted_from_slash_24_to_slash_16():
 
 
 def test_assign_peer_address_with_expand_on_full_slash_24():
-    from agent.drivers.wireguard import _assign_peer_address_with_expand
-
     iface = {"subnet": "10.90.68.0/24", "peers": []}
     used = {f"10.90.68.{host}" for host in range(2, 255)}
     peer: dict = {}
     assert _assign_peer_address_with_expand(iface, peer, used) is True
     assert iface["subnet"] == "10.90.0.0/16"
+    assert iface["interface_address"] == "10.90.68.1"
     assert peer["address"] == "10.90.0.2"
+
+
+def test_interface_address_preserved_after_manual_slash_16():
+    iface = {
+        "subnet": "10.90.0.0/16",
+        "peers": [{"address": f"10.90.68.{host}"} for host in range(2, 20)],
+    }
+    _ensure_interface_address(iface)
+    assert iface["interface_address"] == "10.90.68.1"
+    assert _interface_address_cidr(iface) == "10.90.68.1/16"
+
+
+def test_interface_lines_use_preserved_gateway(monkeypatch):
+    from pathlib import Path
+
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    driver.key = "wireguard"
+    driver.settings = type("S", (), {"data_dir": "/tmp/agent"})()
+    monkeypatch.setattr(
+        "agent.support.peer_egress.apply_script_path",
+        lambda _data: Path("/tmp/apply.sh"),
+    )
+    lines = driver._interface_lines(
+        {
+            "subnet": "10.90.0.0/16",
+            "interface_address": "10.90.68.1",
+            "listen_port": 10295,
+            "private_key": "E" * 43 + "=",
+        }
+    )
+    assert "Address = 10.90.68.1/16" in lines
+
+
+def test_assign_peer_address_skips_interface_gateway_on_slash_16():
+    iface = {"subnet": "10.90.0.0/16", "interface_address": "10.90.68.1", "peers": []}
+    peer: dict = {"address": "10.90.68.1"}
+    _assign_peer_address(peer, "10.90.0.0/16", set(), iface=iface)
+    assert peer["address"] != "10.90.68.1"
 
 
 def test_server_address_is_first_host():

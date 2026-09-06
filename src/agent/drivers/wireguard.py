@@ -155,6 +155,109 @@ def _server_address(subnet: str) -> str:
     return str(next(network.hosts()))
 
 
+def _interface_gateway_host(iface: dict[str, Any]) -> str:
+    stored = str(iface.get("interface_address") or "").strip()
+    if stored:
+        return stored.split("/", 1)[0].strip()
+    return _server_address(str(iface.get("subnet") or ""))
+
+
+def _ensure_interface_address(iface: dict[str, Any], *, previous_subnet: str | None = None) -> None:
+    """Keep a stable gateway IP when the peer pool widens (e.g. /24 → /16)."""
+    subnet = str(iface.get("subnet") or "").strip()
+    if not subnet:
+        return
+
+    network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+    stored = str(iface.get("interface_address") or "").split("/", 1)[0].strip()
+    if stored:
+        try:
+            if ipaddress.ip_address(stored) in network:
+                iface["interface_address"] = stored
+                return
+        except ValueError:
+            pass
+
+    if previous_subnet:
+        old_gateway = _server_address(previous_subnet)
+        try:
+            if ipaddress.ip_address(old_gateway) in network:
+                iface["interface_address"] = old_gateway
+                return
+        except ValueError:
+            pass
+
+    inferred = _infer_gateway_from_peers(iface)
+    if inferred:
+        try:
+            if ipaddress.ip_address(inferred) in network:
+                iface["interface_address"] = inferred
+                return
+        except ValueError:
+            pass
+
+    iface["interface_address"] = _server_address(subnet)
+
+
+def _interface_address_cidr(iface: dict[str, Any]) -> str:
+    subnet = _normalize_subnet(str(iface.get("subnet") or ""))
+    network = ipaddress.ip_network(subnet, strict=False)
+    return f"{_interface_gateway_host(iface)}/{network.prefixlen}"
+
+
+def _interface_address_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    try:
+        return _interface_address_cidr(before) != _interface_address_cidr(after)
+    except AgentError:
+        return str(before.get("subnet") or "") != str(after.get("subnet") or "")
+
+
+def _infer_gateway_from_peers(iface: dict[str, Any]) -> str | None:
+    """Guess legacy /24 gateway (e.g. 10.90.68.1) after pool widen to /16."""
+    subnet = str(iface.get("subnet") or "").strip()
+    if not subnet:
+        return None
+
+    try:
+        network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+    except ValueError:
+        return None
+
+    if network.prefixlen > 24:
+        return None
+
+    counts: dict[str, int] = {}
+    for peer in iface.get("peers") or []:
+        host = str(peer.get("address") or "").split("/", 1)[0].strip()
+        if not host:
+            allowed = str(peer.get("allowed_ips") or "").split(",", 1)[0].strip()
+            host = allowed.split("/", 1)[0].strip()
+        if not host:
+            continue
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if ip not in network:
+            continue
+        prefix = ".".join(host.split(".")[:3])
+        counts[prefix] = counts.get(prefix, 0) + 1
+
+    if not counts:
+        return None
+
+    top = max(counts, key=counts.get)
+    parts = top.split(".")
+    if len(parts) != 3:
+        return None
+    return f"{parts[0]}.{parts[1]}.{parts[2]}.1"
+
+
+def _interface_gateway_reserved(iface: dict[str, Any]) -> set[str]:
+    _ensure_interface_address(iface)
+    return {_interface_gateway_host(iface)}
+
+
 def _normalize_subnet(subnet: str, *, default_prefix: int = 16) -> str:
     """
     Canonical CIDR for peer allocation.
@@ -251,7 +354,7 @@ def _assign_peer_address_with_expand(
 ) -> bool:
     subnet = str(iface.get("subnet") or "")
     try:
-        _assign_peer_address(peer, subnet, used_ips)
+        _assign_peer_address(peer, subnet, used_ips, iface=iface)
         return False
     except AgentError as exc:
         if "No free IPs" not in str(getattr(exc, "message", exc)):
@@ -265,21 +368,30 @@ def _assign_peer_address_with_expand(
         )
 
     iface["subnet"] = expanded
-    _assign_peer_address(peer, expanded, used_ips)
+    _ensure_interface_address(iface, previous_subnet=subnet)
+    _assign_peer_address(peer, expanded, used_ips, iface=iface)
     return True
 
 
 _IMMUTABLE_PEER_KEYS = frozenset({"private_key", "public_key", "address", "allowed_ips"})
 
 
-def _assign_peer_address(peer: dict[str, Any], subnet: str, used_ips: set[str]) -> None:
+def _assign_peer_address(
+    peer: dict[str, Any],
+    subnet: str,
+    used_ips: set[str],
+    *,
+    iface: dict[str, Any] | None = None,
+) -> None:
     """Pick a peer tunnel address; never assign gateway/broadcast/reserved hosts."""
     reserved = _reserved_peer_addresses(subnet)
+    if iface is not None:
+        reserved |= _interface_gateway_reserved(iface)
     requested = str(peer.get("address") or "").strip()
     if requested and requested not in reserved and requested not in used_ips:
         peer["address"] = requested
     else:
-        peer["address"] = _next_ip(subnet, used_ips)
+        peer["address"] = _next_ip(subnet, used_ips | reserved)
     peer["allowed_ips"] = f"{peer['address']}/32"
 
 
@@ -289,7 +401,7 @@ def _repair_reserved_peer_addresses(iface: dict[str, Any]) -> bool:
     if not subnet:
         return False
 
-    reserved = _reserved_peer_addresses(subnet)
+    reserved = _reserved_peer_addresses(subnet) | _interface_gateway_reserved(iface)
     used: set[str] = set()
     for row in iface.get("peers", []):
         addr = str(row.get("address") or "").strip()
@@ -634,6 +746,7 @@ class WireGuardDriver(CoreDriver):
         if payload.get("obfuscation") is not None:
             iface["obfuscation"] = payload["obfuscation"]
 
+        _ensure_interface_address(iface)
         self.store.put_doc(self.key, self._kind, str(iface_id), iface)
         self.audit.record("create", f"{self.key}/interface/{iface_id}")
         up = self._bring_up(iface)
@@ -667,13 +780,16 @@ class WireGuardDriver(CoreDriver):
         iface = self.get_interface(interface_id)
         previous = deepcopy(iface)
         updates = {k: v for k, v in payload.items() if k not in ("id",)}
+        old_subnet = str(previous.get("subnet") or "")
         if "subnet" in updates and updates["subnet"] is not None:
             updates["subnet"] = _normalize_subnet(str(updates["subnet"]))
         iface.update(updates)
+        _ensure_interface_address(iface, previous_subnet=old_subnet or None)
+        bring_up = _interface_address_changed(previous, iface)
         self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
-            self._apply_live(iface)
+            self._apply_live(iface, force_bring_up=bring_up)
         except AgentError:
             self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
@@ -963,11 +1079,13 @@ class WireGuardDriver(CoreDriver):
             }
 
         iface["peers"] = rows
+        _ensure_interface_address(iface, previous_subnet=str(previous.get("subnet") or "") or None)
+        bring_up = _interface_address_changed(previous, iface)
         self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             if wg_apply:
-                self._apply_live(iface)
+                self._apply_live(iface, force_bring_up=bring_up)
             elif egress_only:
                 self._sync_peer_egress()
         except AgentError:
@@ -1445,13 +1563,8 @@ class WireGuardDriver(CoreDriver):
         return Path(self.settings.wireguard.config_dir)
 
     def _interface_lines(self, iface: dict[str, Any]) -> list[str]:
-        address = _normalize_subnet(str(iface["subnet"]))
-        try:
-            network = ipaddress.ip_network(address, strict=False)
-            host = _server_address(str(network))
-            address = f"{host}/{network.prefixlen}"
-        except ValueError:
-            pass
+        _ensure_interface_address(iface)
+        address = _interface_address_cidr(iface)
 
         lines = [
             "[Interface]",
@@ -1568,7 +1681,7 @@ class WireGuardDriver(CoreDriver):
         result = run([quick, "down", str(self._conf_file(name))], check=False)
         return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
 
-    def _apply_live(self, iface: dict[str, Any]) -> None:
+    def _apply_live(self, iface: dict[str, Any], *, force_bring_up: bool = False) -> None:
         self._validate_before_apply(iface)
 
         cli = self._cli_bin()
@@ -1580,6 +1693,25 @@ class WireGuardDriver(CoreDriver):
         if not cli or not quick:
             self._sync_conf(iface)
             self._sync_peer_egress()
+            return
+
+        if force_bring_up:
+            try:
+                if self._interface_is_up(name):
+                    down = self._bring_down(iface)
+                    if not down.get("ok"):
+                        detail = (down.get("stderr") or "wg-quick down failed").strip()
+                        raise AgentError("VALIDATION_ERROR", f"WireGuard interface recycle failed: {detail}")
+                up = self._bring_up(iface)
+                if not up.get("ok"):
+                    detail = (up.get("stderr") or up.get("message") or "wg-quick up failed").strip()
+                    raise AgentError("VALIDATION_ERROR", f"WireGuard interface recycle failed: {detail}")
+            except AgentError:
+                if backup is not None:
+                    conf_path.write_text(backup, encoding="utf-8")
+                else:
+                    conf_path.unlink(missing_ok=True)
+                raise
             return
 
         if not self._interface_is_up(name):
