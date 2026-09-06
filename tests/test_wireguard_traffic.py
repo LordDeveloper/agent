@@ -1,8 +1,10 @@
 from agent.drivers.wireguard import (
     WireGuardDriver,
     _assign_peer_address,
+    _enabled_peers_sorted_by_ip,
     _next_ip,
     _normalize_subnet,
+    _peer_lines_for_conf,
     _repair_reserved_peer_addresses,
     _reserved_peer_addresses,
     _server_address,
@@ -235,3 +237,62 @@ def test_accumulate_transfer_no_handshake_keeps_previous_offline():
     assert peer["outgoing"] == 5
     assert peer["online"] is False
     assert peer["handshake_at"] == "2020-01-01T00:00:00+00:00"
+
+
+def test_enabled_peers_sorted_by_ip():
+    iface = {
+        "peers": [
+            {"id": "c", "address": "10.90.68.15", "is_enabled": True},
+            {"id": "a", "address": "10.90.68.3", "is_enabled": True},
+            {"id": "b", "address": "10.90.0.2", "is_enabled": True},
+            {"id": "off", "address": "10.90.68.99", "is_enabled": False},
+        ],
+    }
+    rows = _enabled_peers_sorted_by_ip(iface)
+    assert [row["id"] for row in rows] == ["b", "a", "c"]
+
+
+def test_peer_lines_for_conf_adds_id_comment_under_peer_section():
+    lines = _peer_lines_for_conf(
+        {
+            "id": "S66SZo",
+            "public_key": "abc123=",
+            "allowed_ips": "10.90.68.5/32",
+            "persistent_keepalive": 25,
+        }
+    )
+    assert lines[:4] == [
+        "[Peer]",
+        "# S66SZo",
+        "PublicKey = abc123=",
+        "AllowedIPs = 10.90.68.5/32",
+    ]
+
+
+def test_render_conf_sorts_peers_and_includes_comments(monkeypatch):
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    monkeypatch.setattr(driver, "_interface_lines", lambda _iface: ["[Interface]", ""])
+    conf = driver._render_conf(
+        {
+            "peers": [
+                {
+                    "id": "peer-high",
+                    "address": "10.90.68.15",
+                    "public_key": "high=",
+                    "allowed_ips": "10.90.68.15/32",
+                    "is_enabled": True,
+                },
+                {
+                    "id": "peer-low",
+                    "address": "10.90.68.3",
+                    "public_key": "low=",
+                    "allowed_ips": "10.90.68.3/32",
+                    "is_enabled": True,
+                },
+            ],
+        }
+    )
+    low_index = conf.index("# peer-low")
+    high_index = conf.index("# peer-high")
+    assert low_index < high_index
+    assert "[Peer]\n# peer-low" in conf

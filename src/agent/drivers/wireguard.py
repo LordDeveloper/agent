@@ -309,6 +309,48 @@ def _repair_reserved_peer_addresses(iface: dict[str, Any]) -> bool:
     return changed
 
 
+def _peer_id_label(peer: dict[str, Any]) -> str:
+    return str(peer.get("id") or peer.get("email") or "").strip()
+
+
+def _peer_tunnel_ip(peer: dict[str, Any]) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    raw = str(peer.get("address") or "").strip()
+    if not raw:
+        allowed = str(peer.get("allowed_ips") or "").split(",", 1)[0].strip()
+        raw = allowed.split("/", 1)[0].strip()
+    if not raw:
+        return ipaddress.ip_address("255.255.255.255")
+    try:
+        return ipaddress.ip_address(raw)
+    except ValueError:
+        return ipaddress.ip_address("255.255.255.255")
+
+
+def _peer_sort_key(peer: dict[str, Any]) -> tuple[Any, ...]:
+    return (_peer_tunnel_ip(peer), _peer_id_label(peer))
+
+
+def _enabled_peers_sorted_by_ip(iface: dict[str, Any]) -> list[dict[str, Any]]:
+    peers = [row for row in iface.get("peers", []) if record_is_enabled(row)]
+    return sorted(peers, key=_peer_sort_key)
+
+
+def _peer_lines_for_conf(peer: dict[str, Any]) -> list[str]:
+    lines = ["[Peer]"]
+    label = _peer_id_label(peer)
+    if label:
+        lines.append(f"# {label}")
+    lines.extend(
+        [
+            f"PublicKey = {peer.get('public_key')}",
+            f"AllowedIPs = {peer.get('allowed_ips')}",
+            f"PersistentKeepalive = {peer.get('persistent_keepalive', 25)}",
+            "",
+        ]
+    )
+    return lines
+
+
 def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -> bool:
     """True when live WireGuard peer config must change (not just egress metadata)."""
     wg_keys = (
@@ -1433,18 +1475,8 @@ class WireGuardDriver(CoreDriver):
 
     def _render_conf(self, iface: dict[str, Any]) -> str:
         lines = self._interface_lines(iface)
-        for peer in iface.get("peers", []):
-            if not record_is_enabled(peer):
-                continue
-            lines.extend(
-                [
-                    "[Peer]",
-                    f"PublicKey = {peer.get('public_key')}",
-                    f"AllowedIPs = {peer.get('allowed_ips')}",
-                    f"PersistentKeepalive = {peer.get('persistent_keepalive', 25)}",
-                    "",
-                ]
-            )
+        for peer in _enabled_peers_sorted_by_ip(iface):
+            lines.extend(_peer_lines_for_conf(peer))
         return "\n".join(lines)
 
     def _validate_before_apply(self, iface: dict[str, Any]) -> None:
