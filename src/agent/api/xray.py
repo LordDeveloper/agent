@@ -157,6 +157,15 @@ def batch_remove_clients(inbound_id: str, body: dict[str, Any], xray: XrayDriver
     return {"success": True, **result}
 
 
+@router.get("/inbounds/{inbound_id}/clients/{client_key}")
+def get_client_record(inbound_id: str, client_key: str, xray: XrayDriver = Depends(get_xray)):
+    try:
+        client = xray.get_client_record(inbound_id, client_key)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "client": client}
+
+
 @router.put("/inbounds/{inbound_id}/clients/{client_key}")
 def update_client(inbound_id: str, client_key: str, payload: ClientPayload, xray: XrayDriver = Depends(get_xray)):
     try:
@@ -192,6 +201,24 @@ def reset_traffic(
         raise_agent_error("INTERNAL_ERROR", f"{type(exc).__name__}: {exc}", 500)
     traffic.reset_client_record("xray", client, client_key)
     return {"success": True, "client": client}
+
+
+@router.get("/diagnose")
+def diagnose_client(
+    key: str | None = None,
+    email: str | None = None,
+    client_id: str | None = None,
+    inbound_id: str | None = None,
+    xray: XrayDriver = Depends(get_xray),
+):
+    client_key = str(key or email or client_id or "").strip()
+    if not client_key:
+        raise_agent_error("VALIDATION_ERROR", "key, email, or client_id is required", 422)
+    try:
+        report = xray.diagnose_client(client_key, inbound_id=inbound_id)
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return report
 
 
 @router.get("/clients/{email}/ips")

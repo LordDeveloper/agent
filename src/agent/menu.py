@@ -887,16 +887,28 @@ def _show_ads_block_test(domain: str) -> None:
 
 def _peer_diagnose_menu() -> None:
     while True:
-        render_header("Peer diagnose")
+        render_header("Peer / client diagnose")
         picked = select(
             [
                 Choice("wireguard", "WireGuard peer", CYAN, "1"),
                 Choice("amnezia", "Amnezia peer", BLUE, "2"),
+                Choice("xray", "Xray client (email)", GREEN, "3"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
+        if picked == "xray":
+            email = prompt_text("Client email (searches all inbounds)")
+            if not str(email or "").strip():
+                continue
+            inbound_id = prompt_text("Inbound id (optional, Enter = all inbounds)", default="")
+            inbound_id = str(inbound_id or "").strip() or None
+            _run_action(
+                "Diagnose Xray client",
+                lambda addr=str(email).strip(), scope=inbound_id: _show_client_diagnose(addr, scope),
+            )
+            continue
         address = prompt_text("Peer address (e.g. 10.80.0.5)")
         if not str(address or "").strip():
             continue
@@ -905,6 +917,26 @@ def _peer_diagnose_menu() -> None:
             f"Diagnose {core} peer",
             lambda addr=str(address).strip(), selected_core=core: _show_peer_diagnose(selected_core, addr),
         )
+
+
+def _show_client_diagnose(email: str, inbound_id: str | None) -> None:
+    from agent.cli import cmd_client_diagnose
+
+    code = cmd_client_diagnose(
+        SimpleNamespace(
+            env_file=None,
+            email=email,
+            key=None,
+            client_id=None,
+            inbound_id=inbound_id,
+        )
+    )
+    if code == 0:
+        _print(paint("  healthy: yes", GREEN))
+    elif code == 2:
+        _print(paint("  client not found", YELLOW))
+    else:
+        _print(paint("  issues detected — see JSON above", RED))
 
 
 def _show_peer_diagnose(core: str, address: str) -> None:
@@ -963,7 +995,7 @@ def run_interactive() -> int:
                     Choice("tls", "TLS Certificates", YELLOW, "4"),
                     Choice("bbr", "BBR", MAGENTA, "5"),
                     Choice("dns_leak", "DNS leak & ads blocker", MAGENTA, "6"),
-                    Choice("peer_diagnose", "Peer diagnose", CYAN, "7"),
+                    Choice("peer_diagnose", "Peer / client diagnose", CYAN, "7"),
                     Choice("status", "Check status", WHITE, "8"),
                     Choice("stats", "Stats", WHITE, "9"),
                     Choice("update", "Update agent", WHITE, "10"),

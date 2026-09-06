@@ -620,6 +620,46 @@ class XrayDriver(CoreDriver):
                 return client
         return None
 
+    def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
+        """Return client metadata from config.json (includes disabled / quota rows)."""
+        key = str(client_key or "").strip()
+        if not key:
+            raise AgentError("VALIDATION_ERROR", "client key is required", 422)
+
+        tag = self.inbound_tag(inbound_id)
+        config = self.read_config()
+        for inbound in config.get("inbounds") or []:
+            if not isinstance(inbound, dict):
+                continue
+            inbound_tag = str(inbound.get("tag") or "").strip()
+            if inbound_tag != tag and str(inbound.get("id") or "") != str(inbound_id):
+                continue
+            client = self._find_client(inbound, key)
+            if client is not None:
+                return normalize_xray_client(client)
+
+        try:
+            inbound = self.get_inbound(inbound_id)
+            client = self._find_client(inbound, key)
+            if client is not None:
+                return normalize_xray_client(client)
+        except AgentError:
+            pass
+
+        raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
+
+    def diagnose_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
+        from agent.support.client_diagnose import diagnose_xray_client, diagnose_xray_clients_by_key
+
+        key = str(client_key or "").strip()
+        if not key:
+            raise ValueError("client key is required")
+
+        if inbound_id is not None and str(inbound_id).strip() != "":
+            return diagnose_xray_client(self, inbound_id, key)
+
+        return diagnose_xray_clients_by_key(self, key)
+
     def _index_clients(self, inbound: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         by_email: dict[str, dict[str, Any]] = {}
         by_id: dict[str, dict[str, Any]] = {}

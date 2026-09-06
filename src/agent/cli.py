@@ -422,6 +422,26 @@ def cmd_peer_diagnose(args: argparse.Namespace) -> int:
         runtime.close()
 
 
+def cmd_client_diagnose(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        driver = runtime.registry.get("xray")
+        if not hasattr(driver, "diagnose_client"):
+            raise AgentError("UNSUPPORTED_CAPABILITY", "Xray core does not support client diagnose")
+        client_key = str(args.email or args.key or args.client_id or "").strip()
+        if not client_key:
+            raise AgentError("VALIDATION_ERROR", "email, key, or client_id is required")
+        inbound_id = str(getattr(args, "inbound_id", "") or "").strip() or None
+        report = driver.diagnose_client(client_key, inbound_id=inbound_id)
+        _print_json(report)
+        healthy = bool((report.get("summary") or {}).get("healthy"))
+        if report.get("found") is False:
+            return 2
+        return 0 if healthy else 1
+    finally:
+        runtime.close()
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -699,6 +719,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="VPN core to inspect (default: wireguard)",
     )
     p_peer_diag.set_defaults(func=cmd_peer_diagnose)
+
+    p_client = sub.add_parser("client", help="Xray client diagnostics")
+    client_sub = p_client.add_subparsers(dest="client_command", required=True)
+
+    p_client_diag = client_sub.add_parser(
+        "diagnose",
+        help="Full config/runtime diagnostic for an Xray client (email, id, or UUID)",
+    )
+    _env_flag(p_client_diag)
+    p_client_diag.add_argument(
+        "--email",
+        help="Client email / remark (searches all inbounds when --inbound-id is omitted)",
+    )
+    p_client_diag.add_argument("--key", help="Alias for email or client UUID")
+    p_client_diag.add_argument("--client-id", help="Client UUID")
+    p_client_diag.add_argument(
+        "--inbound-id",
+        help="Optional inbound id/tag scope (default: search all inbounds by email/id)",
+    )
+    p_client_diag.set_defaults(func=cmd_client_diagnose)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)
