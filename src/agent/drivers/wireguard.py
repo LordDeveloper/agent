@@ -202,6 +202,73 @@ def _next_ip(subnet: str, used: set[str]) -> str:
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")
 
 
+def _slash_16_supernet(subnet: str) -> str | None:
+    """Map 10.x.y.0/24 (or smaller) to the containing RFC1918-style /16 pool."""
+    network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+    if network.version != 4 or network.prefixlen <= 16:
+        return None
+
+    octets = network.network_address.packed
+    return str(ipaddress.ip_network(f"{octets[0]}.{octets[1]}.0.0/16", strict=False))
+
+
+def _expand_subnet_if_exhausted(subnet: str, used_ips: set[str]) -> str | None:
+    """
+    When a legacy /24 pool is full, expand to the containing /16 if every assigned
+    peer address already fits inside it.
+    """
+    expanded = _slash_16_supernet(subnet)
+    if expanded is None:
+        return None
+
+    normalized = _normalize_subnet(subnet)
+    if expanded == normalized:
+        return None
+
+    parent = ipaddress.ip_network(expanded, strict=False)
+    for raw in used_ips:
+        ip_text = str(raw or "").split("/", 1)[0].strip()
+        if not ip_text:
+            continue
+        try:
+            if ipaddress.ip_address(ip_text) not in parent:
+                return None
+        except ValueError:
+            return None
+
+    try:
+        _next_ip(expanded, used_ips)
+    except AgentError:
+        return None
+
+    return expanded
+
+
+def _assign_peer_address_with_expand(
+    iface: dict[str, Any],
+    peer: dict[str, Any],
+    used_ips: set[str],
+) -> bool:
+    subnet = str(iface.get("subnet") or "")
+    try:
+        _assign_peer_address(peer, subnet, used_ips)
+        return False
+    except AgentError as exc:
+        if "No free IPs" not in str(getattr(exc, "message", exc)):
+            raise
+
+    expanded = _expand_subnet_if_exhausted(subnet, used_ips)
+    if expanded is None:
+        raise AgentError(
+            "VALIDATION_ERROR",
+            "No free IPs in subnet — set a wider subnet (e.g. 10.90.0.0/16) and refresh the interface",
+        )
+
+    iface["subnet"] = expanded
+    _assign_peer_address(peer, expanded, used_ips)
+    return True
+
+
 _IMMUTABLE_PEER_KEYS = frozenset({"private_key", "public_key", "address", "allowed_ips"})
 
 
@@ -592,7 +659,7 @@ class WireGuardDriver(CoreDriver):
                 return self.update_peer(interface_id, str(existing.get("id") or peer["id"]), payload)
 
         used_ips = {str(p.get("address") or "") for p in iface.get("peers", []) if p.get("address")}
-        _assign_peer_address(peer, str(iface["subnet"]), used_ips)
+        _assign_peer_address_with_expand(iface, peer, used_ips)
         cli = self._cli_bin() or "wg"
         _materialize_peer_keypair(peer, cli)
         peer.setdefault("incoming", 0)
@@ -696,7 +763,7 @@ class WireGuardDriver(CoreDriver):
         peer = normalize_peer(payload)
         peer.setdefault("id", str(uuid.uuid4()))
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
-        _assign_peer_address(peer, str(iface["subnet"]), used_ips)
+        _assign_peer_address_with_expand(iface, peer, used_ips)
         used_ips.add(str(peer["address"]))
         cli = self._cli_bin() or "wg"
         _materialize_peer_keypair(peer, cli)

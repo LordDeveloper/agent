@@ -21,6 +21,25 @@ def test_next_ip_supports_slash_16_after_slash_24_fill():
     assert _next_ip('10.90.0.0/16', set()) == '10.90.0.2'
 
 
+def test_expand_subnet_if_exhausted_from_slash_24_to_slash_16():
+    from agent.drivers.wireguard import _expand_subnet_if_exhausted
+
+    used = {f"10.90.68.{host}" for host in range(2, 255)}
+    expanded = _expand_subnet_if_exhausted("10.90.68.0/24", used)
+    assert expanded == "10.90.0.0/16"
+
+
+def test_assign_peer_address_with_expand_on_full_slash_24():
+    from agent.drivers.wireguard import _assign_peer_address_with_expand
+
+    iface = {"subnet": "10.90.68.0/24", "peers": []}
+    used = {f"10.90.68.{host}" for host in range(2, 255)}
+    peer: dict = {}
+    assert _assign_peer_address_with_expand(iface, peer, used) is True
+    assert iface["subnet"] == "10.90.0.0/16"
+    assert peer["address"] == "10.90.0.2"
+
+
 def test_server_address_is_first_host():
     assert _server_address("10.80.0.0/24") == "10.80.0.1"
 
