@@ -206,10 +206,33 @@ def _interface_address_cidr(iface: dict[str, Any]) -> str:
 
 
 def _interface_address_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    old_subnet = str(before.get("subnet") or "")
+    before_copy = deepcopy(before)
+    after_copy = deepcopy(after)
+    _ensure_interface_address(before_copy, previous_subnet=old_subnet or None)
+    _ensure_interface_address(after_copy, previous_subnet=old_subnet or None)
     try:
-        return _interface_address_cidr(before) != _interface_address_cidr(after)
+        return _interface_address_cidr(before_copy) != _interface_address_cidr(after_copy)
     except AgentError:
         return str(before.get("subnet") or "") != str(after.get("subnet") or "")
+
+
+def _subnet_prefix_widened(before_subnet: str, after_subnet: str) -> bool:
+    try:
+        before_net = ipaddress.ip_network(_normalize_subnet(before_subnet), strict=False)
+        after_net = ipaddress.ip_network(_normalize_subnet(after_subnet), strict=False)
+    except ValueError:
+        return before_subnet != after_subnet
+    return after_net.prefixlen < before_net.prefixlen
+
+
+def _interface_needs_recycle(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Recycle wg-quick only when the tunnel address/prefix actually changes."""
+    old_subnet = str(before.get("subnet") or "")
+    new_subnet = str(after.get("subnet") or "")
+    if _subnet_prefix_widened(old_subnet, new_subnet):
+        return True
+    return _interface_address_changed(before, after)
 
 
 def _infer_gateway_from_peers(iface: dict[str, Any]) -> str | None:
@@ -785,7 +808,7 @@ class WireGuardDriver(CoreDriver):
             updates["subnet"] = _normalize_subnet(str(updates["subnet"]))
         iface.update(updates)
         _ensure_interface_address(iface, previous_subnet=old_subnet or None)
-        bring_up = _interface_address_changed(previous, iface)
+        bring_up = _interface_needs_recycle(previous, iface)
         self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
@@ -1080,7 +1103,7 @@ class WireGuardDriver(CoreDriver):
 
         iface["peers"] = rows
         _ensure_interface_address(iface, previous_subnet=str(previous.get("subnet") or "") or None)
-        bring_up = _interface_address_changed(previous, iface)
+        bring_up = _interface_needs_recycle(previous, iface)
         self._validate_before_apply(iface)
         self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:

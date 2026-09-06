@@ -5,6 +5,7 @@ from agent.drivers.wireguard import (
     _enabled_peers_sorted_by_ip,
     _ensure_interface_address,
     _interface_address_cidr,
+    _interface_needs_recycle,
     _next_ip,
     _normalize_subnet,
     _peer_lines_for_conf,
@@ -52,6 +53,25 @@ def test_interface_address_preserved_after_manual_slash_16():
     _ensure_interface_address(iface)
     assert iface["interface_address"] == "10.90.68.1"
     assert _interface_address_cidr(iface) == "10.90.68.1/16"
+
+
+def test_interface_needs_recycle_only_when_prefix_widens_or_address_changes():
+    before = {
+        "subnet": "10.90.0.0/16",
+        "peers": [{"address": "10.90.68.5"}, {"address": "10.90.68.6"}],
+    }
+    after_add_peer = {
+        "subnet": "10.90.0.0/16",
+        "peers": [{"address": "10.90.68.5"}, {"address": "10.90.68.6"}, {"address": "10.90.0.3"}],
+    }
+    assert _interface_needs_recycle(before, after_add_peer) is False
+
+    after_expand = {
+        "subnet": "10.90.0.0/16",
+        "interface_address": "10.90.68.1",
+        "peers": [{"address": "10.90.68.5"}],
+    }
+    assert _interface_needs_recycle({"subnet": "10.90.68.0/24", "peers": after_expand["peers"]}, after_expand) is True
 
 
 def test_interface_lines_use_preserved_gateway(monkeypatch):
