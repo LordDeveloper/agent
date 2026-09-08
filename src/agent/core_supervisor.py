@@ -32,9 +32,17 @@ def bootstrap_enabled_cores(
             if key == "xray":
                 if driver.running():
                     logger.info("supervisor core=%s already running", key)
+                    try:
+                        driver.sync_proxy_protocol_forwarders()
+                    except Exception as exc:
+                        logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
                 driver.enable()
+                try:
+                    driver.sync_proxy_protocol_forwarders()
+                except Exception as exc:
+                    logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
             else:
                 logger.info("supervisor enabling interfaces core=%s", key)
                 driver.enable()

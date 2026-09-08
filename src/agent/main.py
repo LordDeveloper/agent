@@ -112,6 +112,9 @@ def create_app(env_file: str | None = None) -> FastAPI:
         stop_quota.set()
         if quota_task is not None:
             await quota_task
+        from agent.support.proxy_protocol_forwarder import stop_forwarders
+
+        stop_forwarders(settings)
         app_log.info("agent stopping")
         store.close()
 

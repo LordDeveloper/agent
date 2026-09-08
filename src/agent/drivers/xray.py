@@ -32,12 +32,18 @@ from agent.support.xray_console import (
     routing_without_rules,
     tail_file,
 )
+from agent.logutil import get_logger
 from agent.support.process import service_is_active
+from agent.support.proxy_protocol_forwarder import (
+    stop_forwarders,
+    sync_forwarders_from_inbounds,
+)
 from agent.xray_service import api_base_from_config, xray_auth_from_config
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
 _CLIENT_BATCH_MAX = 200
+_log = get_logger("xray")
 
 
 class XrayDriver(CoreDriver):
@@ -221,6 +227,7 @@ class XrayDriver(CoreDriver):
     def disable(self) -> dict[str, Any]:
         from agent.xray_service import stop_xray_service
 
+        stop_forwarders(self.settings)
         return stop_xray_service()
 
     def restart(self) -> dict[str, Any]:
@@ -507,6 +514,13 @@ class XrayDriver(CoreDriver):
     def list_inbounds(self) -> list[dict[str, Any]]:
         return [self._normalize(row) for row in self._api().list_inbounds()]
 
+    def sync_proxy_protocol_forwarders(self) -> dict[str, Any]:
+        try:
+            return sync_forwarders_from_inbounds(self.list_inbounds(), settings=self.settings)
+        except AgentError as exc:
+            _log.warning("pp-forward sync skipped: %s", exc.message)
+            return {"enabled": True, "rules": 0, "running": False, "error": exc.code}
+
     def get_inbound(self, inbound_id: int | str) -> dict[str, Any]:
         tag = self.inbound_tag(inbound_id)
         for inbound in self.list_inbounds():
@@ -552,7 +566,9 @@ class XrayDriver(CoreDriver):
         )
         self._api().add_inbounds([api_payload])
         self.audit.record("create", f"xray/inbound/{inbound_id}")
-        return self.get_inbound(inbound_id)
+        created = self.get_inbound(inbound_id)
+        self.sync_proxy_protocol_forwarders()
+        return created
 
     def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         existing = self.get_inbound(inbound_id)
@@ -572,7 +588,9 @@ class XrayDriver(CoreDriver):
             )
             self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}")
-            return self.get_inbound(inbound_id)
+            updated = self.get_inbound(inbound_id)
+            self.sync_proxy_protocol_forwarders()
+            return updated
 
     def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Rebuild protocol/stream for an inbound without delete+create when possible."""
@@ -594,7 +612,9 @@ class XrayDriver(CoreDriver):
             # Prefer in-place edit so clients stay attached and we avoid remove+add churn.
             self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}/refresh")
-            return self.get_inbound(inbound_id)
+            refreshed = self.get_inbound(inbound_id)
+            self.sync_proxy_protocol_forwarders()
+            return refreshed
 
     def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Update port/stream/sniffing/settings without rewriting client lists."""
@@ -612,6 +632,7 @@ class XrayDriver(CoreDriver):
         inbound = self.get_inbound(inbound_id)
         self._api().remove_inbounds([str(inbound.get("tag"))])
         self.audit.record("delete", f"xray/inbound/{inbound_id}")
+        self.sync_proxy_protocol_forwarders()
         return True
 
     def _find_client(self, inbound: dict[str, Any], client_key: str) -> dict[str, Any] | None:

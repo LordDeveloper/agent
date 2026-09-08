@@ -242,6 +242,25 @@ fi
 install -m 755 "$BIN_PATH" "$PREFIX/bin/agent"
 ln -sfn "$PREFIX/bin/agent" /usr/local/bin/agent
 
+PP_ASSET="pp-forward-linux-${HOST_LIBC}-${HOST_ARCH}"
+PP_ID="$(RELEASE_JSON="$RELEASE_JSON" PP_ASSET="$PP_ASSET" python3 - <<'PY'
+import json, os
+payload = json.loads(os.environ["RELEASE_JSON"])
+wanted = os.environ["PP_ASSET"]
+for asset in payload.get("assets") or []:
+    if asset.get("name") == wanted:
+        print(asset["id"])
+        break
+PY
+)"
+if [[ -n "${PP_ID}" ]]; then
+  PP_PATH="${TMP}/${PP_ASSET}"
+  echo "Downloading ${PP_ASSET} (${TAG})..."
+  download_asset "$PP_ID" "$PP_PATH"
+  chmod +x "$PP_PATH"
+  install -m 755 "$PP_PATH" "$PREFIX/bin/pp-forward"
+fi
+
 if [[ -f "$UNIT_PATH" ]]; then
   install -m 644 "$UNIT_PATH" "/etc/systemd/system/${SERVICE_NAME}.service"
 else

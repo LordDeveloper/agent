@@ -7,7 +7,7 @@ block_cipher = None
 a = Analysis(
     ['src/agent/__main__.py'],
     pathex=['src'],
-    binaries=[],
+    binaries=[('dist/pp-forward', '.')],
     datas=[],
     hiddenimports=[
         'agent.cli',

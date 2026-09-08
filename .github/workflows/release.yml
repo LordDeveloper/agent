@@ -8,7 +8,8 @@
 #   agent-linux-musl-arm64
 #   agent-linux-amd64       (alias → gnu-amd64)
 #   agent-linux-arm64       (alias → gnu-arm64)
-#   xray-linux-gnu-amd64 / xray-linux-gnu-arm64  (built from cloned LordDeveloper/xray)
+#   pp-forward-linux-gnu-amd64 / pp-forward-linux-gnu-arm64 / pp-forward-linux-musl-* 
+#   (bundled in agent PyInstaller; also shipped standalone)
 #   amneziawg-linux-gnu-amd64.tar.gz / amneziawg-linux-gnu-arm64.tar.gz
 
 name: Release agent
@@ -37,18 +38,22 @@ jobs:
         include:
           - platform: linux/amd64
             asset: agent-linux-gnu-amd64
+            pp_asset: pp-forward-linux-gnu-amd64
             dockerfile: Dockerfile
             runs-on: ubuntu-latest
           - platform: linux/arm64
             asset: agent-linux-gnu-arm64
+            pp_asset: pp-forward-linux-gnu-arm64
             dockerfile: Dockerfile
             runs-on: ubuntu-24.04-arm
           - platform: linux/amd64
             asset: agent-linux-musl-amd64
+            pp_asset: pp-forward-linux-musl-amd64
             dockerfile: Dockerfile.musl
             runs-on: ubuntu-latest
           - platform: linux/arm64
             asset: agent-linux-musl-arm64
+            pp_asset: pp-forward-linux-musl-arm64
             dockerfile: Dockerfile.musl
             runs-on: ubuntu-24.04-arm
     steps:
@@ -78,14 +83,21 @@ jobs:
           mkdir -p dist
           cp -f dist/export/agent "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
+          PP_ASSET="${{ matrix.pp_asset }}"
+          if [[ -f dist/export/pp-forward ]]; then
+            cp -f dist/export/pp-forward "dist/${PP_ASSET}"
+            chmod +x "dist/${PP_ASSET}"
+          fi
           file "dist/${{ matrix.asset }}" || true
-          ls -lh "dist/${{ matrix.asset }}"
+          ls -lh "dist/${{ matrix.asset }}" "dist/${PP_ASSET}" 2>/dev/null || ls -lh "dist/${{ matrix.asset }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.pp_asset }}
           if-no-files-found: error
 
   build-xray:
@@ -217,6 +229,17 @@ jobs:
           cp -f dist/artifacts/agent-linux-gnu-arm64/agent-linux-gnu-arm64 dist/agent-linux-gnu-arm64
           cp -f dist/artifacts/agent-linux-musl-amd64/agent-linux-musl-amd64 dist/agent-linux-musl-amd64
           cp -f dist/artifacts/agent-linux-musl-arm64/agent-linux-musl-arm64 dist/agent-linux-musl-arm64
+          for pair in \
+            "agent-linux-gnu-amd64:pp-forward-linux-gnu-amd64" \
+            "agent-linux-gnu-arm64:pp-forward-linux-gnu-arm64" \
+            "agent-linux-musl-amd64:pp-forward-linux-musl-amd64" \
+            "agent-linux-musl-arm64:pp-forward-linux-musl-arm64"; do
+            agent_asset="${pair%%:*}"
+            pp_asset="${pair##*:}"
+            if [[ -f "dist/artifacts/${agent_asset}/${pp_asset}" ]]; then
+              cp -f "dist/artifacts/${agent_asset}/${pp_asset}" "dist/${pp_asset}"
+            fi
+          done
           cp -f dist/artifacts/xray-linux-gnu-amd64/xray-linux-gnu-amd64 dist/xray-linux-gnu-amd64
           cp -f dist/artifacts/xray-linux-gnu-arm64/xray-linux-gnu-arm64 dist/xray-linux-gnu-arm64
           cp -f dist/artifacts/amneziawg-linux-gnu-amd64.tar.gz/amneziawg-linux-gnu-amd64.tar.gz dist/amneziawg-linux-gnu-amd64.tar.gz
@@ -225,8 +248,9 @@ jobs:
           cp -f dist/xray-linux-gnu-arm64 dist/xray-linux-arm64
           cp -f dist/agent-linux-gnu-amd64 dist/agent-linux-amd64
           cp -f dist/agent-linux-gnu-arm64 dist/agent-linux-arm64
+          chmod +x dist/agent-linux-* dist/xray-linux-* dist/pp-forward-linux-* 2>/dev/null || true
           chmod +x dist/agent-linux-* dist/xray-linux-*
-          ls -lh dist/agent-linux-* dist/xray-linux-* dist/amneziawg-*.tar.gz
+          ls -lh dist/agent-linux-* dist/xray-linux-* dist/pp-forward-linux-* dist/amneziawg-*.tar.gz 2>/dev/null || ls -lh dist/agent-linux-* dist/xray-linux-* dist/amneziawg-*.tar.gz
           cp -f scripts/get-agent.sh install.sh uninstall.sh systemd/agent.service .env.example dist/
           chmod +x dist/get-agent.sh dist/install.sh dist/uninstall.sh
 
@@ -241,6 +265,10 @@ jobs:
             dist/agent-linux-musl-arm64
             dist/agent-linux-amd64
             dist/agent-linux-arm64
+            dist/pp-forward-linux-gnu-amd64
+            dist/pp-forward-linux-gnu-arm64
+            dist/pp-forward-linux-musl-amd64
+            dist/pp-forward-linux-musl-arm64
             dist/xray-linux-gnu-amd64
             dist/xray-linux-gnu-arm64
             dist/xray-linux-amd64
@@ -264,6 +292,10 @@ jobs:
             dist/agent-linux-musl-arm64
             dist/agent-linux-amd64
             dist/agent-linux-arm64
+            dist/pp-forward-linux-gnu-amd64
+            dist/pp-forward-linux-gnu-arm64
+            dist/pp-forward-linux-musl-amd64
+            dist/pp-forward-linux-musl-arm64
             dist/xray-linux-gnu-amd64
             dist/xray-linux-gnu-arm64
             dist/xray-linux-amd64

@@ -71,6 +71,9 @@ fi
 mkdir -p "$PREFIX/bin" "$CONFIG_DIR" "$DATA_DIR"
 install -m 755 "$BINARY_SRC" "$PREFIX/bin/agent"
 ln -sfn "$PREFIX/bin/agent" /usr/local/bin/agent
+if [[ -f "$ROOT/dist/pp-forward" ]]; then
+  install -m 755 "$ROOT/dist/pp-forward" "$PREFIX/bin/pp-forward"
+fi
 
 if [[ ! -f "$CONFIG_DIR/.env" ]]; then
   TOKEN="$(openssl rand -hex 32)"

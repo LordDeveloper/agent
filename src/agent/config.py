@@ -75,6 +75,9 @@ class AgentSettings(BaseSettings):
     quota_enforce_interval: float = 10.0
     # Seconds between traffic delta samples for panel billing (0 disables background worker).
     traffic_sample_interval: float = 30.0
+    # Sidecar TCP forwarder injecting PROXY protocol v1 for Xray acceptProxyProtocol inbounds.
+    proxy_protocol_forwarder_enabled: bool = True
+    proxy_protocol_forwarder_binary: str = ""
 
     @property
     def xray(self) -> XraySettings:
