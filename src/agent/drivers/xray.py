@@ -419,22 +419,26 @@ class XrayDriver(CoreDriver):
         return inbound
 
     def _edit_inbound_preserving(self, inbound: dict[str, Any], *, preserve_clients: bool) -> None:
-        api_payload = self._wire_inbound(inbound)
-        self._validate_config_mutation(
-            lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
-            inbound=api_payload,
-        )
-        if preserve_clients:
-            # Xray-core preserve_clients merges runtime/disk users; omit client lists so
-            # format updates stay fast even with thousands of clients.
-            slim = deepcopy(api_payload)
-            settings = dict(slim.get("settings") or {})
-            settings.pop("clients", None)
-            settings.pop("users", None)
-            slim["settings"] = settings
-            self._api().edit_inbounds([slim], preserve_clients=True)
-            return
-        self._api().edit_inbounds([api_payload], preserve_clients=False)
+        self._pause_proxy_forwarders()
+        try:
+            api_payload = self._wire_inbound(inbound)
+            self._validate_config_mutation(
+                lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
+                inbound=api_payload,
+            )
+            if preserve_clients:
+                # Xray-core preserve_clients merges runtime/disk users; omit client lists so
+                # format updates stay fast even with thousands of clients.
+                slim = deepcopy(api_payload)
+                settings = dict(slim.get("settings") or {})
+                settings.pop("clients", None)
+                settings.pop("users", None)
+                slim["settings"] = settings
+                self._api().edit_inbounds([slim], preserve_clients=True)
+                return
+            self._api().edit_inbounds([api_payload], preserve_clients=False)
+        finally:
+            self._resume_proxy_forwarders()
 
     def _wire_clients(self, inbound: dict[str, Any], clients: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         protocol = self._protocol_of(inbound)
@@ -521,6 +525,16 @@ class XrayDriver(CoreDriver):
             _log.warning("pp-forward sync skipped: %s", exc.message)
             return {"enabled": True, "rules": 0, "running": False, "error": exc.code}
 
+    def _pause_proxy_forwarders(self) -> None:
+        """Release public listen ports before Xray rebinding (port-1 conflicts)."""
+        stop_forwarders(self.settings)
+
+    def _resume_proxy_forwarders(self) -> None:
+        try:
+            self.sync_proxy_protocol_forwarders()
+        except Exception as exc:  # noqa: BLE001 — best-effort restore after failed edit
+            _log.warning("pp-forward resync failed: %s", exc)
+
     def get_inbound(self, inbound_id: int | str) -> dict[str, Any]:
         tag = self.inbound_tag(inbound_id)
         for inbound in self.list_inbounds():
@@ -564,11 +578,13 @@ class XrayDriver(CoreDriver):
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
         )
-        self._api().add_inbounds([api_payload])
+        self._pause_proxy_forwarders()
+        try:
+            self._api().add_inbounds([api_payload])
+        finally:
+            self._resume_proxy_forwarders()
         self.audit.record("create", f"xray/inbound/{inbound_id}")
-        created = self.get_inbound(inbound_id)
-        self.sync_proxy_protocol_forwarders()
-        return created
+        return self.get_inbound(inbound_id)
 
     def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         existing = self.get_inbound(inbound_id)
@@ -588,9 +604,7 @@ class XrayDriver(CoreDriver):
             )
             self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}")
-            updated = self.get_inbound(inbound_id)
-            self.sync_proxy_protocol_forwarders()
-            return updated
+            return self.get_inbound(inbound_id)
 
     def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Rebuild protocol/stream for an inbound without delete+create when possible."""
@@ -612,9 +626,7 @@ class XrayDriver(CoreDriver):
             # Prefer in-place edit so clients stay attached and we avoid remove+add churn.
             self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}/refresh")
-            refreshed = self.get_inbound(inbound_id)
-            self.sync_proxy_protocol_forwarders()
-            return refreshed
+            return self.get_inbound(inbound_id)
 
     def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Update port/stream/sniffing/settings without rewriting client lists."""
@@ -630,9 +642,12 @@ class XrayDriver(CoreDriver):
 
     def delete_inbound(self, inbound_id: int | str) -> bool:
         inbound = self.get_inbound(inbound_id)
-        self._api().remove_inbounds([str(inbound.get("tag"))])
+        self._pause_proxy_forwarders()
+        try:
+            self._api().remove_inbounds([str(inbound.get("tag"))])
+        finally:
+            self._resume_proxy_forwarders()
         self.audit.record("delete", f"xray/inbound/{inbound_id}")
-        self.sync_proxy_protocol_forwarders()
         return True
 
     def _find_client(self, inbound: dict[str, Any], client_key: str) -> dict[str, Any] | None:
