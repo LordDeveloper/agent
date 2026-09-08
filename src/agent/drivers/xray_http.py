@@ -8,6 +8,53 @@ import httpx
 
 from agent.config import XraySettings
 from agent.errors import AgentError
+from agent.logutil import get_logger
+
+_log = get_logger("xray.http")
+
+
+def format_xray_api_error(
+    status: int,
+    resolved: str,
+    body: Any,
+    *,
+    raw_text: str = "",
+) -> str:
+    """Build a verbose error line from Xray httpapi JSON (error/code/details/runtime_applied)."""
+    prefix = f"Xray HTTP API error ({status}) [{resolved}]"
+    if isinstance(body, dict):
+        chunks: list[str] = []
+        seen: set[str] = set()
+
+        def add(part: str) -> None:
+            text = " ".join(str(part or "").split())
+            if not text or text in seen:
+                return
+            seen.add(text)
+            chunks.append(text)
+
+        add(body.get("error"))
+        add(body.get("message"))
+        code = body.get("code")
+        if code:
+            add(f"code={code}")
+
+        details = body.get("details")
+        if isinstance(details, list):
+            for item in details[:12]:
+                add(item)
+        elif details:
+            add(details)
+
+        if body.get("runtime_applied") is True:
+            add("runtime_applied=true")
+
+        if chunks:
+            return f"{prefix}: {' | '.join(chunks)}"
+        return f"{prefix}: {json.dumps(body, ensure_ascii=False)[:1500]}"
+
+    text = " ".join(str(raw_text or body or "unknown").split())
+    return f"{prefix}: {text[:1500]}"
 
 
 class XrayHttpClient:
@@ -77,13 +124,40 @@ class XrayHttpClient:
 
         if response.status_code >= 400:
             code_hint = ""
+            body: Any = None
+            raw_text = response.text or ""
             try:
                 body = response.json()
-                message = str(body.get("error") or body.get("message") or body)
-                code_hint = str(body.get("code") or "").strip().lower()
             except Exception:
-                message = response.text or "unknown"
-            detail = f"Xray HTTP API error ({response.status_code}) [{resolved}]: {message}"
+                body = None
+
+            if isinstance(body, dict):
+                code_hint = str(body.get("code") or "").strip().lower()
+                message = format_xray_api_error(response.status_code, resolved, body)
+            else:
+                message = format_xray_api_error(
+                    response.status_code,
+                    resolved,
+                    body,
+                    raw_text=raw_text,
+                )
+
+            if isinstance(body, dict):
+                _log.warning(
+                    "xray api rejected request status=%s route=%s body=%s",
+                    response.status_code,
+                    resolved,
+                    json.dumps(body, ensure_ascii=False)[:3000],
+                )
+            elif raw_text.strip():
+                _log.warning(
+                    "xray api rejected request status=%s route=%s body=%s",
+                    response.status_code,
+                    resolved,
+                    raw_text[:3000],
+                )
+
+            detail = message
             message_lower = message.lower()
             # Offline users: Xray iplist returns 404 "...>>>online not found" — not missing config.
             if response.status_code == 404 and "online not found" in message_lower:

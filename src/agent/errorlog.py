@@ -36,21 +36,33 @@ class CoreErrorLog:
 
         level = str(kwargs.get("level") or "error").strip().lower()
         code = str(kwargs.get("code") or "")[:64]
-        message = " ".join(str(kwargs.get("message") or "").split())[:1000]
+        message = " ".join(str(kwargs.get("message") or "").split())[:2000]
+        detail = " ".join(str(kwargs.get("detail") or "").split())[:4000]
         method = str(kwargs.get("method") or "")[:16]
         path = str(kwargs.get("path") or "")[:256]
         status = int(kwargs.get("status") or 0)
 
         logger = get_logger(core)
         emit = logger.error if level == "error" else logger.warning
-        emit(
-            "core_error code=%s status=%s method=%s path=%s message=%s",
-            code,
-            status,
-            method,
-            path,
-            message,
-        )
+        if detail and detail not in message:
+            emit(
+                "core_error code=%s status=%s method=%s path=%s message=%s detail=%s",
+                code,
+                status,
+                method,
+                path,
+                message,
+                detail[:2000],
+            )
+        else:
+            emit(
+                "core_error code=%s status=%s method=%s path=%s message=%s",
+                code,
+                status,
+                method,
+                path,
+                message,
+            )
         flush_logging()
 
         return {
@@ -58,6 +70,7 @@ class CoreErrorLog:
             "level": "error" if level == "error" else "warning",
             "code": code,
             "message": message,
+            "detail": detail,
             "method": method,
             "path": path,
             "status": status,
@@ -126,7 +139,14 @@ def parse_fields(body: str) -> dict[str, Any]:
         "method": "",
         "path": "",
         "message": "",
+        "detail": "",
     }
+    detail_marker = " detail="
+    detail_at = body.find(detail_marker)
+    if detail_at >= 0:
+        result["detail"] = body[detail_at + len(detail_marker) :]
+        body = body[:detail_at]
+
     marker = " message="
     msg_at = body.find(marker)
     prefix = body if msg_at < 0 else body[:msg_at]
@@ -168,7 +188,7 @@ def parse_log_line(line: str) -> dict[str, Any] | None:
         "method": fields["method"],
         "path": fields["path"],
         "status": fields["status"],
-        "detail": "",
+        "detail": fields.get("detail") or "",
     }
 
 
@@ -281,6 +301,7 @@ class CoreErrorCaptureMiddleware(BaseHTTPMiddleware):
             method=request.method,
             path=path,
             status=response.status_code,
+            detail=_detail,
         )
 
         return response
