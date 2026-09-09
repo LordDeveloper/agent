@@ -509,6 +509,8 @@ def _migrate_wg_counter_fields(peer: dict[str, Any]) -> None:
     Legacy WireGuard peers stored kernel raw counters in _incoming/_outgoing.
     Quota baselines from the panel must stay cumulative in _incoming/_outgoing.
     """
+    from agent.support.disable_reason import baseline_looks_like_raw_kernel
+
     if "_raw_incoming" in peer or "_raw_outgoing" in peer:
         peer.setdefault("_raw_incoming", 0)
         peer.setdefault("_raw_outgoing", 0)
@@ -519,12 +521,37 @@ def _migrate_wg_counter_fields(peer: dict[str, Any]) -> None:
     cum_in = int(peer.get("incoming") or 0)
     cum_out = int(peer.get("outgoing") or 0)
 
-    peer["_raw_incoming"] = base_in
-    peer["_raw_outgoing"] = base_out
-
-    if (cum_in > 0 and base_in < cum_in) or (cum_out > 0 and base_out < cum_out):
+    if baseline_looks_like_raw_kernel(base_in, base_out, cum_in, cum_out):
+        peer["_raw_incoming"] = base_in
+        peer["_raw_outgoing"] = base_out
         peer["_incoming"] = cum_in
         peer["_outgoing"] = cum_out
+    else:
+        peer["_raw_incoming"] = 0
+        peer["_raw_outgoing"] = 0
+
+
+def _align_quota_baseline_to_cumulative(peer: dict[str, Any]) -> bool:
+    """Keep quota baselines aligned with cumulative totals (e.g. after kernel rx/tx reset)."""
+    cum_in = int(peer.get("incoming") or 0)
+    cum_out = int(peer.get("outgoing") or 0)
+    base_in = int(peer.get("_incoming") or 0)
+    base_out = int(peer.get("_outgoing") or 0)
+    changed = False
+
+    if base_in > cum_in:
+        peer["_incoming"] = cum_in
+        changed = True
+    if base_out > cum_out:
+        peer["_outgoing"] = cum_out
+        changed = True
+
+    if changed:
+        from agent.support.disable_reason import clear_disabled_metadata
+
+        clear_disabled_metadata(peer)
+
+    return changed
 
 
 def accumulate_transfer(
@@ -546,6 +573,7 @@ def accumulate_transfer(
     total_in = int(peer.get("incoming", 0) or 0)
     total_out = int(peer.get("outgoing", 0) or 0)
 
+    kernel_reset = (prev_in > 0 and incoming < prev_in) or (prev_out > 0 and outgoing < prev_out)
     delta_in = incoming if incoming < prev_in else incoming - prev_in
     delta_out = outgoing if outgoing < prev_out else outgoing - prev_out
 
@@ -553,6 +581,12 @@ def accumulate_transfer(
     peer["outgoing"] = total_out + delta_out
     peer["_raw_incoming"] = int(incoming)
     peer["_raw_outgoing"] = int(outgoing)
+    _align_quota_baseline_to_cumulative(peer)
+
+    if kernel_reset:
+        peer.pop("disabled_reason", None)
+        peer.pop("disabled_at", None)
+        peer.pop("disabled_detail", None)
 
     if endpoint and endpoint not in ("(none)", ""):
         peer["endpoint"] = endpoint
@@ -961,6 +995,20 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("persistent_keepalive", 25)
         return peer
 
+    @staticmethod
+    def _preserve_cumulative_counters(merged: dict[str, Any], before: dict[str, Any]) -> None:
+        """Panel billed usage must not regress agent cumulative store counters on sync."""
+        for key in ("incoming", "outgoing", "_incoming", "_outgoing"):
+            if key not in merged:
+                continue
+            try:
+                new_val = int(merged.get(key) or 0)
+                old_val = int(before.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if old_val > 0 and new_val < old_val:
+                merged[key] = old_val
+
     def _merge_peer_row(self, before: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
         merged = deepcopy(before)
         normalized = normalize_peer(payload)
@@ -982,6 +1030,7 @@ class WireGuardDriver(CoreDriver):
                 merged["exit_interface"] = normalized["exit_interface"]
             else:
                 merged.pop("exit_interface", None)
+        self._preserve_cumulative_counters(merged, before)
         from agent.support.quota import reseed_baseline_if_stale
 
         store_in = int(merged.get("incoming") or 0)

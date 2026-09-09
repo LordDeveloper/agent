@@ -202,6 +202,36 @@ def test_accumulate_transfer_after_reboot_reset():
     assert peer["online"] is False  # handshake timestamp is old vs now
 
 
+def test_accumulate_transfer_after_reboot_aligns_quota_baseline():
+    peer = {
+        "incoming": 1000,
+        "outgoing": 800,
+        "_incoming": 1200,
+        "_outgoing": 900,
+        "_raw_incoming": 900,
+        "_raw_outgoing": 700,
+        "disabled_reason": "quota_exceeded",
+    }
+    accumulate_transfer(peer, incoming=50, outgoing=30)
+    assert peer["_incoming"] == 1050
+    assert peer["_outgoing"] == 830
+    assert "disabled_reason" not in peer
+
+
+def test_migrate_wg_counter_fields_does_not_store_cumulative_as_raw():
+    from agent.drivers.wireguard import _migrate_wg_counter_fields
+
+    peer = {
+        "incoming": 66_505_328_660,
+        "outgoing": 5_403_803_980,
+        "_incoming": 66_505_328_660,
+        "_outgoing": 5_403_803_980,
+    }
+    _migrate_wg_counter_fields(peer)
+    assert peer["_raw_incoming"] == 0
+    assert peer["_raw_outgoing"] == 0
+
+
 def test_accumulate_transfer_migrates_legacy_raw_baseline():
     peer = {
         "incoming": 66_505_328_660,
