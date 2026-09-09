@@ -25,6 +25,15 @@ def _print_json(data) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
+def _emit_diagnose_report(report: dict, args: argparse.Namespace) -> None:
+    if getattr(args, 'json', False):
+        _print_json(report)
+        return
+    from agent.support.diagnose_format import print_diagnose_report
+
+    print_diagnose_report(report)
+
+
 def _env_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--env",
@@ -413,7 +422,7 @@ def cmd_peer_diagnose(args: argparse.Namespace) -> int:
         if not hasattr(driver, "diagnose_address"):
             raise AgentError("UNSUPPORTED_CAPABILITY", f"Core [{core}] does not support peer diagnose")
         report = driver.diagnose_address(args.address)
-        _print_json(report)
+        _emit_diagnose_report(report, args)
         healthy = bool((report.get("summary") or {}).get("healthy"))
         if report.get("found") is False:
             return 2
@@ -433,7 +442,7 @@ def cmd_client_diagnose(args: argparse.Namespace) -> int:
             raise AgentError("VALIDATION_ERROR", "email, key, or client_id is required")
         inbound_id = str(getattr(args, "inbound_id", "") or "").strip() or None
         report = driver.diagnose_client(client_key, inbound_id=inbound_id)
-        _print_json(report)
+        _emit_diagnose_report(report, args)
         healthy = bool((report.get("summary") or {}).get("healthy"))
         if report.get("found") is False:
             return 2
@@ -718,6 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["wireguard", "amnezia"],
         help="VPN core to inspect (default: wireguard)",
     )
+    p_peer_diag.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of a human-readable table",
+    )
     p_peer_diag.set_defaults(func=cmd_peer_diagnose)
 
     p_client = sub.add_parser("client", help="Xray client diagnostics")
@@ -737,6 +751,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_client_diag.add_argument(
         "--inbound-id",
         help="Optional inbound id/tag scope (default: search all inbounds by email/id)",
+    )
+    p_client_diag.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of a human-readable table",
     )
     p_client_diag.set_defaults(func=cmd_client_diagnose)
 

@@ -16,6 +16,8 @@ log = get_logger('tls')
 ACME_HOME = Path(os.environ.get('ACME_HOME', '/root/.acme.sh'))
 ACME_BIN = ACME_HOME / 'acme.sh'
 CERT_BASE = Path(os.environ.get('TLS_CERT_DIR', '/var/lib/agent/certs'))
+ACME_SERVER = (os.environ.get('ACME_SERVER', 'letsencrypt') or 'letsencrypt').strip()
+ACME_DEFAULT_EMAIL = (os.environ.get('ACME_EMAIL', '') or '').strip()
 
 ACME_INSTALL_URL = 'https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh'
 
@@ -30,6 +32,114 @@ def _run(args: list[str], *, timeout: int = 300, env: dict[str, str] | None = No
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=merged)
 
 
+def _resolve_acme_email(email: str = '') -> str:
+    return (email or ACME_DEFAULT_EMAIL).strip()
+
+
+def _acme_server_args() -> list[str]:
+    return ['--server', ACME_SERVER]
+
+
+def _strip_acme_log_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ''
+    if stripped.startswith('[') and '] ' in stripped:
+        return stripped.split('] ', 1)[1].strip()
+    return stripped
+
+
+def _extract_acme_error(combined: str) -> str:
+    """Prefer actionable acme.sh lines over debug timestamps."""
+    meaningful: list[str] = []
+    hints = (
+        'error', 'failed', 'please', 'cannot', 'unable', 'invalid',
+        'rate limit', 'verify error', 'connection refused', 'skipping',
+        'domains not changed', 'register-account',
+    )
+
+    for raw in combined.splitlines():
+        line = _strip_acme_log_line(raw)
+        if not line:
+            continue
+        lower = line.lower()
+        if any(hint in lower for hint in hints):
+            meaningful.append(line)
+
+    if meaningful:
+        return '\n'.join(meaningful[-8:])[:800]
+
+    tail = [_strip_acme_log_line(line) for line in combined.splitlines()[-12:]]
+    tail = [line for line in tail if line]
+    return '\n'.join(tail)[-800:]
+
+
+def _configure_acme(email: str = '') -> None:
+    """Force Let's Encrypt (or ACME_SERVER) and register account email when needed."""
+    if not acme_installed():
+        return
+
+    proc = _run([
+        str(ACME_BIN), '--set-default-ca',
+        '--home', str(ACME_HOME),
+        *_acme_server_args(),
+    ], timeout=60)
+    if proc.returncode != 0:
+        log.warning(
+            'acme.sh --set-default-ca warning: %s',
+            _extract_acme_error(f'{proc.stdout or ""}\n{proc.stderr or ""}'),
+        )
+
+    resolved_email = _resolve_acme_email(email)
+    if not resolved_email:
+        return
+
+    proc = _run([
+        str(ACME_BIN), '--register-account',
+        '--home', str(ACME_HOME),
+        *_acme_server_args(),
+        '-m', resolved_email,
+    ], timeout=60)
+    if proc.returncode != 0:
+        combined = f'{proc.stdout or ""}\n{proc.stderr or ""}'.lower()
+        if 'already' not in combined and 'registered' not in combined:
+            log.warning(
+                'acme.sh --register-account warning: %s',
+                _extract_acme_error(f'{proc.stdout or ""}\n{proc.stderr or ""}'),
+            )
+
+
+def _install_cert_to_agent(domain: str, paths: dict[str, str]) -> None:
+    base_args = [
+        str(ACME_BIN), '--install-cert',
+        '--home', str(ACME_HOME),
+        '-d', domain,
+        '--fullchain-file', paths['cert_file'],
+        '--key-file', paths['key_file'],
+    ]
+    last_error = ''
+    for extra in (['--ecc'], []):
+        proc = _run(base_args + extra, timeout=60)
+        if proc.returncode == 0 and Path(paths['cert_file']).is_file() and Path(paths['key_file']).is_file():
+            return
+        last_error = _extract_acme_error(f'{proc.stdout or ""}\n{proc.stderr or ""}')
+
+    raise AgentError('VALIDATION_ERROR', f'Certificate install failed: {last_error or "unknown error"}')
+
+
+def _try_install_from_acme_store(domain: str, paths: dict[str, str]) -> bool:
+    """Restore agent cert files from an existing acme.sh store entry."""
+    if not acme_installed():
+        return False
+
+    try:
+        _install_cert_to_agent(domain, paths)
+    except AgentError:
+        return False
+
+    return Path(paths['cert_file']).is_file() and Path(paths['key_file']).is_file()
+
+
 # ---------------------------------------------------------------------------
 # acme.sh helpers
 # ---------------------------------------------------------------------------
@@ -39,39 +149,47 @@ def acme_installed() -> bool:
 
 
 def ensure_acme(email: str = '') -> dict:
-    if acme_installed():
-        return {'installed': True, 'downloaded': False, 'path': str(ACME_BIN)}
+    downloaded = False
 
-    curl = shutil.which('curl')
-    wget = shutil.which('wget')
-    if not curl and not wget:
-        raise AgentError('VALIDATION_ERROR', 'curl or wget is required to install acme.sh')
+    if not acme_installed():
+        curl = shutil.which('curl')
+        wget = shutil.which('wget')
+        if not curl and not wget:
+            raise AgentError('VALIDATION_ERROR', 'curl or wget is required to install acme.sh')
 
-    ACME_HOME.mkdir(parents=True, exist_ok=True)
+        ACME_HOME.mkdir(parents=True, exist_ok=True)
 
-    if curl:
-        proc = _run([
-            curl, '-fsSL', ACME_INSTALL_URL,
-            '-o', str(ACME_HOME / 'acme.sh'),
-        ])
-    else:
-        proc = _run([
-            wget, '-qO', str(ACME_HOME / 'acme.sh'), ACME_INSTALL_URL,
-        ])
+        if curl:
+            proc = _run([
+                curl, '-fsSL', ACME_INSTALL_URL,
+                '-o', str(ACME_HOME / 'acme.sh'),
+            ])
+        else:
+            proc = _run([
+                wget, '-qO', str(ACME_HOME / 'acme.sh'), ACME_INSTALL_URL,
+            ])
 
-    if proc.returncode != 0:
-        raise AgentError('VALIDATION_ERROR', f'Failed to download acme.sh: {proc.stderr.strip()[:300]}')
+        if proc.returncode != 0:
+            raise AgentError('VALIDATION_ERROR', f'Failed to download acme.sh: {proc.stderr.strip()[:300]}')
 
-    ACME_BIN.chmod(0o755)
+        ACME_BIN.chmod(0o755)
 
-    install_args = [str(ACME_BIN), '--install', '--home', str(ACME_HOME)]
-    if email:
-        install_args += ['--accountemail', email]
-    proc = _run(install_args)
-    if proc.returncode != 0:
-        log.warning('acme.sh --install warning: %s', proc.stderr.strip()[:300])
+        install_args = [
+            str(ACME_BIN), '--install',
+            '--home', str(ACME_HOME),
+            *_acme_server_args(),
+        ]
+        resolved_email = _resolve_acme_email(email)
+        if resolved_email:
+            install_args += ['--accountemail', resolved_email]
+        proc = _run(install_args)
+        if proc.returncode != 0:
+            log.warning('acme.sh --install warning: %s', proc.stderr.strip()[:300])
+        downloaded = True
 
-    return {'installed': True, 'downloaded': True, 'path': str(ACME_BIN)}
+    _configure_acme(email)
+
+    return {'installed': True, 'downloaded': downloaded, 'path': str(ACME_BIN)}
 
 
 # ---------------------------------------------------------------------------
@@ -228,13 +346,29 @@ def _issue_cert_acme(
             **paths,
         }
 
+    if not force and _try_install_from_acme_store(primary, paths):
+        log.info('certificate restored from acme store domain=%s cert=%s', primary, paths['cert_file'])
+        return {
+            'success': True,
+            'issued': False,
+            'cached': True,
+            'restored': True,
+            'tool': 'acme',
+            'domain': primary,
+            'domains': san_domains,
+            **paths,
+        }
+
     args = [
         str(ACME_BIN), '--issue',
         '--home', str(ACME_HOME),
-        '--server', 'letsencrypt',
-        '--debug', '2',
+        *_acme_server_args(),
         *_domain_args(san_domains),
     ]
+
+    resolved_email = _resolve_acme_email(email)
+    if resolved_email:
+        args += ['--accountemail', resolved_email]
 
     env: dict[str, str] = {}
 
@@ -262,23 +396,12 @@ def _issue_cert_acme(
     proc = _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
-        output = (proc.stdout or '').strip()
-        stderr = (proc.stderr or '').strip()
-        combined = f'{output}\n{stderr}'.strip()
-        last_lines = '\n'.join(combined.splitlines()[-20:])[:800]
-        log.error('acme.sh --issue failed: %s', last_lines)
-        raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {last_lines}')
+        combined = f'{proc.stdout or ""}\n{proc.stderr or ""}'.strip()
+        detail = _extract_acme_error(combined)
+        log.error('acme.sh --issue failed: %s', detail)
+        raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {detail}')
 
-    install_args = [
-        str(ACME_BIN), '--install-cert',
-        '--home', str(ACME_HOME),
-        '-d', primary,
-        '--fullchain-file', paths['cert_file'],
-        '--key-file', paths['key_file'],
-    ]
-    proc = _run(install_args, timeout=60)
-    if proc.returncode != 0:
-        raise AgentError('VALIDATION_ERROR', f'Certificate install failed: {proc.stderr.strip()[:300]}')
+    _install_cert_to_agent(primary, paths)
 
     log.info('certificate issued domain=%s cert=%s tool=acme', primary, paths['cert_file'])
     return {
@@ -300,9 +423,12 @@ def _renew_cert_acme(domain: str, force: bool = False) -> dict:
     if not acme_installed():
         raise AgentError('VALIDATION_ERROR', 'acme.sh is not installed. Call install-acme first.')
 
+    _configure_acme()
+
     args = [
         str(ACME_BIN), '--renew',
         '--home', str(ACME_HOME),
+        *_acme_server_args(),
         '-d', domain,
     ]
     if force:
@@ -310,18 +436,11 @@ def _renew_cert_acme(domain: str, force: bool = False) -> dict:
 
     proc = _run(args, timeout=180)
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()[:500] or proc.stdout.strip()[:500]
-        raise AgentError('VALIDATION_ERROR', f'Certificate renew failed: {stderr}')
+        combined = f'{proc.stdout or ""}\n{proc.stderr or ""}'.strip()
+        raise AgentError('VALIDATION_ERROR', f'Certificate renew failed: {_extract_acme_error(combined)}')
 
     paths = cert_paths(domain)
-    install_args = [
-        str(ACME_BIN), '--install-cert',
-        '--home', str(ACME_HOME),
-        '-d', domain,
-        '--fullchain-file', paths['cert_file'],
-        '--key-file', paths['key_file'],
-    ]
-    _run(install_args, timeout=60)
+    _install_cert_to_agent(domain, paths)
 
     return {'success': True, 'renewed': True, 'tool': 'acme', 'domain': domain, **paths}
 
@@ -505,6 +624,7 @@ def revoke_cert(domain: str) -> dict:
     args = [
         str(ACME_BIN), '--revoke',
         '--home', str(ACME_HOME),
+        *_acme_server_args(),
         '-d', domain,
     ]
     proc = _run(args, timeout=120)

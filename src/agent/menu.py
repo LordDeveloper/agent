@@ -929,26 +929,27 @@ def _show_client_diagnose(email: str, inbound_id: str | None) -> None:
             key=None,
             client_id=None,
             inbound_id=inbound_id,
+            json=False,
         )
     )
     if code == 0:
-        _print(paint("  healthy: yes", GREEN))
+        _print(paint("  ✓ healthy", GREEN))
     elif code == 2:
-        _print(paint("  client not found", YELLOW))
+        _print(paint("  ✗ client not found", YELLOW))
     else:
-        _print(paint("  issues detected — see JSON above", RED))
+        _print(paint("  ✗ issues detected — see table above", RED))
 
 
 def _show_peer_diagnose(core: str, address: str) -> None:
     from agent.cli import cmd_peer_diagnose
 
-    code = cmd_peer_diagnose(SimpleNamespace(env_file=None, core=core, address=address))
+    code = cmd_peer_diagnose(SimpleNamespace(env_file=None, core=core, address=address, json=False))
     if code == 0:
-        _print(paint("  healthy: yes", GREEN))
+        _print(paint("  ✓ healthy", GREEN))
     elif code == 2:
-        _print(paint("  peer not found", YELLOW))
+        _print(paint("  ✗ peer not found", YELLOW))
     else:
-        _print(paint("  issues detected — see JSON above", RED))
+        _print(paint("  ✗ issues detected — see table above", RED))
 
 
 def _token_menu() -> None:
