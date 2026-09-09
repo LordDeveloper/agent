@@ -15,6 +15,18 @@ def has_volume_quota(client: dict[str, Any]) -> bool:
     return int(client.get("volume") or 0) > 0
 
 
+def quota_delta_since_baseline(
+    client: dict[str, Any],
+    live_incoming: int,
+    live_outgoing: int,
+) -> int:
+    base_in = int(client.get("_incoming") or 0)
+    base_out = int(client.get("_outgoing") or 0)
+    delta_in = max(0, live_incoming - base_in)
+    delta_out = max(0, live_outgoing - base_out)
+    return delta_in + delta_out
+
+
 def quota_exceeded(client: dict[str, Any], live_incoming: int, live_outgoing: int) -> bool:
     """
     Compare live cumulative counters against the synced baseline and remaining quota.
@@ -27,12 +39,7 @@ def quota_exceeded(client: dict[str, Any], live_incoming: int, live_outgoing: in
         return False
 
     remaining = int(client.get("volume") or 0)
-    base_in = int(client.get("_incoming") or 0)
-    base_out = int(client.get("_outgoing") or 0)
-
-    delta_in = live_incoming - base_in if live_incoming >= base_in else live_incoming
-    delta_out = live_outgoing - base_out if live_outgoing >= base_out else live_outgoing
-    delta = max(0, delta_in) + max(0, delta_out)
+    delta = quota_delta_since_baseline(client, live_incoming, live_outgoing)
 
     return delta >= remaining
 
@@ -63,6 +70,47 @@ def seed_stale_zero_baseline(client: dict[str, Any]) -> bool:
     client.pop("disabled_detail", None)
 
     return True
+
+
+def seed_ahead_baseline(
+    client: dict[str, Any],
+    live_incoming: int,
+    live_outgoing: int,
+) -> bool:
+    """
+    Panel shadow counters can drift ahead of agent cumulative totals after desync or
+    counter regression. When baseline exceeds live, quota math must treat delta as zero.
+    """
+    base_in = int(client.get("_incoming") or 0)
+    base_out = int(client.get("_outgoing") or 0)
+    changed = False
+
+    if base_in > live_incoming:
+        client["_incoming"] = live_incoming
+        changed = True
+    if base_out > live_outgoing:
+        client["_outgoing"] = live_outgoing
+        changed = True
+
+    if not changed:
+        return False
+
+    client.pop("disabled_reason", None)
+    client.pop("disabled_at", None)
+    client.pop("disabled_detail", None)
+    return True
+
+
+def reseed_baseline_if_stale(
+    client: dict[str, Any],
+    live_incoming: int,
+    live_outgoing: int,
+) -> bool:
+    return seed_stale_zero_baseline(client) or seed_ahead_baseline(
+        client,
+        live_incoming,
+        live_outgoing,
+    )
 
 
 def enforce_driver_quotas(driver: Any) -> int:
@@ -96,7 +144,7 @@ def _enforce_xray(driver: Any) -> int:
         to_reseed: list[dict[str, Any]] = []
 
         for client in driver._clients_of(inbound):
-            if not has_volume_quota(client) or not record_is_enabled(client):
+            if not has_volume_quota(client):
                 continue
 
             email = str(client.get("email") or "")
@@ -109,8 +157,13 @@ def _enforce_xray(driver: Any) -> int:
                 )
 
             row = dict(client)
-            if seed_stale_zero_baseline(row):
+            if reseed_baseline_if_stale(row, live[0], live[1]):
+                if not quota_exceeded(row, live[0], live[1]):
+                    row["is_enabled"] = True
                 to_reseed.append(row)
+                continue
+
+            if not record_is_enabled(client):
                 continue
 
             if not quota_exceeded(row, live[0], live[1]):
@@ -165,7 +218,7 @@ def _enforce_wireguard(driver: Any) -> int:
                 )
 
             row = dict(peer)
-            if seed_stale_zero_baseline(row):
+            if reseed_baseline_if_stale(row, live[0], live[1]):
                 if not quota_exceeded(row, live[0], live[1]):
                     row["is_enabled"] = True
                 to_reseed.append(row)

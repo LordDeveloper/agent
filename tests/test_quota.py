@@ -1,6 +1,8 @@
 from agent.support.quota import (
     has_volume_quota,
     quota_exceeded,
+    reseed_baseline_if_stale,
+    seed_ahead_baseline,
     seed_stale_zero_baseline,
 )
 
@@ -85,6 +87,59 @@ def test_seed_stale_zero_baseline_skips_when_baseline_already_set():
 
     assert seed_stale_zero_baseline(client) is False
     assert client["_incoming"] == 100
+
+
+def test_baseline_ahead_of_live_does_not_trigger_quota_exceeded():
+    client = {
+        "is_enabled": True,
+        "volume": 20_000_000_000,
+        "_incoming": 29_024_362_008,
+        "_outgoing": 5_595_810_232,
+    }
+
+    live_in = 29_003_014_804
+    live_out = 5_590_366_664
+
+    assert quota_exceeded(client, live_in, live_out) is False
+
+
+def test_seed_ahead_baseline_aligns_stale_shadow_counters():
+    client = {
+        "is_enabled": False,
+        "disabled_reason": "quota_exceeded",
+        "volume": 19_091_014_172,
+        "_incoming": 29_024_362_008,
+        "_outgoing": 5_595_810_232,
+        "incoming": 29_003_014_804,
+        "outgoing": 5_590_366_664,
+    }
+
+    live_in = 29_003_014_804
+    live_out = 5_590_366_664
+
+    assert seed_ahead_baseline(client, live_in, live_out) is True
+    assert client["_incoming"] == live_in
+    assert client["_outgoing"] == live_out
+    assert "disabled_reason" not in client
+    assert quota_exceeded(client, live_in, live_out) is False
+
+
+def test_reseed_baseline_if_stale_heals_disabled_peer_for_enforcer():
+    client = {
+        "is_enabled": False,
+        "disabled_reason": "quota_exceeded",
+        "volume": 19_091_014_172,
+        "_incoming": 29_024_362_008,
+        "_outgoing": 5_595_810_232,
+        "incoming": 29_003_014_804,
+        "outgoing": 5_590_366_664,
+    }
+
+    live_in = 29_003_014_804
+    live_out = 5_590_366_664
+
+    assert reseed_baseline_if_stale(client, live_in, live_out) is True
+    assert quota_exceeded(client, live_in, live_out) is False
 
 
 def test_seed_stale_zero_baseline_heals_legacy_raw_kernel_baseline():

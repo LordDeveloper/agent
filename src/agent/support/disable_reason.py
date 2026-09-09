@@ -37,10 +37,9 @@ def mark_quota_disabled(row: dict[str, Any], live_incoming: int, live_outgoing: 
     base_out = int(row.get("_outgoing") or 0)
     store_in = int(row.get("incoming") or 0)
     store_out = int(row.get("outgoing") or 0)
-
-    delta_in = live_incoming - base_in if live_incoming >= base_in else live_incoming
-    delta_out = live_outgoing - base_out if live_outgoing >= base_out else live_outgoing
-    delta = max(0, delta_in) + max(0, delta_out)
+    delta_in = max(0, live_incoming - base_in)
+    delta_out = max(0, live_outgoing - base_out)
+    delta = delta_in + delta_out
 
     row["is_enabled"] = False
     row["disabled_reason"] = "quota_exceeded"
@@ -93,6 +92,14 @@ def explain_disabled(row: dict[str, Any]) -> str:
                 "Peer disabled by quota enforcer: WireGuard raw kernel counters were stored in "
                 f"_incoming/_outgoing (baseline={base_in}/{base_out}) while cumulative totals are "
                 f"{store_in}/{store_out} bytes. Upgrade Agent to v0.3.84+ and sync from panel."
+            )
+        live_in = int(detail.get("live_incoming") or store_in)
+        live_out = int(detail.get("live_outgoing") or store_out)
+        if base_in > live_in or base_out > live_out:
+            return (
+                "Peer disabled by quota enforcer: baseline drifted ahead of live cumulative counters "
+                f"(baseline={base_in}/{base_out}, live={live_in}/{live_out}). "
+                "Upgrade Agent to v0.3.91+ to auto-heal; sync from panel to re-enable."
             )
         if remaining <= 0:
             return (
