@@ -473,7 +473,8 @@ def _enabled_peers_sorted_by_ip(iface: dict[str, Any]) -> list[dict[str, Any]]:
 def _peer_keepalive_seconds(peer: dict[str, Any]) -> int | None:
     """Return explicit keepalive seconds, or None when unset/disabled."""
     raw = peer.get("persistent_keepalive", peer.get("PersistentKeepalive", peer.get("keepalive")))
-    if raw is None or raw == "":
+    # bool is a subclass of int in Python — int(True) == 1 must never become keepalive.
+    if raw is None or raw == "" or isinstance(raw, bool):
         return None
     try:
         value = int(raw)

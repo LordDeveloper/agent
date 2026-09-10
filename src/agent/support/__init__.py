@@ -406,10 +406,14 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         raw = payload.get("persistent_keepalive")
         if raw is None:
             raw = payload.get("PersistentKeepalive", payload.get("keepalive"))
-        try:
-            value = int(raw) if raw is not None and raw != "" else 0
-        except (TypeError, ValueError):
+        # bool subclasses int — never coerce True to PersistentKeepalive = 1.
+        if isinstance(raw, bool) or raw is None or raw == "":
             value = 0
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = 0
         if value > 0:
             peer["persistent_keepalive"] = value
         else:
