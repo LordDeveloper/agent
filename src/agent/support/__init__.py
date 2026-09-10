@@ -401,6 +401,22 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             peer.pop("exit_interface", None)
 
+    keepalive_aliases = ("persistent_keepalive", "PersistentKeepalive", "keepalive")
+    if any(key in payload for key in keepalive_aliases):
+        raw = payload.get("persistent_keepalive")
+        if raw is None:
+            raw = payload.get("PersistentKeepalive", payload.get("keepalive"))
+        try:
+            value = int(raw) if raw is not None and raw != "" else 0
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            peer["persistent_keepalive"] = value
+        else:
+            peer.pop("persistent_keepalive", None)
+            peer.pop("PersistentKeepalive", None)
+            peer.pop("keepalive", None)
+
     for key in _XUI_KEYS:
         peer.pop(key, None)
 

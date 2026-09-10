@@ -89,7 +89,7 @@ class WgPeerPayload(BaseModel):
     email: Optional[str] = None
     public_key: Optional[str] = None
     allowed_ips: Optional[str] = None
-    persistent_keepalive: int = 25
+    persistent_keepalive: Optional[int] = None
     is_enabled: Optional[bool] = None
     volume: Optional[int] = None
     max_connection: Optional[int] = None

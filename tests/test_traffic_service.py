@@ -56,7 +56,7 @@ def test_traffic_service_tracks_pending_delta(tmp_path):
     traffic.sample_all(registry)
 
     payload = traffic.pending_payload()
-    assert payload["users"]["user@example.com"] == {
+    assert payload["users"]["uuid-1"] == {
         "core": "xray",
         "uplink": 200_000,
         "downlink": 200_000,
@@ -69,7 +69,7 @@ def test_traffic_service_tracks_pending_delta(tmp_path):
     driver._clients[0].incoming = 1_300_000
     traffic.sample_all(registry)
     payload = traffic.pending_payload()
-    assert payload["users"]["user@example.com"]["downlink"] == 100_000
+    assert payload["users"]["uuid-1"]["downlink"] == 100_000
 
 
 def test_traffic_service_regression_resets_baseline(tmp_path):
@@ -83,7 +83,7 @@ def test_traffic_service_regression_resets_baseline(tmp_path):
     client.incoming = 1_500
     client.outgoing = 200
     traffic.sample_all(registry)
-    assert traffic.pending_payload()["users"]["reset@example.com"]["downlink"] == 600
+    assert traffic.pending_payload()["users"]["uuid-2"]["downlink"] == 600
 
     traffic.ack_pending()
     client.incoming = 200

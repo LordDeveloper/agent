@@ -470,6 +470,18 @@ def _enabled_peers_sorted_by_ip(iface: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(peers, key=_peer_sort_key)
 
 
+def _peer_keepalive_seconds(peer: dict[str, Any]) -> int | None:
+    """Return explicit keepalive seconds, or None when unset/disabled."""
+    raw = peer.get("persistent_keepalive", peer.get("PersistentKeepalive", peer.get("keepalive")))
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _peer_lines_for_conf(peer: dict[str, Any]) -> list[str]:
     lines = ["[Peer]"]
     label = _peer_id_label(peer)
@@ -479,10 +491,12 @@ def _peer_lines_for_conf(peer: dict[str, Any]) -> list[str]:
         [
             f"PublicKey = {peer.get('public_key')}",
             f"AllowedIPs = {peer.get('allowed_ips')}",
-            f"PersistentKeepalive = {peer.get('persistent_keepalive', 25)}",
-            "",
         ]
     )
+    keepalive = _peer_keepalive_seconds(peer)
+    if keepalive is not None:
+        lines.append(f"PersistentKeepalive = {keepalive}")
+    lines.append("")
     return lines
 
 
@@ -887,7 +901,7 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
         peer.setdefault("max_connection", 0)
-        peer.setdefault("persistent_keepalive", 25)
+        # persistent_keepalive is opt-in via interface/format settings — never invent 25.
 
         if not record_is_enabled(peer):
             # Keep record disabled without applying to live interface.
@@ -922,6 +936,13 @@ class WireGuardDriver(CoreDriver):
                         merged["exit_interface"] = normalized["exit_interface"]
                     else:
                         merged.pop("exit_interface", None)
+                if any(key in payload for key in ("persistent_keepalive", "PersistentKeepalive", "keepalive")):
+                    if "persistent_keepalive" in normalized:
+                        merged["persistent_keepalive"] = normalized["persistent_keepalive"]
+                    else:
+                        merged.pop("persistent_keepalive", None)
+                        merged.pop("PersistentKeepalive", None)
+                        merged.pop("keepalive", None)
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 
@@ -992,7 +1013,6 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
         peer.setdefault("max_connection", 0)
-        peer.setdefault("persistent_keepalive", 25)
         return peer
 
     @staticmethod
@@ -1441,9 +1461,11 @@ class WireGuardDriver(CoreDriver):
             f"PublicKey = {iface.get('public_key')}",
             f"Endpoint = {endpoint_host}:{iface.get('listen_port')}",
             "AllowedIPs = 0.0.0.0/0",
-            f"PersistentKeepalive = {peer.get('persistent_keepalive', 25)}",
-            "",
         ]
+        keepalive = _peer_keepalive_seconds(peer)
+        if keepalive is not None:
+            lines.append(f"PersistentKeepalive = {keepalive}")
+        lines.append("")
         return "\n".join(lines)
 
     def peer_config_bundle(
@@ -1709,7 +1731,7 @@ class WireGuardDriver(CoreDriver):
             "allowed-ips",
             allowed,
             "persistent-keepalive",
-            str(int(peer.get("persistent_keepalive") or 25)),
+            str(_peer_keepalive_seconds(peer) or 0),
         ]
         psk = str(peer.get("preshared_key") or "").strip()
         if psk:

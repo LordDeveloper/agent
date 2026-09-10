@@ -60,7 +60,13 @@ def stats_clients_traffic_pending(
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
-    Pending byte deltas since the last panel ack.
+    Pending byte deltas since the last panel ack (live growth only).
+
+    Contract with NetinjaBot ``UpdateSubscribeStats``:
+      1. Worker/sample stores ``pending = current_cumulative - ack``.
+      2. Panel bills only forward growth (or discards historical backlog > cap).
+      3. Panel must POST ``/pending/ack`` after bill *or* absorb/baseline so
+         the next sample starts from "now" and never replays old pending.
 
     Keys in ``users`` are canonical client ids (panel ``node_id``). The traffic
     worker keeps updating pending rows until each client is acked via POST.
@@ -83,7 +89,11 @@ def stats_clients_traffic_pending_ack(
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
-    Ack clients whose pending volume was applied on the panel.
+    Ack clients whose pending volume was applied *or intentionally discarded*
+    on the panel.
+
+    Advances traffic_ack to the sampled cumulative counters and clears pending
+    so only future consumption appears on the next GET.
 
     Body: ``{"clients": ["node-id-1", "node-id-2"]}`` — canonical ids only.
     """

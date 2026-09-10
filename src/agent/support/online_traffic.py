@@ -7,25 +7,33 @@ from agent.models import UsageSnapshotModel
 
 
 def online_traffic_from_snapshot(driver: CoreDriver) -> dict[str, dict[str, int]]:
-    """Fallback for cores without Xray /api/stats/online/traffic."""
+    """Fallback for cores without Xray /api/stats/online/traffic.
+
+    Emits both peer id (panel node_id) and email keys so the panel enrich
+    path can match the same way pending traffic does.
+    """
     online = set(driver.online_users())
     out: dict[str, dict[str, int]] = {}
     snapshot = driver.usage_snapshot()
     for inbound in snapshot.inbounds:
         for client in inbound.clients:
-            label = str(client.email or client.id or "")
-            if not label:
+            email = str(client.email or "").strip()
+            client_id = str(client.id or "").strip()
+            labels = [label for label in (client_id, email) if label]
+            if not labels:
                 continue
-            if online and label not in online:
+            if online and not any(label in online for label in labels):
                 continue
             if int(client.incoming or 0) <= 0 and int(client.outgoing or 0) <= 0:
                 continue
-            out[label] = {
+            row = {
                 "uplink": int(client.outgoing or 0),
                 "downlink": int(client.incoming or 0),
             }
+            for label in labels:
+                out[label] = row
     for email in online:
-        out.setdefault(email, {})
+        out.setdefault(str(email), {})
     return out
 
 
