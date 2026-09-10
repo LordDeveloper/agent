@@ -19,6 +19,7 @@ from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.support.process import run
+from agent.logutil import get_logger
 
 _ONLINE_HANDSHAKE_SECONDS = 120
 _IP_WINDOW_SECONDS = 600
@@ -26,6 +27,8 @@ _IP_LOG_LIMIT = 50
 _WG_MTU = 1420
 _AWG_MTU = 1280
 _PEER_BATCH_MAX = 200
+
+log = get_logger("wireguard")
 
 
 def endpoint_host(endpoint: str | None) -> str | None:
@@ -470,6 +473,16 @@ def _enabled_peers_sorted_by_ip(iface: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(peers, key=_peer_sort_key)
 
 
+def _strip_peer_keepalive_fields(peer: dict[str, Any]) -> bool:
+    """Remove stored keepalive so conf/live stay clean until panel sets seconds."""
+    changed = False
+    for key in ("persistent_keepalive", "PersistentKeepalive", "keepalive"):
+        if key in peer:
+            peer.pop(key, None)
+            changed = True
+    return changed
+
+
 def _peer_keepalive_seconds(peer: dict[str, Any]) -> int | None:
     """Return explicit keepalive seconds, or None when unset/disabled."""
     raw = peer.get("persistent_keepalive", peer.get("PersistentKeepalive", peer.get("keepalive")))
@@ -626,6 +639,48 @@ class WireGuardDriver(CoreDriver):
         self.settings = settings
         self.audit = audit
         self.store = store
+        self._migrate_keepalive_opt_in()
+
+    def _migrate_keepalive_opt_in(self) -> None:
+        """
+        One-shot: drop stored peer PersistentKeepalive defaults (25/1/True).
+        Keepalive is opt-in from panel interface/format settings only.
+        """
+        meta_key = "keepalive_opt_in_v2"
+        if self.store.get_meta(self.key, meta_key):
+            return
+
+        for iface in list(self.store.list_docs(self.key, self._kind)):
+            for peer in list(iface.get("peers") or []):
+                _strip_peer_keepalive_fields(peer)
+
+            iface_id = iface.get("id")
+            self.store.put_doc(self.key, self._kind, str(iface_id), iface)
+            iface_name = str(iface.get("name") or "")
+            live_up = bool(iface_name) and self._interface_is_up(iface_name)
+            try:
+                # Rewrite conf without PersistentKeepalive lines.
+                self._sync_conf(iface)
+            except Exception:
+                log.exception("keepalive opt-in conf rewrite failed iface=%s", iface_id)
+            if live_up:
+                for peer in iface.get("peers") or []:
+                    if not record_is_enabled(peer):
+                        continue
+                    if not str(peer.get("public_key") or "").strip():
+                        continue
+                    try:
+                        # Force live persistent-keepalive 0 (disabled).
+                        self._add_live_peer(iface_name, peer)
+                    except Exception:
+                        log.exception(
+                            "keepalive opt-in live clear failed iface=%s peer=%s",
+                            iface_id,
+                            peer.get("id") or peer.get("email"),
+                        )
+
+        self.store.set_meta(self.key, meta_key, True)
+        self.audit.record("migrate", f"{self.key}/keepalive_opt_in_v2")
 
     def capabilities(self) -> list[str]:
         return [
@@ -902,7 +957,9 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
         peer.setdefault("max_connection", 0)
-        # persistent_keepalive is opt-in via interface/format settings — never invent 25.
+        # persistent_keepalive is opt-in via interface/format settings — never invent defaults.
+        if _peer_keepalive_seconds(peer) is None:
+            _strip_peer_keepalive_fields(peer)
 
         if not record_is_enabled(peer):
             # Keep record disabled without applying to live interface.
@@ -1014,6 +1071,8 @@ class WireGuardDriver(CoreDriver):
         peer.setdefault("online", False)
         peer.setdefault("ip_logs", [])
         peer.setdefault("max_connection", 0)
+        if _peer_keepalive_seconds(peer) is None:
+            _strip_peer_keepalive_fields(peer)
         return peer
 
     @staticmethod
