@@ -31,6 +31,23 @@ _PEER_BATCH_MAX = 200
 log = get_logger("wireguard")
 
 
+def peer_handshake_unix(peer: dict[str, Any]) -> int:
+    """Return last handshake as unix seconds, or 0 when unknown/never."""
+    raw = peer.get("handshake_at")
+    if isinstance(raw, (int, float)):
+        return int(raw) if int(raw) > 0 else 0
+    if isinstance(raw, str) and raw.strip():
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            stamp = int(ts.timestamp())
+            return stamp if stamp > 0 else 0
+        except ValueError:
+            return 0
+    return 0
+
+
 def endpoint_host(endpoint: str | None) -> str | None:
     if not endpoint or endpoint in ("(none)", ""):
         return None
@@ -1568,6 +1585,7 @@ class WireGuardDriver(CoreDriver):
                         incoming=int(peer.get("incoming", 0) or 0),
                         outgoing=int(peer.get("outgoing", 0) or 0),
                         inbound_id=iface.get("id"),
+                        handshake_at=peer_handshake_unix(peer) or None,
                     )
                 )
             rows.append(

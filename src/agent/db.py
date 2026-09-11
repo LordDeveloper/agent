@@ -241,6 +241,19 @@ class Store:
             )
             self._conn.commit()
 
+    def get_traffic_pending(self, core: str, client_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT core, client_key, delta_incoming, delta_outgoing,
+                       current_incoming, current_outgoing, updated_at
+                FROM traffic_pending
+                WHERE core = ? AND client_key = ?
+                """,
+                (core, client_key),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_traffic_pending(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

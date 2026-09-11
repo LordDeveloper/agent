@@ -9,6 +9,8 @@ class ClientUsageModel(BaseModel):
     incoming: int = 0
     outgoing: int = 0
     inbound_id: Optional[int | str] = None
+    # Unix seconds; WireGuard/Amnezia only. Used to ignore idle counter noise as pending.
+    handshake_at: Optional[int] = None
 
 
 class InboundUsageModel(BaseModel):
