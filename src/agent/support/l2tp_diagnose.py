@@ -179,7 +179,9 @@ def _collect_ppp_sessions(runner: Runner) -> dict[str, dict[str, Any]]:
         if not ifname.startswith('ppp'):
             continue
         operstate = str(iface.get('operstate') or '').upper()
-        is_up = operstate == 'UP'
+        flags = {str(flag).upper() for flag in (iface.get('flags') or [])}
+        # PPP often reports operstate UNKNOWN while the session is fully usable.
+        is_up = operstate == 'UP' or 'UP' in flags or operstate in {'UNKNOWN', ''}
         client_ip = None
         for addr in iface.get('addr_info') or []:
             if not isinstance(addr, dict):
@@ -191,9 +193,12 @@ def _collect_ppp_sessions(runner: Runner) -> dict[str, dict[str, Any]]:
                 break
         if not client_ip:
             continue
+        # Only mark online when we actually have a peer address (session negotiated).
+        if not is_up and client_ip:
+            is_up = True
         sessions[client_ip] = {
             'interface': ifname,
-            'operstate': operstate,
+            'operstate': operstate or 'UNKNOWN',
             'is_up': is_up,
             'online': is_up,
         }
