@@ -64,6 +64,15 @@ _PPP_TUNNEL = "ppp+"
 _L2TP_KIND = "server"
 
 
+def _egress_comment_label(iface: str) -> str:
+    """Make iface names safe for nft/iptables comment tokens (no '+' / '*')."""
+    return str(iface or "").strip().replace("+", "x").replace("*", "x")
+
+
+def _tunnel_egress_comment(tunnel: str) -> str:
+    return f"{_MASQ_COMMENT_PREFIX}tunnel-{_egress_comment_label(tunnel)}"
+
+
 def rule_pref_for_addr(addr: str) -> int:
     """Stable ip-rule preference per peer address (lower = higher priority)."""
     host = str(addr or "").split("/", 1)[0].strip()
@@ -344,18 +353,19 @@ def render_apply_script(
             f'ct state related,established accept comment "{comment}-fwd-in" 2>/dev/null || true'
         )
     for tunnel in tunnels:
-        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        tunnel_comment = _tunnel_egress_comment(tunnel)
+        match = _nft_iface_match(tunnel)
         lines.append(
-            f'  nft add rule inet netinja_egress forward iifname "{tunnel}" '
+            f'  nft add rule inet netinja_egress forward iifname "{match}" '
             f'tcp flags syn / syn,rst tcp option maxseg size set rt mtu '
             f'comment "{tunnel_comment}-mss" 2>/dev/null || true'
         )
         lines.append(
-            f'  nft add rule inet netinja_egress forward iifname "{tunnel}" '
+            f'  nft add rule inet netinja_egress forward iifname "{match}" '
             f'accept comment "{tunnel_comment}-in" 2>/dev/null || true'
         )
         lines.append(
-            f'  nft add rule inet netinja_egress forward oifname "{tunnel}" '
+            f'  nft add rule inet netinja_egress forward oifname "{match}" '
             f'accept comment "{tunnel_comment}-out" 2>/dev/null || true'
         )
     # When nft owns NAT, strip duplicate iptables MASQUERADE (double SNAT = packet loss).
@@ -426,7 +436,7 @@ def _append_iptables_firewall_shell(
             f'-m comment --comment "{comment}-fwd-in" -j ACCEPT'
         )
     for tunnel in tunnels:
-        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        tunnel_comment = _tunnel_egress_comment(tunnel)
         lines.append(
             f'{indent}{binary} -C FORWARD -i "{tunnel}" -p tcp --tcp-flags SYN,RST SYN '
             f'-m comment --comment "{tunnel_comment}-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || '
@@ -1343,7 +1353,7 @@ def _sync_forward_iptables(
     for tunnel in tunnels:
         if not _is_wildcard_iface(tunnel):
             _soften_rp_filter(runner, tunnel)
-        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        tunnel_comment = _tunnel_egress_comment(tunnel)
         if not _iptables(
             runner,
             [
@@ -1429,13 +1439,17 @@ def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> boo
         if getattr(result, "returncode", 1) != 0:
             return False
         text = str(getattr(result, "stdout", "") or "")
-        return all(f"tunnel-{tunnel}-in" in text or f"tunnel-{tunnel}-mss" in text for tunnel in tunnel_ifaces)
+        return all(
+            f"{_tunnel_egress_comment(tunnel)}-in" in text
+            or f"{_tunnel_egress_comment(tunnel)}-mss" in text
+            for tunnel in tunnel_ifaces
+        )
 
     binary = "iptables-legacy" if shutil.which("iptables-legacy") else ("iptables" if shutil.which("iptables") else None)
     if not binary:
         return False
     for tunnel in tunnel_ifaces:
-        comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}-in"
+        comment = f"{_tunnel_egress_comment(tunnel)}-in"
         if not _iptables(
             runner,
             ["-C", "FORWARD", "-i", tunnel, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
@@ -1558,7 +1572,7 @@ def _sync_masquerade_nft(
         if not _is_wildcard_iface(tunnel):
             _soften_rp_filter(runner, tunnel)
         match = _nft_iface_match(tunnel)
-        tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
+        tunnel_comment = _tunnel_egress_comment(tunnel)
         _nft(
             runner,
             [
@@ -1680,16 +1694,29 @@ def _is_wildcard_iface(name: str) -> bool:
 
 
 def _nft(runner: Runner, args: list[str]) -> bool:
+    fixed: list[str] = []
+    index = 0
+    while index < len(args):
+        fixed.append(args[index])
+        if args[index] == "comment" and index + 1 < len(args):
+            value = str(args[index + 1])
+            if not (value.startswith('"') and value.endswith('"')):
+                value = f'"{value}"'
+            fixed.append(value)
+            index += 2
+            continue
+        index += 1
+
     try:
-        result = runner(["nft", *args], check=False, timeout=10)
+        result = runner(["nft", *fixed], check=False, timeout=10)
     except Exception as exc:
-        log.warning("nft %s failed: %s", " ".join(args), exc)
+        log.warning("nft %s failed: %s", " ".join(fixed), exc)
         return False
     if getattr(result, "returncode", 1) != 0:
         stderr = (getattr(result, "stderr", None) or "").strip().lower()
         if "exist" in stderr:
             return True
-        log.warning("nft %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
+        log.warning("nft %s rc=%s %s", " ".join(fixed), getattr(result, "returncode", "?"), stderr)
         return False
     return True
 
