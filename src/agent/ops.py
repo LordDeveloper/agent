@@ -117,16 +117,28 @@ def install_wireguard() -> dict:
 
 
 def _stroke_plugin_paths() -> tuple[Path, ...]:
-    return (
-        Path('/usr/lib/ipsec/plugins/stroke.so'),
-        Path('/usr/lib/x86_64-linux-gnu/ipsec/plugins/stroke.so'),
-        Path('/usr/lib64/ipsec/plugins/stroke.so'),
+    # Ubuntu/Debian ship libstrongswan-stroke.so via strongswan-starter.
+    # Some builds may still use the shorter stroke.so name.
+    roots = (
+        Path('/usr/lib/ipsec/plugins'),
+        Path('/usr/lib/x86_64-linux-gnu/ipsec/plugins'),
+        Path('/usr/lib64/ipsec/plugins'),
+        Path('/usr/lib/aarch64-linux-gnu/ipsec/plugins'),
     )
+    names = ('libstrongswan-stroke.so', 'stroke.so')
+    return tuple(root / name for root in roots for name in names)
 
 
 def stroke_plugin_present() -> bool:
     """stroke provides charon.ctl; without it ipsec.conf conns never load."""
     return any(path.is_file() for path in _stroke_plugin_paths())
+
+
+def find_stroke_plugin() -> Path | None:
+    for path in _stroke_plugin_paths():
+        if path.is_file():
+            return path
+    return None
 
 
 def charon_ctl_ready() -> bool:
@@ -159,8 +171,9 @@ def ensure_stroke_plugin_enabled() -> None:
             existing = conf.read_text(encoding='utf-8')
         except OSError:
             existing = ''
+    normalized = existing.replace('load=yes', 'load = yes').replace('load=no', 'load = no')
     # Force-enable even if a package shipped load = no.
-    if 'load = yes' not in existing.replace('load=yes', 'load = yes'):
+    if 'load = yes' not in normalized or 'load = no' in normalized:
         try:
             conf.write_text(desired, encoding='utf-8')
         except OSError as exc:
@@ -170,43 +183,65 @@ def ensure_stroke_plugin_enabled() -> None:
             ) from exc
 
 
+def _apt_install(packages: list[str]) -> str:
+    if not which('apt-get'):
+        raise AgentError(
+            'VALIDATION_ERROR',
+            'apt-get missing; cannot install L2TP/IPsec packages '
+            f'(need {", ".join(packages)})',
+        )
+    # libcharon-extra-plugins is in universe on Ubuntu.
+    run_cmd(['apt-get', 'update', '-y'], check=False)
+    proc = run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+    out = ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
+    if proc.returncode != 0:
+        raise AgentError(
+            'VALIDATION_ERROR',
+            'apt-get install failed for L2TP/IPsec packages: '
+            + (out[-1500:] if out else f'exit {proc.returncode}'),
+        )
+    return out
+
+
 def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
     """
-    Ensure xl2tpd + strongSwan + stroke plugin are installed and stroke is loadable.
+    Ensure xl2tpd + strongSwan starter/stroke are installed and stroke is loadable.
 
-    Without stroke, starter never creates /var/run/charon.ctl and every IKE
-    handshake is answered with NO_PROPOSAL_CHOSEN even when ipsec.conf is correct.
+    stroke lives in strongswan-starter as libstrongswan-stroke.so. Without it,
+    starter never creates /var/run/charon.ctl and every IKE handshake is answered
+    with NO_PROPOSAL_CHOSEN even when ipsec.conf is correct.
     """
     packages = [
         'xl2tpd',
         'ppp',
         'strongswan',
+        'strongswan-starter',
+        'strongswan-charon',
         'strongswan-pki',
         'libcharon-extra-plugins',
+        'libcharon-extauth-plugins',
     ]
     have_bins = bool(which('xl2tpd') and (which('ipsec') or Path('/usr/sbin/ipsec').is_file()))
     need_pkgs = force_apt or not have_bins or not stroke_plugin_present()
+    apt_log = ''
 
     if need_pkgs:
-        if not which('apt-get'):
-            raise AgentError(
-                'VALIDATION_ERROR',
-                'apt-get missing; cannot install L2TP/IPsec packages '
-                f'(need stroke plugin + {", ".join(packages)})',
-            )
-        run_cmd(['apt-get', 'update', '-y'], check=False)
-        run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+        apt_log = _apt_install(packages)
 
     if not which('xl2tpd'):
         raise AgentError('VALIDATION_ERROR', 'xl2tpd not available after install')
     if not which('ipsec') and not Path('/usr/sbin/ipsec').is_file():
         raise AgentError('VALIDATION_ERROR', 'strongSwan (ipsec) not available after install')
-    if not stroke_plugin_present():
+
+    stroke_path = find_stroke_plugin()
+    if stroke_path is None:
+        searched = ', '.join(str(p) for p in _stroke_plugin_paths())
         raise AgentError(
             'VALIDATION_ERROR',
             'strongSwan stroke plugin still missing after apt install '
-            '(package libcharon-extra-plugins); without it /var/run/charon.ctl '
-            'is never created and ipsec.conf is ignored',
+            '(expected libstrongswan-stroke.so from package strongswan-starter). '
+            f'Searched: {searched}'
+            + (f'. apt: {apt_log[-800:]}' if apt_log else ''),
         )
 
     ensure_stroke_plugin_enabled()
@@ -225,6 +260,7 @@ def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
         'core': 'l2tp',
         'installed': True,
         'stroke_plugin': True,
+        'stroke_path': str(stroke_path),
         'packages': packages,
         'message': 'installed' if need_pkgs else 'already installed',
     }
