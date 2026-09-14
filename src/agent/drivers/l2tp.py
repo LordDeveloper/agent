@@ -387,7 +387,8 @@ class L2tpDriver(CoreDriver):
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
                 if any(k in payload for k in ('username', 'password', 'address', 'is_enabled', 'exit_interface')):
                     self._apply_all_configs()
-                    self._ensure_services(start=True, reload=True)
+                    # Soft ensure — never restart xl2tpd/ipsec (keeps existing PPP sessions).
+                    self._ensure_services(start=True)
                 else:
                     self._apply_all_configs()
                 self._sync_peer_egress()
@@ -404,7 +405,8 @@ class L2tpDriver(CoreDriver):
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self._apply_all_configs()
         self._sync_peer_egress()
-        self._ensure_services(start=True, reload=True)
+        # chap-secrets update only — do not bounce live tunnels.
+        self._ensure_services(start=True)
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
@@ -784,6 +786,12 @@ class L2tpDriver(CoreDriver):
                 log.warning('l2tp runtime dir %s: %s', path, exc)
 
     def _ensure_services(self, *, start: bool, restart: bool = False, reload: bool = False) -> None:
+        """Start L2TP stack; only bounce processes when restart=True.
+
+        ``reload`` is kept for callers but is treated as a soft ensure (same as
+        start-only): rewriting chap-secrets does not require killing xl2tpd/ipsec.
+        A hard bounce drops every live PPP/IPsec session.
+        """
         if not start:
             return
 
@@ -798,7 +806,11 @@ class L2tpDriver(CoreDriver):
 
         self._ensure_runtime_dirs()
 
-        need_clean_restart = restart or reload or not charon_ctl_ready()
+        force = bool(restart)
+        if reload and not force:
+            log.info('l2tp soft ensure (reload requested) — keeping live PPP/IPsec sessions')
+
+        need_clean_restart = force or not charon_ctl_ready()
         for unit in ('strongswan-starter', 'ipsec'):
             unit_exists = (
                 Path(f'/lib/systemd/system/{unit}.service').is_file()
@@ -814,15 +826,13 @@ class L2tpDriver(CoreDriver):
             if need_clean_restart or not self._service_active(unit):
                 self._restart_ipsec_clean(unit)
             else:
+                # Already healthy — leave CHILD_SAs alone (ipsec reload would drop them).
                 run(['systemctl', 'start', unit], check=False, timeout=60)
                 if not charon_ctl_ready():
                     self._restart_ipsec_clean(unit)
-                else:
-                    run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
-                    run(['ipsec', 'reload'], check=False, timeout=30)
             break
 
-        self._ensure_xl2tpd(force_restart=restart or reload)
+        self._ensure_xl2tpd(force_restart=force)
 
     def _restart_ipsec_clean(self, unit: str) -> None:
         """Stop stale charon/starter PIDs, clear sockets, start unit, wait for charon.ctl."""
@@ -878,6 +888,14 @@ class L2tpDriver(CoreDriver):
 
         self._ensure_runtime_dirs()
         self._load_l2tp_kernel_modules()
+
+        running = self._service_active('xl2tpd') or self._xl2tpd_process_running()
+        if running and not force_restart:
+            # chap-secrets / options are re-read by pppd on each new auth.
+            # Killing xl2tpd here used to drop every live L2TP client on peer create.
+            log.info('xl2tpd already running — skip restart to keep existing PPP sessions')
+            return True
+
         self._clear_xl2tpd_stale_state()
 
         probe_ok, probe_msg = self._probe_xl2tpd_config()
