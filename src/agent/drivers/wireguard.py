@@ -338,11 +338,15 @@ def _reserved_peer_addresses(subnet: str) -> set[str]:
 
 
 def _next_ip(subnet: str, used: set[str]) -> str:
+    from agent.support.l2tp_ip import wireguard_skips_host
+
     reserved = _reserved_peer_addresses(subnet)
     network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
     for host in network.hosts():
         ip = str(host)
         if ip in reserved or ip in used:
+            continue
+        if wireguard_skips_host(ip):
             continue
         return ip
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")

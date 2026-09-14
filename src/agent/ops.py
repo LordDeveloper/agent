@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agent.errors import AgentError
 
-KNOWN_CORES = ("xray", "wireguard", "amnezia")
+KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp")
 
 
 def which(cmd: str) -> str | None:
@@ -115,6 +115,31 @@ def install_wireguard() -> dict:
     return {"core": "wireguard", "installed": True, "message": "installed"}
 
 
+def install_l2tp() -> dict:
+    """Install xl2tpd, ppp, and strongSwan via apt when available."""
+    if which('xl2tpd') and (which('ipsec') or Path('/usr/sbin/ipsec').is_file()):
+        return {'core': 'l2tp', 'installed': True, 'message': 'already installed'}
+
+    packages = ['xl2tpd', 'ppp', 'strongswan', 'strongswan-pki']
+    if which('apt-get'):
+        run_cmd(['apt-get', 'update', '-y'], check=False)
+        run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+
+    if not which('xl2tpd'):
+        raise AgentError('VALIDATION_ERROR', 'xl2tpd not available after install')
+    if not which('ipsec') and not Path('/usr/sbin/ipsec').is_file():
+        raise AgentError('VALIDATION_ERROR', 'strongSwan (ipsec) not available after install')
+
+    for path in (
+        Path('/etc/xl2tpd'),
+        Path('/etc/ppp'),
+        Path('/etc/netinja/l2tp'),
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    return {'core': 'l2tp', 'installed': True, 'message': 'installed', 'packages': packages}
+
+
 def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:
     from agent.amnezia_release import amnezia_bundle_present, install_amnezia_bundle
 
@@ -133,6 +158,7 @@ INSTALLERS = {
     "xray": install_xray,
     "wireguard": install_wireguard,
     "amnezia": install_amnezia,
+    "l2tp": install_l2tp,
 }
 
 
@@ -175,6 +201,7 @@ def write_env_file(
             "XRAY_CONFIG=/usr/local/etc/xray/config.json",
             "WIREGUARD_CONFIG_DIR=/etc/wireguard",
             "AMNEZIA_CONFIG_DIR=/etc/amneziawg",
+            "L2TP_CONFIG_DIR=/etc/netinja/l2tp",
             "",
         ]
     )

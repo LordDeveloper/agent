@@ -19,7 +19,7 @@ def bootstrap_enabled_cores(
     logger = log or logging.getLogger("app")
     enabled = set(settings.cores())
 
-    for key in ("xray", "wireguard", "amnezia"):
+    for key in ("xray", "wireguard", "amnezia", "l2tp"):
         if key not in enabled:
             continue
         driver = registry._drivers.get(key)
@@ -43,6 +43,12 @@ def bootstrap_enabled_cores(
                     driver.sync_proxy_protocol_forwarders()
                 except Exception as exc:
                     logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
+            elif key == "l2tp":
+                if driver.running():
+                    logger.info("supervisor core=%s already running", key)
+                    continue
+                logger.info("supervisor starting core=%s", key)
+                driver.enable()
             else:
                 logger.info("supervisor enabling interfaces core=%s", key)
                 driver.enable()

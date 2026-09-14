@@ -892,6 +892,7 @@ def _peer_diagnose_menu() -> None:
             [
                 Choice("wireguard", "WireGuard peer", CYAN, "1"),
                 Choice("amnezia", "Amnezia peer", BLUE, "2"),
+                Choice("l2tp", "L2TP user", GREEN, "3"),
                 Choice("xray", "Xray client (email)", GREEN, "3"),
                 Choice("back", "Back", WHITE, "0"),
             ]
@@ -912,7 +913,7 @@ def _peer_diagnose_menu() -> None:
         address = prompt_text("Peer address (e.g. 10.80.0.5)")
         if not str(address or "").strip():
             continue
-        core = "amnezia" if picked == "amnezia" else "wireguard"
+        core = picked if picked in {"wireguard", "amnezia", "l2tp"} else "wireguard"
         _run_action(
             f"Diagnose {core} peer",
             lambda addr=str(address).strip(), selected_core=core: _show_peer_diagnose(selected_core, addr),

@@ -118,6 +118,8 @@ def enforce_driver_quotas(driver: Any) -> int:
         return _enforce_xray(driver)
     if driver.key in {"wireguard", "amnezia"}:
         return _enforce_wireguard(driver)
+    if driver.key == "l2tp":
+        return _enforce_l2tp(driver)
     return 0
 
 
@@ -240,6 +242,67 @@ def _enforce_wireguard(driver: Any) -> int:
             continue
 
         driver.batch_peers(interface_id, peers=to_disable, mode="update")
+        disabled += len(to_disable)
+
+    return disabled
+
+
+def _enforce_l2tp(driver: Any) -> int:
+    driver.sync_user_stats()
+    snapshot = driver.usage_snapshot()
+    traffic_by_email: dict[str, tuple[int, int]] = {}
+    traffic_by_id: dict[str, tuple[int, int]] = {}
+
+    for inbound in snapshot.inbounds:
+        for client in inbound.clients:
+            if client.email:
+                traffic_by_email[str(client.email)] = (int(client.incoming), int(client.outgoing))
+            if client.id:
+                traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
+
+    disabled = 0
+
+    for server in driver.list_servers():
+        server_id = server.get('id')
+        to_disable: list[dict[str, Any]] = []
+        to_reseed: list[dict[str, Any]] = []
+
+        for user in server.get('users') or []:
+            if not isinstance(user, dict) or not has_volume_quota(user):
+                continue
+
+            email = str(user.get('email') or '')
+            uid = str(user.get('id') or '')
+            live = traffic_by_email.get(email) or traffic_by_id.get(uid)
+            if live is None:
+                live = (
+                    int(user.get('_incoming') or 0),
+                    int(user.get('_outgoing') or 0),
+                )
+
+            row = dict(user)
+            if reseed_baseline_if_stale(row, live[0], live[1]):
+                if not quota_exceeded(row, live[0], live[1]):
+                    row['is_enabled'] = True
+                to_reseed.append(row)
+                continue
+
+            if not record_is_enabled(user):
+                continue
+
+            if not quota_exceeded(row, live[0], live[1]):
+                continue
+
+            mark_quota_disabled(row, live[0], live[1])
+            to_disable.append(row)
+
+        if to_reseed:
+            driver.batch_users(server_id, users=to_reseed, mode='update')
+
+        if not to_disable:
+            continue
+
+        driver.batch_users(server_id, users=to_disable, mode='update')
         disabled += len(to_disable)
 
     return disabled

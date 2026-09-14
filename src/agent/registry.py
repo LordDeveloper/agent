@@ -3,6 +3,7 @@ from agent.config import AgentSettings
 from agent.db import Store
 from agent.drivers.amnezia import AmneziaDriver
 from agent.drivers.base import CoreDriver
+from agent.drivers.l2tp import L2tpDriver
 from agent.drivers.wireguard import WireGuardDriver
 from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError
@@ -21,6 +22,7 @@ class CoreRegistry:
             "xray": XrayDriver,
             "wireguard": WireGuardDriver,
             "amnezia": AmneziaDriver,
+            "l2tp": L2tpDriver,
         }
         for key, factory in factories.items():
             self._drivers[key] = factory(settings, audit, store)

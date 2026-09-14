@@ -95,6 +95,36 @@ def test_traffic_service_regression_resets_baseline(tmp_path):
     assert traffic.pending_payload()["users"] == {}
 
 
+def test_traffic_service_migrates_legacy_email_rows_to_client_id(tmp_path):
+    store = Store(tmp_path / "agent.db")
+    traffic = TrafficService(store)
+    client = ClientUsageModel(
+        id="uuid-new",
+        email="legacy@example.com",
+        incoming=1_000,
+        outgoing=500,
+    )
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    store.set_traffic_ack("xray", "legacy@example.com", 800, 400)
+    store.upsert_traffic_pending("xray", "legacy@example.com", 200, 100, 1_000, 500)
+
+    traffic.sample_all(registry)
+
+    assert traffic.pending_payload()["users"]["uuid-new"] == {
+        "core": "xray",
+        "uplink": 100,
+        "downlink": 200,
+    }
+    assert traffic.pending_payload()["users"].get("legacy@example.com") is None
+    assert store.get_traffic_ack("xray", "legacy@example.com") is None
+    assert store.get_traffic_ack("xray", "uuid-new") == {
+        "incoming": 800,
+        "outgoing": 400,
+    }
+
+
 def test_wireguard_stale_handshake_does_not_create_pending(tmp_path):
     store = Store(tmp_path / "agent.db")
     traffic = TrafficService(store)

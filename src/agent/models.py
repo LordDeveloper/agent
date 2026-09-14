@@ -119,3 +119,36 @@ class AmneziaInterfacePayload(WgInterfacePayload):
 
 class AmneziaPeerPayload(WgPeerPayload):
     obfuscation: Optional[AmneziaObfuscation] = None
+
+
+class L2tpServerPayload(BaseModel):
+    model_config = {'extra': 'allow'}
+
+    id: Optional[int | str] = None
+    name: Optional[str] = None
+    listen_port: int = 1701
+    subnet: Optional[str] = None
+    ipsec_psk: Optional[str] = None
+    public_host: Optional[str] = None
+    users: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class L2tpUserPayload(BaseModel):
+    model_config = {'extra': 'allow'}
+
+    id: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    address: Optional[str] = None
+    linked_peer_id: Optional[str] = None
+    linked_core: Optional[str] = None
+    linked_interface_id: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    volume: Optional[int] = None
+    incoming: Optional[int] = None
+    outgoing: Optional[int] = None
+    max_connection: Optional[int] = None
+    expires_at: Optional[str] = None
+    exit_interface: Optional[str] = None

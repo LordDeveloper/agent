@@ -769,9 +769,12 @@ class XrayDriver(CoreDriver):
                         client["email"] = str(client["id"])[:8]
                     email = str(client.get("email") or "").strip()
                     cid = str(client.get("id") or "").strip()
-                    existing = by_email.get(email) if email else None
-                    if existing is None and cid:
-                        existing = by_id.get(cid)
+                    # Canonical identity is panel node_id (Xray id). Match id
+                    # first so a rotated credential never collides with a stale
+                    # row that still claims the same email alias.
+                    existing = by_id.get(cid) if cid else None
+                    if existing is None and email:
+                        existing = by_email.get(email)
 
                     if mode_key == "add" and existing is not None:
                         failed += 1
@@ -1054,16 +1057,31 @@ class XrayDriver(CoreDriver):
         return self.get_inbound(inbound_id)
 
     def update_client(self, inbound_id: int | str, client_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # Canonical key is panel ``node_id`` (Xray ``id``); always try it first,
+        # then fall back to the configured email alias from the payload.
         inbound = self.get_inbound(inbound_id)
         current = self._find_client(inbound, client_key)
+        payload_email = ""
+        try:
+            payload_email = str((payload or {}).get("email") or "").strip()
+        except Exception:
+            payload_email = ""
+        if current is None and payload_email and payload_email != str(client_key or "").strip():
+            current = self._find_client(inbound, payload_email)
         if current is None:
             merged = normalize_xray_client(payload)
             merged.setdefault("id", client_key)
             if not merged.get("email"):
-                merged["email"] = client_key
+                merged["email"] = payload_email or client_key
             mode = "upsert"
         else:
             merged = normalize_xray_client({**current, **payload})
+            # Never rename the stored canonical id through an update payload.
+            stored_id = str(current.get("id") or "").strip()
+            if stored_id:
+                merged["id"] = stored_id
+            if not str(merged.get("email") or "").strip():
+                merged["email"] = payload_email or str(current.get("email") or client_key)
             mode = "update"
         result = self.batch_clients(inbound_id, [merged], mode=mode)
         if result.get("failed"):
@@ -1463,11 +1481,18 @@ class XrayDriver(CoreDriver):
             counters = dict(inbound_traffic.get(tag) or {})
             clients: list[ClientUsageModel] = []
             for client in inbound.get("settings", {}).get("clients", []):
-                email = str(client.get("email") or "")
+                cid = str(client.get("id") or "").strip()
+                email = str(client.get("email") or "").strip()
+                # Xray runtime stats are keyed by email alias while the panel
+                # bills by canonical node_id. Keep both identifiers on the row
+                # and prefer the matching alias before summing to zero traffic.
                 traffic = dict(user_traffic.get(email) or {})
+                if not traffic and cid and cid in user_traffic:
+                    traffic = dict(user_traffic.get(cid) or {})
+                canonical = cid or email
                 clients.append(
                     ClientUsageModel(
-                        id=str(client.get("id") or email),
+                        id=canonical,
                         email=email or None,
                         incoming=int(traffic.get("downlink") or 0),
                         outgoing=int(traffic.get("uplink") or 0),
@@ -1488,7 +1513,22 @@ class XrayDriver(CoreDriver):
     def online_users(self) -> list[str]:
         if not self.running():
             return []
-        return self._api().online_users()
+        users = self._api().online_users()
+        # Runtime reports the email alias; map it to canonical node_id so the
+        # panel online check matches the same key used for traffic billing.
+        try:
+            alias: dict[str, str] = {}
+            for inbound in self.list_inbounds():
+                for row in (inbound.get("settings") or {}).get("clients") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    email = str(row.get("email") or "").strip()
+                    cid = str(row.get("id") or "").strip()
+                    if email and cid:
+                        alias[email] = cid
+        except Exception:
+            alias = {}
+        return [alias.get(str(item), str(item)) for item in users]
 
     def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot
@@ -1503,6 +1543,18 @@ class XrayDriver(CoreDriver):
         users = body.get("users") or {}
         if not isinstance(users, dict):
             return online_traffic_from_snapshot(self)
+        try:
+            alias = {}
+            for inbound in self.list_inbounds():
+                for row in (inbound.get("settings") or {}).get("clients") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    email = str(row.get("email") or "").strip()
+                    cid = str(row.get("id") or "").strip()
+                    if email and cid:
+                        alias[email] = cid
+        except Exception:
+            alias = {}
         out: dict[str, dict[str, int]] = {}
         for email, row in users.items():
             if not isinstance(row, dict):
@@ -1511,7 +1563,11 @@ class XrayDriver(CoreDriver):
             for key in ("uplink", "downlink", "sessions"):
                 if key in row and row[key] is not None:
                     entry[key] = int(row[key])
-            out[str(email)] = entry
+            label = str(email)
+            out[label] = entry
+            canonical = alias.get(label)
+            if canonical and canonical != label:
+                out[canonical] = entry
         # Xray /api/stats/online/traffic may return session presence without
         # uplink/downlink; fall back to QueryStats snapshot counters.
         if out and not any(

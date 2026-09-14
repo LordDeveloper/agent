@@ -724,7 +724,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_peer_diag.add_argument(
         "--core",
         default="wireguard",
-        choices=["wireguard", "amnezia"],
+        choices=["wireguard", "amnezia", "l2tp"],
         help="VPN core to inspect (default: wireguard)",
     )
     p_peer_diag.add_argument(

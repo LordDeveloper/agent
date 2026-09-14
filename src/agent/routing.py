@@ -4,6 +4,7 @@ ROUTE_SLUGS = {
     "xray": "xray",
     "wireguard": "wireguard",
     "amnezia": "amnezia",
+    "l2tp": "l2tp",
 }
 
 ALIASES = {

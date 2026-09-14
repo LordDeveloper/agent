@@ -13,7 +13,7 @@ BINARY_SRC=""
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--with xray,wireguard,amnezia] [--binary ./dist/agent] [--open-firewall] [--uninstall]
+Usage: install.sh [--with xray,wireguard,amnezia,l2tp] [--binary ./dist/agent] [--open-firewall] [--uninstall]
 
 Deploys a local pre-built binary. For remote GitHub install use:
   scripts/get-agent.sh   # curl-friendly; supports private repos via GITHUB_TOKEN
@@ -88,6 +88,7 @@ XRAY_API_BASE=http://127.0.0.1:8080
 XRAY_BINARY=/usr/local/bin/xray
 WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
+L2TP_CONFIG_DIR=/etc/netinja/l2tp
 EOF
   chmod 600 "$CONFIG_DIR/.env"
 else
@@ -153,6 +154,11 @@ install_core() {
       DEBIAN_FRONTEND=noninteractive apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard || true
       echo "AmneziaWG kernel module may require manual install on this kernel"
+      ;;
+    l2tp)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y xl2tpd ppp strongswan strongswan-pki
+      mkdir -p /etc/netinja/l2tp /etc/xl2tpd /etc/ppp
       ;;
   esac
 }

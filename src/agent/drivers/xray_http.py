@@ -371,13 +371,20 @@ class XrayHttpClient:
         proto = str(protocol or current.get("protocol") or "vless").strip().lower()
         existing = self._inbound_clients(current)
         by_email: dict[str, dict[str, Any]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
         extras: list[dict[str, Any]] = []
         for row in existing:
             email = self._client_email(row)
+            cid = str(row.get("id") or "").strip()
             if email:
                 by_email[email] = row
-            else:
+            if cid:
+                by_id[cid] = row
+            if not email and not cid:
                 extras.append(row)
+
+        def _client_id(row: dict[str, Any]) -> str:
+            return str(row.get("id") or "").strip()
 
         mode_key = str(mode or "upsert").strip().lower()
         applied = 0
@@ -385,38 +392,77 @@ class XrayHttpClient:
 
         if mode_key == "remove":
             drop = {str(email).strip() for email in (remove_emails or []) if str(email).strip()}
-            before = len(by_email)
+            before = len(by_email) + len([row for row in extras if _client_id(row) in drop])
             by_email = {email: row for email, row in by_email.items() if email not in drop}
-            applied = max(0, before - len(by_email))
+            by_id = {cid: row for cid, row in by_id.items() if self._client_email(row) not in drop and cid not in drop}
+            extras = [row for row in extras if _client_id(row) not in drop]
+            applied = max(0, before - (len(by_email) + len(extras)))
         else:
             for raw in clients:
                 if not isinstance(raw, dict):
                     errors.append({"email": "", "message": "client must be an object"})
                     continue
                 email = self._client_email(raw)
+                cid = _client_id(raw)
                 try:
                     native = xray_protocol_user(proto, raw)
                 except Exception as exc:  # noqa: BLE001
                     errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
                     continue
+                # Canonical identity is panel node_id (Xray id); email is alias.
+                target = by_id.get(cid) if cid else None
+                if target is None and email:
+                    target = by_email.get(email)
                 if mode_key == "add":
-                    if email and email in by_email:
+                    if target is not None:
                         errors.append({"email": email, "message": "client already exists"})
                         continue
+                    if cid:
+                        by_id[cid] = native
                     if email:
                         by_email[email] = native
-                    else:
+                    if not cid and not email:
                         extras.append(native)
                     applied += 1
                 elif mode_key == "edit":
-                    if not email or email not in by_email:
+                    if target is None:
                         errors.append({"email": email, "message": "client not found"})
                         continue
-                    by_email[email] = {**by_email[email], **native}
+                    merged_row = {**target, **native}
+                    old_email = self._client_email(target)
+                    old_id = _client_id(target)
+                    if old_email and old_email in by_email and by_email[old_email] is target:
+                        del by_email[old_email]
+                    if old_id and old_id in by_id and by_id[old_id] is target:
+                        del by_id[old_id]
+                    new_email = self._client_email(merged_row) or old_email
+                    new_id = _client_id(merged_row) or old_id
+                    if new_email:
+                        by_email[new_email] = merged_row
+                    if new_id:
+                        by_id[new_id] = merged_row
                     applied += 1
                 else:  # upsert
-                    if email:
-                        by_email[email] = {**by_email.get(email, {}), **native}
+                    if target is not None:
+                        merged_row = {**target, **native}
+                        old_email = self._client_email(target)
+                        old_id = _client_id(target)
+                        if old_email and old_email in by_email and by_email[old_email] is target:
+                            del by_email[old_email]
+                        if old_id and old_id in by_id and by_id[old_id] is target:
+                            del by_id[old_id]
+                        new_email = self._client_email(merged_row) or old_email
+                        new_id = _client_id(merged_row) or old_id
+                        if new_email:
+                            by_email[new_email] = merged_row
+                        if new_id:
+                            by_id[new_id] = merged_row
+                    elif cid:
+                        by_id[cid] = native
+                        if email:
+                            by_email[email] = native
+                    elif email:
+                        by_email[email] = native
                     else:
                         extras.append(native)
                     applied += 1
@@ -426,9 +472,21 @@ class XrayHttpClient:
             for key, value in inbound_settings.items():
                 if key not in {"clients", "users"}:
                     settings[key] = value
-        merged = extras + list(by_email.values())
-        settings["clients"] = merged
-        settings["users"] = merged
+        merged = extras + list(by_id.values())
+        seen: set[int] = set()
+        deduped: list[dict[str, Any]] = []
+        for row in merged:
+            marker = id(row)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(row)
+        for row in by_email.values():
+            if id(row) not in seen:
+                seen.add(id(row))
+                deduped.append(row)
+        settings["clients"] = deduped
+        settings["users"] = deduped
         if proto == "vless":
             settings.setdefault("decryption", "none")
 
