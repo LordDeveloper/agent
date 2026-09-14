@@ -15,6 +15,40 @@ def sanitize_lns_name(name: str, fallback: str) -> str:
     return cleaned[:48]
 
 
+def _append_lns_default(
+    lines: list[str],
+    *,
+    ranges: list[tuple[str, str]],
+    gateway: str,
+    auth_name: str = 'l2tpd',
+) -> None:
+    """
+    Incoming L2TP/IPsec clients are accepted only via [lns default].
+
+    xl2tpd get_lns() ignores named [lns foo] sections unless the peer matches a
+    lac= IP ACL; with access control=no it returns deflns. Without [lns default],
+    every client gets "Denied connection to unauthorized peer" / No Authorization.
+    """
+    lines.append('[lns default]')
+    for start, end in ranges:
+        lines.append(f'ip range = {start}-{end}')
+    lines.extend(
+        [
+            f'local ip = {gateway}',
+            'require chap = yes',
+            'refuse pap = yes',
+            # Tunnel-layer auth rejects phone/Windows L2TP clients before PPP.
+            'require authentication = no',
+            # Must match options.xl2tpd "name l2tpd" / chap-secrets server "*".
+            f'name = {auth_name}',
+            'ppp debug = no',
+            'pppoptfile = /etc/ppp/options.xl2tpd',
+            'length bit = yes',
+            '',
+        ]
+    )
+
+
 def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
     lines = [
         '; Managed by Netinja Agent — do not edit manually',
@@ -24,54 +58,33 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
         'access control = no',
         '',
     ]
-    rendered = 0
+
+    ranges: list[tuple[str, str]] = []
+    gateways: list[str] = []
+    seen_subnets: set[str] = set()
     for server in servers:
         try:
-            raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
-            name = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
             subnet = normalize_l2tp_subnet(str(server.get('subnet') or ''))
+            if subnet in seen_subnets:
+                continue
+            seen_subnets.add(subnet)
             start, end = l2tp_pool_bounds(subnet)
             gateway = l2tp_gateway(subnet)
         except Exception as exc:
             log.warning('skip L2TP server %s in xl2tpd.conf: %s', server.get('id'), exc)
             continue
+        ranges.append((start, end))
+        gateways.append(gateway)
 
-        lines.extend(
-            [
-                f'[lns {name}]',
-                f'ip range = {start}-{end}',
-                f'local ip = {gateway}',
-                'require chap = yes',
-                'refuse pap = yes',
-                # PPP auth (chap-secrets) happens in pppd. L2TP-layer tunnel auth
-                # rejects Android/iOS/Windows L2TP/IPsec clients before CHAP runs
-                # ("Denied connection to unauthorized peer" / No Authorization).
-                'require authentication = no',
-                f'name = {name}',
-                'ppp debug = no',
-                'pppoptfile = /etc/ppp/options.xl2tpd',
-                'length bit = yes',
-                '',
-            ]
-        )
-        rendered += 1
-
-    if rendered == 0:
-        # Keep daemon bootable even with empty store (global-only).
-        lines.extend(
-            [
-                '[lns default]',
-                'ip range = 10.255.255.10-10.255.255.20',
-                'local ip = 10.255.255.1',
-                'require chap = yes',
-                'refuse pap = yes',
-                'require authentication = no',
-                'name = default',
-                'ppp debug = no',
-                'pppoptfile = /etc/ppp/options.xl2tpd',
-                'length bit = yes',
-                '',
-            ]
+    if ranges:
+        _append_lns_default(lines, ranges=ranges, gateway=gateways[0], auth_name='l2tpd')
+    else:
+        # Keep daemon bootable even with empty store.
+        _append_lns_default(
+            lines,
+            ranges=[('10.255.255.10', '10.255.255.20')],
+            gateway='10.255.255.1',
+            auth_name='l2tpd',
         )
 
     return '\n'.join(lines).rstrip() + '\n'
