@@ -43,7 +43,10 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
                 f'local ip = {gateway}',
                 'require chap = yes',
                 'refuse pap = yes',
-                'require authentication = yes',
+                # PPP auth (chap-secrets) happens in pppd. L2TP-layer tunnel auth
+                # rejects Android/iOS/Windows L2TP/IPsec clients before CHAP runs
+                # ("Denied connection to unauthorized peer" / No Authorization).
+                'require authentication = no',
                 f'name = {name}',
                 'ppp debug = no',
                 'pppoptfile = /etc/ppp/options.xl2tpd',
@@ -62,7 +65,7 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
                 'local ip = 10.255.255.1',
                 'require chap = yes',
                 'refuse pap = yes',
-                'require authentication = yes',
+                'require authentication = no',
                 'name = default',
                 'ppp debug = no',
                 'pppoptfile = /etc/ppp/options.xl2tpd',
