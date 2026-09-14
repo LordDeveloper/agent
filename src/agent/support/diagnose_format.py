@@ -177,12 +177,42 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
     if is_l2tp:
         lines.append(f'  Linked peer:  {entity.get("linked_peer_id") or "-"}')
         lines.append(f'  Exit iface:   {routing.get("exit_interface") or entity.get("exit_interface") or "-"}')
+        lines.append(f'  CIDR:         {match.get("cidr") or routing.get("cidr") or "-"}')
     else:
         lines.extend([
             f'  Public key:   {_truncate(str(entity.get("public_key") or "-"), 56)}',
             f'  AllowedIPs:   {_truncate(str(entity.get("allowed_ips") or "-"), 56)}',
             f'  Exit iface:   {entity.get("exit_interface") or "-"}',
         ])
+
+    linked_peer = match.get('linked_peer')
+    if is_l2tp and isinstance(linked_peer, dict):
+        lines.extend([
+            '',
+            'Linked WireGuard/Amnezia peer',
+            f'  Found:        {_yes_no(linked_peer.get("found"))}',
+            f'  Core:         {linked_peer.get("core") or "-"}',
+            f'  Peer id:      {linked_peer.get("id") or entity.get("linked_peer_id") or "-"}',
+            f'  Email:        {linked_peer.get("email") or "-"}',
+            f'  Address:      {linked_peer.get("address") or "-"}',
+            f'  Exit iface:   {linked_peer.get("exit_interface") or "-"}',
+            f'  Enabled:      {_yes_no(linked_peer.get("is_enabled"))}',
+            f'  Online:       {_yes_no(linked_peer.get("online"))}',
+        ])
+        iface = linked_peer.get('interface') if isinstance(linked_peer.get('interface'), dict) else {}
+        if iface:
+            lines.append(
+                f'  Interface:    {iface.get("name") or iface.get("id") or "-"}'
+                f' · subnet {iface.get("subnet") or "-"}'
+            )
+        lines.append(
+            f'  Exit match:   {_yes_no(routing.get("exit_matches_linked"))}'
+            f' (L2TP={routing.get("exit_interface") or "-"}'
+            f' / WG={routing.get("linked_exit_interface") or linked_peer.get("exit_interface") or "-"})'
+        )
+        lines.append(
+            f'  IP note:      L2TP IP is intentionally different from WG peer IP'
+        )
 
     lines.extend([
         '',
@@ -194,6 +224,7 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
         lines.extend([
             f'  Interface:    {live_row.get("interface") or "-"}',
             f'  Interface up: {_yes_no(live_row.get("is_up"))}',
+            f'  Online:       {_yes_no(live_row.get("online") or live_row.get("is_up"))}',
         ])
     else:
         lines.extend([
@@ -201,6 +232,54 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
             f'  Handshake:    {entity.get("handshake_at") or "-"}',
             f'  Endpoint:     {entity.get("endpoint") or "-"}',
         ])
+
+    if routing:
+        lines.extend([
+            '',
+            'Routing / egress',
+            f'  Exit iface:   {routing.get("exit_interface") or "-"}',
+            f'  Expected tbl: {routing.get("expected_table") or "-"}',
+            f'  Rule pref:    {routing.get("expected_rule_pref") or "-"}',
+        ])
+        policy = routing.get('policy_route') if isinstance(routing.get('policy_route'), dict) else {}
+        if policy:
+            lines.append(
+                f'  Policy tbl:   {policy.get("table") or "-"}'
+                f' · default={_yes_no(policy.get("has_default"))}'
+            )
+        rules = list(routing.get('ip_rules') or [])
+        if rules:
+            lines.append(f'  IP rules:     {len(rules)} matching')
+            for rule in rules[:4]:
+                if isinstance(rule, dict):
+                    lines.append(
+                        f'                src={rule.get("src") or "-"}'
+                        f' → table {rule.get("table") or "-"}'
+                        f' pref={rule.get("pref") or "-"}'
+                    )
+        egress = routing.get('simulated_egress') if isinstance(routing.get('simulated_egress'), dict) else {}
+        if egress:
+            lines.append(f'  Route get:    {_truncate(str(egress.get("raw") or "-"), 72)}')
+        nat = routing.get('nat') if isinstance(routing.get('nat'), dict) else {}
+        if nat:
+            lines.append(f'  NAT MASQ:     {_yes_no(nat.get("masquerade"))}')
+
+    companion = match.get('l2tp_companion')
+    if not is_l2tp and isinstance(companion, dict):
+        lines.extend([
+            '',
+            'L2TP companion',
+            f'  Found:        {_yes_no(companion.get("found"))}',
+            f'  User id:      {companion.get("id") or "-"}',
+            f'  Username:     {companion.get("username") or "-"}',
+            f'  Address:      {companion.get("address") or "-"}',
+            f'  Linked id:    {companion.get("linked_peer_id") or "-"}',
+            f'  Exit iface:   {companion.get("exit_interface") or "-"}',
+            f'  Enabled:      {_yes_no(companion.get("is_enabled"))}',
+            f'  Online:       {_yes_no(companion.get("online"))}',
+            f'  Server:       {companion.get("server_name") or companion.get("server_id") or "-"}',
+        ])
+
     lines.append('')
 
     checks = list(match.get('checks') or [])

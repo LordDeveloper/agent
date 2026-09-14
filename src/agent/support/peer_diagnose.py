@@ -590,6 +590,21 @@ def diagnose_peer_address(
         for row in rows
     ]
 
+    for match, row in zip(matches, rows):
+        companion = _find_l2tp_companion(store, row.get('peer') or {})
+        if companion is not None:
+            match['l2tp_companion'] = companion
+            if companion.get('found'):
+                match.setdefault('checks', []).append(
+                    {
+                        'name': 'l2tp_companion',
+                        'ok': True,
+                        'linked_peer_id': companion.get('linked_peer_id'),
+                        'l2tp_address': companion.get('address'),
+                        'exit_interface': companion.get('exit_interface'),
+                    }
+                )
+
     issue_count = sum(match['issue_counts']['error'] for match in matches)
     warning_count = sum(match['issue_counts']['warning'] for match in matches)
     healthy = issue_count == 0 and all(match.get('healthy') for match in matches)
@@ -608,3 +623,42 @@ def diagnose_peer_address(
             'match_count': len(matches),
         },
     }
+
+
+def _find_l2tp_companion(store: Store, peer: dict[str, Any]) -> dict[str, Any] | None:
+    """Attach L2TP companion summary when diagnosing a WireGuard/Amnezia peer."""
+    peer_id = str(peer.get('id') or '').strip()
+    peer_email = str(peer.get('email') or '').strip()
+    if not peer_id and not peer_email:
+        return None
+
+    try:
+        from agent.support.l2tp_diagnose import find_users_by_linked_peer_id
+    except Exception:
+        return None
+
+    for key in (peer_id, peer_email):
+        if not key:
+            continue
+        rows = find_users_by_linked_peer_id(store, 'l2tp', key)
+        if not rows:
+            continue
+        row = rows[0]
+        user = row.get('user') or {}
+        server = row.get('server') or {}
+        return {
+            'found': True,
+            'id': user.get('id'),
+            'username': user.get('username'),
+            'email': user.get('email'),
+            'address': normalize_peer_host(user.get('address')),
+            'linked_peer_id': user.get('linked_peer_id') or key,
+            'exit_interface': user.get('exit_interface'),
+            'is_enabled': record_is_enabled(user),
+            'online': bool(user.get('online')),
+            'server_id': server.get('id'),
+            'server_name': server.get('name'),
+            'server_subnet': server.get('subnet'),
+        }
+
+    return None
