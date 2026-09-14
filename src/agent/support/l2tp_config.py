@@ -92,9 +92,10 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
 
 def render_ppp_options() -> str:
     # Server-oriented options (not serial modem). Matches common L2TP/IPsec LNS setups.
+    # pppd only accepts '#' comments — ';' is treated as an option and exits with code 2.
     return '\n'.join(
         [
-            '; Managed by Netinja Agent',
+            '# Managed by Netinja Agent',
             'ipcp-accept-local',
             'ipcp-accept-remote',
             'noccp',
