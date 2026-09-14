@@ -658,16 +658,20 @@ class L2tpDriver(CoreDriver):
         return l2tp_servers_as_interfaces(servers)
 
     def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
-        """Fill exit_interface from linked WireGuard/Amnezia peer when missing."""
+        """Keep exit_interface aligned with the linked WireGuard/Amnezia peer.
+
+        Always refresh from the linked peer when found — companion users otherwise
+        keep a stale/empty exit after the WG peer moves to another region node.
+        """
         from agent.support.peer_egress import normalize_exit_interface
 
-        current = normalize_exit_interface(user.get('exit_interface'))
-        if current:
-            user['exit_interface'] = current
-            return
-
-        linked = str(user.get('linked_peer_id') or user.get('id') or '').strip()
+        linked = str(user.get('linked_peer_id') or '').strip()
         if not linked:
+            linked = str(user.get('id') or '').strip()
+        if not linked:
+            current = normalize_exit_interface(user.get('exit_interface'))
+            if current:
+                user['exit_interface'] = current
             return
 
         for core in ('wireguard', 'amnezia'):
@@ -683,6 +687,12 @@ class L2tpDriver(CoreDriver):
                     if exit_iface:
                         user['exit_interface'] = exit_iface
                         return
+
+        current = normalize_exit_interface(user.get('exit_interface'))
+        if current:
+            user['exit_interface'] = current
+        else:
+            user.pop('exit_interface', None)
 
     def _sync_peer_egress(self) -> None:
         try:
@@ -711,8 +721,33 @@ class L2tpDriver(CoreDriver):
                 self._egress_interfaces(),
                 data_dir=self.settings.data_dir,
             )
+            self._install_ppp_egress_hook()
         except Exception:
             log.exception('l2tp peer egress reconcile failed')
+
+    def _install_ppp_egress_hook(self) -> None:
+        """Re-apply peer egress when a PPP session comes up (pppN appears after L2TP auth)."""
+        from agent.support.peer_egress import apply_script_path
+
+        hook_dir = Path('/etc/ppp/ip-up.d')
+        hook = hook_dir / '99-netinja-l2tp-egress'
+        script = apply_script_path(self.settings.data_dir)
+        content = (
+            '#!/bin/sh\n'
+            '# Managed by Netinja Agent — refresh L2TP/WG peer egress after PPP up\n'
+            f'SCRIPT="{script}"\n'
+            'if [ -x "$SCRIPT" ]; then\n'
+            '  "$SCRIPT" >/dev/null 2>&1 || true\n'
+            'fi\n'
+        )
+        try:
+            hook_dir.mkdir(parents=True, exist_ok=True)
+            previous = hook.read_text(encoding='utf-8') if hook.is_file() else ''
+            if previous != content:
+                hook.write_text(content, encoding='utf-8')
+            hook.chmod(0o755)
+        except OSError as exc:
+            log.warning('l2tp ppp ip-up hook install failed: %s', exc)
 
     def _install_to_system(self, staging: Path) -> None:
         targets = {
