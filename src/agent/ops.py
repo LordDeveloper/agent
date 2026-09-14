@@ -134,6 +134,8 @@ def install_l2tp() -> dict:
         Path('/etc/xl2tpd'),
         Path('/etc/ppp'),
         Path('/etc/agent/bin/l2tp'),
+        Path('/var/run/xl2tpd'),
+        Path('/run/xl2tpd'),
     ):
         path.mkdir(parents=True, exist_ok=True)
 

@@ -20,13 +20,11 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
         subnet = normalize_l2tp_subnet(str(server.get('subnet') or ''))
         start, end = l2tp_pool_bounds(subnet)
         gateway = l2tp_gateway(subnet)
-        port = int(server.get('listen_port') or 1701)
         lines.extend(
             [
                 f'[lns {name}]',
                 f'ip range = {start}-{end}',
                 f'local ip = {gateway}',
-                f'port = {port}',
                 'require chap = yes',
                 'refuse pap = yes',
                 'require authentication = yes',

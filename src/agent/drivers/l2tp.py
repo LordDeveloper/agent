@@ -200,9 +200,16 @@ class L2tpDriver(CoreDriver):
         user.setdefault('id', str(uuid.uuid4()))
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
 
-        for existing in server.get('users') or []:
-            if str(existing.get('id')) == str(user['id']) or str(existing.get('email')) == str(user.get('email')):
+        for existing in list(server.get('users') or []):
+            same_id = str(existing.get('id')) == str(user['id'])
+            same_email = str(existing.get('email') or '') == str(user.get('email') or '')
+            if same_id:
                 return self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+            if same_email:
+                # Peer identity rotate: drop the stale user so username/password/address can change.
+                self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                server = self.get_server(server_id)
+                break
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
@@ -349,6 +356,10 @@ class L2tpDriver(CoreDriver):
 
     def diagnose_address(self, address: str) -> dict[str, Any]:
         from agent.support.l2tp_diagnose import diagnose_user_address
+
+        # Heal before reporting — xl2tpd often stays stopped after reboot/config write.
+        if self.installed() and not self._service_active('xl2tpd'):
+            self._ensure_services(start=True, restart=True)
 
         self.sync_user_stats()
         return diagnose_user_address(self.store, self.key, address)
@@ -515,7 +526,20 @@ class L2tpDriver(CoreDriver):
 
     def _service_active(self, unit: str) -> bool:
         result = run(['systemctl', 'is-active', unit], check=False, timeout=10)
-        return result.returncode == 0 and 'active' in (result.stdout or '')
+        return (result.stdout or '').strip() == 'active'
+
+    def _ensure_runtime_dirs(self) -> None:
+        for path in (
+            Path('/etc/xl2tpd'),
+            Path('/etc/ppp'),
+            Path('/var/run/xl2tpd'),
+            Path('/run/xl2tpd'),
+            Path('/var/run/pppd'),
+        ):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.warning('l2tp runtime dir %s: %s', path, exc)
 
     def _ensure_services(self, *, start: bool, restart: bool = False, reload: bool = False) -> None:
         if not start:
@@ -524,23 +548,63 @@ class L2tpDriver(CoreDriver):
             log.warning('l2tp packages missing — run POST /cores/l2tp/install')
             return
 
-        for unit in ('strongswan-starter', 'ipsec'):
-            if self._service_active(unit) or shutil.which('ipsec'):
-                run(['systemctl', 'enable', unit], check=False, timeout=15)
-                if restart:
-                    run(['systemctl', 'restart', unit], check=False, timeout=60)
-                else:
-                    run(['systemctl', 'start', unit], check=False, timeout=60)
-                run(['ipsec', 'reload'], check=False, timeout=30)
-                break
+        self._ensure_runtime_dirs()
 
+        for unit in ('strongswan-starter', 'ipsec'):
+            unit_exists = (
+                Path(f'/lib/systemd/system/{unit}.service').is_file()
+                or Path(f'/usr/lib/systemd/system/{unit}.service').is_file()
+                or Path(f'/etc/systemd/system/{unit}.service').is_file()
+                or self._service_active(unit)
+                or shutil.which('ipsec') is not None
+            )
+            if not unit_exists:
+                continue
+            run(['systemctl', 'unmask', unit], check=False, timeout=15)
+            run(['systemctl', 'enable', unit], check=False, timeout=15)
+            if restart or not self._service_active(unit):
+                run(['systemctl', 'reset-failed', unit], check=False, timeout=15)
+                run(['systemctl', 'restart', unit], check=False, timeout=60)
+            else:
+                run(['systemctl', 'start', unit], check=False, timeout=60)
+            run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
+            run(['ipsec', 'reload'], check=False, timeout=30)
+            break
+
+        self._ensure_xl2tpd(force_restart=restart or reload)
+
+    def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
+        run(['systemctl', 'unmask', 'xl2tpd'], check=False, timeout=15)
         run(['systemctl', 'enable', 'xl2tpd'], check=False, timeout=15)
-        if restart:
+
+        if force_restart or not self._service_active('xl2tpd'):
+            run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
             run(['systemctl', 'restart', 'xl2tpd'], check=False, timeout=60)
-        elif reload:
-            run(['systemctl', 'reload-or-restart', 'xl2tpd'], check=False, timeout=60)
         else:
             run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
+
+        if self._service_active('xl2tpd'):
+            return True
+
+        run(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
+        run(['systemctl', 'restart', 'xl2tpd'], check=False, timeout=60)
+
+        if self._service_active('xl2tpd'):
+            return True
+
+        status = run(['systemctl', 'status', 'xl2tpd', '--no-pager', '-l', '-n', '30'], check=False, timeout=15)
+        journal = run(
+            ['journalctl', '-u', 'xl2tpd', '-n', '40', '--no-pager', '-o', 'cat'],
+            check=False,
+            timeout=15,
+        )
+        log.error(
+            'xl2tpd failed to become active\nstatus=%s\njournal=%s',
+            (status.stdout or status.stderr or '').strip(),
+            (journal.stdout or journal.stderr or '').strip(),
+        )
+        return False
 
     def _collect_ppp_sessions(self) -> dict[str, dict[str, Any]]:
         from agent.support.l2tp_diagnose import _collect_ppp_sessions
