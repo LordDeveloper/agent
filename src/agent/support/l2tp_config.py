@@ -102,8 +102,6 @@ def render_ppp_options() -> str:
 def render_chap_secrets(servers: list[dict[str, Any]]) -> str:
     lines = ['# Managed by Netinja Agent — client server secret IP']
     for server in servers:
-        raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
-        lns = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
         for user in server.get('users') or []:
             if not isinstance(user, dict):
                 continue
@@ -115,7 +113,9 @@ def render_chap_secrets(servers: list[dict[str, Any]]) -> str:
             # Avoid breaking chap-secrets field splitting.
             username = username.replace('\t', '').replace(' ', '')
             password = password.replace('\t', '').replace(' ', '')
-            lines.append(f'{username}\t{lns}\t{password}\t{address}')
+            # Server column must be "*" (or match pppd "name"). Binding to the LNS
+            # section title (wg-l2tp-…) breaks CHAP because options.xl2tpd uses name=l2tpd.
+            lines.append(f'{username}\t*\t{password}\t{address}')
     return '\n'.join(lines) + '\n'
 
 
@@ -135,6 +135,7 @@ def render_ipsec_conf(servers: list[dict[str, Any]]) -> str:
         '    leftprotoport=17/%any',
         '    right=%any',
         '    rightprotoport=17/%any',
+        '    forceencaps=yes',
         '    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!',
         '    esp=aes256-sha1,aes128-sha1,3des-sha1!',
         '    rekey=no',

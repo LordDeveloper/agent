@@ -172,6 +172,25 @@ class L2tpDriver(CoreDriver):
                 return candidate
         raise AgentError('VALIDATION_ERROR', 'No free /16 subnet for L2TP server')
 
+    def _used_addresses_for_subnet(self, subnet: str) -> set[str]:
+        """Collect assigned IPs across all L2TP servers that share this /16."""
+        try:
+            target = normalize_l2tp_subnet(subnet)
+        except AgentError:
+            return set()
+        used: set[str] = set()
+        for row in self.list_servers():
+            try:
+                if normalize_l2tp_subnet(str(row.get('subnet') or '')) != target:
+                    continue
+            except AgentError:
+                continue
+            for user in row.get('users') or []:
+                addr = str(user.get('address') or '').strip()
+                if addr:
+                    used.add(addr)
+        return used
+
     def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
@@ -204,7 +223,16 @@ class L2tpDriver(CoreDriver):
             same_id = str(existing.get('id')) == str(user['id'])
             same_email = str(existing.get('email') or '') == str(user.get('email') or '')
             if same_id:
-                return self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+                existing_addr = str(existing.get('address') or '').strip()
+                try:
+                    if existing_addr:
+                        assert_l2tp_address(server['subnet'], existing_addr)
+                    return self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+                except AgentError:
+                    # Subnet changed (e.g. companion moved to L2TP core pool) — recreate.
+                    self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                    server = self.get_server(server_id)
+                    break
             if same_email:
                 # Peer identity rotate: drop the stale user so username/password/address can change.
                 self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
@@ -213,9 +241,15 @@ class L2tpDriver(CoreDriver):
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        used = {str(u.get('address') or '') for u in server.get('users') or [] if u.get('address')}
+        used = self._used_addresses_for_subnet(str(server.get('subnet') or ''))
         if user.get('address'):
-            user['address'] = assert_l2tp_address(server['subnet'], str(user['address']))
+            try:
+                user['address'] = assert_l2tp_address(server['subnet'], str(user['address']))
+            except AgentError:
+                user['address'] = next_l2tp_ip(server['subnet'], used)
+            else:
+                if str(user['address']) in used:
+                    user['address'] = next_l2tp_ip(server['subnet'], used)
         else:
             user['address'] = next_l2tp_ip(server['subnet'], used)
 
