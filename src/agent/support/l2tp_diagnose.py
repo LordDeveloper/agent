@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Any, Callable
 from agent.db import Store
 from agent.support import record_is_enabled
 from agent.support.disable_reason import explain_disabled
-from agent.support.l2tp_ip import assert_l2tp_address, is_l2tp_host
+from agent.support.l2tp_ip import assert_l2tp_address, is_l2tp_host, matching_l2tp_subnet
 from agent.support.peer_diagnose import (
     _iface_link,
     _ip_rules_for_source,
@@ -242,12 +243,58 @@ def diagnose_user_match(
         )
 
     subnet = str(server.get('subnet') or '')
+    sibling_subnets: list[str] = []
+    if store is not None:
+        for row in store.list_docs(core, _SERVER_KIND):
+            raw = str((row or {}).get('subnet') or '').strip()
+            if raw:
+                sibling_subnets.append(raw)
+    if subnet and subnet not in sibling_subnets:
+        sibling_subnets.insert(0, subnet)
+
     try:
         assert_l2tp_address(subnet, host)
-        checks.append({'name': 'address_in_l2tp_range', 'ok': True})
+        checks.append({'name': 'address_in_l2tp_range', 'ok': True, 'subnet': subnet})
     except Exception as exc:
-        checks.append({'name': 'address_in_l2tp_range', 'ok': False})
-        issues.append(_issue('error', 'ADDRESS_RANGE_INVALID', str(exc)))
+        matched = matching_l2tp_subnet(host, sibling_subnets)
+        l2tp_shaped = False
+        try:
+            l2tp_shaped = is_l2tp_host(ipaddress.ip_address(host))
+        except ValueError:
+            l2tp_shaped = False
+        if matched:
+            checks.append(
+                {
+                    'name': 'address_in_l2tp_range',
+                    'ok': True,
+                    'subnet': matched,
+                    'server_subnet': subnet,
+                }
+            )
+            issues.append(
+                _issue(
+                    'warning',
+                    'ADDRESS_SUBNET_DRIFT',
+                    f'L2TP address [{host}] is in [{matched}] but server subnet is [{subnet}]',
+                    address=host,
+                    server_subnet=subnet,
+                    matched_subnet=matched,
+                )
+            )
+        elif l2tp_shaped:
+            checks.append({'name': 'address_in_l2tp_range', 'ok': True, 'subnet': None})
+            issues.append(
+                _issue(
+                    'warning',
+                    'ADDRESS_SUBNET_DRIFT',
+                    f'L2TP address [{host}] is a valid L2TP host but outside server subnet [{subnet}]',
+                    address=host,
+                    server_subnet=subnet,
+                )
+            )
+        else:
+            checks.append({'name': 'address_in_l2tp_range', 'ok': False})
+            issues.append(_issue('error', 'ADDRESS_RANGE_INVALID', str(exc)))
 
     username = str(user.get('username') or '').strip()
     password = str(user.get('password') or '').strip()

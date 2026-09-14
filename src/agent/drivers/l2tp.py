@@ -29,6 +29,7 @@ from agent.support.l2tp_config import (
 )
 from agent.support.l2tp_ip import (
     assert_l2tp_address,
+    is_l2tp_host,
     l2tp_gateway,
     next_l2tp_ip,
     normalize_l2tp_subnet,
@@ -283,12 +284,81 @@ class L2tpDriver(CoreDriver):
                 )
         return changed
 
+    def _align_server_subnets_to_users(self) -> int:
+        """If every client IP sits in another /16, move the server subnet to match.
+
+        Panel used to rewrite companion subnet from inbound-id while users kept
+        the originally allocated addresses (e.g. 10.188.128.x vs 10.164.0.0/16).
+        """
+        import ipaddress
+
+        changed = 0
+        for server in self.list_servers():
+            votes: dict[str, int] = {}
+            for user in server.get('users') or []:
+                if not isinstance(user, dict):
+                    continue
+                host = str(user.get('address') or '').split('/', 1)[0].strip()
+                if not host:
+                    continue
+                try:
+                    ip = ipaddress.ip_address(host)
+                except ValueError:
+                    continue
+                if ip.version != 4 or not is_l2tp_host(ip):
+                    continue
+                net = str(ipaddress.ip_network(f'{ip}/16', strict=False))
+                votes[net] = votes.get(net, 0) + 1
+            if not votes:
+                continue
+            inferred = max(votes, key=votes.get)
+            try:
+                current = normalize_l2tp_subnet(str(server.get('subnet') or ''))
+            except AgentError:
+                current = ''
+            if inferred == current:
+                continue
+            sid = str(server.get('id'))
+            server['subnet'] = inferred
+            server['gateway'] = l2tp_gateway(inferred)
+            self.store.put_doc(self.key, self._kind, sid, server)
+            changed += 1
+            log.warning(
+                'l2tp aligned server %s subnet %s -> %s from client addresses',
+                sid,
+                current or '(empty)',
+                inferred,
+            )
+        return changed
+
     def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
         if 'subnet' in updates and updates['subnet'] is not None:
-            updates['subnet'] = normalize_l2tp_subnet(str(updates['subnet']))
-            updates['gateway'] = l2tp_gateway(updates['subnet'])
+            new_subnet = normalize_l2tp_subnet(str(updates['subnet']))
+            old_subnet = str(server.get('subnet') or '').strip()
+            orphaned = []
+            if old_subnet and new_subnet != old_subnet:
+                for user in server.get('users') or []:
+                    addr = str((user or {}).get('address') or '').strip()
+                    if not addr:
+                        continue
+                    try:
+                        assert_l2tp_address(new_subnet, addr)
+                    except AgentError:
+                        orphaned.append(addr)
+            if orphaned:
+                log.warning(
+                    'l2tp keep subnet %s (ignore %s) — %s live client IPs would leave the pool',
+                    old_subnet or new_subnet,
+                    new_subnet,
+                    len(orphaned),
+                )
+                updates.pop('subnet', None)
+                updates.pop('gateway', None)
+            else:
+                updates['subnet'] = new_subnet
+                updates['gateway'] = l2tp_gateway(new_subnet)
         if 'ipsec_psk' in updates:
             psk = str(updates.get('ipsec_psk') or '').strip()
             updates['ipsec_psk'] = psk or DEFAULT_IPSEC_PSK
@@ -628,6 +698,7 @@ class L2tpDriver(CoreDriver):
     def _apply_all_configs(self) -> None:
         # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
         self._repair_duplicate_addresses()
+        self._align_server_subnets_to_users()
         servers = self.list_servers()
         templates = resolve_templates(servers)
         staging = self._staging_dir()

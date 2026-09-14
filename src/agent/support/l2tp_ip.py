@@ -83,6 +83,20 @@ def next_l2tp_ip(subnet: str, used: set[str]) -> str:
     raise AgentError('VALIDATION_ERROR', 'No free IPs in L2TP pool — widen subnet or remove users')
 
 
+def matching_l2tp_subnet(address: str, subnets: list[str]) -> str | None:
+    """Return the first /16 in ``subnets`` that contains this L2TP client address."""
+    for raw in subnets:
+        text = str(raw or '').strip()
+        if not text:
+            continue
+        try:
+            assert_l2tp_address(text, address)
+            return normalize_l2tp_subnet(text)
+        except AgentError:
+            continue
+    return None
+
+
 def assert_l2tp_address(subnet: str, address: str) -> str:
     host = str(address or '').split('/', 1)[0].strip()
     if not host:

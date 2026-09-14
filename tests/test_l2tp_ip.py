@@ -52,6 +52,13 @@ def test_next_l2tp_ip_skips_wireguard_range():
     assert second == '10.90.128.3'
 
 
+def test_matching_l2tp_subnet_picks_the_pool_that_contains_the_host():
+    from agent.support.l2tp_ip import matching_l2tp_subnet
+
+    assert matching_l2tp_subnet('10.188.128.3', ['10.164.0.0/16', '10.188.0.0/16']) == '10.188.0.0/16'
+    assert matching_l2tp_subnet('10.188.128.3', ['10.164.0.0/16']) is None
+
+
 def test_assert_l2tp_address_rejects_wireguard_slice():
     with pytest.raises(AgentError):
         assert_l2tp_address('10.90.0.0/16', '10.90.0.50')
