@@ -34,12 +34,12 @@ class CoreRegistry:
         resolved = resolve_core_key(key) or ""
         return resolved in self._drivers
 
-    def get(self, key: str) -> CoreDriver:
+    def get(self, key: str, *, require_enabled: bool = True) -> CoreDriver:
         resolved = resolve_core_key(key) or ""
         driver = self._drivers.get(resolved)
         if driver is None:
             raise AgentError("CONFIG_NOT_FOUND", f"Core [{key}] is not enabled", 404)
-        if resolved not in self.settings.cores():
+        if require_enabled and resolved not in self.settings.cores():
             raise AgentError("CONFIG_NOT_FOUND", f"Core [{key}] is not enabled", 404)
         return driver
 

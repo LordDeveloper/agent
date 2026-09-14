@@ -103,7 +103,25 @@ def _core_installed(name: str) -> bool:
         return Path("/usr/local/bin/xray").is_file() or which("xray") is not None
     if name == "wireguard":
         return which("wg") is not None
-    return which("awg") is not None
+    if name == "amnezia":
+        return which("awg") is not None
+    if name == "l2tp":
+        return which("xl2tpd") is not None and (
+            which("ipsec") is not None or Path("/usr/sbin/ipsec").is_file()
+        )
+    return False
+
+
+_CORE_LABELS = {
+    "xray": "Xray",
+    "wireguard": "WireGuard",
+    "amnezia": "Amnezia",
+    "l2tp": "L2TP",
+}
+
+
+def _core_label(name: str) -> str:
+    return _CORE_LABELS.get(name, name.capitalize())
 
 
 def _enabled_cores() -> set[str]:
@@ -148,7 +166,7 @@ def render_header(subtitle: str | None = None) -> None:
     _print(kv("Agent service", svc, svc_color))
     for core in KNOWN_CORES:
         state, color = _core_state(core)
-        _print(kv(core.capitalize(), state, color))
+        _print(kv(_core_label(core), state, color))
     _print(double_line())
     _print()
 
@@ -248,24 +266,141 @@ def _show_xray_status() -> None:
     except OSError:
         version = "-"
     _print(kv("Version", version, WHITE))
+    _show_core_runtime_status("xray")
 
 
-def _xray_menu() -> None:
+def _show_core_runtime_status(name: str) -> None:
+    from agent.runtime import open_runtime
+
+    label = _core_label(name)
+    runtime = open_runtime()
+    try:
+        enabled = name in set(runtime.settings.cores())
+        _print(kv("Enabled in .env", "yes" if enabled else "no", GREEN if enabled else YELLOW))
+        try:
+            driver = runtime.registry.get(name, require_enabled=False)
+        except Exception as exc:
+            _print(paint(f"  {label} driver unavailable: {exc}", YELLOW))
+            return
+
+        installed = bool(driver.installed())
+        running = bool(driver.running())
+        version = driver.version() or "-"
+        _print(kv("Installed", "yes" if installed else "no", GREEN if installed else RED))
+        _print(kv("Running", "yes" if running else "no", GREEN if running else RED))
+        _print(kv("Version", version, WHITE))
+    finally:
+        runtime.close()
+
+
+def _show_core_start(name: str) -> None:
+    from agent.runtime import open_runtime
+
+    label = _core_label(name)
+    runtime = open_runtime()
+    try:
+        driver = runtime.registry.get(name, require_enabled=False)
+        if name not in set(runtime.settings.cores()):
+            _print(paint(
+                f"  Warning: {label} is not in ENABLED_CORES — API routes stay off until you add it.",
+                YELLOW,
+            ))
+        if not driver.installed():
+            _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
+            return
+        result = driver.enable()
+        _print(paint(f"  {label} started.", GREEN))
+        if isinstance(result, dict) and result:
+            for key, value in result.items():
+                if key in {"enabled", "restarted"}:
+                    continue
+                _print(kv(str(key), str(value), DIM))
+    finally:
+        runtime.close()
+
+
+def _show_core_restart(name: str) -> None:
+    from agent.runtime import open_runtime
+
+    label = _core_label(name)
+    runtime = open_runtime()
+    try:
+        driver = runtime.registry.get(name, require_enabled=False)
+        if name not in set(runtime.settings.cores()):
+            _print(paint(
+                f"  Warning: {label} is not in ENABLED_CORES — API routes stay off until you add it.",
+                YELLOW,
+            ))
+        if not driver.installed():
+            _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
+            return
+        result = driver.restart()
+        _print(paint(f"  {label} restarted.", GREEN))
+        if isinstance(result, dict) and result:
+            for key, value in result.items():
+                if key in {"enabled", "restarted"}:
+                    continue
+                _print(kv(str(key), str(value), DIM))
+    finally:
+        runtime.close()
+
+
+def _core_ops_menu(name: str) -> None:
+    label = _core_label(name)
     while True:
-        render_header("Xray")
-        picked = select(
-            [
-                Choice("latest", "Install / update latest release", GREEN, "1"),
-                Choice("tag", "Install custom tag", CYAN, "2"),
-                Choice("status", "Show binary status", WHITE, "3"),
-                Choice("back", "Back", WHITE, "0"),
-            ]
-        )
+        render_header(label)
+        choices = []
+        if name == "xray":
+            choices.extend(
+                [
+                    Choice("latest", "Install / update latest release", GREEN, "1"),
+                    Choice("tag", "Install custom tag", CYAN, "2"),
+                    Choice("start", "Start", GREEN, "3"),
+                    Choice("restart", "Restart", YELLOW, "4"),
+                    Choice("status", "Status", WHITE, "5"),
+                    Choice("back", "Back", WHITE, "0"),
+                ]
+            )
+        else:
+            choices.extend(
+                [
+                    Choice("install", f"Install {label}", GREEN, "1"),
+                    Choice("start", "Start", GREEN, "2"),
+                    Choice("restart", "Restart", YELLOW, "3"),
+                    Choice("status", "Status", WHITE, "4"),
+                    Choice("back", "Back", WHITE, "0"),
+                ]
+            )
+
+        picked = select(choices)
         if picked in {None, "back"}:
             return
+
         if picked == "status":
-            _run_action("Xray status", _show_xray_status)
+            if name == "xray":
+                _run_action(f"{label} status", _show_xray_status)
+            else:
+                _run_action(f"{label} status", lambda n=name: _show_core_runtime_status(n))
             continue
+
+        if picked == "start":
+            if not confirm(f"Start {label} now?", default=True):
+                continue
+            _run_action(f"Start {label}", lambda n=name: _show_core_start(n))
+            continue
+
+        if picked == "restart":
+            if not confirm(f"Restart {label} now?", default=True):
+                continue
+            _run_action(f"Restart {label}", lambda n=name: _show_core_restart(n))
+            continue
+
+        if picked == "install":
+            if not confirm(f"Install {label} on this host?", default=True):
+                continue
+            _run_action(f"Install {label}", lambda n=name: _show_install(n))
+            continue
+
         if picked == "latest":
             if not confirm("Download latest LordDeveloper/xray release for this host?", default=True):
                 continue
@@ -275,18 +410,23 @@ def _xray_menu() -> None:
             )
             continue
 
-        tag = prompt_text("Release tag (e.g. v1.0.7)", default="")
-        tag = (tag or "").strip()
-        if not tag:
-            _print(paint("  Tag is required.", YELLOW))
-            pause()
-            continue
-        if not confirm(f"Install Xray release [{tag}]?", default=True):
-            continue
-        _run_action(
-            f"Install Xray ({tag})",
-            lambda t=tag: _show_install("xray", force=True, tag=t),
-        )
+        if picked == "tag":
+            tag = prompt_text("Release tag (e.g. v1.0.7)", default="")
+            tag = (tag or "").strip()
+            if not tag:
+                _print(paint("  Tag is required.", YELLOW))
+                pause()
+                continue
+            if not confirm(f"Install Xray release [{tag}]?", default=True):
+                continue
+            _run_action(
+                f"Install Xray ({tag})",
+                lambda t=tag: _show_install("xray", force=True, tag=t),
+            )
+
+
+def _xray_menu() -> None:
+    _core_ops_menu("xray")
 
 
 def _cores_menu() -> None:
@@ -296,8 +436,9 @@ def _cores_menu() -> None:
             [
                 Choice("list", "List cores", CYAN, "1"),
                 Choice("xray", "Xray", GREEN, "2"),
-                Choice("wireguard", "Install WireGuard", GREEN, "3"),
-                Choice("amnezia", "Install Amnezia", GREEN, "4"),
+                Choice("wireguard", "WireGuard", GREEN, "3"),
+                Choice("amnezia", "Amnezia", GREEN, "4"),
+                Choice("l2tp", "L2TP", GREEN, "5"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -306,12 +447,7 @@ def _cores_menu() -> None:
         if picked == "list":
             _run_action("Core list", _show_core_list)
             continue
-        if picked == "xray":
-            _xray_menu()
-            continue
-        if not confirm(f"Install {picked} on this host?", default=True):
-            continue
-        _run_action(f"Install {picked}", lambda name=picked: _show_install(name))
+        _core_ops_menu(picked)
 
 
 def _show_stats(*, online_only: bool) -> None:
@@ -398,6 +534,7 @@ def _wizard() -> None:
             Choice("xray", "Xray", CYAN),
             Choice("wireguard", "WireGuard", GREEN),
             Choice("amnezia", "Amnezia", BLUE),
+            Choice("l2tp", "L2TP", GREEN),
         ],
         selected={"xray"},
     )

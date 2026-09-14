@@ -133,7 +133,7 @@ def install_l2tp() -> dict:
     for path in (
         Path('/etc/xl2tpd'),
         Path('/etc/ppp'),
-        Path('/etc/netinja/l2tp'),
+        Path('/etc/agent/bin/l2tp'),
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -201,7 +201,7 @@ def write_env_file(
             "XRAY_CONFIG=/usr/local/etc/xray/config.json",
             "WIREGUARD_CONFIG_DIR=/etc/wireguard",
             "AMNEZIA_CONFIG_DIR=/etc/amneziawg",
-            "L2TP_CONFIG_DIR=/etc/netinja/l2tp",
+            "L2TP_CONFIG_DIR=/etc/agent/bin/l2tp",
             "",
         ]
     )

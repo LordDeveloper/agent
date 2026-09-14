@@ -82,6 +82,10 @@ class TrafficService:
 
                 driver = registry.get(core_key)
 
+                if core_key == "l2tp":
+
+                    self._drop_linked_l2tp_billing(driver)
+
                 snapshot = driver.usage_snapshot()
 
             except Exception:
@@ -376,11 +380,18 @@ class TrafficService:
 
         users: dict[str, dict[str, Any]] = {}
 
+        linked_l2tp = self._linked_l2tp_client_keys()
+
 
 
         for row in rows:
 
             label = str(row["client_key"])
+
+            # Linked L2TP companions must never contribute to panel pending volume.
+            if str(row.get("core") or "") == "l2tp" and label in linked_l2tp:
+
+                continue
 
             users[label] = {
 
@@ -513,6 +524,80 @@ class TrafficService:
         )
 
         self.store.delete_traffic_pending(row["core"], row["client_key"])
+
+
+
+    def _linked_l2tp_client_keys(self) -> set[str]:
+
+        """Canonical ids/emails of L2TP users linked to a WireGuard/Amnezia peer."""
+
+        keys: set[str] = set()
+
+        try:
+
+            docs = self.store.list_docs("l2tp", "server")
+
+        except Exception:
+
+            return keys
+
+        for doc in docs:
+
+            if not isinstance(doc, dict):
+
+                continue
+
+            for user in doc.get("users") or []:
+
+                if not isinstance(user, dict):
+
+                    continue
+
+                if not str(user.get("linked_peer_id") or "").strip():
+
+                    continue
+
+                for candidate in (user.get("id"), user.get("email")):
+
+                    label = str(candidate or "").strip()
+
+                    if label:
+
+                        keys.add(label)
+
+        return keys
+
+
+
+    def _drop_linked_l2tp_billing(self, driver: Any) -> None:
+
+        """Remove pending/ack rows for companion L2TP users (WG peer owns billing)."""
+
+        try:
+
+            servers = driver.list_servers()
+
+        except Exception:
+
+            return
+
+        for server in servers or []:
+
+            if not isinstance(server, dict):
+
+                continue
+
+            for user in server.get("users") or []:
+
+                if not isinstance(user, dict):
+
+                    continue
+
+                if not str(user.get("linked_peer_id") or "").strip():
+
+                    continue
+
+                self.reset_client_record("l2tp", user)
 
 
 

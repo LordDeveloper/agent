@@ -48,8 +48,11 @@ def _gen_password() -> str:
     return secrets.token_urlsafe(12)
 
 
+DEFAULT_IPSEC_PSK = '12345678'
+
+
 def _gen_psk() -> str:
-    return secrets.token_urlsafe(16)
+    return DEFAULT_IPSEC_PSK
 
 
 class L2tpDriver(CoreDriver):
@@ -145,7 +148,7 @@ class L2tpDriver(CoreDriver):
             'listen_port': int(payload.get('listen_port') or 1701),
             'subnet': subnet,
             'gateway': l2tp_gateway(subnet),
-            'ipsec_psk': str(payload.get('ipsec_psk') or _gen_psk()),
+            'ipsec_psk': DEFAULT_IPSEC_PSK,
             'public_host': str(payload.get('public_host') or ''),
             'users': list(payload.get('users') or []),
         }
@@ -175,6 +178,8 @@ class L2tpDriver(CoreDriver):
         if 'subnet' in updates and updates['subnet'] is not None:
             updates['subnet'] = normalize_l2tp_subnet(str(updates['subnet']))
             updates['gateway'] = l2tp_gateway(updates['subnet'])
+        # Shared IPsec PSK for all L2TP servers on this agent.
+        updates['ipsec_psk'] = DEFAULT_IPSEC_PSK
         server.update(updates)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self._apply_all_configs()
@@ -356,6 +361,9 @@ class L2tpDriver(CoreDriver):
             for user in server.get('users') or []:
                 if not record_is_enabled(user):
                     continue
+                # Companion users bill only via the linked WireGuard/Amnezia peer.
+                if str(user.get('linked_peer_id') or '').strip():
+                    continue
                 clients.append(
                     ClientUsageModel(
                         id=str(user.get('id')),
@@ -382,6 +390,8 @@ class L2tpDriver(CoreDriver):
         online: list[str] = []
         for server in self.list_servers():
             for user in server.get('users') or []:
+                if str(user.get('linked_peer_id') or '').strip():
+                    continue
                 if user.get('online') and record_is_enabled(user):
                     online.append(str(user.get('email') or user.get('id')))
         return online
@@ -403,6 +413,11 @@ class L2tpDriver(CoreDriver):
                 if live and live.get('is_up'):
                     user['online'] = True
                     user['connected_at'] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+                    # Linked companions are not billed — keep session state only.
+                    if str(user.get('linked_peer_id') or '').strip():
+                        if before_online != user.get('online'):
+                            changed = True
+                        continue
                     rx = int(live.get('incoming') or 0)
                     tx = int(live.get('outgoing') or 0)
                     prev_rx = int(user.get('_raw_incoming') or 0)

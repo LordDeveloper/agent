@@ -88,7 +88,7 @@ XRAY_API_BASE=http://127.0.0.1:8080
 XRAY_BINARY=/usr/local/bin/xray
 WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
-L2TP_CONFIG_DIR=/etc/netinja/l2tp
+L2TP_CONFIG_DIR=/etc/agent/bin/l2tp
 EOF
   chmod 600 "$CONFIG_DIR/.env"
 else
@@ -158,7 +158,7 @@ install_core() {
     l2tp)
       DEBIAN_FRONTEND=noninteractive apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y xl2tpd ppp strongswan strongswan-pki
-      mkdir -p /etc/netinja/l2tp /etc/xl2tpd /etc/ppp
+      mkdir -p /etc/agent/bin/l2tp /etc/xl2tpd /etc/ppp
       ;;
   esac
 }

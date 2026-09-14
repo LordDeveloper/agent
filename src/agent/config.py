@@ -29,7 +29,7 @@ class AmneziaSettings(BaseModel):
 
 
 class L2tpSettings(BaseModel):
-    config_dir: str = "/etc/netinja/l2tp"
+    config_dir: str = "/etc/agent/bin/l2tp"
 
 
 class AgentSettings(BaseSettings):
@@ -74,7 +74,7 @@ class AgentSettings(BaseSettings):
 
     wireguard_config_dir: str = "/etc/wireguard"
     amnezia_config_dir: str = "/etc/amneziawg"
-    l2tp_config_dir: str = "/etc/netinja/l2tp"
+    l2tp_config_dir: str = "/etc/agent/bin/l2tp"
     # Seconds between local volume-quota checks (0 disables). Cuts clients on the agent
     # before the Laravel panel polls, so overshoot stays near zero.
     quota_enforce_interval: float = 10.0

@@ -271,6 +271,10 @@ def _enforce_l2tp(driver: Any) -> int:
             if not isinstance(user, dict) or not has_volume_quota(user):
                 continue
 
+            # Companion users share quota with the linked WireGuard/Amnezia peer.
+            if str(user.get('linked_peer_id') or '').strip():
+                continue
+
             email = str(user.get('email') or '')
             uid = str(user.get('id') or '')
             live = traffic_by_email.get(email) or traffic_by_id.get(uid)
