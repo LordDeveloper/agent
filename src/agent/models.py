@@ -130,6 +130,7 @@ class L2tpServerPayload(BaseModel):
     subnet: Optional[str] = None
     ipsec_psk: Optional[str] = None
     public_host: Optional[str] = None
+    templates: Optional[dict[str, Any]] = None
     users: list[dict[str, Any]] = Field(default_factory=list)
 
 

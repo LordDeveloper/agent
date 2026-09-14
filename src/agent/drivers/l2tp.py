@@ -19,11 +19,13 @@ from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
 from agent.support.l2tp_config import (
+    normalize_templates,
     render_chap_secrets,
     render_ipsec_conf,
     render_ipsec_secrets,
     render_ppp_options,
     render_xl2tpd_conf,
+    resolve_templates,
 )
 from agent.support.l2tp_ip import (
     assert_l2tp_address,
@@ -154,14 +156,17 @@ class L2tpDriver(CoreDriver):
 
         name = str(payload.get('name') or f'l2tp-{server_id}')
         subnet = normalize_l2tp_subnet(str(payload.get('subnet') or self._default_subnet(server_id)))
+        psk = str(payload.get('ipsec_psk') or '').strip() or DEFAULT_IPSEC_PSK
+        templates = normalize_templates(payload.get('templates'))
         server = {
             'id': server_id,
             'name': name,
             'listen_port': int(payload.get('listen_port') or 1701),
             'subnet': subnet,
             'gateway': l2tp_gateway(subnet),
-            'ipsec_psk': DEFAULT_IPSEC_PSK,
+            'ipsec_psk': psk,
             'public_host': str(payload.get('public_host') or ''),
+            'templates': templates,
             'users': list(payload.get('users') or []),
         }
         self.store.put_doc(self.key, self._kind, str(server_id), server)
@@ -283,8 +288,11 @@ class L2tpDriver(CoreDriver):
         if 'subnet' in updates and updates['subnet'] is not None:
             updates['subnet'] = normalize_l2tp_subnet(str(updates['subnet']))
             updates['gateway'] = l2tp_gateway(updates['subnet'])
-        # Shared IPsec PSK for all L2TP servers on this agent.
-        updates['ipsec_psk'] = DEFAULT_IPSEC_PSK
+        if 'ipsec_psk' in updates:
+            psk = str(updates.get('ipsec_psk') or '').strip()
+            updates['ipsec_psk'] = psk or DEFAULT_IPSEC_PSK
+        if 'templates' in updates:
+            updates['templates'] = normalize_templates(updates.get('templates'))
         server.update(updates)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self._apply_all_configs()
@@ -610,12 +618,13 @@ class L2tpDriver(CoreDriver):
         # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
         self._repair_duplicate_addresses()
         servers = self.list_servers()
+        templates = resolve_templates(servers)
         staging = self._staging_dir()
         files = {
-            staging / 'xl2tpd.conf': render_xl2tpd_conf(servers),
-            staging / 'options.xl2tpd': render_ppp_options(),
+            staging / 'xl2tpd.conf': render_xl2tpd_conf(servers, templates=templates),
+            staging / 'options.xl2tpd': render_ppp_options(templates=templates),
             staging / 'chap-secrets': render_chap_secrets(servers),
-            staging / 'ipsec.conf': render_ipsec_conf(servers),
+            staging / 'ipsec.conf': render_ipsec_conf(servers, templates=templates),
             staging / 'ipsec.secrets': render_ipsec_secrets(servers),
         }
         for path, content in files.items():
