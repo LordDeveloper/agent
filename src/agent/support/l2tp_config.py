@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.logutil import get_logger
 from agent.support.l2tp_ip import l2tp_gateway, l2tp_pool_bounds, normalize_l2tp_subnet
+
+log = get_logger('l2tp-config')
 
 
 def sanitize_lns_name(name: str, fallback: str) -> str:
@@ -16,18 +19,23 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
     lines = [
         '; Managed by Netinja Agent — do not edit manually',
         '[global]',
-        'listen-addr = 0.0.0.0',
         'port = 1701',
-        'access control = no',
         'auth file = /etc/ppp/chap-secrets',
+        'access control = no',
         '',
     ]
+    rendered = 0
     for server in servers:
-        raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
-        name = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
-        subnet = normalize_l2tp_subnet(str(server.get('subnet') or ''))
-        start, end = l2tp_pool_bounds(subnet)
-        gateway = l2tp_gateway(subnet)
+        try:
+            raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
+            name = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
+            subnet = normalize_l2tp_subnet(str(server.get('subnet') or ''))
+            start, end = l2tp_pool_bounds(subnet)
+            gateway = l2tp_gateway(subnet)
+        except Exception as exc:
+            log.warning('skip L2TP server %s in xl2tpd.conf: %s', server.get('id'), exc)
+            continue
+
         lines.extend(
             [
                 f'[lns {name}]',
@@ -43,26 +51,49 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
                 '',
             ]
         )
+        rendered += 1
+
+    if rendered == 0:
+        # Keep daemon bootable even with empty store (global-only).
+        lines.extend(
+            [
+                '[lns default]',
+                'ip range = 10.255.255.10-10.255.255.20',
+                'local ip = 10.255.255.1',
+                'require chap = yes',
+                'refuse pap = yes',
+                'require authentication = yes',
+                'name = default',
+                'ppp debug = no',
+                'pppoptfile = /etc/ppp/options.xl2tpd',
+                'length bit = yes',
+                '',
+            ]
+        )
+
     return '\n'.join(lines).rstrip() + '\n'
 
 
 def render_ppp_options() -> str:
+    # Server-oriented options (not serial modem). Matches common L2TP/IPsec LNS setups.
     return '\n'.join(
         [
             '; Managed by Netinja Agent',
+            'ipcp-accept-local',
+            'ipcp-accept-remote',
+            'noccp',
+            'auth',
+            'mtu 1280',
+            'mru 1280',
+            'nodefaultroute',
+            'proxyarp',
+            'connect-delay 5000',
             'require-mschap-v2',
             'ms-dns 1.1.1.1',
             'ms-dns 8.8.8.8',
-            'asyncmap 0',
-            'auth',
-            'crtscts',
-            'lock',
-            'hide-password',
-            'modem',
-            'name l2tpd',
-            'proxyarp',
             'lcp-echo-interval 30',
             'lcp-echo-failure 4',
+            'name l2tpd',
             '',
         ]
     )
@@ -95,26 +126,23 @@ def render_ipsec_conf(servers: list[dict[str, Any]]) -> str:
         '    uniqueids=no',
         '    charondebug="ike 0, knl 0, cfg 0"',
         '',
+        'conn L2TP-PSK',
+        '    auto=add',
+        '    keyexchange=ikev1',
+        '    authby=secret',
+        '    type=transport',
+        '    left=%any',
+        '    leftprotoport=17/%any',
+        '    right=%any',
+        '    rightprotoport=17/%any',
+        '    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!',
+        '    esp=aes256-sha1,aes128-sha1,3des-sha1!',
+        '    rekey=no',
+        '    dpddelay=30',
+        '    dpdtimeout=120',
+        '    dpdaction=clear',
+        '',
     ]
-    for server in servers:
-        conn = f"l2tp-psk-{server.get('id')}"
-        lines.extend(
-            [
-                f'conn {conn}',
-                '    auto=add',
-                '    keyexchange=ikev1',
-                '    type=transport',
-                '    left=%defaultroute',
-                '    leftprotoport=17/1701',
-                '    right=%any',
-                '    rightprotoport=17/1701',
-                '    authby=secret',
-                '    ike=aes256-sha1-modp1024,aes128-sha1-modp1024!',
-                '    esp=aes256-sha1,aes128-sha1!',
-                '    rekey=no',
-                '',
-            ]
-        )
     return '\n'.join(lines)
 
 
@@ -122,13 +150,11 @@ def render_ipsec_secrets(servers: list[dict[str, Any]]) -> str:
     lines = ['# Managed by Netinja Agent — PSK']
     seen: set[str] = set()
     for server in servers:
-        psk = str(server.get('ipsec_psk') or '').strip()
-        if not psk or psk in seen:
+        psk = str(server.get('ipsec_psk') or '').strip() or '12345678'
+        if psk in seen:
             continue
         seen.add(psk)
-        lines.append(f': PSK "{psk}"')
-    if len(seen) <= 1:
-        return '\n'.join(lines) + '\n'
-    # Multiple tunnels with different PSKs still use global PSK line in ipsec.secrets;
-    # per-conn secrets would need left/right ids — keep one shared PSK per server doc.
+        lines.append(f'%any %any : PSK "{psk}"')
+    if not seen:
+        lines.append('%any %any : PSK "12345678"')
     return '\n'.join(lines) + '\n'

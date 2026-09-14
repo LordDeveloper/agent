@@ -574,23 +574,47 @@ class L2tpDriver(CoreDriver):
         self._ensure_xl2tpd(force_restart=restart or reload)
 
     def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
+        # Always rewrite configs before touching the unit — stale huge ip-range
+        # or invalid flags are the usual reason SysV start exits 1 with no detail.
+        try:
+            self._apply_all_configs()
+        except Exception as exc:
+            log.error('l2tp config apply failed before xl2tpd start: %s', exc)
+
+        self._ensure_runtime_dirs()
+        self._load_l2tp_kernel_modules()
+        self._clear_xl2tpd_stale_state()
+
+        probe_ok, probe_msg = self._probe_xl2tpd_config()
+        if not probe_ok:
+            log.error('xl2tpd config probe failed: %s', probe_msg)
+
         run(['systemctl', 'unmask', 'xl2tpd'], check=False, timeout=15)
         run(['systemctl', 'enable', 'xl2tpd'], check=False, timeout=15)
+        run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
 
         if force_restart or not self._service_active('xl2tpd'):
-            run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
-            run(['systemctl', 'restart', 'xl2tpd'], check=False, timeout=60)
+            run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
+            self._clear_xl2tpd_stale_state()
+            run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
         else:
             run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
 
         if self._service_active('xl2tpd'):
             return True
 
+        # SysV generator often hides the real daemon error — start binary ourselves.
+        direct_ok, direct_msg = self._start_xl2tpd_direct()
+        if direct_ok and self._xl2tpd_process_running():
+            log.warning('xl2tpd started via direct binary after systemctl failure')
+            return True
+
         run(['systemctl', 'daemon-reload'], check=False, timeout=30)
         run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
-        run(['systemctl', 'restart', 'xl2tpd'], check=False, timeout=60)
+        self._clear_xl2tpd_stale_state()
+        run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
 
-        if self._service_active('xl2tpd'):
+        if self._service_active('xl2tpd') or self._xl2tpd_process_running():
             return True
 
         status = run(['systemctl', 'status', 'xl2tpd', '--no-pager', '-l', '-n', '30'], check=False, timeout=15)
@@ -599,12 +623,85 @@ class L2tpDriver(CoreDriver):
             check=False,
             timeout=15,
         )
+        conf_head = ''
+        conf_path = Path('/etc/xl2tpd/xl2tpd.conf')
+        if conf_path.is_file():
+            conf_head = '\n'.join(conf_path.read_text(encoding='utf-8', errors='replace').splitlines()[:40])
         log.error(
-            'xl2tpd failed to become active\nstatus=%s\njournal=%s',
+            'xl2tpd failed to become active\nprobe=%s\ndirect=%s\nstatus=%s\njournal=%s\nconf_head=\n%s',
+            probe_msg,
+            direct_msg,
             (status.stdout or status.stderr or '').strip(),
             (journal.stdout or journal.stderr or '').strip(),
+            conf_head,
         )
         return False
+
+    def _load_l2tp_kernel_modules(self) -> None:
+        for mod in ('l2tp_ppp', 'l2tp_netlink', 'pppoe', 'pppox', 'ppp_generic'):
+            run(['modprobe', '-q', mod], check=False, timeout=15)
+
+    def _clear_xl2tpd_stale_state(self) -> None:
+        run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
+        for path in (
+            Path('/var/run/xl2tpd.pid'),
+            Path('/run/xl2tpd.pid'),
+            Path('/var/run/xl2tpd/l2tp-control'),
+            Path('/run/xl2tpd/l2tp-control'),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _xl2tpd_binary(self) -> str:
+        return shutil.which('xl2tpd') or '/usr/sbin/xl2tpd'
+
+    def _xl2tpd_process_running(self) -> bool:
+        result = run(['pgrep', '-x', 'xl2tpd'], check=False, timeout=5)
+        return result.returncode == 0
+
+    def _probe_xl2tpd_config(self) -> tuple[bool, str]:
+        """Run xl2tpd briefly in foreground to surface parse/die errors SysV hides."""
+        binary = self._xl2tpd_binary()
+        conf = '/etc/xl2tpd/xl2tpd.conf'
+        if not Path(binary).is_file():
+            return False, f'binary missing: {binary}'
+        if not Path(conf).is_file():
+            return False, f'config missing: {conf}'
+
+        try:
+            result = subprocess.run(
+                [binary, '-D', '-c', conf],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Still running after 1.5s ⇒ config accepted; stop probe instance.
+            run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
+            out = ''
+            if exc.stdout:
+                out += exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode('utf-8', 'replace')
+            if exc.stderr:
+                out += exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode('utf-8', 'replace')
+            return True, (out.strip() or 'probe timed out while running (config ok)')
+
+        out = ((result.stdout or '') + (result.stderr or '')).strip()
+        if result.returncode == 0 and self._xl2tpd_process_running():
+            return True, out or 'probe exited 0'
+        return False, out or f'probe exit={result.returncode}'
+
+    def _start_xl2tpd_direct(self) -> tuple[bool, str]:
+        binary = self._xl2tpd_binary()
+        conf = '/etc/xl2tpd/xl2tpd.conf'
+        self._clear_xl2tpd_stale_state()
+        result = run([binary, '-c', conf], check=False, timeout=15)
+        out = ((result.stdout or '') + (result.stderr or '')).strip()
+        if self._xl2tpd_process_running():
+            return True, out or 'direct start ok'
+        return False, out or f'direct exit={result.returncode}'
 
     def _collect_ppp_sessions(self) -> dict[str, dict[str, Any]]:
         from agent.support.l2tp_diagnose import _collect_ppp_sessions
