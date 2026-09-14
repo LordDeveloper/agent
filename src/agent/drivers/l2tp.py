@@ -191,6 +191,80 @@ class L2tpDriver(CoreDriver):
                     used.add(addr)
         return used
 
+    def _allocate_l2tp_address(
+        self,
+        subnet: str,
+        *,
+        preferred: str | None = None,
+        exclude_user_id: str | None = None,
+    ) -> str:
+        """Pick a free L2TP client IP unique across every server on this /16."""
+        used = self._used_addresses_for_subnet(subnet)
+        if exclude_user_id is not None:
+            for row in self.list_servers():
+                for user in row.get('users') or []:
+                    if str(user.get('id')) == str(exclude_user_id):
+                        used.discard(str(user.get('address') or '').strip())
+
+        preferred_host = str(preferred or '').strip()
+        if preferred_host:
+            try:
+                preferred_host = assert_l2tp_address(subnet, preferred_host)
+                if preferred_host not in used:
+                    return preferred_host
+            except AgentError:
+                pass
+
+        return next_l2tp_ip(subnet, used)
+
+    def _repair_duplicate_addresses(self) -> int:
+        """Reassign client IPs that collide across companion/pure L2TP servers."""
+        # address -> list of (server_id, user_index)
+        collisions: dict[str, list[tuple[str, int]]] = {}
+        servers = list(self.list_servers())
+        by_id = {str(row.get('id')): row for row in servers}
+
+        for row in servers:
+            sid = str(row.get('id'))
+            try:
+                normalize_l2tp_subnet(str(row.get('subnet') or ''))
+            except AgentError:
+                continue
+            for idx, user in enumerate(row.get('users') or []):
+                if not isinstance(user, dict):
+                    continue
+                addr = str(user.get('address') or '').strip()
+                if not addr:
+                    continue
+                collisions.setdefault(addr, []).append((sid, idx))
+
+        changed = 0
+        for addr, owners in collisions.items():
+            if len(owners) <= 1:
+                continue
+            # Keep the first owner; give everyone else a fresh unique IP.
+            for sid, idx in owners[1:]:
+                server = by_id.get(sid)
+                if not server:
+                    continue
+                subnet = str(server.get('subnet') or '')
+                user = (server.get('users') or [])[idx]
+                new_addr = self._allocate_l2tp_address(
+                    subnet,
+                    exclude_user_id=str(user.get('id') or ''),
+                )
+                server['users'][idx]['address'] = new_addr
+                self.store.put_doc(self.key, self._kind, sid, server)
+                changed += 1
+                log.warning(
+                    'reassigned duplicate L2TP IP %s -> %s (server=%s user=%s)',
+                    addr,
+                    new_addr,
+                    sid,
+                    user.get('id'),
+                )
+        return changed
+
     def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
@@ -224,12 +298,18 @@ class L2tpDriver(CoreDriver):
             same_email = str(existing.get('email') or '') == str(user.get('email') or '')
             if same_id:
                 existing_addr = str(existing.get('address') or '').strip()
+                subnet = str(server.get('subnet') or '')
                 try:
                     if existing_addr:
-                        assert_l2tp_address(server['subnet'], existing_addr)
+                        assert_l2tp_address(subnet, existing_addr)
+                    # Another companion server may already own this IP — force a new one.
+                    used_by_others = self._used_addresses_for_subnet(subnet)
+                    used_by_others.discard(existing_addr)
+                    if existing_addr and existing_addr in used_by_others:
+                        raise AgentError('VALIDATION_ERROR', f'Duplicate L2TP address [{existing_addr}]')
                     return self.update_user(server_id, str(existing.get('id') or user['id']), payload)
                 except AgentError:
-                    # Subnet changed (e.g. companion moved to L2TP core pool) — recreate.
+                    # Subnet changed or duplicate IP — recreate with a free address.
                     self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
                     server = self.get_server(server_id)
                     break
@@ -241,17 +321,10 @@ class L2tpDriver(CoreDriver):
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        used = self._used_addresses_for_subnet(str(server.get('subnet') or ''))
-        if user.get('address'):
-            try:
-                user['address'] = assert_l2tp_address(server['subnet'], str(user['address']))
-            except AgentError:
-                user['address'] = next_l2tp_ip(server['subnet'], used)
-            else:
-                if str(user['address']) in used:
-                    user['address'] = next_l2tp_ip(server['subnet'], used)
-        else:
-            user['address'] = next_l2tp_ip(server['subnet'], used)
+        user['address'] = self._allocate_l2tp_address(
+            str(server.get('subnet') or ''),
+            preferred=str(user.get('address') or '') or None,
+        )
 
         user.setdefault('incoming', 0)
         user.setdefault('outgoing', 0)
@@ -522,6 +595,8 @@ class L2tpDriver(CoreDriver):
         return path
 
     def _apply_all_configs(self) -> None:
+        # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
+        self._repair_duplicate_addresses()
         servers = self.list_servers()
         staging = self._staging_dir()
         files = {
