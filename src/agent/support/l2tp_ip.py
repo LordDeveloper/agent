@@ -47,11 +47,16 @@ def l2tp_gateway(subnet: str) -> str:
 
 
 def l2tp_pool_bounds(subnet: str) -> tuple[str, str]:
-    """Return inclusive start/end host IPs for xl2tpd local ip range."""
+    """Inclusive start/end for xl2tpd ``ip range``.
+
+    xl2tpd allocates bookkeeping for every address in the range at startup.
+    A full upper-/16 slice (*.128.2–*.254.254) can make the daemon exit on start.
+    Keep one /24 of L2TP hosts (third octet = 128) — enough for ~253 clients.
+    """
     network = ipaddress.ip_network(normalize_l2tp_subnet(subnet), strict=False)
     octets = network.network_address.packed
     start = ipaddress.ip_address(bytes([octets[0], octets[1], L2TP_THIRD_OCTET_MIN, 2]))
-    end = ipaddress.ip_address(bytes([octets[0], octets[1], 254, 254]))
+    end = ipaddress.ip_address(bytes([octets[0], octets[1], L2TP_THIRD_OCTET_MIN, 254]))
     return str(start), str(end)
 
 
@@ -63,15 +68,15 @@ def _l2tp_reserved(subnet: str) -> set[str]:
 
 def next_l2tp_ip(subnet: str, used: set[str]) -> str:
     reserved = _l2tp_reserved(subnet)
-    network = ipaddress.ip_network(normalize_l2tp_subnet(subnet), strict=False)
-    for host in network.hosts():
-        ip = ipaddress.ip_address(str(host))
-        if not is_l2tp_host(ip):
-            continue
-        # Skip sub-net anchors inside the L2TP slice (e.g. 10.90.128.0).
-        if ip.packed[3] == 0:
-            continue
+    start, end = l2tp_pool_bounds(subnet)
+    start_ip = ipaddress.ip_address(start)
+    end_ip = ipaddress.ip_address(end)
+    current = int(start_ip)
+    last = int(end_ip)
+    while current <= last:
+        host = ipaddress.ip_address(current)
         label = str(host)
+        current += 1
         if label in reserved or label in used:
             continue
         return label
@@ -94,6 +99,13 @@ def assert_l2tp_address(subnet: str, address: str) -> str:
     network = ipaddress.ip_network(normalize_l2tp_subnet(subnet), strict=False)
     if ip not in network:
         raise AgentError('VALIDATION_ERROR', f'L2TP address [{host}] is outside subnet [{subnet}]')
+
+    start, end = l2tp_pool_bounds(subnet)
+    if not (ipaddress.ip_address(start) <= ip <= ipaddress.ip_address(end)):
+        raise AgentError(
+            'VALIDATION_ERROR',
+            f'L2TP address [{host}] is outside xl2tpd pool [{start}-{end}]',
+        )
     return host
 
 

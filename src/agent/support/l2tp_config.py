@@ -5,6 +5,13 @@ from typing import Any
 from agent.support.l2tp_ip import l2tp_gateway, l2tp_pool_bounds, normalize_l2tp_subnet
 
 
+def sanitize_lns_name(name: str, fallback: str) -> str:
+    """xl2tpd section titles must be simple tokens."""
+    cleaned = ''.join(ch if (ch.isalnum() or ch in '-_') else '-' for ch in str(name or '').strip())
+    cleaned = cleaned.strip('-_') or fallback
+    return cleaned[:48]
+
+
 def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
     lines = [
         '; Managed by Netinja Agent — do not edit manually',
@@ -16,7 +23,8 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
         '',
     ]
     for server in servers:
-        name = str(server.get('name') or f"l2tp-{server.get('id')}")
+        raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
+        name = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
         subnet = normalize_l2tp_subnet(str(server.get('subnet') or ''))
         start, end = l2tp_pool_bounds(subnet)
         gateway = l2tp_gateway(subnet)
@@ -29,7 +37,7 @@ def render_xl2tpd_conf(servers: list[dict[str, Any]]) -> str:
                 'refuse pap = yes',
                 'require authentication = yes',
                 f'name = {name}',
-                'ppp debug = 0',
+                'ppp debug = no',
                 'pppoptfile = /etc/ppp/options.xl2tpd',
                 'length bit = yes',
                 '',
@@ -63,7 +71,8 @@ def render_ppp_options() -> str:
 def render_chap_secrets(servers: list[dict[str, Any]]) -> str:
     lines = ['# Managed by Netinja Agent — client server secret IP']
     for server in servers:
-        lns = str(server.get('name') or f"l2tp-{server.get('id')}")
+        raw_name = str(server.get('name') or f"l2tp-{server.get('id')}")
+        lns = sanitize_lns_name(raw_name, f"l2tp-{server.get('id')}")
         for user in server.get('users') or []:
             if not isinstance(user, dict):
                 continue
@@ -72,6 +81,9 @@ def render_chap_secrets(servers: list[dict[str, Any]]) -> str:
             address = str(user.get('address') or '*').strip() or '*'
             if not username or not password:
                 continue
+            # Avoid breaking chap-secrets field splitting.
+            username = username.replace('\t', '').replace(' ', '')
+            password = password.replace('\t', '').replace(' ', '')
             lines.append(f'{username}\t{lns}\t{password}\t{address}')
     return '\n'.join(lines) + '\n'
 

@@ -39,7 +39,8 @@ def test_l2tp_gateway_and_pool_in_upper_slice():
     assert l2tp_gateway(subnet) == '10.90.128.1'
     start, end = l2tp_pool_bounds(subnet)
     assert start == '10.90.128.2'
-    assert end == '10.90.254.254'
+    # xl2tpd cannot boot with a multi-/24 range — keep one /24.
+    assert end == '10.90.128.254'
 
 
 def test_next_l2tp_ip_skips_wireguard_range():
