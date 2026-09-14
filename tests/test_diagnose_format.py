@@ -62,32 +62,53 @@ def test_format_xray_client_diagnose_report():
     assert 'CLIENT_OFFLINE' in rendered
 
 
-def test_format_peer_not_found_report():
+def test_format_l2tp_user_diagnose_shows_username():
     report = {
         'success': True,
-        'found': False,
-        'core': 'wireguard',
-        'address': '10.80.0.99',
-        'cidr': '10.80.0.99/32',
-        'matches': [],
-        'issues': [
+        'found': True,
+        'core': 'l2tp',
+        'address': '10.164.128.2',
+        'summary': {
+            'healthy': True,
+            'issue_count': 0,
+            'warning_count': 1,
+            'match_count': 1,
+        },
+        'matches': [
             {
-                'level': 'error',
-                'code': 'PEER_NOT_FOUND',
-                'message': 'No peer with address [10.80.0.99] found in wireguard store',
+                'healthy': True,
+                'address': '10.164.128.2',
+                'server': {'id': 12, 'name': 'wg-l2tp-12', 'subnet': '10.164.0.0/16'},
+                'user': {
+                    'id': 'peer-1',
+                    'email': 'user@example.com',
+                    'username': 'u_e123916e',
+                    'address': '10.164.128.2',
+                    'linked_peer_id': 'peer-1',
+                    'is_enabled': True,
+                    'online': False,
+                },
+                'live': None,
+                'routing': {'exit_interface': None},
+                'checks': [
+                    {'name': 'credentials_present', 'ok': True},
+                    {'name': 'ppp_session', 'ok': False},
+                ],
+                'issues': [
+                    {
+                        'level': 'warning',
+                        'code': 'NOT_ONLINE',
+                        'message': 'No active PPP session for [10.164.128.2]',
+                    }
+                ],
             }
         ],
-        'summary': {
-            'healthy': False,
-            'issue_count': 1,
-            'warning_count': 0,
-            'match_count': 0,
-        },
     }
 
     rendered = format_diagnose_report(report, use_color=False)
 
-    assert 'wireguard peer' in rendered
-    assert '10.80.0.99' in rendered
-    assert 'Found: no' in rendered
-    assert 'PEER_NOT_FOUND' in rendered
+    assert 'l2tp peer' in rendered
+    assert 'Username:' in rendered
+    assert 'u_e123916e' in rendered
+    assert 'Linked peer:' in rendered
+    assert 'wg-l2tp-12' in rendered

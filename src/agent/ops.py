@@ -5,6 +5,7 @@ import secrets
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from agent.errors import AgentError
 
@@ -115,13 +116,84 @@ def install_wireguard() -> dict:
     return {"core": "wireguard", "installed": True, "message": "installed"}
 
 
-def install_l2tp() -> dict:
-    """Install xl2tpd, ppp, and strongSwan via apt when available."""
-    if which('xl2tpd') and (which('ipsec') or Path('/usr/sbin/ipsec').is_file()):
-        return {'core': 'l2tp', 'installed': True, 'message': 'already installed'}
+def _stroke_plugin_paths() -> tuple[Path, ...]:
+    return (
+        Path('/usr/lib/ipsec/plugins/stroke.so'),
+        Path('/usr/lib/x86_64-linux-gnu/ipsec/plugins/stroke.so'),
+        Path('/usr/lib64/ipsec/plugins/stroke.so'),
+    )
 
-    packages = ['xl2tpd', 'ppp', 'strongswan', 'strongswan-pki']
-    if which('apt-get'):
+
+def stroke_plugin_present() -> bool:
+    """stroke provides charon.ctl; without it ipsec.conf conns never load."""
+    return any(path.is_file() for path in _stroke_plugin_paths())
+
+
+def charon_ctl_ready() -> bool:
+    return any(
+        path.exists()
+        for path in (
+            Path('/var/run/charon.ctl'),
+            Path('/run/charon.ctl'),
+        )
+    )
+
+
+def ensure_stroke_plugin_enabled() -> None:
+    """Make sure stroke plugin is present on disk and load=yes in strongswan.d."""
+    conf = Path('/etc/strongswan.d/charon/stroke.conf')
+    try:
+        conf.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    desired = (
+        '# Managed by Netinja Agent — required for ipsec.conf / charon.ctl\n'
+        'stroke {\n'
+        '    load = yes\n'
+        '}\n'
+    )
+    existing = ''
+    if conf.is_file():
+        try:
+            existing = conf.read_text(encoding='utf-8')
+        except OSError:
+            existing = ''
+    # Force-enable even if a package shipped load = no.
+    if 'load = yes' not in existing.replace('load=yes', 'load = yes'):
+        try:
+            conf.write_text(desired, encoding='utf-8')
+        except OSError as exc:
+            raise AgentError(
+                'VALIDATION_ERROR',
+                f'cannot enable strongSwan stroke plugin config: {exc}',
+            ) from exc
+
+
+def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
+    """
+    Ensure xl2tpd + strongSwan + stroke plugin are installed and stroke is loadable.
+
+    Without stroke, starter never creates /var/run/charon.ctl and every IKE
+    handshake is answered with NO_PROPOSAL_CHOSEN even when ipsec.conf is correct.
+    """
+    packages = [
+        'xl2tpd',
+        'ppp',
+        'strongswan',
+        'strongswan-pki',
+        'libcharon-extra-plugins',
+    ]
+    have_bins = bool(which('xl2tpd') and (which('ipsec') or Path('/usr/sbin/ipsec').is_file()))
+    need_pkgs = force_apt or not have_bins or not stroke_plugin_present()
+
+    if need_pkgs:
+        if not which('apt-get'):
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'apt-get missing; cannot install L2TP/IPsec packages '
+                f'(need stroke plugin + {", ".join(packages)})',
+            )
         run_cmd(['apt-get', 'update', '-y'], check=False)
         run_cmd(['apt-get', 'install', '-y', *packages], check=False)
 
@@ -129,6 +201,15 @@ def install_l2tp() -> dict:
         raise AgentError('VALIDATION_ERROR', 'xl2tpd not available after install')
     if not which('ipsec') and not Path('/usr/sbin/ipsec').is_file():
         raise AgentError('VALIDATION_ERROR', 'strongSwan (ipsec) not available after install')
+    if not stroke_plugin_present():
+        raise AgentError(
+            'VALIDATION_ERROR',
+            'strongSwan stroke plugin still missing after apt install '
+            '(package libcharon-extra-plugins); without it /var/run/charon.ctl '
+            'is never created and ipsec.conf is ignored',
+        )
+
+    ensure_stroke_plugin_enabled()
 
     for path in (
         Path('/etc/xl2tpd'),
@@ -136,10 +217,22 @@ def install_l2tp() -> dict:
         Path('/etc/agent/bin/l2tp'),
         Path('/var/run/xl2tpd'),
         Path('/run/xl2tpd'),
+        Path('/etc/strongswan.d/charon'),
     ):
         path.mkdir(parents=True, exist_ok=True)
 
-    return {'core': 'l2tp', 'installed': True, 'message': 'installed', 'packages': packages}
+    return {
+        'core': 'l2tp',
+        'installed': True,
+        'stroke_plugin': True,
+        'packages': packages,
+        'message': 'installed' if need_pkgs else 'already installed',
+    }
+
+
+def install_l2tp() -> dict:
+    """Install xl2tpd, ppp, and strongSwan via apt when available."""
+    return ensure_l2tp_ipsec_runtime(force_apt=False)
 
 
 def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:

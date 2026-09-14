@@ -77,8 +77,12 @@ class L2tpDriver(CoreDriver):
         ]
 
     def installed(self) -> bool:
-        return shutil.which('xl2tpd') is not None and (
-            shutil.which('ipsec') is not None or Path('/usr/sbin/ipsec').is_file()
+        from agent.ops import stroke_plugin_present
+
+        return (
+            shutil.which('xl2tpd') is not None
+            and (shutil.which('ipsec') is not None or Path('/usr/sbin/ipsec').is_file())
+            and stroke_plugin_present()
         )
 
     def running(self) -> bool:
@@ -101,7 +105,15 @@ class L2tpDriver(CoreDriver):
     def install(self) -> dict[str, Any]:
         from agent.ops import install_l2tp
 
-        return install_l2tp()
+        result = install_l2tp()
+        # Apply conf + clean-restart strongSwan so stroke/charon.ctl take effect now.
+        try:
+            self._apply_all_configs()
+            self._ensure_services(start=True, restart=True)
+        except Exception as exc:
+            log.error('l2tp post-install apply/restart failed: %s', exc)
+            result = {**result, 'apply_error': str(exc)}
+        return result
 
     def enable(self) -> dict[str, Any]:
         self._apply_all_configs()
@@ -653,12 +665,19 @@ class L2tpDriver(CoreDriver):
     def _ensure_services(self, *, start: bool, restart: bool = False, reload: bool = False) -> None:
         if not start:
             return
-        if not self.installed():
-            log.warning('l2tp packages missing — run POST /cores/l2tp/install')
-            return
+
+        from agent.ops import charon_ctl_ready, ensure_l2tp_ipsec_runtime
+
+        try:
+            ensure_l2tp_ipsec_runtime()
+        except Exception as exc:
+            log.error('l2tp ipsec runtime ensure failed: %s', exc)
+            if not self.installed():
+                return
 
         self._ensure_runtime_dirs()
 
+        need_clean_restart = restart or reload or not charon_ctl_ready()
         for unit in ('strongswan-starter', 'ipsec'):
             unit_exists = (
                 Path(f'/lib/systemd/system/{unit}.service').is_file()
@@ -671,16 +690,62 @@ class L2tpDriver(CoreDriver):
                 continue
             run(['systemctl', 'unmask', unit], check=False, timeout=15)
             run(['systemctl', 'enable', unit], check=False, timeout=15)
-            if restart or not self._service_active(unit):
-                run(['systemctl', 'reset-failed', unit], check=False, timeout=15)
-                run(['systemctl', 'restart', unit], check=False, timeout=60)
+            if need_clean_restart or not self._service_active(unit):
+                self._restart_ipsec_clean(unit)
             else:
                 run(['systemctl', 'start', unit], check=False, timeout=60)
-            run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
-            run(['ipsec', 'reload'], check=False, timeout=30)
+                if not charon_ctl_ready():
+                    self._restart_ipsec_clean(unit)
+                else:
+                    run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
+                    run(['ipsec', 'reload'], check=False, timeout=30)
             break
 
         self._ensure_xl2tpd(force_restart=restart or reload)
+
+    def _restart_ipsec_clean(self, unit: str) -> None:
+        """Stop stale charon/starter PIDs, clear sockets, start unit, wait for charon.ctl."""
+        from agent.ops import charon_ctl_ready
+
+        run(['systemctl', 'reset-failed', unit], check=False, timeout=15)
+        run(['systemctl', 'stop', unit], check=False, timeout=60)
+        run(['ipsec', 'stop'], check=False, timeout=30)
+        # Orphaned pid/socket files leave starter unable to push ipsec.conf.
+        run(['pkill', '-9', '-f', '/usr/lib/ipsec/charon'], check=False, timeout=15)
+        run(['pkill', '-9', '-f', '/usr/lib/ipsec/starter'], check=False, timeout=15)
+        for base in (Path('/var/run'), Path('/run')):
+            for name in ('charon.pid', 'starter.charon.pid', 'charon.ctl', 'starter.pid'):
+                path = base / name
+                try:
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                except OSError as exc:
+                    log.warning('l2tp remove stale ipsec path %s: %s', path, exc)
+
+        run(['systemctl', 'start', unit], check=False, timeout=60)
+
+        ready = False
+        for _ in range(20):
+            if charon_ctl_ready() and self._service_active(unit):
+                ready = True
+                break
+            time.sleep(0.25)
+
+        if not ready:
+            log.error(
+                'l2tp strongSwan started but charon.ctl is missing — '
+                'stroke plugin may still be unloaded; check libcharon-extra-plugins'
+            )
+            return
+
+        run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
+        run(['ipsec', 'reload'], check=False, timeout=30)
+        status = run(['ipsec', 'statusall'], check=False, timeout=30)
+        text = (status.stdout or '') + (status.stderr or '')
+        if 'L2TP-PSK' not in text:
+            log.warning('l2tp ipsec reload finished but L2TP-PSK conn not visible in statusall')
+        else:
+            log.info('l2tp ipsec L2TP-PSK conn loaded')
 
     def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
         # Always rewrite configs before touching the unit — stale huge ip-range

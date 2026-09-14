@@ -136,30 +136,72 @@ def _format_issues_table(issues: list[dict[str, Any]]) -> str:
 def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list[str]:
     iface = dict(match.get('interface') or {})
     peer = dict(match.get('peer') or {})
+    # L2TP diagnose returns `user` (+ `server`) instead of WireGuard `peer` (+ `interface`).
+    user = dict(match.get('user') or {})
+    server = dict(match.get('server') or {})
+    entity = peer if peer else user
     live = match.get('live')
     live_iface = match.get('live_interface')
+    routing = dict(match.get('routing') or {})
+    is_l2tp = bool(user) and not peer
 
     title = f'Match {index}/{total}'
-    iface_name = str(iface.get('name') or '-')
-    peer_label = str(peer.get('email') or peer.get('id') or match.get('address') or '-')
-    lines = [f'── {title} · {iface_name} · {peer_label} ──', '']
+    scope_label = str(
+        server.get('name')
+        or iface.get('name')
+        or server.get('id')
+        or '-'
+    )
+    peer_label = str(
+        entity.get('username')
+        or entity.get('email')
+        or entity.get('id')
+        or match.get('address')
+        or '-'
+    )
+    lines = [f'── {title} · {scope_label} · {peer_label} ──', '']
+
+    section = 'User' if is_l2tp else 'Peer'
+    lines.extend([
+        section,
+        f'  Address:      {match.get("address") or entity.get("address") or "-"}',
+    ])
+    if is_l2tp or entity.get('username'):
+        lines.append(f'  Username:     {entity.get("username") or "-"}')
+    if entity.get('email'):
+        lines.append(f'  Email:        {entity.get("email") or "-"}')
+    lines.extend([
+        f'  Enabled:      {_yes_no(entity.get("is_enabled"))}',
+        f'  Online:       {_yes_no(entity.get("online"))}',
+    ])
+    if is_l2tp:
+        lines.append(f'  Linked peer:  {entity.get("linked_peer_id") or "-"}')
+        lines.append(f'  Exit iface:   {routing.get("exit_interface") or entity.get("exit_interface") or "-"}')
+    else:
+        lines.extend([
+            f'  Public key:   {_truncate(str(entity.get("public_key") or "-"), 56)}',
+            f'  AllowedIPs:   {_truncate(str(entity.get("allowed_ips") or "-"), 56)}',
+            f'  Exit iface:   {entity.get("exit_interface") or "-"}',
+        ])
 
     lines.extend([
-        'Peer',
-        f'  Address:      {match.get("address") or peer.get("address") or "-"}',
-        f'  Enabled:      {_yes_no(peer.get("is_enabled"))}',
-        f'  Online:       {_yes_no(peer.get("online"))}',
-        f'  Public key:   {_truncate(str(peer.get("public_key") or "-"), 56)}',
-        f'  AllowedIPs:   {_truncate(str(peer.get("allowed_ips") or "-"), 56)}',
-        f'  Exit iface:   {peer.get("exit_interface") or "-"}',
         '',
         'Live runtime',
         f'  Present:      {_yes_no(live is not None)}',
-        f'  Interface up: {_yes_no((live_iface or {}).get("is_up") if isinstance(live_iface, dict) else None)}',
-        f'  Handshake:    {peer.get("handshake_at") or "-"}',
-        f'  Endpoint:     {peer.get("endpoint") or "-"}',
-        '',
     ])
+    if is_l2tp:
+        live_row = live if isinstance(live, dict) else {}
+        lines.extend([
+            f'  Interface:    {live_row.get("interface") or "-"}',
+            f'  Interface up: {_yes_no(live_row.get("is_up"))}',
+        ])
+    else:
+        lines.extend([
+            f'  Interface up: {_yes_no((live_iface or {}).get("is_up") if isinstance(live_iface, dict) else None)}',
+            f'  Handshake:    {entity.get("handshake_at") or "-"}',
+            f'  Endpoint:     {entity.get("endpoint") or "-"}',
+        ])
+    lines.append('')
 
     checks = list(match.get('checks') or [])
     if checks:

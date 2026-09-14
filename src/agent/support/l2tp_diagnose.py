@@ -175,6 +175,33 @@ def diagnose_user_match(
     if not ipsec_up:
         issues.append(_issue('warning', 'IPSEC_DOWN', 'strongSwan/ipsec service is not active'))
 
+    try:
+        from agent.ops import charon_ctl_ready, stroke_plugin_present
+
+        stroke_ok = stroke_plugin_present()
+        ctl_ok = charon_ctl_ready()
+    except Exception:
+        stroke_ok = False
+        ctl_ok = False
+    checks.append({'name': 'ipsec_stroke_plugin', 'ok': stroke_ok})
+    checks.append({'name': 'ipsec_charon_ctl', 'ok': ctl_ok})
+    if not stroke_ok:
+        issues.append(
+            _issue(
+                'error',
+                'IPSEC_STROKE_MISSING',
+                'strongSwan stroke plugin missing — ipsec.conf never loads (NO_PROP for all clients)',
+            )
+        )
+    elif not ctl_ok:
+        issues.append(
+            _issue(
+                'error',
+                'IPSEC_CHARON_CTL_MISSING',
+                '/var/run/charon.ctl missing — starter cannot load L2TP-PSK; restart strongswan after installing libcharon-extra-plugins',
+            )
+        )
+
     sessions = ppp_sessions if ppp_sessions is not None else _collect_ppp_sessions(runner)
     live = sessions.get(host)
     checks.append({'name': 'ppp_session', 'ok': live is not None and live.get('is_up')})
