@@ -76,6 +76,7 @@ class L2tpDriver(CoreDriver):
             'backup_restore',
             'peer_diagnose',
             'linked_peers',
+            'peer_egress_routing',
         ]
 
     def installed(self) -> bool:
@@ -354,12 +355,14 @@ class L2tpDriver(CoreDriver):
         user.setdefault('connected_at', None)
         user.setdefault('max_connection', 0)
         user.setdefault('ip_logs', [])
+        self._ensure_user_exit_interface(user)
 
         server.setdefault('users', []).append(user)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        self.audit.record('create', f'{self.key}/user/{user.get("id")}')
         self._apply_all_configs()
-        self._ensure_services(start=True, reload=True)
-        self.audit.record('create', f'{self.key}/user/{user["id"]}')
+        self._sync_peer_egress()
+        self._ensure_services(start=True)
         return user
 
     def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -379,12 +382,17 @@ class L2tpDriver(CoreDriver):
                     from agent.support.disable_reason import clear_disabled_metadata
 
                     clear_disabled_metadata(merged)
+                self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                self._apply_all_configs()
-                self._ensure_services(start=True, reload=True)
+                if any(k in payload for k in ('username', 'password', 'address', 'is_enabled', 'exit_interface')):
+                    self._apply_all_configs()
+                    self._ensure_services(start=True, reload=True)
+                else:
+                    self._apply_all_configs()
+                self._sync_peer_egress()
                 return merged
-        raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
+        raise AgentError('CONFIG_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
     def delete_user(self, server_id: int | str, user_id: str) -> bool:
         server = self.get_server(server_id)
@@ -395,6 +403,7 @@ class L2tpDriver(CoreDriver):
         server['users'] = filtered
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self._apply_all_configs()
+        self._sync_peer_egress()
         self._ensure_services(start=True, reload=True)
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
@@ -636,6 +645,74 @@ class L2tpDriver(CoreDriver):
                     pass
 
         self._install_to_system(staging)
+        self._sync_peer_egress()
+
+    def _egress_interfaces(self) -> list[dict[str, Any]]:
+        from agent.support.peer_egress import l2tp_servers_as_interfaces
+
+        servers = self.list_servers()
+        for server in servers:
+            for user in server.get('users') or []:
+                if isinstance(user, dict):
+                    self._ensure_user_exit_interface(user)
+        return l2tp_servers_as_interfaces(servers)
+
+    def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
+        """Fill exit_interface from linked WireGuard/Amnezia peer when missing."""
+        from agent.support.peer_egress import normalize_exit_interface
+
+        current = normalize_exit_interface(user.get('exit_interface'))
+        if current:
+            user['exit_interface'] = current
+            return
+
+        linked = str(user.get('linked_peer_id') or user.get('id') or '').strip()
+        if not linked:
+            return
+
+        for core in ('wireguard', 'amnezia'):
+            for iface in self.store.list_docs(core, 'interface'):
+                for peer in iface.get('peers') or []:
+                    if not isinstance(peer, dict):
+                        continue
+                    peer_id = str(peer.get('id') or '').strip()
+                    peer_email = str(peer.get('email') or '').strip()
+                    if linked not in {peer_id, peer_email}:
+                        continue
+                    exit_iface = normalize_exit_interface(peer.get('exit_interface'))
+                    if exit_iface:
+                        user['exit_interface'] = exit_iface
+                        return
+
+    def _sync_peer_egress(self) -> None:
+        try:
+            from agent.support.peer_egress import reconcile_core_egress
+
+            # Persist any exit filled from linked WG peers before reconcile.
+            dirty = False
+            for server in self.list_servers():
+                changed = False
+                for user in server.get('users') or []:
+                    if not isinstance(user, dict):
+                        continue
+                    before = str(user.get('exit_interface') or '')
+                    self._ensure_user_exit_interface(user)
+                    if str(user.get('exit_interface') or '') != before:
+                        changed = True
+                if changed:
+                    self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+                    dirty = True
+            if dirty:
+                log.info('l2tp filled exit_interface from linked wireguard/amnezia peers')
+
+            reconcile_core_egress(
+                self.store,
+                self.key,
+                self._egress_interfaces(),
+                data_dir=self.settings.data_dir,
+            )
+        except Exception:
+            log.exception('l2tp peer egress reconcile failed')
 
     def _install_to_system(self, staging: Path) -> None:
         targets = {

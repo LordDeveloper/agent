@@ -59,7 +59,9 @@ _MASQ_COMMENT_PREFIX = "netinja-egress-"
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
 _SYSCTL_DROPIN = Path("/etc/sysctl.d/99-netinja-peer-egress.conf")
-_EGRESS_CORES = ("wireguard", "amnezia")
+_EGRESS_CORES = ("wireguard", "amnezia", "l2tp")
+_PPP_TUNNEL = "ppp+"
+_L2TP_KIND = "server"
 
 
 def rule_pref_for_addr(addr: str) -> int:
@@ -96,11 +98,50 @@ def tunnel_interface_names(interfaces: list[dict[str, Any]]) -> list[str]:
 def all_tunnel_interface_names(store: Store) -> list[str]:
     names: set[str] = set()
     for core in _EGRESS_CORES:
+        if core == "l2tp":
+            if _l2tp_has_egress_users(store):
+                names.add(_PPP_TUNNEL)
+                names.update(live_ppp_interface_names())
+            continue
         for row in store.list_docs(core, _IFACE_KIND):
             name = str(row.get("name") or "").strip()
             if name:
                 names.add(name)
     return sorted(names)
+
+
+def live_ppp_interface_names() -> list[str]:
+    net = Path("/sys/class/net")
+    if not net.is_dir():
+        return []
+    return sorted(p.name for p in net.iterdir() if p.name.startswith("ppp") and p.is_dir())
+
+
+def _l2tp_has_egress_users(store: Store) -> bool:
+    for server in store.list_docs("l2tp", _L2TP_KIND):
+        for user in server.get("users") or []:
+            if not isinstance(user, dict) or not record_is_enabled(user):
+                continue
+            if normalize_exit_interface(user.get("exit_interface")) and peer_source_cidr(user.get("address")):
+                return True
+    return False
+
+
+def l2tp_servers_as_interfaces(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map L2TP server users into the interface/peers shape used by reconcile_core_egress."""
+    peers: list[dict[str, Any]] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        for user in server.get("users") or []:
+            if not isinstance(user, dict):
+                continue
+            peers.append(dict(user))
+    return [{"name": _PPP_TUNNEL, "peers": peers}]
+
+
+def desired_rules_from_l2tp_servers(servers: list[dict[str, Any]]) -> list[dict[str, str | int]]:
+    return desired_rules_from_interfaces(l2tp_servers_as_interfaces(servers))
 
 
 def peer_source_cidr(address: Any) -> str | None:
@@ -149,28 +190,52 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
     merged: list[dict[str, str | int]] = []
     seen: set[str] = set()
     for core in _EGRESS_CORES:
-        ifaces = store.list_docs(core, _IFACE_KIND)
-        if ifaces:
-            source = desired_rules_from_interfaces(ifaces)
+        if core == "l2tp":
+            servers = store.list_docs(core, _L2TP_KIND)
+            if servers:
+                source = desired_rules_from_l2tp_servers(servers)
+            else:
+                state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
+                source = []
+                for row in state.get("rules") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    addr = str(row.get("addr") or "").strip()
+                    iface = str(row.get("iface") or "").strip()
+                    table = int(row.get("table") or 0)
+                    if not addr or not iface or table <= 0:
+                        continue
+                    source.append(
+                        {
+                            "addr": addr,
+                            "cidr": f"{addr}/32",
+                            "iface": iface,
+                            "table": table,
+                        }
+                    )
         else:
-            state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
-            source = []
-            for row in state.get("rules") or []:
-                if not isinstance(row, dict):
-                    continue
-                addr = str(row.get("addr") or "").strip()
-                iface = str(row.get("iface") or "").strip()
-                table = int(row.get("table") or 0)
-                if not addr or not iface or table <= 0:
-                    continue
-                source.append(
-                    {
-                        "addr": addr,
-                        "cidr": f"{addr}/32",
-                        "iface": iface,
-                        "table": table,
-                    }
-                )
+            ifaces = store.list_docs(core, _IFACE_KIND)
+            if ifaces:
+                source = desired_rules_from_interfaces(ifaces)
+            else:
+                state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
+                source = []
+                for row in state.get("rules") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    addr = str(row.get("addr") or "").strip()
+                    iface = str(row.get("iface") or "").strip()
+                    table = int(row.get("table") or 0)
+                    if not addr or not iface or table <= 0:
+                        continue
+                    source.append(
+                        {
+                            "addr": addr,
+                            "cidr": f"{addr}/32",
+                            "iface": iface,
+                            "table": table,
+                        }
+                    )
         for row in source:
             addr = str(row["addr"])
             if addr in seen:
@@ -498,10 +563,15 @@ def repair_peer_egress(
 
     cores: dict[str, Any] = {}
     for core in _EGRESS_CORES:
-        ifaces = store.list_docs(core, _IFACE_KIND)
+        if core == "l2tp":
+            servers = store.list_docs(core, _L2TP_KIND)
+            ifaces = l2tp_servers_as_interfaces(servers) if servers else []
+        else:
+            ifaces = store.list_docs(core, _IFACE_KIND)
         state = store.get_doc(core, _STATE_KIND, _STATE_ID)
         if not ifaces and not state:
             continue
+        # Empty synthetic iface with no peers still needs force when state exists.
         cores[core] = reconcile_core_egress(
             store,
             core,
@@ -1271,7 +1341,8 @@ def _sync_forward_iptables(
             )
 
     for tunnel in tunnels:
-        _soften_rp_filter(runner, tunnel)
+        if not _is_wildcard_iface(tunnel):
+            _soften_rp_filter(runner, tunnel)
         tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
         if not _iptables(
             runner,
@@ -1484,7 +1555,9 @@ def _sync_masquerade_nft(
     for tunnel in tunnel_ifaces or []:
         if not tunnel:
             continue
-        _soften_rp_filter(runner, tunnel)
+        if not _is_wildcard_iface(tunnel):
+            _soften_rp_filter(runner, tunnel)
+        match = _nft_iface_match(tunnel)
         tunnel_comment = f"{_MASQ_COMMENT_PREFIX}tunnel-{tunnel}"
         _nft(
             runner,
@@ -1495,7 +1568,7 @@ def _sync_masquerade_nft(
                 "netinja_egress",
                 "forward",
                 "iifname",
-                tunnel,
+                match,
                 "tcp",
                 "flags",
                 "syn",
@@ -1521,7 +1594,7 @@ def _sync_masquerade_nft(
                 "netinja_egress",
                 "forward",
                 "iifname",
-                tunnel,
+                match,
                 "accept",
                 "comment",
                 f"{tunnel_comment}-in",
@@ -1536,7 +1609,7 @@ def _sync_masquerade_nft(
                 "netinja_egress",
                 "forward",
                 "oifname",
-                tunnel,
+                match,
                 "accept",
                 "comment",
                 f"{tunnel_comment}-out",
@@ -1591,6 +1664,19 @@ def _sync_masquerade_iptables(
             ["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             binary=binary,
         )
+
+
+def _nft_iface_match(name: str) -> str:
+    """iptables uses ppp+; nft wants ppp*."""
+    text = str(name or "").strip()
+    if text.endswith("+"):
+        return text[:-1] + "*"
+    return text
+
+
+def _is_wildcard_iface(name: str) -> bool:
+    text = str(name or "")
+    return "+" in text or "*" in text
 
 
 def _nft(runner: Runner, args: list[str]) -> bool:
