@@ -812,13 +812,12 @@ class L2tpDriver(CoreDriver):
                     exit_iface = normalize_exit_interface(peer.get('exit_interface'))
                     if exit_iface:
                         user['exit_interface'] = exit_iface
-                        return
+                    # Peer found: never drop a known exit just because WG is mid-update.
+                    return
 
         current = normalize_exit_interface(user.get('exit_interface'))
         if current:
             user['exit_interface'] = current
-        else:
-            user.pop('exit_interface', None)
 
     def _sync_peer_egress(self) -> None:
         try:
