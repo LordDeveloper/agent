@@ -76,7 +76,13 @@ class TrafficService:
 
 
 
-        for core_key in registry.settings.cores():
+        live_companions = self._live_linked_peer_keys()
+
+        cores = list(registry.settings.cores())
+        if "l2tp" in cores:
+            cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+
+        for core_key in cores:
 
             try:
 
@@ -93,6 +99,9 @@ class TrafficService:
                 log.exception("traffic sample failed core=%s", core_key)
 
                 continue
+
+            if core_key == "l2tp":
+                live_companions = self._live_linked_peer_keys()
 
 
 
@@ -125,6 +134,8 @@ class TrafficService:
                         int(client.outgoing or 0),
 
                         handshake_at=getattr(client, "handshake_at", None),
+
+                        session_live=label in live_companions,
 
                     )
 
@@ -200,6 +211,8 @@ class TrafficService:
 
         handshake_at: int | None = None,
 
+        session_live: bool = False,
+
     ) -> str:
 
         ack = self.store.get_traffic_ack(core, client_key_label)
@@ -257,18 +270,18 @@ class TrafficService:
 
 
         if (delta_in > 0 or delta_out > 0) and self._peer_handshake_is_stale(core, handshake_at):
+            if not session_live:
+                return self._absorb_stale_peer_delta(
 
-            return self._absorb_stale_peer_delta(
+                    core,
 
-                core,
+                    client_key_label,
 
-                client_key_label,
+                    current_incoming,
 
-                current_incoming,
+                    current_outgoing,
 
-                current_outgoing,
-
-            )
+                )
 
 
 
@@ -558,6 +571,52 @@ class TrafficService:
                     continue
 
                 for candidate in (user.get("id"), user.get("email")):
+
+                    label = str(candidate or "").strip()
+
+                    if label:
+
+                        keys.add(label)
+
+        return keys
+
+
+
+    def _live_linked_peer_keys(self) -> set[str]:
+
+        """Peer id/email whose L2TP companion currently has a PPP session."""
+
+        keys: set[str] = set()
+
+        try:
+
+            docs = self.store.list_docs("l2tp", "server")
+
+        except Exception:
+
+            return keys
+
+        for doc in docs:
+
+            if not isinstance(doc, dict):
+
+                continue
+
+            for user in doc.get("users") or []:
+
+                if not isinstance(user, dict):
+
+                    continue
+
+                linked = str(user.get("linked_peer_id") or "").strip()
+
+                if not linked or not user.get("online"):
+
+                    continue
+
+                keys.add(linked)
+
+                for candidate in (user.get("email"), user.get("id")):
 
                     label = str(candidate or "").strip()
 

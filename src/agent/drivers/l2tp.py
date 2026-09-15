@@ -626,33 +626,77 @@ class L2tpDriver(CoreDriver):
         for server in self.list_servers():
             changed = False
             for user in server.get('users') or []:
+                if not isinstance(user, dict):
+                    continue
                 address = str(user.get('address') or '').split('/', 1)[0].strip()
                 live = sessions.get(address)
                 before_online = user.get('online')
+                before_in = user.get('_raw_incoming')
+                before_out = user.get('_raw_outgoing')
                 if live and live.get('is_up'):
                     user['online'] = True
                     user['connected_at'] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
-                    # Linked companions are not billed — keep session state only.
-                    if str(user.get('linked_peer_id') or '').strip():
-                        if before_online != user.get('online'):
-                            changed = True
-                        continue
                     rx = int(live.get('incoming') or 0)
                     tx = int(live.get('outgoing') or 0)
                     prev_rx = int(user.get('_raw_incoming') or 0)
                     prev_tx = int(user.get('_raw_outgoing') or 0)
                     delta_in = rx if rx < prev_rx else rx - prev_rx
                     delta_out = tx if tx < prev_tx else tx - prev_tx
-                    user['incoming'] = int(user.get('incoming') or 0) + delta_in
-                    user['outgoing'] = int(user.get('outgoing') or 0) + delta_out
                     user['_raw_incoming'] = rx
                     user['_raw_outgoing'] = tx
+                    linked = str(user.get('linked_peer_id') or '').strip()
+                    if linked:
+                        # Bill the WireGuard/Amnezia peer — L2TP is only the access layer.
+                        if delta_in or delta_out:
+                            self._credit_linked_peer(linked, delta_in, delta_out)
+                    else:
+                        user['incoming'] = int(user.get('incoming') or 0) + delta_in
+                        user['outgoing'] = int(user.get('outgoing') or 0) + delta_out
                 else:
                     user['online'] = False
-                if before_online != user.get('online'):
+                if (
+                    before_online != user.get('online')
+                    or before_in != user.get('_raw_incoming')
+                    or before_out != user.get('_raw_outgoing')
+                ):
                     changed = True
             if changed:
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+
+    def _credit_linked_peer(self, linked_peer_id: str, delta_in: int, delta_out: int) -> bool:
+        """Add companion PPP bytes to the linked WG/Amnezia peer cumulative counters."""
+        if delta_in <= 0 and delta_out <= 0:
+            return False
+        linked = str(linked_peer_id or '').strip()
+        if not linked:
+            return False
+
+        for core in ('wireguard', 'amnezia'):
+            for iface in self.store.list_docs(core, 'interface'):
+                if not isinstance(iface, dict):
+                    continue
+                peers = iface.get('peers') or []
+                for peer in peers:
+                    if not isinstance(peer, dict):
+                        continue
+                    if linked not in {
+                        str(peer.get('id') or '').strip(),
+                        str(peer.get('email') or '').strip(),
+                    }:
+                        continue
+                    peer['incoming'] = int(peer.get('incoming') or 0) + delta_in
+                    peer['outgoing'] = int(peer.get('outgoing') or 0) + delta_out
+                    self.store.put_doc(core, 'interface', str(iface.get('id')), iface)
+                    log.info(
+                        'l2tp credited %s/%s bytes to %s peer %s',
+                        delta_in,
+                        delta_out,
+                        core,
+                        linked,
+                    )
+                    return True
+        log.warning('l2tp companion traffic dropped — linked peer [%s] not found', linked)
+        return False
 
     def _connected_unix(self, user: dict[str, Any]) -> int | None:
         raw = user.get('connected_at')
