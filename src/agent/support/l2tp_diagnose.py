@@ -86,6 +86,31 @@ def find_users_by_linked_peer_id(store: Store, core: str, linked_peer_id: str) -
     return rows
 
 
+def live_linked_peer_keys(store: Store, *, runner: Runner | None = None) -> set[str]:
+    """Ids/emails of WG/Amnezia peers whose L2TP companion currently has a PPP session."""
+    sessions = _collect_ppp_sessions(runner or run)
+    keys: set[str] = set()
+    for server in store.list_docs('l2tp', _SERVER_KIND):
+        if not isinstance(server, dict):
+            continue
+        for user in server.get('users') or []:
+            if not isinstance(user, dict):
+                continue
+            linked = str(user.get('linked_peer_id') or '').strip()
+            if not linked:
+                continue
+            host = normalize_peer_host(user.get('address'))
+            live = sessions.get(host) if host else None
+            if not (live and live.get('is_up')):
+                continue
+            keys.add(linked)
+            for candidate in (user.get('id'), user.get('email')):
+                label = str(candidate or '').strip()
+                if label:
+                    keys.add(label)
+    return keys
+
+
 def find_linked_peer(store: Store, linked_peer_id: str) -> dict[str, Any] | None:
     """Resolve WireGuard/Amnezia peer referenced by L2TP companion linked_peer_id."""
     linked = str(linked_peer_id or '').strip()

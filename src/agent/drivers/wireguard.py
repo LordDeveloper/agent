@@ -1605,11 +1605,24 @@ class WireGuardDriver(CoreDriver):
 
     def online_users(self) -> list[str]:
         self.sync_peer_stats()
+        from agent.support.l2tp_diagnose import live_linked_peer_keys
+
+        companion = live_linked_peer_keys(self.store)
         online: list[str] = []
+        seen: set[str] = set()
         for iface in self.list_interfaces():
             for peer in iface.get("peers", []):
-                if peer.get("online") and record_is_enabled(peer):
-                    online.append(str(peer.get("email") or peer.get("id")))
+                if not record_is_enabled(peer):
+                    continue
+                peer_id = str(peer.get("id") or "").strip()
+                email = str(peer.get("email") or "").strip()
+                live = bool(peer.get("online")) or peer_id in companion or email in companion
+                if not live:
+                    continue
+                for label in (peer_id, email):
+                    if label and label not in seen:
+                        seen.add(label)
+                        online.append(label)
         return online
 
     def online_traffic(self) -> dict[str, dict[str, int]]:

@@ -607,12 +607,21 @@ class L2tpDriver(CoreDriver):
     def online_users(self) -> list[str]:
         self.sync_user_stats()
         online: list[str] = []
+        seen: set[str] = set()
         for server in self.list_servers():
             for user in server.get('users') or []:
-                if str(user.get('linked_peer_id') or '').strip():
+                if not user.get('online') or not record_is_enabled(user):
                     continue
-                if user.get('online') and record_is_enabled(user):
-                    online.append(str(user.get('email') or user.get('id')))
+                labels = [
+                    str(user.get('linked_peer_id') or '').strip(),
+                    str(user.get('id') or '').strip(),
+                    str(user.get('email') or '').strip(),
+                ]
+                # Standalone L2TP: id/email. Companion: also emit linked WG node_id for panel stats/online.
+                for label in labels:
+                    if label and label not in seen:
+                        seen.add(label)
+                        online.append(label)
         return online
 
     def online_traffic(self) -> dict[str, dict[str, int]]:
