@@ -235,8 +235,11 @@ def _collect_ppp_sessions(runner: Runner) -> dict[str, dict[str, Any]]:
             tx = int(Path(f'{stats_path}/tx_bytes').read_text(encoding='utf-8').strip())
         except OSError:
             rx = tx = 0
-        sessions[client_ip]['incoming'] = rx
-        sessions[client_ip]['outgoing'] = tx
+        # Match WireGuard store convention used by the panel:
+        # incoming = download (server → client), outgoing = upload (client → server).
+        # PPP rx is from the client; PPP tx is to the client.
+        sessions[client_ip]['incoming'] = tx
+        sessions[client_ip]['outgoing'] = rx
         sessions[client_ip]['seen_at'] = now
 
     return sessions
