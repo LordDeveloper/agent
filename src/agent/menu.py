@@ -1090,6 +1090,119 @@ def _show_peer_diagnose(core: str, address: str) -> None:
         _print(paint("  ✗ issues detected — see table above", RED))
 
 
+def _mullvad_menu() -> None:
+    while True:
+        render_header("Mullvad")
+        picked = select(
+            [
+                Choice("key", "Set private key", GREEN, "1"),
+                Choice("status", "Status", CYAN, "2"),
+                Choice("fallback", "Run fallback now", YELLOW, "3"),
+                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "4"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "key":
+            _run_action("Mullvad private key", _show_mullvad_set_key)
+        elif picked == "status":
+            _run_action("Mullvad status", _show_mullvad_status)
+        elif picked == "fallback":
+            _run_action("Mullvad fallback", _show_mullvad_fallback)
+        elif picked == "refresh":
+            _run_action("Mullvad catalog", _show_mullvad_refresh)
+
+
+def _mullvad_runtime_service():
+    from agent.runtime import open_runtime
+    from agent.support.mullvad import MullvadService
+
+    runtime = open_runtime()
+    service = MullvadService(runtime.store, config_dir=runtime.settings.wireguard_config_dir)
+    return runtime, service
+
+
+def _show_mullvad_set_key() -> None:
+    from agent.support.mullvad import mask_key
+
+    runtime, service = _mullvad_runtime_service()
+    try:
+        current = service.settings()
+        preview = current.get("key_preview") or "not set"
+        _print(kv("Current key", preview, CYAN))
+        _print(kv("Address", current.get("address") or "from existing Mullvad iface", WHITE))
+        value = prompt_text("Private key")
+        if not value:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        saved = service.save_settings(private_key=value)
+        _print(paint("  Private key saved.", GREEN))
+        _print(kv("Key", mask_key(saved.get("private_key") or ""), WHITE))
+        _print(kv("Address", saved.get("address") or "-", WHITE))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_status() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        payload = service.status()
+        settings = payload.get("settings") or {}
+        _print(kv("Private key", "set" if settings.get("has_private_key") else "missing", GREEN if settings.get("has_private_key") else YELLOW))
+        _print(kv("Address", settings.get("address") or "-", WHITE))
+        tunnels = payload.get("tunnels") or []
+        if not tunnels:
+            _print(paint("  No adopted/created Mullvad exits yet.", DIM))
+            return
+        for row in tunnels:
+            tone = GREEN if row.get("healthy") else (YELLOW if row.get("up") else RED)
+            host = row.get("hostname") or "-"
+            _print(paint(
+                f"  {row.get('iface') or '-'}  {row.get('country_code')}  {host}  "
+                f"{'up' if row.get('up') else 'down'}  {row.get('message') or ''}",
+                tone,
+            ))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_fallback() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        result = service.fallback()
+        changed = result.get("changed") or []
+        failed = result.get("failed") or []
+        skipped = result.get("skipped") or []
+        _print(kv("Changed", str(len(changed)), GREEN if changed else WHITE))
+        _print(kv("Failed", str(len(failed)), RED if failed else WHITE))
+        _print(kv("Healthy", str(len(skipped)), WHITE))
+        for row in changed:
+            _print(paint(f"  {row.get('iface')} → {row.get('hostname')} ({row.get('message')})", GREEN))
+        for row in failed:
+            _print(paint(f"  {row.get('iface')}: {row.get('message')}", RED))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_refresh() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        payload = service.locations(force=True)
+        locations = payload.get("locations") or []
+        bound = [row for row in locations if row.get("bound")]
+        _print(kv("Countries", str(len(locations)), WHITE))
+        _print(kv("Bound exits", str(len(bound)), GREEN))
+        for row in bound:
+            _print(paint(
+                f"  {row.get('iface')}  {row.get('country_code')}  {row.get('hostname') or '-'}"
+                f"{'  adopted' if row.get('adopted') else ''}",
+                CYAN,
+            ))
+    finally:
+        runtime.close()
+
+
 def _token_menu() -> None:
     while True:
         render_header("Token")
@@ -1139,6 +1252,7 @@ def run_interactive() -> int:
                     Choice("stats", "Stats", WHITE, "9"),
                     Choice("update", "Update agent", WHITE, "10"),
                     Choice("token", "Auth token", WHITE, "11"),
+                    Choice("mullvad", "Mullvad", GREEN, "12"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]
             )
@@ -1171,6 +1285,8 @@ def run_interactive() -> int:
                 _update_menu()
             elif picked == "token":
                 _token_menu()
+            elif picked == "mullvad":
+                _mullvad_menu()
     except KeyboardInterrupt:
         show_cursor()
         _print(paint("\n  Goodbye.\n", DIM))

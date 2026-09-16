@@ -83,6 +83,8 @@ class AgentSettings(BaseSettings):
     # Sidecar TCP forwarder injecting PROXY protocol v1 for Xray acceptProxyProtocol inbounds.
     proxy_protocol_forwarder_enabled: bool = True
     proxy_protocol_forwarder_binary: str = ""
+    # Seconds between Mullvad exit fallback checks (0 disables).
+    mullvad_fallback_interval: float = 60.0
 
     @property
     def xray(self) -> XraySettings:

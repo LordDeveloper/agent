@@ -21,6 +21,8 @@ from agent.api.amnezia import router as amnezia_router
 from agent.api.l2tp import router as l2tp_router
 from agent.api.tls import router as tls_router
 from agent.api.network import router as network_router
+from agent.api.mullvad import router as mullvad_router
+from agent.mullvad_worker import mullvad_worker_loop
 from agent.errorlog import CoreErrorCaptureMiddleware, CoreErrorLog
 from agent.logutil import get_logger, resolve_log_path, setup_logging
 from agent.registry import CoreRegistry
@@ -105,8 +107,18 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 traffic_worker_loop(registry, traffic, settings, stop_traffic),
             )
 
+        stop_mullvad = asyncio.Event()
+        mullvad_task = None
+        if float(getattr(settings, "mullvad_fallback_interval", 60.0) or 0) > 0:
+            mullvad_task = asyncio.create_task(
+                mullvad_worker_loop(store, settings, stop_mullvad),
+            )
+
         yield
 
+        stop_mullvad.set()
+        if mullvad_task is not None:
+            await mullvad_task
         stop_traffic.set()
         if traffic_task is not None:
             await traffic_task
@@ -140,6 +152,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(l2tp_router, prefix="/api/v1", dependencies=auth)
     app.include_router(tls_router, prefix="/api/v1", dependencies=auth)
     app.include_router(network_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(mullvad_router, prefix="/api/v1", dependencies=auth)
 
     @app.get("/health")
     def root_health(request: Request):
