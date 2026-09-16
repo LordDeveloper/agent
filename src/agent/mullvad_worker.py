@@ -18,17 +18,18 @@ async def mullvad_worker_loop(
     settings: AgentSettings,
     stop_event: asyncio.Event,
 ) -> None:
-    interval = max(15.0, float(getattr(settings, "mullvad_fallback_interval", 60.0) or 0))
+    interval = max(15.0, float(getattr(settings, "mullvad_fallback_interval", 30.0) or 0))
     log.info("mullvad fallback worker started interval=%ss", interval)
     service = MullvadService(store, config_dir=settings.wireguard_config_dir)
 
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            break
-        except asyncio.TimeoutError:
-            pass
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=5)
+        log.info("mullvad fallback worker stopped")
+        return
+    except asyncio.TimeoutError:
+        pass
 
+    while not stop_event.is_set():
         try:
             result = await asyncio.to_thread(service.fallback)
             changed = len(result.get("changed") or [])
@@ -37,5 +38,11 @@ async def mullvad_worker_loop(
                 log.info("mullvad fallback changed=%s failed=%s", changed, failed)
         except Exception:
             log.exception("mullvad fallback cycle failed")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            continue
 
     log.info("mullvad fallback worker stopped")

@@ -194,3 +194,17 @@ def test_does_not_adopt_non_mullvad_conf(tmp_path: Path):
     )
     bindings = svc.refresh_bindings()
     assert bindings == []
+
+
+def test_locations_ping_uses_best_relay(tmp_path: Path):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, {"1.1.1.1": 40, "2.2.2.2": 12, "6.6.6.6": 70}.get(host, 200)),
+    )
+    payload = svc.locations(ping=True)
+    de = next(row for row in payload["locations"] if row["country_code"] == "de")
+    jp = next(row for row in payload["locations"] if row["country_code"] == "jp")
+    assert de["reachable"] is True
+    assert de["ping_ms"] == 12
+    assert jp["ping_ms"] == 70
+    assert jp["ping_via"] == "relay"

@@ -68,6 +68,41 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
         result = run_probe(nodes, outbounds)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+
+    failed: list[str] = []
+    by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict)}
+    for row in result.get("nodes") or []:
+        if not isinstance(row, dict) or row.get("ok"):
+            continue
+        raw = by_id.get(str(row.get("id")))
+        iface = ""
+        if isinstance(raw, dict):
+            iface = str(raw.get("exit_interface") or "").strip()
+        if iface:
+            failed.append(iface)
+
+    if failed:
+        import threading
+
+        store = request.app.state.store
+        settings = request.app.state.settings
+
+        def _run_fallback() -> None:
+            from agent.support.mullvad import MullvadService
+
+            service = MullvadService(store, config_dir=settings.wireguard_config_dir)
+            seen: set[str] = set()
+            for iface in failed:
+                if iface in seen:
+                    continue
+                seen.add(iface)
+                try:
+                    service.fallback_iface(iface)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run_fallback, daemon=True).start()
+
     return {"success": True, **result}
 
 

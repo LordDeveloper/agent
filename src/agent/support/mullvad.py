@@ -243,12 +243,19 @@ def tcp_probe(host: str, port: int = WG_PORT, *, timeout: float = TCP_TIMEOUT) -
         return False, None
 
 
-def pick_best_relay(
+def sample_relays(relays: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+    owned = [row for row in relays if row.get("owned")]
+    rest = [row for row in relays if not row.get("owned")]
+    return (owned + rest)[: max(1, limit)]
+
+
+def score_relays(
     relays: list[dict[str, Any]],
     *,
     exclude_hostname: str = "",
     probe: TcpProbe | None = None,
-) -> dict[str, Any] | None:
+    workers: int = 16,
+) -> list[tuple[int, dict[str, Any]]]:
     checker = probe or (lambda host, port: tcp_probe(host, port))
     scored: list[tuple[int, dict[str, Any]]] = []
     skip = str(exclude_hostname or "").strip().lower()
@@ -263,17 +270,27 @@ def pick_best_relay(
             return None
         return latency, row
 
-    workers = min(16, max(1, len(relays)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    if not relays:
+        return []
+    pool_size = min(max(1, workers), max(1, len(relays)))
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
         futures = [pool.submit(_one, row) for row in relays]
         for future in as_completed(futures):
             result = future.result()
             if result is not None:
                 scored.append(result)
-    if not scored:
-        return None
     scored.sort(key=lambda item: item[0])
-    return scored[0][1]
+    return scored
+
+
+def pick_best_relay(
+    relays: list[dict[str, Any]],
+    *,
+    exclude_hostname: str = "",
+    probe: TcpProbe | None = None,
+) -> dict[str, Any] | None:
+    scored = score_relays(relays, exclude_hostname=exclude_hostname, probe=probe)
+    return scored[0][1] if scored else None
 
 
 def conf_path(config_dir: str | Path, iface: str) -> Path:
@@ -351,7 +368,7 @@ class MullvadService:
         row = self.store.get_doc(CORE, KIND_LOCATION, code)
         return row if isinstance(row, dict) else None
 
-    def locations(self, *, force: bool = False) -> dict[str, Any]:
+    def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
         relays = fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch()
         self.refresh_bindings(relays)
         bound = {str(row.get("country_code") or "").lower(): row for row in self.bindings()}
@@ -367,12 +384,60 @@ class MullvadService:
                     "adopted": bool((bind or {}).get("adopted")),
                     "hostname": str((bind or {}).get("hostname") or "") or None,
                     "endpoint": str((bind or {}).get("endpoint") or "") or None,
+                    "ping_ms": None,
+                    "reachable": None,
+                    "ping_via": None,
                 }
             )
+        if ping:
+            locations = self._attach_pings(locations, relays)
         return {
             "settings": {k: v for k, v in self.settings().items() if k != "private_key"},
             "locations": locations,
         }
+
+    def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        jobs: list[tuple[str, str]] = []
+        for item in locations:
+            code = str(item.get("country_code") or "")
+            for row in sample_relays(active_relays(relays, code), 6):
+                ipv4 = str(row.get("ipv4_addr_in") or "").strip()
+                if ipv4:
+                    jobs.append((code, ipv4))
+
+        best: dict[str, int] = {}
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(32, max(1, len(jobs)))) as pool:
+                futures = {pool.submit(self.probe, ip, WG_PORT): code for code, ip in jobs}
+                for future, code in futures.items():
+                    ok, latency = future.result()
+                    if not ok or latency is None:
+                        continue
+                    previous = best.get(code)
+                    if previous is None or latency < previous:
+                        best[code] = latency
+
+        for item in locations:
+            code = str(item.get("country_code") or "")
+            iface = str(item.get("iface") or "")
+            tunnel_ok = False
+            tunnel_ms: int | None = None
+            if item.get("bound") and iface and self._iface_up(iface):
+                tunnel_ok, _message, tunnel_ms = self.egress_probe(interface=iface, runner=self.runner)
+            catalog_ms = best.get(code)
+            if tunnel_ok and tunnel_ms:
+                item["ping_ms"] = tunnel_ms
+                item["reachable"] = True
+                item["ping_via"] = "tunnel"
+            elif catalog_ms:
+                item["ping_ms"] = catalog_ms
+                item["reachable"] = True
+                item["ping_via"] = "relay"
+            else:
+                item["ping_ms"] = None
+                item["reachable"] = False
+                item["ping_via"] = None
+        return locations
 
     def refresh_bindings(self, relays: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         catalog = relays if relays is not None else self.fetch()
@@ -454,6 +519,17 @@ class MullvadService:
         self._apply_relay(iface, relay)
         self._put_binding(country_code=code, iface=iface, relay=relay, adopted=bool((bind or {}).get("adopted")))
         return self._present_binding(self.binding_for(code) or {})
+
+    def fallback_iface(self, iface: str) -> dict[str, Any] | None:
+        name = str(iface or "").strip()
+        if not name:
+            return None
+        relays = self.fetch()
+        self.refresh_bindings(relays)
+        for bind in self.bindings():
+            if str(bind.get("iface") or "").strip() == name:
+                return self._fallback_one(bind, relays)
+        return None
 
     def fallback(self, country_code: str | None = None) -> dict[str, Any]:
         relays = self.fetch()

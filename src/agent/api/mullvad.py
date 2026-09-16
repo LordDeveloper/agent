@@ -13,9 +13,9 @@ def _service(request: Request) -> MullvadService:
 
 
 @router.get("/locations")
-def mullvad_locations(request: Request, force: bool = False):
+def mullvad_locations(request: Request, force: bool = False, ping: bool = False):
     try:
-        payload = _service(request).locations(force=force)
+        payload = _service(request).locations(force=force, ping=ping)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
