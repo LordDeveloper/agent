@@ -9,6 +9,7 @@ iface name — and panel exit_interface — stay unchanged.
 
 import ipaddress
 import re
+import shutil
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,6 +41,9 @@ KIND_SETTINGS = "settings"
 KIND_LOCATION = "location"
 CORE = "mullvad"
 SETTINGS_ID = "account"
+PERSIST_UNIT_TEMPLATE = "agent-mullvad-wg@.service"
+PERSIST_HOLD_SCRIPT = Path("/var/lib/agent/mullvad-wg-hold.sh")
+PERSIST_UNIT_PATH = Path("/etc/systemd/system") / PERSIST_UNIT_TEMPLATE
 _WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
 
 # Host iface names already in use on this deployment (not always ISO).
@@ -340,6 +344,79 @@ def conf_path(config_dir: str | Path, iface: str) -> Path:
     return Path(config_dir) / f"{iface}.conf"
 
 
+def render_persist_hold_script(config_dir: str | Path) -> str:
+    root = str(Path(config_dir)).replace("'", "'\"'\"'")
+    return f"""#!/bin/sh
+set -eu
+IFACE=${{1:-}}
+CONF='{root}'/"$IFACE".conf
+case "$IFACE" in
+  ''|*[!A-Za-z0-9_.-]*) echo "invalid iface" >&2; exit 1 ;;
+esac
+if [ ! -f "$CONF" ]; then
+  echo "missing $CONF" >&2
+  exit 1
+fi
+
+bring_up() {{
+  ip link add name "$IFACE" type wireguard 2>/dev/null || true
+  tmp=$(mktemp)
+  if ! wg-quick strip "$CONF" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! wg setconf "$IFACE" "$tmp" 2>/dev/null; then
+    wg syncconf "$IFACE" "$tmp" || {{ rm -f "$tmp"; return 1; }}
+  fi
+  rm -f "$tmp"
+  ip link set dev "$IFACE" up
+  addrs=$(awk -F= 'BEGIN {{ IGNORECASE=1 }} $1 ~ /^[[:space:]]*Address[[:space:]]*$/ {{ print $2 }}' "$CONF" | tr -d ' ')
+  old_ifs=$IFS
+  IFS=,
+  for cidr in $addrs; do
+    [ -n "$cidr" ] || continue
+    case "$cidr" in
+      *:*) ip -6 addr add "$cidr" dev "$IFACE" 2>/dev/null || true ;;
+      *) ip -4 addr add "$cidr" dev "$IFACE" 2>/dev/null || true ;;
+    esac
+  done
+  IFS=$old_ifs
+}}
+
+while true; do
+  if [ ! -d "/sys/class/net/$IFACE" ]; then
+    bring_up || true
+  else
+    ip link set dev "$IFACE" up 2>/dev/null || true
+  fi
+  sleep 8
+done
+"""
+
+
+def render_persist_unit(script_path: str | Path) -> str:
+    script = str(script_path)
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=Netinja Mullvad WireGuard exit %i",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "Conflicts=wg-quick@%i.service",
+            "",
+            "[Service]",
+            "Type=simple",
+            "Restart=always",
+            "RestartSec=5",
+            f"ExecStart={script} %i",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        ]
+    )
+
+
 def read_conf(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -359,6 +436,8 @@ class MullvadService:
         fetch: FetchRelays | None = None,
         probe: TcpProbe | None = None,
         egress_probe: Callable[..., tuple[bool, str, int | None]] | None = None,
+        persist_script: str | Path | None = None,
+        persist_unit_path: str | Path | None = None,
     ) -> None:
         self.store = store
         self.config_dir = Path(config_dir)
@@ -366,6 +445,8 @@ class MullvadService:
         self.fetch = fetch or fetch_relays
         self.probe = probe or (lambda host, port: tcp_probe(host, port))
         self.egress_probe = egress_probe or _curl_probe
+        self.persist_script = Path(persist_script) if persist_script else PERSIST_HOLD_SCRIPT
+        self.persist_unit_path = Path(persist_unit_path) if persist_unit_path else PERSIST_UNIT_PATH
 
     def settings(self) -> dict[str, Any]:
         row = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
@@ -727,6 +808,10 @@ class MullvadService:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(dump_wg_conf(parsed), encoding="utf-8")
         self._sync_iface(iface, path)
+        try:
+            self._ensure_persist_unit(iface)
+        except Exception as exc:
+            log.warning("mullvad persist unit failed iface=%s: %s", iface, exc)
         if not settings.get("private_key") or not settings.get("address"):
             self.store.put_doc(
                 CORE,
@@ -735,31 +820,144 @@ class MullvadService:
                 {"private_key": private_key, "address": interface["Address"]},
             )
 
-    def _sync_iface(self, iface: str, path: Path) -> None:
-        if self._iface_up(iface):
-            strip = self.runner(["wg-quick", "strip", str(path)], check=False, timeout=15)
-            if getattr(strip, "returncode", 1) != 0:
-                strip = self.runner(["wg-quick", "strip", iface], check=False, timeout=15)
-            stripped = (getattr(strip, "stdout", "") or "").strip()
-            if getattr(strip, "returncode", 1) != 0 or not stripped:
-                raise AgentError("EXEC_ERROR", f"wg-quick strip failed for {iface}", 500)
-            tmp = path.with_suffix(".sync")
-            tmp.write_text(stripped + "\n", encoding="utf-8")
+    def restore_interfaces(self) -> dict[str, Any]:
+        restored: list[str] = []
+        persisted: list[str] = []
+        failed: list[str] = []
+        for bind in self.bindings():
+            iface = normalize_exit_interface(str(bind.get("iface") or ""))
+            if not iface:
+                continue
+            path = conf_path(self.config_dir, iface)
             try:
-                sync = self.runner(["wg", "syncconf", iface, str(tmp)], check=False, timeout=15)
-            finally:
+                if path.is_file() and not self._iface_up(iface):
+                    self._sync_iface(iface, path)
+                    restored.append(iface)
+                if self._ensure_persist_unit(iface).get("ok"):
+                    persisted.append(iface)
+            except Exception as exc:
+                log.warning("mullvad restore failed iface=%s: %s", iface, exc)
+                failed.append(iface)
+        return {"restored": restored, "persisted": persisted, "failed": failed}
+
+    def _ensure_persist_unit(self, iface: str) -> dict[str, Any]:
+        name = normalize_exit_interface(iface)
+        if not name:
+            return {"ok": False, "skipped": True, "reason": "invalid iface"}
+        if shutil.which("systemctl") is None:
+            return {"ok": False, "skipped": True, "reason": "systemctl not found"}
+
+        script_text = render_persist_hold_script(self.config_dir)
+        unit_text = render_persist_unit(self.persist_script)
+        try:
+            self.persist_script.parent.mkdir(parents=True, exist_ok=True)
+            self.persist_unit_path.parent.mkdir(parents=True, exist_ok=True)
+            previous_script = self.persist_script.read_text(encoding="utf-8") if self.persist_script.is_file() else ""
+            previous_unit = self.persist_unit_path.read_text(encoding="utf-8") if self.persist_unit_path.is_file() else ""
+            changed = previous_script != script_text or previous_unit != unit_text
+            if previous_script != script_text:
+                self.persist_script.write_text(script_text, encoding="utf-8")
                 try:
-                    tmp.unlink()
+                    self.persist_script.chmod(0o755)
                 except OSError:
                     pass
-            if getattr(sync, "returncode", 1) != 0:
-                err = (getattr(sync, "stderr", "") or getattr(sync, "stdout", "") or "wg syncconf failed").strip()
-                raise AgentError("EXEC_ERROR", err, 500)
-            return
+            if previous_unit != unit_text:
+                self.persist_unit_path.write_text(unit_text, encoding="utf-8")
+            if changed:
+                self.runner(["systemctl", "daemon-reload"], check=False, timeout=30)
+        except OSError as exc:
+            log.warning("mullvad persist unit write failed: %s", exc)
+            return {"ok": False, "skipped": False, "reason": str(exc)}
 
-        up = self.runner(["wg-quick", "up", iface], check=False, timeout=30)
-        if getattr(up, "returncode", 1) != 0:
-            err = (getattr(up, "stderr", "") or getattr(up, "stdout", "") or "wg-quick up failed").strip()
+        instance = f"agent-mullvad-wg@{name}.service"
+        self.runner(["systemctl", "disable", f"wg-quick@{name}.service"], check=False, timeout=30)
+        enabled = self.runner(["systemctl", "is-enabled", instance], check=False, timeout=10)
+        if getattr(enabled, "returncode", 1) != 0:
+            self.runner(["systemctl", "enable", instance], check=False, timeout=30)
+        active = self.runner(["systemctl", "is-active", instance], check=False, timeout=10)
+        started = getattr(active, "returncode", 1) == 0
+        if not started:
+            start = self.runner(["systemctl", "start", instance], check=False, timeout=30)
+            started = getattr(start, "returncode", 1) == 0
+        return {"ok": True, "unit": instance, "started": started}
+
+    def _sync_iface(self, iface: str, path: Path) -> None:
+        stripped = self._stripped_conf(iface, path)
+        existed = self._iface_up(iface)
+        if not existed:
+            self._create_wg_link(iface)
+        self._wg_apply_conf(iface, stripped)
+        self._link_up(iface)
+        self._assign_tunnel_address(iface, path)
+
+    def _stripped_conf(self, iface: str, path: Path) -> str:
+        strip = self.runner(["wg-quick", "strip", str(path)], check=False, timeout=15)
+        if getattr(strip, "returncode", 1) != 0:
+            strip = self.runner(["wg-quick", "strip", iface], check=False, timeout=15)
+        stripped = (getattr(strip, "stdout", "") or "").strip()
+        if getattr(strip, "returncode", 1) != 0 or not stripped:
+            raise AgentError("EXEC_ERROR", f"wg-quick strip failed for {iface}", 500)
+        return stripped
+
+    def _proc_err(self, proc: Any, fallback: str) -> str:
+        return (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or fallback).strip() or fallback
+
+    def _is_exists_err(self, err: str) -> bool:
+        text = err.lower()
+        return "file exists" in text or "already exists" in text
+
+    def _create_wg_link(self, iface: str) -> None:
+        add = self.runner(["ip", "link", "add", "name", iface, "type", "wireguard"], check=False, timeout=10)
+        if getattr(add, "returncode", 1) == 0 or self._iface_up(iface):
+            return
+        err = self._proc_err(add, f"ip link add {iface} failed")
+        if self._is_exists_err(err):
+            return
+        raise AgentError("EXEC_ERROR", err, 500)
+
+    def _wg_apply_conf(self, iface: str, stripped: str) -> None:
+        tmp = Path(str(self.config_dir / iface) + ".sync")
+        tmp.write_text(stripped + "\n", encoding="utf-8")
+        try:
+            applied = self.runner(["wg", "setconf", iface, str(tmp)], check=False, timeout=15)
+            if getattr(applied, "returncode", 1) != 0:
+                applied = self.runner(["wg", "syncconf", iface, str(tmp)], check=False, timeout=15)
+            if getattr(applied, "returncode", 1) != 0:
+                raise AgentError("EXEC_ERROR", self._proc_err(applied, f"wg setconf {iface} failed"), 500)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _link_up(self, iface: str) -> None:
+        result = self.runner(["ip", "link", "set", "dev", iface, "up"], check=False, timeout=10)
+        if getattr(result, "returncode", 1) == 0:
+            return
+        raise AgentError("EXEC_ERROR", self._proc_err(result, f"ip link set {iface} up failed"), 500)
+
+    def _assign_tunnel_address(self, iface: str, path: Path) -> None:
+        parsed = read_conf(path) or {}
+        address = str((parsed.get("interface") or {}).get("Address") or "").strip()
+        if not address:
+            return
+        for raw in address.split(","):
+            cidr = raw.strip()
+            if not cidr:
+                continue
+            if "/" not in cidr:
+                cidr = f"{cidr}/32"
+            family = "-6" if ":" in cidr.split("/", 1)[0] else "-4"
+            result = self.runner(
+                ["ip", family, "addr", "add", cidr, "dev", iface],
+                check=False,
+                timeout=10,
+            )
+            if getattr(result, "returncode", 1) == 0:
+                continue
+            err = self._proc_err(result, f"ip addr add {cidr} dev {iface} failed")
+            if self._is_exists_err(err):
+                continue
             raise AgentError("EXEC_ERROR", err, 500)
 
     def _iface_up(self, iface: str) -> bool:

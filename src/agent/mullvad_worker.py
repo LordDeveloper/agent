@@ -31,6 +31,13 @@ async def mullvad_worker_loop(
 
     while not stop_event.is_set():
         try:
+            restored = await asyncio.to_thread(service.restore_interfaces)
+            if restored.get("restored") or restored.get("failed"):
+                log.info(
+                    "mullvad restore restored=%s failed=%s",
+                    restored.get("restored"),
+                    restored.get("failed"),
+                )
             result = await asyncio.to_thread(service.fallback)
             changed = len(result.get("changed") or [])
             failed = len(result.get("failed") or [])

@@ -11,6 +11,8 @@ from agent.support.mullvad import (
     pick_best_relay,
     preferred_iface,
     country_for_iface_name,
+    render_persist_hold_script,
+    render_persist_unit,
 )
 
 PRIV = "E" * 43 + "="
@@ -211,6 +213,81 @@ def test_locations_ping_uses_best_relay(tmp_path: Path):
     assert jp["ping_via"] == "relay"
     assert de["ping_ip"] == "2.2.2.2"
     assert jp["ping_ip"] == "6.6.6.6"
+
+
+def test_sync_iface_creates_link_without_wg_quick_up(tmp_path: Path):
+    commands = []
+
+    def runner(args, **_k):
+        commands.append(list(args))
+        if args[:2] == ["wg-quick", "strip"]:
+            return FakeProc(returncode=0, stdout="[Interface]\nPrivateKey=abc\n", stderr="")
+        if args[:3] == ["ip", "link", "add"]:
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[0] == "wg" and args[1] == "setconf":
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[:4] == ["ip", "link", "set", "dev"]:
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[:2] == ["ip", "-4"] and "addr" in args:
+            return FakeProc(returncode=2, stdout="", stderr="RTNETLINK answers: File exists")
+        return FakeProc(returncode=1, stdout="", stderr="unexpected " + " ".join(args))
+
+    svc = _service(tmp_path, runner=runner)
+    path = tmp_path / "wg" / "no.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc._iface_up = lambda _name: False  # type: ignore[method-assign]
+    svc._sync_iface("no", path)
+
+    assert ["wg-quick", "up", "no"] not in commands
+    assert ["ip", "link", "add", "name", "no", "type", "wireguard"] in commands
+    assert ["ip", "link", "set", "dev", "no", "up"] in commands
+    assert any(cmd[:3] == ["wg", "setconf", "no"] for cmd in commands)
+
+
+def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):
+    commands = []
+
+    def runner(args, **_k):
+        commands.append(list(args))
+        joined = " ".join(args)
+        if args[:2] == ["systemctl", "is-enabled"]:
+            return FakeProc(returncode=1, stdout="disabled", stderr="")
+        if args[:2] == ["systemctl", "is-active"]:
+            return FakeProc(returncode=1, stdout="inactive", stderr="")
+        if args[0] == "systemctl":
+            return FakeProc(returncode=0, stdout="", stderr="")
+        return FakeProc(returncode=1, stdout="", stderr="unexpected " + joined)
+
+    monkeypatch.setattr("agent.support.mullvad.shutil.which", lambda _name: "/bin/systemctl")
+    svc = _service(tmp_path, runner=runner)
+    svc.persist_script = tmp_path / "mullvad-wg-hold.sh"
+    svc.persist_unit_path = tmp_path / "systemd" / "agent-mullvad-wg@.service"
+    result = svc._ensure_persist_unit("no")
+    assert result["ok"] is True
+    assert result["unit"] == "agent-mullvad-wg@no.service"
+    script = svc.persist_script.read_text(encoding="utf-8")
+    unit = svc.persist_unit_path.read_text(encoding="utf-8")
+    assert "ip link add name \"$IFACE\" type wireguard" in script
+    assert "wg-quick up" not in script
+    assert "Restart=always" in unit
+    assert "Conflicts=wg-quick@%i.service" in unit
+    assert ["systemctl", "enable", "agent-mullvad-wg@no.service"] in commands
+    assert ["systemctl", "start", "agent-mullvad-wg@no.service"] in commands
+    assert ["systemctl", "disable", "wg-quick@no.service"] in commands
+
+
+def test_persist_unit_template_points_at_hold_script():
+    text = render_persist_unit("/var/lib/agent/mullvad-wg-hold.sh")
+    assert "ExecStart=/var/lib/agent/mullvad-wg-hold.sh %i" in text
+    assert "ip link add" in render_persist_hold_script("/etc/wireguard")
 
 
 def test_parse_ping_ms_from_linux_ping():
