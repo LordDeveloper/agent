@@ -6,6 +6,7 @@ from agent.support.mullvad import (
     MullvadService,
     dump_wg_conf,
     group_locations,
+    parse_ping_ms,
     parse_wg_conf,
     pick_best_relay,
     preferred_iface,
@@ -208,3 +209,11 @@ def test_locations_ping_uses_best_relay(tmp_path: Path):
     assert de["ping_ms"] == 12
     assert jp["ping_ms"] == 70
     assert jp["ping_via"] == "relay"
+    assert de["ping_ip"] == "2.2.2.2"
+    assert jp["ping_ip"] == "6.6.6.6"
+
+
+def test_parse_ping_ms_from_linux_ping():
+    assert parse_ping_ms("64 bytes from 1.1.1.1: icmp_seq=1 ttl=54 time=14.2 ms") == 14
+    assert parse_ping_ms("time=8.04 ms") == 8
+    assert parse_ping_ms("no rtt") is None

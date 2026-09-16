@@ -35,6 +35,7 @@ WG_PORT = 51820
 HANDSHAKE_MAX_AGE = 180
 TCP_TIMEOUT = 1.5
 CACHE_TTL = 3600.0
+_PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.I)
 KIND_SETTINGS = "settings"
 KIND_LOCATION = "location"
 CORE = "mullvad"
@@ -230,6 +231,48 @@ def match_relay(
     return None
 
 
+def parse_ping_ms(output: str) -> int | None:
+    match = _PING_TIME_RE.search(str(output or ""))
+    if not match:
+        return None
+    try:
+        return max(1, int(round(float(match.group(1)))))
+    except ValueError:
+        return None
+
+
+def icmp_ping(host: str, *, runner: Runner | None = None, timeout: float = 2.5) -> tuple[bool, int | None]:
+    ip = str(host or "").strip()
+    if not ip:
+        return False, None
+    execute = runner or run
+    result = execute(
+        ["ping", "-4", "-n", "-c", "1", "-W", "1", ip],
+        check=False,
+        timeout=timeout,
+    )
+    body = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
+    latency = parse_ping_ms(body)
+    if getattr(result, "returncode", 1) == 0 and latency:
+        return True, latency
+    if latency:
+        return True, latency
+    return False, None
+
+
+def ping_relay_ip(
+    host: str,
+    *,
+    runner: Runner | None = None,
+    tcp: TcpProbe | None = None,
+) -> tuple[bool, int | None]:
+    ok, latency = icmp_ping(host, runner=runner)
+    if ok:
+        return True, latency
+    checker = tcp or tcp_probe
+    return checker(host, WG_PORT)
+
+
 def tcp_probe(host: str, port: int = WG_PORT, *, timeout: float = TCP_TIMEOUT) -> tuple[bool, int | None]:
     host = str(host or "").strip()
     if not host or port <= 0:
@@ -385,6 +428,7 @@ class MullvadService:
                     "hostname": str((bind or {}).get("hostname") or "") or None,
                     "endpoint": str((bind or {}).get("endpoint") or "") or None,
                     "ping_ms": None,
+                    "ping_ip": None,
                     "reachable": None,
                     "ping_via": None,
                 }
@@ -399,42 +443,54 @@ class MullvadService:
     def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
         jobs: list[tuple[str, str]] = []
         for item in locations:
+            iface = str(item.get("iface") or "")
+            has_tunnel = bool(item.get("bound") and iface and self._iface_up(iface))
+            if has_tunnel:
+                continue
             code = str(item.get("country_code") or "")
-            for row in sample_relays(active_relays(relays, code), 6):
+            candidates = active_relays(relays, code)
+            for row in sample_relays(candidates, 12):
                 ipv4 = str(row.get("ipv4_addr_in") or "").strip()
                 if ipv4:
                     jobs.append((code, ipv4))
 
-        best: dict[str, int] = {}
+        best: dict[str, tuple[int, str]] = {}
         if jobs:
             with ThreadPoolExecutor(max_workers=min(32, max(1, len(jobs)))) as pool:
-                futures = {pool.submit(self.probe, ip, WG_PORT): code for code, ip in jobs}
-                for future, code in futures.items():
+                futures = {
+                    pool.submit(ping_relay_ip, ip, runner=self.runner, tcp=self.probe): (code, ip)
+                    for code, ip in jobs
+                }
+                for future in as_completed(futures):
+                    code, ip = futures[future]
                     ok, latency = future.result()
                     if not ok or latency is None:
                         continue
                     previous = best.get(code)
-                    if previous is None or latency < previous:
-                        best[code] = latency
+                    if previous is None or latency < previous[0]:
+                        best[code] = (latency, ip)
 
         for item in locations:
             code = str(item.get("country_code") or "")
             iface = str(item.get("iface") or "")
-            tunnel_ok = False
-            tunnel_ms: int | None = None
-            if item.get("bound") and iface and self._iface_up(iface):
+            has_tunnel = bool(item.get("bound") and iface and self._iface_up(iface))
+            if has_tunnel:
                 tunnel_ok, _message, tunnel_ms = self.egress_probe(interface=iface, runner=self.runner)
-            catalog_ms = best.get(code)
-            if tunnel_ok and tunnel_ms:
-                item["ping_ms"] = tunnel_ms
-                item["reachable"] = True
-                item["ping_via"] = "tunnel"
-            elif catalog_ms:
-                item["ping_ms"] = catalog_ms
+                if tunnel_ok and tunnel_ms:
+                    item["ping_ms"] = tunnel_ms
+                    item["ping_ip"] = None
+                    item["reachable"] = True
+                    item["ping_via"] = "tunnel"
+                    continue
+            catalog = best.get(code)
+            if catalog:
+                item["ping_ms"] = catalog[0]
+                item["ping_ip"] = catalog[1]
                 item["reachable"] = True
                 item["ping_via"] = "relay"
             else:
                 item["ping_ms"] = None
+                item["ping_ip"] = None
                 item["reachable"] = False
                 item["ping_via"] = None
         return locations
