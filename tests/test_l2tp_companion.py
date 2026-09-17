@@ -67,6 +67,37 @@ def test_companion_follows_wg_exit_and_enable(tmp_path):
     assert user["is_enabled"] is False
 
 
+def test_matching_wg_peer_id_is_treated_as_companion(tmp_path):
+    _, store = _store(tmp_path)
+    store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {
+            "id": 1,
+            "peers": [
+                {
+                    "id": "peer-1",
+                    "email": "a@test",
+                    "exit_interface": "fr",
+                    "is_enabled": True,
+                    "expires_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+        },
+    )
+    user = {
+        "id": "peer-1",
+        "address": "10.90.128.3",
+        "is_enabled": True,
+        "exit_interface": "usa",
+    }
+    assert apply_linked_state(user, store) is True
+    assert user["linked_peer_id"] == "peer-1"
+    assert user["exit_interface"] == "fr"
+    assert user["expires_at"] == "2026-01-01T00:00:00Z"
+
+
 def test_missing_wg_peer_clears_stale_exit(tmp_path):
     _, store = _store(tmp_path)
     user = {
@@ -234,3 +265,59 @@ def test_l2tp_reconcile_runtime_updates_exit(tmp_path, monkeypatch):
     driver.reconcile_runtime()
     user = store.get_doc("l2tp", "server", "1")["users"][0]
     assert user["exit_interface"] == "sw"
+
+
+def test_wireguard_peer_exit_update_syncs_companion(tmp_path, monkeypatch):
+    from agent.drivers.wireguard import WireGuardDriver
+
+    settings, store = _store(tmp_path)
+    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._apply_all_configs", lambda self: None)
+    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._ensure_services", lambda self, **kwargs: None)
+    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._install_ppp_egress_hook", lambda self: None)
+    monkeypatch.setattr("agent.support.peer_egress.reconcile_core_egress", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._validate_before_apply", lambda self, iface: None)
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._apply_live", lambda self, iface, **kwargs: None)
+    store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {
+            "id": 1,
+            "name": "wg1",
+            "subnet": "10.90.0.0/16",
+            "peers": [
+                {
+                    "id": "peer-1",
+                    "email": "a@test",
+                    "address": "10.90.0.2",
+                    "exit_interface": "usa",
+                    "is_enabled": True,
+                }
+            ],
+        },
+    )
+    store.put_doc(
+        "l2tp",
+        "server",
+        "1",
+        {
+            "id": 1,
+            "users": [
+                {
+                    "id": "peer-1",
+                    "linked_peer_id": "peer-1",
+                    "address": "10.90.128.3",
+                    "exit_interface": "usa",
+                    "is_enabled": True,
+                }
+            ],
+        },
+    )
+    driver = WireGuardDriver(settings, AuditLog(store), store)
+    driver.update_peer(
+        1,
+        "peer-1",
+        {"id": "peer-1", "email": "a@test", "exit_interface": "de", "is_enabled": True},
+    )
+    user = store.get_doc("l2tp", "server", "1")["users"][0]
+    assert user["exit_interface"] == "de"

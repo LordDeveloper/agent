@@ -55,13 +55,17 @@ def find_linked_peer(store: Store, user: dict[str, Any]) -> dict[str, Any] | Non
 
 def apply_linked_state(user: dict[str, Any], store: Store) -> bool:
     """Mutate a companion user to match the linked WG peer. Pure L2TP is untouched."""
-    if not is_companion_user(user):
-        return False
+    linked = companion_link_id(user)
+    peer = find_linked_peer(store, user)
+    if not linked:
+        if peer is None:
+            return False
+        user["linked_peer_id"] = str(peer.get("id") or user.get("id") or "")
 
     before_enabled = record_is_enabled(user)
     before_exit = str(user.get("exit_interface") or "")
     before_reason = str(user.get("disabled_reason") or "")
-    peer = find_linked_peer(store, user)
+    before_expires = user.get("expires_at")
     if peer is None:
         user["is_enabled"] = False
         user.pop("exit_interface", None)
@@ -91,10 +95,17 @@ def apply_linked_state(user: dict[str, Any], store: Store) -> bool:
         user["is_enabled"] = False
         user["disabled_reason"] = _DISABLED_REASON
 
+    if "expires_at" in peer:
+        user["expires_at"] = peer.get("expires_at")
+    else:
+        user.pop("expires_at", None)
+
     changed = (
         record_is_enabled(user) != before_enabled
         or str(user.get("exit_interface") or "") != before_exit
         or str(user.get("disabled_reason") or "") != before_reason
+        or user.get("expires_at") != before_expires
+        or (not linked and bool(companion_link_id(user)))
     )
     if changed:
         log.info(
@@ -129,7 +140,9 @@ def sync_companions(store: Store, *, drop_keys: Iterable[str] | None = None) -> 
         kept: list[dict[str, Any]] = []
         dirty = False
         for user in users:
-            if drop and (_user_keys(user) & drop) and is_companion_user(user):
+            if drop and (_user_keys(user) & drop) and (
+                is_companion_user(user) or find_linked_peer(store, user) is not None
+            ):
                 log.info(
                     "l2tp companion %s removed; linked wireguard peer deleted",
                     user.get("address") or user.get("id"),

@@ -1031,6 +1031,7 @@ class WireGuardDriver(CoreDriver):
                 # exit_interface / metadata-only updates must not wg syncconf + nft flush.
                 if _peer_change_needs_wg_apply(before, merged):
                     self.update_interface(interface_id, iface)
+                    self._sync_linked_l2tp()
                 else:
                     self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                     self._sync_peer_egress()
@@ -1274,6 +1275,7 @@ class WireGuardDriver(CoreDriver):
                 self._apply_live(iface, force_bring_up=bring_up)
             elif egress_only:
                 self._sync_peer_egress()
+            self._sync_linked_l2tp()
         except AgentError:
             self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
