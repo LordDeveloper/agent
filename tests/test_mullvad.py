@@ -171,6 +171,58 @@ def test_fallback_rewrites_peer_keeps_iface_name(tmp_path: Path, monkeypatch):
     assert svc.binding_for("de")["iface"] == "de"
 
 
+def test_fallback_ignores_handshake_when_egress_is_down(tmp_path: Path, monkeypatch):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
+        egress=lambda **_k: (False, "curl timeout", None),
+    )
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_latest_handshake", lambda _iface: int(__import__("time").time()))
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+    result = svc.fallback("de")
+    assert result["changed"]
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["peers"][0]["PublicKey"] == PUB_BER
+
+
+def test_fallback_iface_uses_country_from_iface_name(tmp_path: Path, monkeypatch):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
+        egress=lambda **_k: (False, "down", None),
+    )
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+    monkeypatch.setattr(svc, "_live_peer", lambda _iface: {"public_key": PUB_FRA, "endpoint": "1.1.1.1:51820"})
+    result = svc.fallback_iface("de")
+    assert result is not None
+    assert result["status"] == "changed"
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["peers"][0]["PublicKey"] == PUB_BER
+
+
 def test_ensure_new_location_uses_preferred_iface(tmp_path: Path, monkeypatch):
     svc = _service(tmp_path)
     svc.save_settings(private_key=PRIV, address="10.64.9.9/32")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent.logutil import get_logger
+from agent.support import record_is_enabled
 from agent.support.l2tp_ip import l2tp_gateway, l2tp_pool_bounds, normalize_l2tp_subnet
 
 log = get_logger('l2tp-config')
@@ -207,6 +208,8 @@ def render_chap_secrets(servers: list[dict[str, Any]]) -> str:
             password = str(user.get('password') or '').strip()
             address = str(user.get('address') or '*').strip() or '*'
             if not username or not password:
+                continue
+            if not record_is_enabled(user):
                 continue
             username = username.replace('\t', '').replace(' ', '')
             password = password.replace('\t', '').replace(' ', '')

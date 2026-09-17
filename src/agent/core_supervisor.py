@@ -45,7 +45,11 @@ def bootstrap_enabled_cores(
                     logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
             elif key == "l2tp":
                 if driver.running():
-                    logger.info("supervisor core=%s already running", key)
+                    logger.info("supervisor core=%s already running; reconcile companions", key)
+                    try:
+                        driver.reconcile_runtime()
+                    except Exception as exc:
+                        logger.warning("supervisor l2tp companion reconcile failed: %s", exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
                 driver.enable()

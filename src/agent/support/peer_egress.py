@@ -173,14 +173,29 @@ def desired_rules_from_interfaces(interfaces: list[dict[str, Any]]) -> list[dict
     seen: set[str] = set()
     for iface in interfaces:
         for peer in iface.get("peers") or []:
-            if not isinstance(peer, dict) or not record_is_enabled(peer):
+            if not isinstance(peer, dict):
                 continue
-            exit_iface = normalize_exit_interface(peer.get("exit_interface"))
             cidr = peer_source_cidr(peer.get("address"))
-            if not exit_iface or not cidr:
+            if not cidr:
                 continue
             addr = cidr.split("/", 1)[0]
             if addr in seen:
+                continue
+            linked = str(peer.get("linked_peer_id") or "").strip()
+            exit_iface = normalize_exit_interface(peer.get("exit_interface"))
+            if linked and (not record_is_enabled(peer) or not exit_iface):
+                seen.add(addr)
+                rules.append(
+                    {
+                        "addr": addr,
+                        "cidr": cidr,
+                        "iface": "",
+                        "table": 0,
+                        "action": "prohibit",
+                    }
+                )
+                continue
+            if not record_is_enabled(peer) or not exit_iface:
                 continue
             seen.add(addr)
             rules.append(
@@ -189,6 +204,7 @@ def desired_rules_from_interfaces(interfaces: list[dict[str, Any]]) -> list[dict
                     "cidr": cidr,
                     "iface": exit_iface,
                     "table": table_id_for_interface(exit_iface),
+                    "action": "lookup",
                 }
             )
     return rules
@@ -210,9 +226,23 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                     if not isinstance(row, dict):
                         continue
                     addr = str(row.get("addr") or "").strip()
+                    action = str(row.get("action") or "lookup")
                     iface = str(row.get("iface") or "").strip()
                     table = int(row.get("table") or 0)
-                    if not addr or not iface or table <= 0:
+                    if not addr:
+                        continue
+                    if action == "prohibit":
+                        source.append(
+                            {
+                                "addr": addr,
+                                "cidr": f"{addr}/32",
+                                "iface": "",
+                                "table": 0,
+                                "action": "prohibit",
+                            }
+                        )
+                        continue
+                    if not iface or table <= 0:
                         continue
                     source.append(
                         {
@@ -220,6 +250,7 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                             "cidr": f"{addr}/32",
                             "iface": iface,
                             "table": table,
+                            "action": "lookup",
                         }
                     )
         else:
@@ -233,9 +264,23 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                     if not isinstance(row, dict):
                         continue
                     addr = str(row.get("addr") or "").strip()
+                    action = str(row.get("action") or "lookup")
                     iface = str(row.get("iface") or "").strip()
                     table = int(row.get("table") or 0)
-                    if not addr or not iface or table <= 0:
+                    if not addr:
+                        continue
+                    if action == "prohibit":
+                        source.append(
+                            {
+                                "addr": addr,
+                                "cidr": f"{addr}/32",
+                                "iface": "",
+                                "table": 0,
+                                "action": "prohibit",
+                            }
+                        )
+                        continue
+                    if not iface or table <= 0:
                         continue
                     source.append(
                         {
@@ -243,6 +288,7 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                             "cidr": f"{addr}/32",
                             "iface": iface,
                             "table": table,
+                            "action": "lookup",
                         }
                     )
         for row in source:
@@ -296,13 +342,21 @@ def render_apply_script(
     for row in rules:
         addr = str(row["addr"])
         cidr = str(row.get("cidr") or f"{addr}/32")
+        pref = rule_pref_for_addr(addr)
+        if str(row.get("action") or "lookup") == "prohibit":
+            lines.append(f'ip rule del from "{cidr}" prohibit 2>/dev/null || true')
+            lines.append(
+                f'ip rule add from "{cidr}" pref {pref} prohibit 2>/dev/null || true'
+            )
+            continue
         table = int(row["table"])
         iface = str(row["iface"])
-        masq.add(iface)
+        if iface:
+            masq.add(iface)
         # Cold boot / PostUp: install table then rule with stable preference.
-        pref = rule_pref_for_addr(addr)
         lines.append(f'if _default_for_iface "{iface}" {table}; then')
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
+        lines.append(f'  ip rule del from "{cidr}" prohibit 2>/dev/null || true')
         lines.append(
             f'  ip rule add from "{cidr}" lookup {table} pref {pref} 2>/dev/null || true'
         )
@@ -633,9 +687,10 @@ def reconcile_core_egress(
             "table": int(row.get("table") or 0),
             "iface": str(row.get("iface") or ""),
             "cidr": peer_source_cidr(row.get("addr")) or f"{row.get('addr')}/32",
+            "action": str(row.get("action") or "lookup"),
         }
         for row in prev_rules
-        if str(row.get("addr") or "").strip() and int(row.get("table") or 0) > 0
+        if str(row.get("addr") or "").strip()
     }
 
     _ensure_ip_forward(execute)
@@ -646,12 +701,14 @@ def reconcile_core_egress(
     # 1) Warm every desired exit table first (shared by many peers).
     warmed: set[tuple[str, int]] = set()
     for row in desired:
+        if str(row.get("action") or "lookup") == "prohibit":
+            continue
         iface = str(row["iface"])
         table = int(row["table"])
         key = (iface, table)
         if key in warmed:
             continue
-        if not _iface_exists(execute, iface):
+        if not iface or not _iface_exists(execute, iface):
             continue
         _soften_rp_filter(execute, iface)
         if _install_default_route(execute, iface=iface, table=table):
@@ -663,15 +720,30 @@ def reconcile_core_egress(
     for row in desired:
         addr = str(row["addr"])
         cidr = str(row["cidr"])
+        action = str(row.get("action") or "lookup")
+        pref = rule_pref_for_addr(addr)
+        old = prev_by_addr.get(addr)
+        old_action = str((old or {}).get("action") or "lookup")
+        if action == "prohibit":
+            if not _has_from_prohibit_rule(execute, cidr=cidr):
+                if not _ip(execute, ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"]):
+                    log.warning("peer egress skipped %s: failed to add prohibit rule", cidr)
+                    continue
+            if old and old_action != "prohibit":
+                old_table = int(old.get("table") or 0)
+                if old_table > 0:
+                    _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                switched.append(addr)
+            applied.append(row)
+            continue
+
         table = int(row["table"])
         iface = str(row["iface"])
         if (iface, table) not in warmed:
             log.warning("peer egress skipped %s: exit interface [%s] missing or route failed", cidr, iface)
             continue
 
-        pref = rule_pref_for_addr(addr)
-        old = prev_by_addr.get(addr)
-        switching = bool(old and (int(old["table"]) != table or str(old["iface"]) != iface))
+        switching = bool(old and (int(old["table"]) != table or str(old["iface"]) != iface or old_action != "lookup"))
         already = _has_from_lookup_rule(execute, cidr=cidr, table=table)
 
         if switching and not already:
@@ -703,6 +775,10 @@ def reconcile_core_egress(
                 _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
             switched.append(addr)
 
+        if old_action == "prohibit":
+            _ip(execute, ["rule", "del", "from", cidr, "prohibit"])
+            switched.append(addr)
+
         applied.append(row)
 
     desired_keys = {(str(row["addr"]), int(row["table"]), str(row["iface"])) for row in applied}
@@ -720,7 +796,11 @@ def reconcile_core_egress(
             # Already handled as atomic switch above.
             continue
         cidr = peer_source_cidr(addr) or f"{addr}/32"
-        if table:
+        prev_action = str(row.get("action") or "lookup")
+        if prev_action == "prohibit":
+            _ip(execute, ["rule", "del", "from", cidr, "prohibit"])
+            switched.append(addr)
+        elif table:
             _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
             switched.append(addr)
 
@@ -728,7 +808,7 @@ def reconcile_core_egress(
     for addr in dict.fromkeys(switched):
         _flush_conntrack(execute, addr)
 
-    desired_tables = {int(row["table"]): str(row["iface"]) for row in applied}
+    desired_tables = {int(row["table"]): str(row["iface"]) for row in applied if int(row.get("table") or 0) > 0}
     prev_tables = {
         int(row.get("table") or 0): str(row.get("iface") or "")
         for row in prev_rules
@@ -739,7 +819,7 @@ def reconcile_core_egress(
         if table not in desired_tables:
             _ip(execute, ["route", "flush", "table", str(table)])
 
-    masq_ifaces = sorted({str(row["iface"]) for row in applied})
+    masq_ifaces = sorted({str(row["iface"]) for row in applied if str(row.get("iface") or "").strip()})
     # Keep MASQUERADE on recently-used exits too (switch italy→deutch must not
     # briefly leave the new exit without SNAT if apply races).
     for iface in previous.get("masq") or []:
@@ -779,7 +859,12 @@ def reconcile_core_egress(
 
     state = {
         "rules": [
-            {"addr": str(row["addr"]), "table": int(row["table"]), "iface": str(row["iface"])}
+            {
+                "addr": str(row["addr"]),
+                "table": int(row["table"]),
+                "iface": str(row["iface"]),
+                "action": str(row.get("action") or "lookup"),
+            }
             for row in applied
         ],
         "tables": sorted(desired_tables.keys()),
@@ -864,6 +949,38 @@ def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
     needle_a = f"lookup {table}"
     needle_b = f"table {table}"
     return needle_a in text or needle_b in text
+
+
+def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
+    host = cidr.split("/", 1)[0]
+    try:
+        result = runner(["ip", "-j", "rule", "show"], check=False, timeout=5)
+    except Exception:
+        result = None
+    if result is not None and getattr(result, "returncode", 1) == 0:
+        raw = str(getattr(result, "stdout", "") or "").strip()
+        if raw:
+            try:
+                rows = json.loads(raw)
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        src = str(row.get("src") or "").strip()
+                        if src not in (host, cidr):
+                            continue
+                        kind = str(row.get("type") or row.get("action") or "").lower()
+                        if kind == "prohibit":
+                            return True
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    try:
+        result = runner(["ip", "rule", "show", "from", cidr], check=False, timeout=5)
+    except Exception:
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    return "prohibit" in str(getattr(result, "stdout", "") or "").lower()
 
 
 def _soften_rp_filter(runner: Runner, iface: str) -> None:

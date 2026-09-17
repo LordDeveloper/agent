@@ -4,8 +4,11 @@ from fastapi import APIRouter, Request
 
 from agent.db import Store
 from agent.errors import AgentError, raise_agent_error
+from agent.logutil import get_logger
 from agent.support.peer_egress import all_desired_rules_from_store, all_tunnel_interface_names, repair_peer_egress
 from agent.support.host_interfaces import list_host_interfaces
+
+log = get_logger("network")
 
 router = APIRouter(prefix="/network", tags=["network"])
 
@@ -97,9 +100,13 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
                     continue
                 seen.add(iface)
                 try:
-                    service.fallback_iface(iface)
+                    result = service.fallback_iface(iface)
+                    if result and result.get("status") == "changed":
+                        log.info("mullvad probe fallback iface=%s %s", iface, result.get("message"))
+                    elif result and result.get("status") == "failed":
+                        log.warning("mullvad probe fallback iface=%s %s", iface, result.get("message"))
                 except Exception:
-                    pass
+                    log.exception("mullvad probe fallback failed iface=%s", iface)
 
         threading.Thread(target=_run_fallback, daemon=True).start()
 

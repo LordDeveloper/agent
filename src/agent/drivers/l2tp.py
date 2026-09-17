@@ -122,7 +122,12 @@ class L2tpDriver(CoreDriver):
     def enable(self) -> dict[str, Any]:
         self._apply_all_configs()
         self._ensure_services(start=True)
+        self._sync_peer_egress()
         return {'enabled': True, 'servers': len(self.list_servers())}
+
+    def reconcile_runtime(self, *, drop_keys: list[str] | None = None) -> None:
+        """Re-derive companion egress from WG peers without bouncing xl2tpd."""
+        self._sync_peer_egress(drop_keys=drop_keys)
 
     def disable(self) -> dict[str, Any]:
         run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
@@ -784,61 +789,32 @@ class L2tpDriver(CoreDriver):
         return l2tp_servers_as_interfaces(servers)
 
     def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
-        """Keep exit_interface aligned with the linked WireGuard/Amnezia peer.
-
-        Always refresh from the linked peer when found — companion users otherwise
-        keep a stale/empty exit after the WG peer moves to another region node.
-        """
+        """Keep companion users aligned with the linked WireGuard/Amnezia peer."""
+        from agent.support.l2tp_companion import apply_linked_state, is_companion_user
         from agent.support.peer_egress import normalize_exit_interface
 
-        linked = str(user.get('linked_peer_id') or '').strip()
-        if not linked:
-            linked = str(user.get('id') or '').strip()
-        if not linked:
-            current = normalize_exit_interface(user.get('exit_interface'))
-            if current:
-                user['exit_interface'] = current
+        if is_companion_user(user):
+            apply_linked_state(user, self.store)
             return
-
-        for core in ('wireguard', 'amnezia'):
-            for iface in self.store.list_docs(core, 'interface'):
-                for peer in iface.get('peers') or []:
-                    if not isinstance(peer, dict):
-                        continue
-                    peer_id = str(peer.get('id') or '').strip()
-                    peer_email = str(peer.get('email') or '').strip()
-                    if linked not in {peer_id, peer_email}:
-                        continue
-                    exit_iface = normalize_exit_interface(peer.get('exit_interface'))
-                    if exit_iface:
-                        user['exit_interface'] = exit_iface
-                    # Peer found: never drop a known exit just because WG is mid-update.
-                    return
 
         current = normalize_exit_interface(user.get('exit_interface'))
         if current:
             user['exit_interface'] = current
 
-    def _sync_peer_egress(self) -> None:
+    def _sync_peer_egress(self, drop_keys: list[str] | None = None) -> None:
         try:
+            from agent.support.l2tp_companion import sync_companions
             from agent.support.peer_egress import reconcile_core_egress
 
-            # Persist any exit filled from linked WG peers before reconcile.
-            dirty = False
-            for server in self.list_servers():
-                changed = False
-                for user in server.get('users') or []:
-                    if not isinstance(user, dict):
-                        continue
-                    before = str(user.get('exit_interface') or '')
-                    self._ensure_user_exit_interface(user)
-                    if str(user.get('exit_interface') or '') != before:
-                        changed = True
-                if changed:
-                    self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                    dirty = True
-            if dirty:
-                log.info('l2tp filled exit_interface from linked wireguard/amnezia peers')
+            result = sync_companions(self.store, drop_keys=drop_keys)
+            if result.get('changed'):
+                log.info(
+                    'l2tp companions synced updated=%s removed=%s',
+                    result.get('updated'),
+                    result.get('removed'),
+                )
+                self._apply_all_configs()
+                self._ensure_services(start=True)
 
             reconcile_core_egress(
                 self.store,

@@ -43,6 +43,32 @@ def test_desired_rules_from_interfaces_skips_disabled_and_missing_exit():
     }
 
 
+def test_desired_rules_prohibit_disabled_companion():
+    rules = desired_rules_from_interfaces(
+        [
+            {
+                "peers": [
+                    {
+                        "address": "10.90.128.3",
+                        "linked_peer_id": "peer-1",
+                        "exit_interface": "de",
+                        "is_enabled": False,
+                    }
+                ]
+            }
+        ]
+    )
+    assert rules == [
+        {
+            "addr": "10.90.128.3",
+            "cidr": "10.90.128.3/32",
+            "iface": "",
+            "table": 0,
+            "action": "prohibit",
+        }
+    ]
+
+
 def test_list_host_interfaces_filters_loopback(monkeypatch):
     payload = [
         {

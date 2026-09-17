@@ -1040,12 +1040,23 @@ class WireGuardDriver(CoreDriver):
     def delete_peer(self, interface_id: int | str, peer_id: str) -> bool:
         iface = self.get_interface(interface_id)
         peers = iface.get("peers", [])
-        filtered = [p for p in peers if str(p.get("id")) != peer_id and str(p.get("email")) != peer_id]
+        drop_keys: list[str] = []
+        filtered: list[dict[str, Any]] = []
+        for peer in peers:
+            if str(peer.get("id")) == peer_id or str(peer.get("email")) == peer_id:
+                for key in (peer.get("id"), peer.get("email")):
+                    text = str(key or "").strip()
+                    if text:
+                        drop_keys.append(text)
+                continue
+            filtered.append(peer)
         if len(filtered) == len(peers):
             raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
         iface["peers"] = filtered
         self.update_interface(interface_id, iface)
         self.audit.record("delete", f"{self.key}/peer/{peer_id}")
+        if drop_keys:
+            self._sync_linked_l2tp(drop_keys=drop_keys)
         return True
 
     def _peer_index(self, iface: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -1309,14 +1320,17 @@ class WireGuardDriver(CoreDriver):
         matched: set[str] = set()
 
         filtered: list[dict[str, Any]] = []
+        drop_keys: list[str] = []
         for peer in iface.get("peers", []):
             peer_id = str(peer.get("id") or "")
             email = str(peer.get("email") or "")
             if peer_id in remove_keys or email in remove_keys:
                 if peer_id:
                     matched.add(peer_id)
+                    drop_keys.append(peer_id)
                 if email:
                     matched.add(email)
+                    drop_keys.append(email)
                 succeeded += 1
                 continue
             filtered.append(peer)
@@ -1351,6 +1365,8 @@ class WireGuardDriver(CoreDriver):
             f"{self.key}/interface/{interface_id}/peers/batch",
             f"removed={succeeded} failed={failed} ms={elapsed_ms}",
         )
+        if drop_keys:
+            self._sync_linked_l2tp(drop_keys=drop_keys)
         return {
             "ok": failed == 0,
             "succeeded": succeeded,
@@ -1943,3 +1959,12 @@ class WireGuardDriver(CoreDriver):
             from agent.logutil import get_logger
 
             get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)
+        self._sync_linked_l2tp()
+
+    def _sync_linked_l2tp(self, drop_keys: list[str] | None = None) -> None:
+        try:
+            from agent.drivers.l2tp import L2tpDriver
+
+            L2tpDriver(self.settings, self.audit, self.store).reconcile_runtime(drop_keys=drop_keys)
+        except Exception:
+            log.exception("linked l2tp companion reconcile failed")
