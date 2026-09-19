@@ -97,6 +97,20 @@ def test_pick_best_relay_skips_excluded_and_uses_lowest_ping():
     assert best_all["hostname"] == "de-ber-wg-001"
 
 
+def test_pick_best_relay_uses_catalog_when_tcp_closed():
+    de = [row for row in RELAYS if row["country_code"] == "de"]
+    best = pick_best_relay(de, exclude_hostname="de-fra-wg-001", probe=lambda _host, _port: (False, None))
+    assert best is not None
+    assert best["hostname"] == "de-ber-wg-001"
+    none = pick_best_relay(
+        de,
+        exclude_hostname="de-fra-wg-001",
+        probe=lambda _host, _port: (False, None),
+        require_reachable=True,
+    )
+    assert none is None
+
+
 def test_group_locations_uses_alias_iface():
     grouped = {row["country_code"]: row for row in group_locations(RELAYS)}
     assert grouped["us"]["iface"] == "usa"
@@ -108,7 +122,7 @@ def _service(tmp_path: Path, runner=None, probe=None, egress=None) -> MullvadSer
     store = Store(tmp_path / "agent.db")
     conf = tmp_path / "wg"
     conf.mkdir()
-    return MullvadService(
+    svc = MullvadService(
         store,
         config_dir=conf,
         runner=runner or (lambda *_a, **_k: FakeProc(returncode=0, stdout="", stderr="")),
@@ -116,6 +130,8 @@ def _service(tmp_path: Path, runner=None, probe=None, egress=None) -> MullvadSer
         probe=probe or (lambda host, _port: (True, 10 if host != "1.1.1.1" else 50)),
         egress_probe=egress or (lambda **_k: (True, "ok", 12)),
     )
+    svc.handshake_wait = 0
+    return svc
 
 
 def test_adopts_existing_de_conf(tmp_path: Path):
@@ -169,6 +185,38 @@ def test_fallback_rewrites_peer_keeps_iface_name(tmp_path: Path, monkeypatch):
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
     assert parsed["interface"]["PostUp"] == "keep-me"
     assert svc.binding_for("de")["iface"] == "de"
+
+
+def test_fallback_switches_when_relay_tcp_probe_fails(tmp_path: Path, monkeypatch):
+    svc = _service(
+        tmp_path,
+        probe=lambda _host, _port: (False, None),
+        egress=lambda **_k: (False, "down", None),
+    )
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+    healthy_calls = {"n": 0}
+
+    def healthy(_iface):
+        healthy_calls["n"] += 1
+        return healthy_calls["n"] > 1
+
+    monkeypatch.setattr(svc, "_iface_healthy", healthy)
+    result = svc.fallback("de")
+    assert result["changed"]
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["peers"][0]["PublicKey"] == PUB_BER
 
 
 def test_fallback_ignores_handshake_when_egress_is_down(tmp_path: Path, monkeypatch):

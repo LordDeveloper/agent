@@ -303,6 +303,7 @@ def score_relays(
     exclude_hostnames: list[str] | set[str] | None = None,
     probe: TcpProbe | None = None,
     workers: int = 16,
+    require_reachable: bool = False,
 ) -> list[tuple[int, dict[str, Any]]]:
     checker = probe or (lambda host, port: tcp_probe(host, port))
     scored: list[tuple[int, dict[str, Any]]] = []
@@ -315,10 +316,13 @@ def score_relays(
         if hostname and hostname in skip:
             return None
         ipv4 = str(row.get("ipv4_addr_in") or "").strip()
-        ok, latency = checker(ipv4, WG_PORT)
-        if not ok or latency is None:
+        ok, latency = checker(ipv4, WG_PORT) if ipv4 else (False, None)
+        if ok and latency is not None:
+            return latency, row
+        if require_reachable:
             return None
-        return latency, row
+        # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
+        return (40_000 if row.get("owned") else 50_000), row
 
     if not relays:
         return []
@@ -329,7 +333,13 @@ def score_relays(
             result = future.result()
             if result is not None:
                 scored.append(result)
-    scored.sort(key=lambda item: item[0])
+    scored.sort(
+        key=lambda item: (
+            item[0],
+            0 if item[1].get("owned") else 1,
+            str(item[1].get("hostname") or ""),
+        )
+    )
     return scored
 
 
@@ -339,12 +349,14 @@ def pick_best_relay(
     exclude_hostname: str = "",
     exclude_hostnames: list[str] | set[str] | None = None,
     probe: TcpProbe | None = None,
+    require_reachable: bool = False,
 ) -> dict[str, Any] | None:
     scored = score_relays(
         relays,
         exclude_hostname=exclude_hostname,
         exclude_hostnames=exclude_hostnames,
         probe=probe,
+        require_reachable=require_reachable,
     )
     return scored[0][1] if scored else None
 
@@ -452,8 +464,9 @@ class MullvadService:
         self.config_dir = Path(config_dir)
         self.runner = runner or run
         self.fetch = fetch or fetch_relays
-        self.probe = probe or (lambda host, port: tcp_probe(host, port))
+        self.probe = probe or (lambda host, _port: ping_relay_ip(host, runner=self.runner))
         self.egress_probe = egress_probe or _curl_probe
+        self.handshake_wait = 2.0
         self.persist_script = Path(persist_script) if persist_script else PERSIST_HOLD_SCRIPT
         self.persist_unit_path = Path(persist_unit_path) if persist_unit_path else PERSIST_UNIT_PATH
 
@@ -759,12 +772,30 @@ class MullvadService:
 
         candidates = active_relays(relays, code)
         tried = {hostname.strip().lower()} if hostname.strip() else set()
-        last_error = "no healthy Mullvad relay in country"
+        last_error = "no Mullvad relay left in country"
         last_changed: dict[str, Any] | None = None
+        if not candidates:
+            log.warning("mullvad fallback no catalog relays country=%s iface=%s", code, iface)
+            return {**presented, "status": "failed", "message": last_error}
+
         attempts = min(4, max(1, len(candidates)))
+        log.info(
+            "mullvad fallback start country=%s iface=%s candidates=%s exclude=%s",
+            code,
+            iface,
+            len(candidates),
+            ",".join(sorted(tried)) or "-",
+        )
         for _ in range(attempts):
             relay = pick_best_relay(candidates, exclude_hostnames=tried, probe=self.probe)
             if relay is None:
+                log.warning(
+                    "mullvad fallback no candidate left country=%s iface=%s tried=%s catalog=%s",
+                    code,
+                    iface,
+                    ",".join(sorted(tried)) or "-",
+                    len(candidates),
+                )
                 break
             relay_host = str(relay.get("hostname") or "").strip()
             try:
@@ -785,6 +816,9 @@ class MullvadService:
                     "status": "changed",
                     "message": f"switched to {relay_host}",
                 }
+                wait = float(getattr(self, "handshake_wait", 0) or 0)
+                if wait > 0:
+                    time.sleep(wait)
                 if self._iface_healthy(iface):
                     return last_changed
                 log.warning(
