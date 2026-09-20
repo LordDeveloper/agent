@@ -14,9 +14,14 @@ DEFAULT_PPP_OPTIONS = '\n'.join(
         'ipcp-accept-local',
         'ipcp-accept-remote',
         'noccp',
+        'nobsdcomp',
+        'novj',
+        'novjccomp',
+        'nopcomp',
+        'noaccomp',
         'auth',
-        'mtu 1280',
-        'mru 1280',
+        'mtu 1400',
+        'mru 1400',
         'nodefaultroute',
         'proxyarp',
         'connect-delay 5000',
@@ -30,11 +35,17 @@ DEFAULT_PPP_OPTIONS = '\n'.join(
     ]
 )
 
+# AES-128 first — Windows RAS L2TP/IPsec is software-crypto; AES-256-first is slow.
 DEFAULT_IPSEC_IKE = (
+    'aes128-sha256-modp2048,aes128-sha1-modp2048,aes256-sha256-modp2048,'
+    'aes256-sha1-modp2048,aes128-sha1-modp1024,aes256-sha1-modp1024,3des-sha1-modp1024!'
+)
+DEFAULT_IPSEC_ESP = 'aes128-sha256,aes128-sha1,aes256-sha256,aes256-sha1,3des-sha1!'
+LEGACY_IPSEC_IKE = (
     'aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,'
     'aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!'
 )
-DEFAULT_IPSEC_ESP = 'aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1,3des-sha1!'
+LEGACY_IPSEC_ESP = 'aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1,3des-sha1!'
 
 
 def sanitize_lns_name(name: str, fallback: str = 'l2tpd') -> str:
@@ -79,18 +90,52 @@ def normalize_templates(raw: Any) -> dict[str, Any]:
     if ppp.startswith(';'):
         ppp = '#' + ppp[1:]
     ppp = ppp.replace('\n;', '\n#')
-    return {
-        'ppp_options': ppp or defaults['ppp_options'],
-        'ipsec_ike': ike or defaults['ipsec_ike'],
-        'ipsec_esp': esp or defaults['ipsec_esp'],
-        'forceencaps': _as_bool(src.get('forceencaps'), bool(defaults['forceencaps'])),
-        'require_authentication': _as_bool(
-            src.get('require_authentication'),
-            bool(defaults['require_authentication']),
-        ),
-        'access_control': _as_bool(src.get('access_control'), bool(defaults['access_control'])),
-        'lns_name': sanitize_lns_name(str(src.get('lns_name') or ''), str(defaults['lns_name'])),
-    }
+    return _upgrade_managed_templates(
+        {
+            'ppp_options': ppp or defaults['ppp_options'],
+            'ipsec_ike': ike or defaults['ipsec_ike'],
+            'ipsec_esp': esp or defaults['ipsec_esp'],
+            'forceencaps': _as_bool(src.get('forceencaps'), bool(defaults['forceencaps'])),
+            'require_authentication': _as_bool(
+                src.get('require_authentication'),
+                bool(defaults['require_authentication']),
+            ),
+            'access_control': _as_bool(src.get('access_control'), bool(defaults['access_control'])),
+            'lns_name': sanitize_lns_name(str(src.get('lns_name') or ''), str(defaults['lns_name'])),
+        }
+    )
+
+
+def _upgrade_managed_templates(tpl: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite stock MTU 1280 / AES-256-first templates that stall Windows RAS."""
+    ppp = str(tpl.get('ppp_options') or '')
+    if '# Managed by Netinja Agent' in ppp:
+        ppp = ppp.replace('mtu 1280', 'mtu 1400').replace('mru 1280', 'mru 1400')
+        missing = [
+            flag
+            for flag in ('nobsdcomp', 'novj', 'novjccomp', 'nopcomp', 'noaccomp')
+            if not any(line.strip() == flag for line in ppp.splitlines())
+        ]
+        if missing:
+            lines = ppp.splitlines()
+            out: list[str] = []
+            injected = False
+            for line in lines:
+                out.append(line)
+                if not injected and line.strip() == 'noccp':
+                    out.extend(missing)
+                    injected = True
+            if not injected:
+                out = missing + out
+            ppp = '\n'.join(out) + ('\n' if ppp.endswith('\n') else '')
+        tpl['ppp_options'] = ppp
+
+    if str(tpl.get('ipsec_ike') or '').strip() == LEGACY_IPSEC_IKE:
+        tpl['ipsec_ike'] = DEFAULT_IPSEC_IKE
+    if str(tpl.get('ipsec_esp') or '').strip() == LEGACY_IPSEC_ESP:
+        tpl['ipsec_esp'] = DEFAULT_IPSEC_ESP
+
+    return tpl
 
 
 def resolve_templates(servers: list[dict[str, Any]]) -> dict[str, Any]:

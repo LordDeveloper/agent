@@ -40,3 +40,23 @@ def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
 
     staging = Path(settings.l2tp.config_dir)
     assert staging.exists() is False  # apply was monkeypatched
+
+
+def test_normalize_templates_upgrades_windows_slow_defaults():
+    from agent.support.l2tp_config import DEFAULT_IPSEC_ESP, DEFAULT_IPSEC_IKE, normalize_templates
+
+    upgraded = normalize_templates(
+        {
+            'ppp_options': '# Managed by Netinja Agent\nnoccp\nmtu 1280\nmru 1280\n',
+            'ipsec_ike': (
+                'aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,'
+                'aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!'
+            ),
+            'ipsec_esp': 'aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1,3des-sha1!',
+        }
+    )
+
+    assert 'mtu 1400' in upgraded['ppp_options']
+    assert 'nobsdcomp' in upgraded['ppp_options']
+    assert upgraded['ipsec_ike'] == DEFAULT_IPSEC_IKE
+    assert upgraded['ipsec_esp'] == DEFAULT_IPSEC_ESP
