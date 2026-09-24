@@ -304,6 +304,7 @@ def score_relays(
     probe: TcpProbe | None = None,
     workers: int = 16,
     require_reachable: bool = False,
+    prefer_measured: bool = True,
 ) -> list[tuple[int, dict[str, Any]]]:
     checker = probe or (lambda host, port: tcp_probe(host, port))
     scored: list[tuple[int, dict[str, Any]]] = []
@@ -311,18 +312,18 @@ def score_relays(
     skip.update(str(name or "").strip().lower() for name in (exclude_hostnames or []))
     skip.discard("")
 
-    def _one(row: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    def _one(row: dict[str, Any]) -> tuple[int, dict[str, Any], bool] | None:
         hostname = str(row.get("hostname") or "").strip().lower()
         if hostname and hostname in skip:
             return None
         ipv4 = str(row.get("ipv4_addr_in") or "").strip()
         ok, latency = checker(ipv4, WG_PORT) if ipv4 else (False, None)
         if ok and latency is not None:
-            return latency, row
+            return latency, row, True
         if require_reachable:
             return None
         # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
-        return (40_000 if row.get("owned") else 50_000), row
+        return (40_000 if row.get("owned") else 50_000), row, False
 
     if not relays:
         return []
@@ -333,14 +334,18 @@ def score_relays(
             result = future.result()
             if result is not None:
                 scored.append(result)
-    scored.sort(
+
+    measured = [item for item in scored if item[2]]
+    pool = measured if (prefer_measured and measured) else scored
+    ranked = [(latency, row) for latency, row, _measured in pool]
+    ranked.sort(
         key=lambda item: (
             item[0],
             0 if item[1].get("owned") else 1,
             str(item[1].get("hostname") or ""),
         )
     )
-    return scored
+    return ranked
 
 
 def pick_best_relay(
@@ -350,6 +355,7 @@ def pick_best_relay(
     exclude_hostnames: list[str] | set[str] | None = None,
     probe: TcpProbe | None = None,
     require_reachable: bool = False,
+    prefer_measured: bool = True,
 ) -> dict[str, Any] | None:
     scored = score_relays(
         relays,
@@ -357,8 +363,31 @@ def pick_best_relay(
         exclude_hostnames=exclude_hostnames,
         probe=probe,
         require_reachable=require_reachable,
+        prefer_measured=prefer_measured,
     )
     return scored[0][1] if scored else None
+
+
+def present_relay_row(
+    row: dict[str, Any],
+    *,
+    ping_ms: int | None = None,
+    measured: bool = False,
+    current: bool = False,
+) -> dict[str, Any]:
+    return {
+        "hostname": str(row.get("hostname") or "").strip(),
+        "country_code": str(row.get("country_code") or "").strip().lower(),
+        "country_name": str(row.get("country_name") or "").strip(),
+        "city_code": str(row.get("city_code") or "").strip().lower(),
+        "city_name": str(row.get("city_name") or "").strip(),
+        "ipv4": str(row.get("ipv4_addr_in") or "").strip(),
+        "pubkey": str(row.get("pubkey") or "").strip(),
+        "owned": bool(row.get("owned")),
+        "ping_ms": ping_ms,
+        "measured": bool(measured and ping_ms is not None),
+        "current": bool(current),
+    }
 
 
 def conf_path(config_dir: str | Path, iface: str) -> Path:
@@ -713,7 +742,7 @@ class MullvadService:
         log.info("mullvad fallback iface=%s country=%s hostname=%s", name, code, hostname or "-")
         return self._fallback_one(synthesized, relays)
 
-    def fallback(self, country_code: str | None = None) -> dict[str, Any]:
+    def fallback(self, country_code: str | None = None, *, optimize: bool = False) -> dict[str, Any]:
         relays = self.fetch()
         self.refresh_bindings(relays)
         targets = self.bindings()
@@ -727,7 +756,7 @@ class MullvadService:
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         for bind in targets:
-            result = self._fallback_one(bind, relays)
+            result = self._fallback_one(bind, relays, optimize=optimize)
             status = result.get("status")
             if status == "changed":
                 changed.append(result)
@@ -735,7 +764,105 @@ class MullvadService:
                 failed.append(result)
             else:
                 skipped.append(result)
-        return {"changed": changed, "skipped": skipped, "failed": failed}
+        return {"changed": changed, "skipped": skipped, "failed": failed, "optimize": bool(optimize)}
+
+    def country_relays(self, country_code: str, *, ping: bool = True) -> dict[str, Any]:
+        code = str(country_code or "").strip().lower()
+        if not re.fullmatch(r"[a-z]{2}", code or ""):
+            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+
+        relays = self.fetch()
+        self.refresh_bindings(relays)
+        candidates = active_relays(relays, code)
+        if not candidates:
+            raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
+
+        bind = self.binding_for(code) or {}
+        current_host = str(bind.get("hostname") or "").strip().lower()
+        rows: list[dict[str, Any]] = []
+
+        if ping:
+            scored = score_relays(candidates, probe=self.probe, prefer_measured=False)
+            for latency, row in scored:
+                measured = latency < 40_000
+                rows.append(
+                    present_relay_row(
+                        row,
+                        ping_ms=latency if measured else None,
+                        measured=measured,
+                        current=str(row.get("hostname") or "").strip().lower() == current_host,
+                    )
+                )
+        else:
+            for row in sorted(
+                candidates,
+                key=lambda item: (
+                    0 if item.get("owned") else 1,
+                    str(item.get("city_name") or ""),
+                    str(item.get("hostname") or ""),
+                ),
+            ):
+                rows.append(
+                    present_relay_row(
+                        row,
+                        current=str(row.get("hostname") or "").strip().lower() == current_host,
+                    )
+                )
+
+        return {
+            "country_code": code,
+            "iface": str(bind.get("iface") or preferred_iface(code) or ""),
+            "bound": bool(bind),
+            "current_hostname": str(bind.get("hostname") or "") or None,
+            "relays": rows,
+        }
+
+    def switch_relay(self, country_code: str, hostname: str) -> dict[str, Any]:
+        code = str(country_code or "").strip().lower()
+        host = str(hostname or "").strip()
+        if not re.fullmatch(r"[a-z]{2}", code or ""):
+            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+        if not host:
+            raise AgentError("VALIDATION_ERROR", "hostname is required", 422)
+
+        relays = self.fetch()
+        self.refresh_bindings(relays)
+        candidates = active_relays(relays, code)
+        relay = next(
+            (row for row in candidates if str(row.get("hostname") or "").strip().lower() == host.lower()),
+            None,
+        )
+        if relay is None:
+            raise AgentError("NOT_FOUND", f"Relay [{host}] not found for {code}", 404)
+
+        bind = self.binding_for(code)
+        if not bind:
+            raise AgentError("NOT_FOUND", f"No Mullvad binding for {code}; ensure the location first", 404)
+
+        iface = str(bind.get("iface") or "").strip()
+        if not iface:
+            raise AgentError("VALIDATION_ERROR", f"Missing interface for {code}", 422)
+
+        previous = str(bind.get("hostname") or "").strip()
+        self._apply_relay(iface, relay)
+        self._put_binding(
+            country_code=code,
+            iface=iface,
+            relay=relay,
+            adopted=bool(bind.get("adopted")),
+            extra={
+                "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "last_error": "",
+                "manual_switch": True,
+            },
+        )
+        presented = self._present_binding(self.binding_for(code) or bind)
+        return {
+            **presented,
+            "status": "changed" if previous.lower() != host.lower() else "ok",
+            "previous_hostname": previous or None,
+            "message": f"switched to {host}" if previous.lower() != host.lower() else f"already on {host}",
+        }
 
     def status(self) -> dict[str, Any]:
         self.refresh_bindings()
@@ -760,34 +887,72 @@ class MullvadService:
         settings.pop("private_key", None)
         return {"settings": settings, "tunnels": rows}
 
-    def _fallback_one(self, bind: dict[str, Any], relays: list[dict[str, Any]]) -> dict[str, Any]:
+    def _fallback_one(
+        self,
+        bind: dict[str, Any],
+        relays: list[dict[str, Any]],
+        *,
+        optimize: bool = False,
+    ) -> dict[str, Any]:
         code = str(bind.get("country_code") or "").strip().lower()
         iface = str(bind.get("iface") or "").strip()
         hostname = str(bind.get("hostname") or "")
         presented = self._present_binding(bind)
         if not iface:
             return {**presented, "status": "failed", "message": "missing iface"}
-        if self._iface_up(iface) and self._iface_healthy(iface):
+
+        healthy = self._iface_up(iface) and self._iface_healthy(iface)
+        if healthy and not optimize:
             return {**presented, "status": "ok", "message": "healthy"}
 
         candidates = active_relays(relays, code)
-        tried = {hostname.strip().lower()} if hostname.strip() else set()
+        tried = {hostname.strip().lower()} if hostname.strip() and not optimize else set()
         last_error = "no Mullvad relay left in country"
         last_changed: dict[str, Any] | None = None
         if not candidates:
             log.warning("mullvad fallback no catalog relays country=%s iface=%s", code, iface)
             return {**presented, "status": "failed", "message": last_error}
 
+        if optimize and healthy:
+            scored = score_relays(candidates, probe=self.probe, prefer_measured=True)
+            if not scored:
+                return {**presented, "status": "ok", "message": "healthy"}
+            best_ms, best = scored[0]
+            best_host = str(best.get("hostname") or "").strip()
+            if best_host.lower() == hostname.strip().lower():
+                return {**presented, "status": "ok", "message": "already fastest"}
+            current_ms = next(
+                (
+                    latency
+                    for latency, row in scored
+                    if str(row.get("hostname") or "").strip().lower() == hostname.strip().lower()
+                ),
+                None,
+            )
+            if (
+                current_ms is not None
+                and best_ms < 40_000
+                and current_ms < 40_000
+                and (current_ms - best_ms) < max(20, int(current_ms * 0.2))
+            ):
+                return {
+                    **presented,
+                    "status": "ok",
+                    "message": f"current relay within speed margin ({current_ms}ms vs {best_ms}ms)",
+                }
+            tried = {hostname.strip().lower()} if hostname.strip() else set()
+
         attempts = min(4, max(1, len(candidates)))
         log.info(
-            "mullvad fallback start country=%s iface=%s candidates=%s exclude=%s",
+            "mullvad fallback start country=%s iface=%s candidates=%s exclude=%s optimize=%s",
             code,
             iface,
             len(candidates),
             ",".join(sorted(tried)) or "-",
+            optimize,
         )
         for _ in range(attempts):
-            relay = pick_best_relay(candidates, exclude_hostnames=tried, probe=self.probe)
+            relay = pick_best_relay(candidates, exclude_hostnames=tried, probe=self.probe, prefer_measured=True)
             if relay is None:
                 log.warning(
                     "mullvad fallback no candidate left country=%s iface=%s tried=%s catalog=%s",
@@ -808,6 +973,7 @@ class MullvadService:
                     extra={
                         "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "last_error": "",
+                        "manual_switch": False,
                     },
                 )
                 log.info("mullvad fallback country=%s iface=%s hostname=%s", code, iface, relay_host)

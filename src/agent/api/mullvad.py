@@ -21,6 +21,15 @@ def mullvad_locations(request: Request, force: bool = False, ping: bool = False)
     return {"success": True, **payload}
 
 
+@router.get("/locations/{country_code}/relays")
+def mullvad_country_relays(country_code: str, request: Request, ping: bool = True):
+    try:
+        payload = _service(request).country_relays(country_code, ping=ping)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
 @router.get("/status")
 def mullvad_status(request: Request):
     try:
@@ -52,19 +61,28 @@ def mullvad_ensure(country_code: str, request: Request):
     return {"success": True, **payload}
 
 
-@router.post("/locations/{country_code}/fallback")
-def mullvad_fallback_one(country_code: str, request: Request):
+@router.post("/locations/{country_code}/relay")
+def mullvad_switch_relay(country_code: str, body: dict[str, Any], request: Request):
     try:
-        payload = _service(request).fallback(country_code)
+        payload = _service(request).switch_relay(country_code, str(body.get("hostname") or ""))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
+@router.post("/locations/{country_code}/fallback")
+def mullvad_fallback_one(country_code: str, request: Request, optimize: bool = False):
+    try:
+        payload = _service(request).fallback(country_code, optimize=optimize)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/fallback")
-def mullvad_fallback_all(request: Request):
+def mullvad_fallback_all(request: Request, optimize: bool = False):
     try:
-        payload = _service(request).fallback()
+        payload = _service(request).fallback(optimize=optimize)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

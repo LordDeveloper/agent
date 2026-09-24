@@ -1097,8 +1097,10 @@ def _mullvad_menu() -> None:
             [
                 Choice("key", "Set private key", GREEN, "1"),
                 Choice("status", "Status", CYAN, "2"),
-                Choice("fallback", "Run fallback now", YELLOW, "3"),
-                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "4"),
+                Choice("fallback", "Run fallback now (by speed)", YELLOW, "3"),
+                Choice("optimize", "Optimize to fastest relay", YELLOW, "4"),
+                Choice("switch", "Switch relay manually", GREEN, "5"),
+                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "6"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -1110,6 +1112,10 @@ def _mullvad_menu() -> None:
             _run_action("Mullvad status", _show_mullvad_status)
         elif picked == "fallback":
             _run_action("Mullvad fallback", _show_mullvad_fallback)
+        elif picked == "optimize":
+            _run_action("Mullvad optimize", lambda: _show_mullvad_fallback(optimize=True))
+        elif picked == "switch":
+            _run_action("Mullvad switch relay", _show_mullvad_switch_relay)
         elif picked == "refresh":
             _run_action("Mullvad catalog", _show_mullvad_refresh)
 
@@ -1167,13 +1173,14 @@ def _show_mullvad_status() -> None:
         runtime.close()
 
 
-def _show_mullvad_fallback() -> None:
+def _show_mullvad_fallback(optimize: bool = False) -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        result = service.fallback()
+        result = service.fallback(optimize=optimize)
         changed = result.get("changed") or []
         failed = result.get("failed") or []
         skipped = result.get("skipped") or []
+        _print(kv("Mode", "optimize by speed" if optimize else "unhealthy only", CYAN))
         _print(kv("Changed", str(len(changed)), GREEN if changed else WHITE))
         _print(kv("Failed", str(len(failed)), RED if failed else WHITE))
         _print(kv("Healthy", str(len(skipped)), WHITE))
@@ -1181,6 +1188,51 @@ def _show_mullvad_fallback() -> None:
             _print(paint(f"  {row.get('iface')} → {row.get('hostname')} ({row.get('message')})", GREEN))
         for row in failed:
             _print(paint(f"  {row.get('iface')}: {row.get('message')}", RED))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_switch_relay() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        tunnels = (service.status().get("tunnels") or [])
+        if not tunnels:
+            _print(paint("  No Mullvad tunnels bound yet.", YELLOW))
+            return
+        country = prompt_text(
+            "Country code",
+            default=str(tunnels[0].get("country_code") or "").strip().lower(),
+        )
+        if not country:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        payload = service.country_relays(country, ping=True)
+        relays = payload.get("relays") or []
+        if not relays:
+            _print(paint("  No relays found.", YELLOW))
+            return
+        current = str(payload.get("current_hostname") or "")
+        _print(kv("Current", current or "-", CYAN))
+        choices = []
+        for index, row in enumerate(relays[:24], start=1):
+            ping = row.get("ping_ms")
+            ping_label = f"{ping}ms" if ping is not None else "n/a"
+            mark = " *" if row.get("current") else ""
+            label = (
+                f"{row.get('hostname')}  {row.get('city_name') or row.get('city_code') or '-'}  "
+                f"{ping_label}{mark}"
+            )
+            choices.append(Choice(str(row.get("hostname") or ""), label, GREEN if row.get("current") else WHITE, str(index)))
+        choices.append(Choice("back", "Cancel", WHITE, "0"))
+        picked = select(choices)
+        if picked in {None, "back"}:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        result = service.switch_relay(country, picked)
+        tone = GREEN if result.get("status") == "changed" else WHITE
+        _print(paint(f"  {result.get('message')}", tone))
+        _print(kv("Hostname", result.get("hostname") or "-", WHITE))
+        _print(kv("Iface", result.get("iface") or "-", WHITE))
     finally:
         runtime.close()
 

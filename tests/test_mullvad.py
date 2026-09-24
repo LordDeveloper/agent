@@ -97,6 +97,19 @@ def test_pick_best_relay_skips_excluded_and_uses_lowest_ping():
     assert best_all["hostname"] == "de-ber-wg-001"
 
 
+def test_pick_best_relay_prefers_measured_ping_over_owned_guess():
+    owned_fra = dict(RELAYS[0], owned=True)
+    slow_ber = dict(RELAYS[1], owned=False)
+
+    def probe(host, _port):
+        if host == "2.2.2.2":
+            return True, 18
+        return False, None
+
+    best = pick_best_relay([owned_fra, slow_ber], probe=probe)
+    assert best["hostname"] == "de-ber-wg-001"
+
+
 def test_pick_best_relay_uses_catalog_when_tcp_closed():
     de = [row for row in RELAYS if row["country_code"] == "de"]
     best = pick_best_relay(de, exclude_hostname="de-fra-wg-001", probe=lambda _host, _port: (False, None))
@@ -350,6 +363,36 @@ def test_sync_iface_creates_link_without_wg_quick_up(tmp_path: Path):
     assert ["ip", "link", "add", "name", "no", "type", "wireguard"] in commands
     assert ["ip", "link", "set", "dev", "no", "up"] in commands
     assert any(cmd[:3] == ["wg", "setconf", "no"] for cmd in commands)
+
+
+def test_switch_relay_rewrites_peer(tmp_path: Path, monkeypatch):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
+    )
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+
+    listed = svc.country_relays("de", ping=True)
+    assert listed["current_hostname"] == "de-fra-wg-001"
+    assert listed["relays"][0]["hostname"] == "de-ber-wg-001"
+
+    result = svc.switch_relay("de", "de-ber-wg-001")
+    assert result["status"] == "changed"
+    assert result["hostname"] == "de-ber-wg-001"
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["peers"][0]["PublicKey"] == PUB_BER
 
 
 def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):
