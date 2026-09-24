@@ -21,7 +21,7 @@ PUB_BER = "B" * 43 + "="
 PUB_NYC = "C" * 43 + "="
 
 
-def _relay(country, name, city, pubkey, ip, city_name=None, country_name=None):
+def _relay(country, name, city, pubkey, ip, city_name=None, country_name=None, speed=None, owned=False):
     names = {
         "de": "Germany",
         "us": "USA",
@@ -29,7 +29,7 @@ def _relay(country, name, city, pubkey, ip, city_name=None, country_name=None):
         "mx": "Mexico",
         "jp": "Japan",
     }
-    return {
+    row = {
         "hostname": name,
         "country_code": country,
         "country_name": country_name or names.get(country, country),
@@ -39,16 +39,20 @@ def _relay(country, name, city, pubkey, ip, city_name=None, country_name=None):
         "type": "wireguard",
         "pubkey": pubkey,
         "ipv4_addr_in": ip,
+        "owned": owned,
     }
+    if speed is not None:
+        row["network_port_speed"] = speed
+    return row
 
 
 RELAYS = [
-    _relay("de", "de-fra-wg-001", "fra", PUB_FRA, "1.1.1.1", "Frankfurt"),
-    _relay("de", "de-ber-wg-001", "ber", PUB_BER, "2.2.2.2", "Berlin"),
-    _relay("us", "us-nyc-wg-001", "nyc", PUB_NYC, "3.3.3.3", "New York"),
-    _relay("se", "se-sto-wg-001", "sto", "D" * 43 + "=", "4.4.4.4", "Stockholm"),
-    _relay("mx", "mx-qro-wg-001", "qro", "F" * 43 + "=", "5.5.5.5", "Queretaro"),
-    _relay("jp", "jp-tyo-wg-001", "tyo", "G" * 43 + "=", "6.6.6.6", "Tokyo"),
+    _relay("de", "de-fra-wg-001", "fra", PUB_FRA, "1.1.1.1", "Frankfurt", speed=1000),
+    _relay("de", "de-ber-wg-001", "ber", PUB_BER, "2.2.2.2", "Berlin", speed=10000),
+    _relay("us", "us-nyc-wg-001", "nyc", PUB_NYC, "3.3.3.3", "New York", speed=1000),
+    _relay("se", "se-sto-wg-001", "sto", "D" * 43 + "=", "4.4.4.4", "Stockholm", speed=1000),
+    _relay("mx", "mx-qro-wg-001", "qro", "F" * 43 + "=", "5.5.5.5", "Queretaro", speed=1000),
+    _relay("jp", "jp-tyo-wg-001", "tyo", "G" * 43 + "=", "6.6.6.6", "Tokyo", speed=1000),
 ]
 
 
@@ -108,6 +112,29 @@ def test_pick_best_relay_prefers_measured_ping_over_owned_guess():
 
     best = pick_best_relay([owned_fra, slow_ber], probe=probe)
     assert best["hostname"] == "de-ber-wg-001"
+
+
+def test_pick_best_relay_by_catalog_speed():
+    de = [row for row in RELAYS if row["country_code"] == "de"]
+    # Berlin has 10G, Frankfurt 1G — speed metric should prefer Berlin even if ping is worse.
+    def probe(host, _port):
+        latency = {"1.1.1.1": 10, "2.2.2.2": 80}.get(host)
+        if latency is None:
+            return False, None
+        return True, latency
+
+    best_ping = pick_best_relay(de, probe=probe, metric="ping")
+    assert best_ping["hostname"] == "de-fra-wg-001"
+    best_speed = pick_best_relay(de, probe=probe, metric="speed")
+    assert best_speed["hostname"] == "de-ber-wg-001"
+
+
+def test_save_settings_relay_metric(tmp_path: Path):
+    svc = _service(tmp_path)
+    svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="speed")
+    assert svc.relay_metric() == "speed"
+    svc.save_settings(relay_metric="ping")
+    assert svc.relay_metric() == "ping"
 
 
 def test_pick_best_relay_uses_catalog_when_tcp_closed():
@@ -363,6 +390,30 @@ def test_sync_iface_creates_link_without_wg_quick_up(tmp_path: Path):
     assert ["ip", "link", "add", "name", "no", "type", "wireguard"] in commands
     assert ["ip", "link", "set", "dev", "no", "up"] in commands
     assert any(cmd[:3] == ["wg", "setconf", "no"] for cmd in commands)
+
+
+def test_assign_tunnel_address_ignores_already_assigned(tmp_path: Path):
+    commands = []
+
+    def runner(args, **_k):
+        commands.append(list(args))
+        if args[:2] == ["ip", "-4"] and "addr" in args:
+            return FakeProc(returncode=2, stdout="", stderr="Error: ipv4: Address already assigned.")
+        return FakeProc(returncode=1, stdout="", stderr="unexpected " + " ".join(args))
+
+    svc = _service(tmp_path, runner=runner)
+    path = tmp_path / "wg" / "us.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc._assign_tunnel_address("us", path)
+    assert ["ip", "-4", "addr", "add", "10.64.9.9/32", "dev", "us"] in commands
 
 
 def test_switch_relay_rewrites_peer(tmp_path: Path, monkeypatch):

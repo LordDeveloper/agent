@@ -1097,10 +1097,11 @@ def _mullvad_menu() -> None:
             [
                 Choice("key", "Set private key", GREEN, "1"),
                 Choice("status", "Status", CYAN, "2"),
-                Choice("fallback", "Run fallback now (by speed)", YELLOW, "3"),
-                Choice("optimize", "Optimize to fastest relay", YELLOW, "4"),
-                Choice("switch", "Switch relay manually", GREEN, "5"),
-                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "6"),
+                Choice("metric", "Relay pick metric (ping/speed)", MAGENTA, "3"),
+                Choice("fallback", "Run fallback now", YELLOW, "4"),
+                Choice("optimize", "Optimize to best relay", YELLOW, "5"),
+                Choice("switch", "Switch relay manually", GREEN, "6"),
+                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "7"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -1110,6 +1111,8 @@ def _mullvad_menu() -> None:
             _run_action("Mullvad private key", _show_mullvad_set_key)
         elif picked == "status":
             _run_action("Mullvad status", _show_mullvad_status)
+        elif picked == "metric":
+            _run_action("Mullvad relay metric", _show_mullvad_relay_metric)
         elif picked == "fallback":
             _run_action("Mullvad fallback", _show_mullvad_fallback)
         elif picked == "optimize":
@@ -1157,6 +1160,7 @@ def _show_mullvad_status() -> None:
         settings = payload.get("settings") or {}
         _print(kv("Private key", "set" if settings.get("has_private_key") else "missing", GREEN if settings.get("has_private_key") else YELLOW))
         _print(kv("Address", settings.get("address") or "-", WHITE))
+        _print(kv("Relay metric", settings.get("relay_metric") or "ping", CYAN))
         tunnels = payload.get("tunnels") or []
         if not tunnels:
             _print(paint("  No adopted/created Mullvad exits yet.", DIM))
@@ -1169,6 +1173,27 @@ def _show_mullvad_status() -> None:
                 f"{'up' if row.get('up') else 'down'}  {row.get('message') or ''}",
                 tone,
             ))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_relay_metric() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        current = service.relay_metric()
+        _print(kv("Current", current, CYAN))
+        picked = select(
+            [
+                Choice("ping", "Ping (lowest latency)", GREEN if current == "ping" else WHITE, "1"),
+                Choice("speed", "Speed (highest port Mbps)", GREEN if current == "speed" else WHITE, "2"),
+                Choice("back", "Cancel", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        saved = service.save_settings(relay_metric=picked)
+        _print(paint(f"  Relay metric set to {saved.get('relay_metric')}.", GREEN))
     finally:
         runtime.close()
 
@@ -1217,9 +1242,11 @@ def _show_mullvad_switch_relay() -> None:
         for index, row in enumerate(relays[:24], start=1):
             ping = row.get("ping_ms")
             ping_label = f"{ping}ms" if ping is not None else "n/a"
+            ipv4 = str(row.get("ipv4") or "").strip() or "-"
             mark = " *" if row.get("current") else ""
             label = (
-                f"{row.get('hostname')}  {row.get('city_name') or row.get('city_code') or '-'}  "
+                f"{row.get('hostname')}  {ipv4}  "
+                f"{row.get('city_name') or row.get('city_code') or '-'}  "
                 f"{ping_label}{mark}"
             )
             choices.append(Choice(str(row.get("hostname") or ""), label, GREEN if row.get("current") else WHITE, str(index)))

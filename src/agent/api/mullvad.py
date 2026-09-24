@@ -42,10 +42,20 @@ def mullvad_status(request: Request):
 @router.post("/settings")
 def mullvad_settings(body: dict[str, Any], request: Request):
     try:
-        payload = _service(request).save_settings(
-            private_key=str(body.get("private_key") or ""),
-            address=str(body["address"]).strip() if "address" in body and body.get("address") is not None else None,
-        )
+        kwargs: dict[str, Any] = {}
+        if "private_key" in body and body.get("private_key") is not None:
+            kwargs["private_key"] = str(body.get("private_key") or "")
+        if "address" in body:
+            kwargs["address"] = (
+                str(body["address"]).strip()
+                if body.get("address") is not None
+                else None
+            )
+        if "relay_metric" in body and body.get("relay_metric") is not None:
+            kwargs["relay_metric"] = str(body.get("relay_metric") or "")
+        if not kwargs:
+            raise AgentError("VALIDATION_ERROR", "No settings provided", 422)
+        payload = _service(request).save_settings(**kwargs)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     public = {k: v for k, v in payload.items() if k != "private_key"}

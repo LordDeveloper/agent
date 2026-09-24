@@ -41,6 +41,9 @@ KIND_SETTINGS = "settings"
 KIND_LOCATION = "location"
 CORE = "mullvad"
 SETTINGS_ID = "account"
+RELAY_METRIC_PING = "ping"
+RELAY_METRIC_SPEED = "speed"
+RELAY_METRICS = {RELAY_METRIC_PING, RELAY_METRIC_SPEED}
 PERSIST_UNIT_TEMPLATE = "agent-mullvad-wg@.service"
 PERSIST_HOLD_SCRIPT = Path("/var/lib/agent/mullvad-wg-hold.sh")
 PERSIST_UNIT_PATH = Path("/etc/systemd/system") / PERSIST_UNIT_TEMPLATE
@@ -296,6 +299,25 @@ def sample_relays(relays: list[dict[str, Any]], limit: int = 6) -> list[dict[str
     return (owned + rest)[: max(1, limit)]
 
 
+def normalize_relay_metric(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"speed", "bandwidth", "port_speed", "network_port_speed"}:
+        return RELAY_METRIC_SPEED
+    return RELAY_METRIC_PING
+
+
+def relay_network_speed_mbps(row: dict[str, Any]) -> int:
+    for key in ("network_port_speed", "network_port_speed_mbps", "speed"):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return max(0, int(round(float(raw))))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def score_relays(
     relays: list[dict[str, Any]],
     *,
@@ -305,9 +327,16 @@ def score_relays(
     workers: int = 16,
     require_reachable: bool = False,
     prefer_measured: bool = True,
+    metric: str = RELAY_METRIC_PING,
 ) -> list[tuple[int, dict[str, Any]]]:
+    """Rank relays for fallback/ensure.
+
+    metric=ping  → lower measured latency wins
+    metric=speed → higher Mullvad network_port_speed wins (Mbps from catalog)
+    """
+    metric = normalize_relay_metric(metric)
     checker = probe or (lambda host, port: tcp_probe(host, port))
-    scored: list[tuple[int, dict[str, Any]]] = []
+    scored: list[tuple[int, dict[str, Any], bool]] = []
     skip = {str(exclude_hostname or "").strip().lower()}
     skip.update(str(name or "").strip().lower() for name in (exclude_hostnames or []))
     skip.discard("")
@@ -318,10 +347,18 @@ def score_relays(
             return None
         ipv4 = str(row.get("ipv4_addr_in") or "").strip()
         ok, latency = checker(ipv4, WG_PORT) if ipv4 else (False, None)
-        if ok and latency is not None:
-            return latency, row, True
-        if require_reachable:
+        measured = bool(ok and latency is not None)
+        if require_reachable and not measured:
             return None
+        if metric == RELAY_METRIC_SPEED:
+            # Negative Mbps so ascending sort prefers higher port speed.
+            speed = relay_network_speed_mbps(row)
+            if speed <= 0 and not measured:
+                # Unknown catalog speed: push after known speeds.
+                return 0, row, False
+            return -speed, row, measured
+        if measured:
+            return int(latency or 0), row, True
         # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
         return (40_000 if row.get("owned") else 50_000), row, False
 
@@ -335,9 +372,16 @@ def score_relays(
             if result is not None:
                 scored.append(result)
 
-    measured = [item for item in scored if item[2]]
-    pool = measured if (prefer_measured and measured) else scored
-    ranked = [(latency, row) for latency, row, _measured in pool]
+    if metric == RELAY_METRIC_PING:
+        measured = [item for item in scored if item[2]]
+        pool = measured if (prefer_measured and measured) else scored
+    elif prefer_measured:
+        measured = [item for item in scored if item[2]]
+        pool = measured if measured else scored
+    else:
+        pool = scored
+
+    ranked = [(score, row) for score, row, _measured in pool]
     ranked.sort(
         key=lambda item: (
             item[0],
@@ -356,6 +400,7 @@ def pick_best_relay(
     probe: TcpProbe | None = None,
     require_reachable: bool = False,
     prefer_measured: bool = True,
+    metric: str = RELAY_METRIC_PING,
 ) -> dict[str, Any] | None:
     scored = score_relays(
         relays,
@@ -364,6 +409,7 @@ def pick_best_relay(
         probe=probe,
         require_reachable=require_reachable,
         prefer_measured=prefer_measured,
+        metric=metric,
     )
     return scored[0][1] if scored else None
 
@@ -375,6 +421,7 @@ def present_relay_row(
     measured: bool = False,
     current: bool = False,
 ) -> dict[str, Any]:
+    speed = relay_network_speed_mbps(row)
     return {
         "hostname": str(row.get("hostname") or "").strip(),
         "country_code": str(row.get("country_code") or "").strip().lower(),
@@ -384,6 +431,7 @@ def present_relay_row(
         "ipv4": str(row.get("ipv4_addr_in") or "").strip(),
         "pubkey": str(row.get("pubkey") or "").strip(),
         "owned": bool(row.get("owned")),
+        "speed_mbps": speed if speed > 0 else None,
         "ping_ms": ping_ms,
         "measured": bool(measured and ping_ms is not None),
         "current": bool(current),
@@ -503,21 +551,37 @@ class MullvadService:
         row = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         private_key = str(row.get("private_key") or "").strip()
         address = str(row.get("address") or "").strip()
+        metric = normalize_relay_metric(row.get("relay_metric"))
         return {
             "private_key": private_key,
             "address": address,
             "has_private_key": bool(private_key),
             "key_preview": mask_key(private_key),
+            "relay_metric": metric,
+            "relay_metric_label": "سرعت پورت" if metric == RELAY_METRIC_SPEED else "پینگ",
         }
 
-    def save_settings(self, *, private_key: str, address: str | None = None) -> dict[str, Any]:
-        key = str(private_key or "").strip()
-        if not _WG_KEY_RE.match(key):
-            raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
+    def relay_metric(self) -> str:
+        return normalize_relay_metric(self.settings().get("relay_metric"))
+
+    def save_settings(
+        self,
+        *,
+        private_key: str | None = None,
+        address: str | None = None,
+        relay_metric: str | None = None,
+    ) -> dict[str, Any]:
         current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+        key = str(private_key if private_key is not None else current.get("private_key") or "").strip()
+        if private_key is not None and not _WG_KEY_RE.match(key):
+            raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
+        if private_key is None and not key and relay_metric is None:
+            raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
+
         addr = str(address if address is not None else current.get("address") or "").strip()
-        if not addr:
-            addr = self._discover_address()
+        if address is not None or (private_key is not None and not addr):
+            if not addr:
+                addr = self._discover_address()
         if addr:
             try:
                 ipaddress.ip_interface(addr if "/" in addr else f"{addr}/32")
@@ -525,7 +589,15 @@ class MullvadService:
                 raise AgentError("VALIDATION_ERROR", "Invalid Mullvad tunnel address", 422) from exc
             if "/" not in addr:
                 addr = f"{addr}/32"
-        payload = {"private_key": key, "address": addr}
+
+        metric = normalize_relay_metric(
+            relay_metric if relay_metric is not None else current.get("relay_metric")
+        )
+        payload = {
+            "private_key": key,
+            "address": addr,
+            "relay_metric": metric,
+        }
         self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
         return self.settings()
 
@@ -700,7 +772,12 @@ class MullvadService:
             relay = next((row for row in candidates if str(row.get("hostname") or "") == current_host), None)
         if relay is None:
             exclude = current_host if not healthy else ""
-            relay = pick_best_relay(candidates, exclude_hostname=exclude, probe=self.probe)
+            relay = pick_best_relay(
+                candidates,
+                exclude_hostname=exclude,
+                probe=self.probe,
+                metric=self.relay_metric(),
+            )
         if relay is None:
             relay = candidates[0]
 
@@ -779,41 +856,44 @@ class MullvadService:
 
         bind = self.binding_for(code) or {}
         current_host = str(bind.get("hostname") or "").strip().lower()
+        metric = self.relay_metric()
         rows: list[dict[str, Any]] = []
 
+        ping_by_host: dict[str, int | None] = {}
         if ping:
-            scored = score_relays(candidates, probe=self.probe, prefer_measured=False)
-            for latency, row in scored:
-                measured = latency < 40_000
-                rows.append(
-                    present_relay_row(
-                        row,
-                        ping_ms=latency if measured else None,
-                        measured=measured,
-                        current=str(row.get("hostname") or "").strip().lower() == current_host,
-                    )
-                )
-        else:
-            for row in sorted(
+            for score, row in score_relays(
                 candidates,
-                key=lambda item: (
-                    0 if item.get("owned") else 1,
-                    str(item.get("city_name") or ""),
-                    str(item.get("hostname") or ""),
-                ),
+                probe=self.probe,
+                prefer_measured=False,
+                metric=RELAY_METRIC_PING,
             ):
-                rows.append(
-                    present_relay_row(
-                        row,
-                        current=str(row.get("hostname") or "").strip().lower() == current_host,
-                    )
+                host = str(row.get("hostname") or "").strip().lower()
+                ping_by_host[host] = score if score < 40_000 else None
+
+        scored = score_relays(
+            candidates,
+            probe=self.probe,
+            prefer_measured=False,
+            metric=metric,
+        )
+        for _score, row in scored:
+            host = str(row.get("hostname") or "").strip().lower()
+            ping_ms = ping_by_host.get(host)
+            rows.append(
+                present_relay_row(
+                    row,
+                    ping_ms=ping_ms,
+                    measured=ping_ms is not None,
+                    current=host == current_host,
                 )
+            )
 
         return {
             "country_code": code,
             "iface": str(bind.get("iface") or preferred_iface(code) or ""),
             "bound": bool(bind),
             "current_hostname": str(bind.get("hostname") or "") or None,
+            "relay_metric": metric,
             "relays": rows,
         }
 
@@ -913,46 +993,69 @@ class MullvadService:
             log.warning("mullvad fallback no catalog relays country=%s iface=%s", code, iface)
             return {**presented, "status": "failed", "message": last_error}
 
+        metric = self.relay_metric()
         if optimize and healthy:
-            scored = score_relays(candidates, probe=self.probe, prefer_measured=True)
+            scored = score_relays(candidates, probe=self.probe, prefer_measured=True, metric=metric)
             if not scored:
                 return {**presented, "status": "ok", "message": "healthy"}
-            best_ms, best = scored[0]
+            best_score, best = scored[0]
             best_host = str(best.get("hostname") or "").strip()
             if best_host.lower() == hostname.strip().lower():
-                return {**presented, "status": "ok", "message": "already fastest"}
-            current_ms = next(
+                return {**presented, "status": "ok", "message": f"already best by {metric}"}
+            current_score = next(
                 (
-                    latency
-                    for latency, row in scored
+                    score
+                    for score, row in scored
                     if str(row.get("hostname") or "").strip().lower() == hostname.strip().lower()
                 ),
                 None,
             )
-            if (
-                current_ms is not None
-                and best_ms < 40_000
-                and current_ms < 40_000
-                and (current_ms - best_ms) < max(20, int(current_ms * 0.2))
-            ):
-                return {
-                    **presented,
-                    "status": "ok",
-                    "message": f"current relay within speed margin ({current_ms}ms vs {best_ms}ms)",
-                }
+            if metric == RELAY_METRIC_PING:
+                if (
+                    current_score is not None
+                    and best_score < 40_000
+                    and current_score < 40_000
+                    and (current_score - best_score) < max(20, int(current_score * 0.2))
+                ):
+                    return {
+                        **presented,
+                        "status": "ok",
+                        "message": f"current relay within ping margin ({current_score}ms vs {best_score}ms)",
+                    }
+            else:
+                # scores are negative Mbps; within 10% port-speed gap keep current
+                if current_score is not None and best_score < 0 and current_score < 0:
+                    best_mbps = -best_score
+                    current_mbps = -current_score
+                    if best_mbps > 0 and (best_mbps - current_mbps) < max(100, int(best_mbps * 0.1)):
+                        return {
+                            **presented,
+                            "status": "ok",
+                            "message": (
+                                f"current relay within speed margin "
+                                f"({current_mbps}Mbps vs {best_mbps}Mbps)"
+                            ),
+                        }
             tried = {hostname.strip().lower()} if hostname.strip() else set()
 
         attempts = min(4, max(1, len(candidates)))
         log.info(
-            "mullvad fallback start country=%s iface=%s candidates=%s exclude=%s optimize=%s",
+            "mullvad fallback start country=%s iface=%s candidates=%s exclude=%s optimize=%s metric=%s",
             code,
             iface,
             len(candidates),
             ",".join(sorted(tried)) or "-",
             optimize,
+            metric,
         )
         for _ in range(attempts):
-            relay = pick_best_relay(candidates, exclude_hostnames=tried, probe=self.probe, prefer_measured=True)
+            relay = pick_best_relay(
+                candidates,
+                exclude_hostnames=tried,
+                probe=self.probe,
+                prefer_measured=True,
+                metric=metric,
+            )
             if relay is None:
                 log.warning(
                     "mullvad fallback no candidate left country=%s iface=%s tried=%s catalog=%s",
@@ -1166,7 +1269,11 @@ class MullvadService:
 
     def _is_exists_err(self, err: str) -> bool:
         text = err.lower()
-        return "file exists" in text or "already exists" in text
+        return (
+            "file exists" in text
+            or "already exists" in text
+            or "already assigned" in text
+        )
 
     def _create_wg_link(self, iface: str) -> None:
         add = self.runner(["ip", "link", "add", "name", iface, "type", "wireguard"], check=False, timeout=10)
@@ -1294,6 +1401,7 @@ class MullvadService:
             {
                 "private_key": str(current.get("private_key") or private_key),
                 "address": str(current.get("address") or address),
+                "relay_metric": normalize_relay_metric(current.get("relay_metric")),
             },
         )
 
