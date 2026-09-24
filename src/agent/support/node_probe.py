@@ -24,6 +24,12 @@ PROBE_TIMEOUT = 5
 CONNECT_TIMEOUT = 3
 BIND_ERROR_CODES = frozenset({45, 55})
 
+# Small Cloudflare download used to rank Mullvad relays by real egress throughput.
+# Bind by WireGuard interface NAME — never by tunnel IP (shared across exits).
+SPEED_TEST_URL = 'https://speed.cloudflare.com/__down?bytes=2000000'
+SPEED_CONNECT_TIMEOUT = 4
+SPEED_MAX_TIME = 12
+
 
 def _runner(runner: Runner | None) -> Runner:
     return runner or run
@@ -176,6 +182,76 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
 
     detail = errors[-1] if errors else 'اتصال برقرار نشد'
     return False, detail, None
+
+
+def _parse_curl_speed(body: str) -> tuple[int, float | None]:
+    parts = (body or '').strip().split()
+    if not parts:
+        return 0, None
+    try:
+        http_code = int(parts[0])
+    except ValueError:
+        http_code = 0
+    speed_bps: float | None = None
+    if len(parts) >= 2:
+        try:
+            speed_bps = max(0.0, float(parts[1]))
+        except ValueError:
+            speed_bps = None
+    return http_code, speed_bps
+
+
+def curl_speed_mbps(
+    *,
+    interface: str | None = None,
+    runner: Runner | None = None,
+    url: str = SPEED_TEST_URL,
+) -> tuple[bool, str, float | None]:
+    """Measure download Mbps through a named interface via curl --interface.
+
+    Mullvad exits share one tunnel Address (same private key). Binding by IP is
+    ambiguous; always pass the WireGuard interface name (e.g. ``us``, ``de``).
+    """
+    execute = _runner(runner)
+    if not shutil.which('curl'):
+        return False, 'curl در Agent موجود نیست', None
+
+    # Keep the iface name as-is — do not resolve to the shared tunnel IP.
+    bind = str(interface or '').strip()
+    if not bind:
+        return False, 'نام اینترفیس مشخص نیست', None
+
+    cmd = [
+        'curl',
+        '-4',
+        '--interface',
+        bind,
+        '--connect-timeout',
+        str(SPEED_CONNECT_TIMEOUT),
+        '--max-time',
+        str(SPEED_MAX_TIME),
+        '-sS',
+        '-o',
+        '/dev/null',
+        '-w',
+        '%{http_code} %{speed_download}',
+        url,
+    ]
+    result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
+    raw_code = getattr(result, 'returncode', 1)
+    code = int(raw_code if raw_code is not None else 1)
+    body = (getattr(result, 'stdout', '') or '').strip()
+    stderr = (getattr(result, 'stderr', '') or '').strip()
+
+    if code != 0:
+        return False, stderr or f'curl exit {code}', None
+
+    http_code, speed_bps = _parse_curl_speed(body)
+    if http_code not in {200, 204, 206} or speed_bps is None:
+        return False, f'HTTP {http_code or "?"} / no speed', None
+
+    mbps = round((speed_bps * 8.0) / 1_000_000.0, 2)
+    return True, f'{mbps} Mbps', mbps
 
 
 def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str, int | None]:

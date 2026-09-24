@@ -21,7 +21,7 @@ import httpx
 from agent.db import Store
 from agent.errors import AgentError
 from agent.logutil import get_logger
-from agent.support.node_probe import _curl_probe
+from agent.support.node_probe import _curl_probe, curl_speed_mbps
 from agent.support.peer_egress import normalize_exit_interface
 from agent.support.process import run
 
@@ -299,9 +299,27 @@ def sample_relays(relays: list[dict[str, Any]], limit: int = 6) -> list[dict[str
     return (owned + rest)[: max(1, limit)]
 
 
+def normalize_tunnel_address(value: Any) -> str:
+    """Validate and normalize Address (supports comma-separated IPv4+IPv6)."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts: list[str] = []
+    for raw in text.split(","):
+        cidr = raw.strip()
+        if not cidr:
+            continue
+        try:
+            iface = ipaddress.ip_interface(cidr if "/" in cidr else f"{cidr}/32")
+        except ValueError as exc:
+            raise AgentError("VALIDATION_ERROR", "Invalid Mullvad tunnel address", 422) from exc
+        parts.append(str(iface))
+    return ",".join(parts)
+
+
 def normalize_relay_metric(value: Any) -> str:
     text = str(value or "").strip().lower()
-    if text in {"speed", "bandwidth", "port_speed", "network_port_speed"}:
+    if text in {"speed", "bandwidth", "port_speed", "network_port_speed", "throughput"}:
         return RELAY_METRIC_SPEED
     return RELAY_METRIC_PING
 
@@ -332,9 +350,10 @@ def score_relays(
     """Rank relays for fallback/ensure.
 
     metric=ping  → lower measured latency wins
-    metric=speed → higher Mullvad network_port_speed wins (Mbps from catalog)
+    metric=speed → same ping shortlist (real Mbps is measured later via curl --interface)
     """
-    metric = normalize_relay_metric(metric)
+    # Catalog port Mbps is not used for ranking; throughput is measured per-iface with curl.
+    _ = normalize_relay_metric(metric)
     checker = probe or (lambda host, port: tcp_probe(host, port))
     scored: list[tuple[int, dict[str, Any], bool]] = []
     skip = {str(exclude_hostname or "").strip().lower()}
@@ -350,13 +369,6 @@ def score_relays(
         measured = bool(ok and latency is not None)
         if require_reachable and not measured:
             return None
-        if metric == RELAY_METRIC_SPEED:
-            # Negative Mbps so ascending sort prefers higher port speed.
-            speed = relay_network_speed_mbps(row)
-            if speed <= 0 and not measured:
-                # Unknown catalog speed: push after known speeds.
-                return 0, row, False
-            return -speed, row, measured
         if measured:
             return int(latency or 0), row, True
         # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
@@ -372,14 +384,8 @@ def score_relays(
             if result is not None:
                 scored.append(result)
 
-    if metric == RELAY_METRIC_PING:
-        measured = [item for item in scored if item[2]]
-        pool = measured if (prefer_measured and measured) else scored
-    elif prefer_measured:
-        measured = [item for item in scored if item[2]]
-        pool = measured if measured else scored
-    else:
-        pool = scored
+    measured = [item for item in scored if item[2]]
+    pool = measured if (prefer_measured and measured) else scored
 
     ranked = [(score, row) for score, row, _measured in pool]
     ranked.sort(
@@ -420,8 +426,15 @@ def present_relay_row(
     ping_ms: int | None = None,
     measured: bool = False,
     current: bool = False,
+    speed_mbps: float | int | None = None,
 ) -> dict[str, Any]:
-    speed = relay_network_speed_mbps(row)
+    port_speed = relay_network_speed_mbps(row)
+    measured_speed = None
+    if speed_mbps is not None:
+        try:
+            measured_speed = round(float(speed_mbps), 2)
+        except (TypeError, ValueError):
+            measured_speed = None
     return {
         "hostname": str(row.get("hostname") or "").strip(),
         "country_code": str(row.get("country_code") or "").strip().lower(),
@@ -431,7 +444,8 @@ def present_relay_row(
         "ipv4": str(row.get("ipv4_addr_in") or "").strip(),
         "pubkey": str(row.get("pubkey") or "").strip(),
         "owned": bool(row.get("owned")),
-        "speed_mbps": speed if speed > 0 else None,
+        "port_mbps": port_speed if port_speed > 0 else None,
+        "speed_mbps": measured_speed if measured_speed is not None else (port_speed if port_speed > 0 else None),
         "ping_ms": ping_ms,
         "measured": bool(measured and ping_ms is not None),
         "current": bool(current),
@@ -558,7 +572,7 @@ class MullvadService:
             "has_private_key": bool(private_key),
             "key_preview": mask_key(private_key),
             "relay_metric": metric,
-            "relay_metric_label": "سرعت پورت" if metric == RELAY_METRIC_SPEED else "پینگ",
+            "relay_metric_label": "سرعت واقعی (curl)" if metric == RELAY_METRIC_SPEED else "پینگ",
         }
 
     def relay_metric(self) -> str:
@@ -578,21 +592,28 @@ class MullvadService:
         if private_key is None and not key and relay_metric is None:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
 
+        metric = normalize_relay_metric(
+            relay_metric if relay_metric is not None else current.get("relay_metric")
+        )
+
+        # Metric-only updates must not re-validate Address: exits share one key/IP and
+        # configs often store dual-stack Address (IPv4,IPv6) that older code rejected.
+        if relay_metric is not None and private_key is None and address is None:
+            payload = {
+                "private_key": key,
+                "address": str(current.get("address") or "").strip(),
+                "relay_metric": metric,
+            }
+            self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
+            return self.settings()
+
         addr = str(address if address is not None else current.get("address") or "").strip()
         if address is not None or (private_key is not None and not addr):
             if not addr:
                 addr = self._discover_address()
         if addr:
-            try:
-                ipaddress.ip_interface(addr if "/" in addr else f"{addr}/32")
-            except ValueError as exc:
-                raise AgentError("VALIDATION_ERROR", "Invalid Mullvad tunnel address", 422) from exc
-            if "/" not in addr:
-                addr = f"{addr}/32"
+            addr = normalize_tunnel_address(addr)
 
-        metric = normalize_relay_metric(
-            relay_metric if relay_metric is not None else current.get("relay_metric")
-        )
         payload = {
             "private_key": key,
             "address": addr,
@@ -776,7 +797,7 @@ class MullvadService:
                 candidates,
                 exclude_hostname=exclude,
                 probe=self.probe,
-                metric=self.relay_metric(),
+                metric=RELAY_METRIC_PING,
             )
         if relay is None:
             relay = candidates[0]
@@ -994,14 +1015,23 @@ class MullvadService:
             return {**presented, "status": "failed", "message": last_error}
 
         metric = self.relay_metric()
+        if metric == RELAY_METRIC_SPEED:
+            return self._fallback_one_by_speed(
+                bind,
+                candidates,
+                optimize=optimize,
+                healthy=healthy,
+                tried=tried,
+            )
+
         if optimize and healthy:
-            scored = score_relays(candidates, probe=self.probe, prefer_measured=True, metric=metric)
+            scored = score_relays(candidates, probe=self.probe, prefer_measured=True, metric=RELAY_METRIC_PING)
             if not scored:
                 return {**presented, "status": "ok", "message": "healthy"}
             best_score, best = scored[0]
             best_host = str(best.get("hostname") or "").strip()
             if best_host.lower() == hostname.strip().lower():
-                return {**presented, "status": "ok", "message": f"already best by {metric}"}
+                return {**presented, "status": "ok", "message": "already best by ping"}
             current_score = next(
                 (
                     score
@@ -1010,32 +1040,17 @@ class MullvadService:
                 ),
                 None,
             )
-            if metric == RELAY_METRIC_PING:
-                if (
-                    current_score is not None
-                    and best_score < 40_000
-                    and current_score < 40_000
-                    and (current_score - best_score) < max(20, int(current_score * 0.2))
-                ):
-                    return {
-                        **presented,
-                        "status": "ok",
-                        "message": f"current relay within ping margin ({current_score}ms vs {best_score}ms)",
-                    }
-            else:
-                # scores are negative Mbps; within 10% port-speed gap keep current
-                if current_score is not None and best_score < 0 and current_score < 0:
-                    best_mbps = -best_score
-                    current_mbps = -current_score
-                    if best_mbps > 0 and (best_mbps - current_mbps) < max(100, int(best_mbps * 0.1)):
-                        return {
-                            **presented,
-                            "status": "ok",
-                            "message": (
-                                f"current relay within speed margin "
-                                f"({current_mbps}Mbps vs {best_mbps}Mbps)"
-                            ),
-                        }
+            if (
+                current_score is not None
+                and best_score < 40_000
+                and current_score < 40_000
+                and (current_score - best_score) < max(20, int(current_score * 0.2))
+            ):
+                return {
+                    **presented,
+                    "status": "ok",
+                    "message": f"current relay within ping margin ({current_score}ms vs {best_score}ms)",
+                }
             tried = {hostname.strip().lower()} if hostname.strip() else set()
 
         attempts = min(4, max(1, len(candidates)))
@@ -1054,7 +1069,7 @@ class MullvadService:
                 exclude_hostnames=tried,
                 probe=self.probe,
                 prefer_measured=True,
-                metric=metric,
+                metric=RELAY_METRIC_PING,
             )
             if relay is None:
                 log.warning(
@@ -1114,6 +1129,213 @@ class MullvadService:
             return last_changed
         return {**presented, "status": "failed", "message": last_error}
 
+    def _measure_iface_speed(self, iface: str) -> float | None:
+        ok, _message, mbps = curl_speed_mbps(interface=iface, runner=self.runner)
+        if not ok or mbps is None:
+            return None
+        return float(mbps)
+
+    def _fallback_one_by_speed(
+        self,
+        bind: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        *,
+        optimize: bool,
+        healthy: bool,
+        tried: set[str],
+    ) -> dict[str, Any]:
+        """Pick relay by real curl download Mbps bound to the WireGuard iface name."""
+        code = str(bind.get("country_code") or "").strip().lower()
+        iface = str(bind.get("iface") or "").strip()
+        hostname = str(bind.get("hostname") or "").strip()
+        presented = self._present_binding(bind)
+        if not iface:
+            return {**presented, "status": "failed", "message": "missing iface"}
+
+        if healthy and not optimize:
+            return {**presented, "status": "ok", "message": "healthy"}
+
+        shortlist_n = 5 if optimize else 4
+        ranked = score_relays(
+            candidates,
+            exclude_hostnames=tried,
+            probe=self.probe,
+            prefer_measured=True,
+            metric=RELAY_METRIC_PING,
+        )
+        shortlist = [row for _score, row in ranked[:shortlist_n]]
+        if not shortlist:
+            return {**presented, "status": "failed", "message": "no Mullvad relay left in country"}
+
+        log.info(
+            "mullvad speed-rank start country=%s iface=%s shortlist=%s optimize=%s",
+            code,
+            iface,
+            ",".join(str(r.get("hostname") or "") for r in shortlist),
+            optimize,
+        )
+
+        best_relay: dict[str, Any] | None = None
+        best_mbps = -1.0
+        current_mbps: float | None = None
+        last_error = "speed probe failed"
+        applied_host = hostname
+
+        # Measure current first without switching when already healthy.
+        if healthy and hostname:
+            current_mbps = self._measure_iface_speed(iface)
+            if current_mbps is not None:
+                best_mbps = current_mbps
+                best_relay = next(
+                    (
+                        row
+                        for row in candidates
+                        if str(row.get("hostname") or "").strip().lower() == hostname.lower()
+                    ),
+                    None,
+                )
+                log.info(
+                    "mullvad speed current iface=%s hostname=%s mbps=%s",
+                    iface,
+                    hostname,
+                    current_mbps,
+                )
+
+        for relay in shortlist:
+            relay_host = str(relay.get("hostname") or "").strip()
+            if not relay_host:
+                continue
+            if relay_host.lower() in tried and relay_host.lower() != hostname.lower():
+                continue
+            if healthy and relay_host.lower() == hostname.lower():
+                continue
+            try:
+                self._apply_relay(iface, relay)
+                applied_host = relay_host
+                self._put_binding(
+                    country_code=code,
+                    iface=iface,
+                    relay=relay,
+                    adopted=bool(bind.get("adopted")),
+                    extra={
+                        "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "last_error": "",
+                        "manual_switch": False,
+                    },
+                )
+                wait = float(getattr(self, "handshake_wait", 0) or 0)
+                if wait > 0:
+                    time.sleep(wait)
+                if not self._iface_healthy(iface):
+                    last_error = f"egress still down after {relay_host}"
+                    tried.add(relay_host.lower())
+                    continue
+                mbps = self._measure_iface_speed(iface)
+                if mbps is None:
+                    last_error = f"curl speed failed on {relay_host}"
+                    tried.add(relay_host.lower())
+                    continue
+                log.info(
+                    "mullvad speed measured iface=%s hostname=%s mbps=%s",
+                    iface,
+                    relay_host,
+                    mbps,
+                )
+                if mbps > best_mbps:
+                    best_mbps = mbps
+                    best_relay = relay
+            except AgentError as exc:
+                last_error = exc.message
+                log.warning(
+                    "mullvad speed apply failed country=%s iface=%s hostname=%s: %s",
+                    code,
+                    iface,
+                    relay_host,
+                    exc.message,
+                )
+                tried.add(relay_host.lower())
+
+        if best_relay is None:
+            return {**presented, "status": "failed", "message": last_error}
+
+        best_host = str(best_relay.get("hostname") or "").strip()
+        # Within ~10% of current measured speed, keep current.
+        if (
+            optimize
+            and healthy
+            and current_mbps is not None
+            and best_host.lower() == hostname.lower()
+        ):
+            return {
+                **presented,
+                "status": "ok",
+                "message": f"already best by curl speed ({current_mbps} Mbps)",
+            }
+        if (
+            optimize
+            and healthy
+            and current_mbps is not None
+            and best_mbps > 0
+            and (best_mbps - current_mbps) < max(0.5, current_mbps * 0.1)
+            and hostname
+        ):
+            current_relay = next(
+                (
+                    row
+                    for row in candidates
+                    if str(row.get("hostname") or "").strip().lower() == hostname.lower()
+                ),
+                None,
+            )
+            if current_relay is not None and applied_host.lower() != hostname.lower():
+                try:
+                    self._apply_relay(iface, current_relay)
+                    self._put_binding(
+                        country_code=code,
+                        iface=iface,
+                        relay=current_relay,
+                        adopted=bool(bind.get("adopted")),
+                        extra={"last_error": "", "manual_switch": False},
+                    )
+                except AgentError:
+                    pass
+            return {
+                **presented,
+                "status": "ok",
+                "message": (
+                    f"current relay within speed margin ({current_mbps}Mbps vs {best_mbps}Mbps)"
+                ),
+            }
+
+        if applied_host.lower() != best_host.lower():
+            try:
+                self._apply_relay(iface, best_relay)
+                self._put_binding(
+                    country_code=code,
+                    iface=iface,
+                    relay=best_relay,
+                    adopted=bool(bind.get("adopted")),
+                    extra={
+                        "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "last_error": "",
+                        "manual_switch": False,
+                    },
+                )
+            except AgentError as exc:
+                return {**presented, "status": "failed", "message": exc.message}
+
+        if best_host.lower() == hostname.lower():
+            return {
+                **self._present_binding(self.binding_for(code) or bind),
+                "status": "ok",
+                "message": f"already best by curl speed ({best_mbps} Mbps)",
+            }
+        return {
+            **self._present_binding(self.binding_for(code) or bind),
+            "status": "changed",
+            "message": f"switched to {best_host} ({best_mbps} Mbps via curl --interface {iface})",
+        }
+
     def _allocate_iface(self, country_code: str) -> str:
         preferred = preferred_iface(country_code)
         used = {str(row.get("iface") or "").strip() for row in self.bindings()}
@@ -1154,7 +1376,9 @@ class MullvadService:
                 422,
             )
         interface["PrivateKey"] = private_key
-        interface["Address"] = address if "/" in address else f"{address}/32"
+        interface["Address"] = normalize_tunnel_address(
+            address if "/" in address or "," in address else f"{address}/32"
+        ) or (address if "/" in address else f"{address}/32")
         if "Table" not in interface:
             interface["Table"] = "off"
 

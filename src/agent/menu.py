@@ -1185,7 +1185,7 @@ def _show_mullvad_relay_metric() -> None:
         picked = select(
             [
                 Choice("ping", "Ping (lowest latency)", GREEN if current == "ping" else WHITE, "1"),
-                Choice("speed", "Speed (highest port Mbps)", GREEN if current == "speed" else WHITE, "2"),
+                Choice("speed", "Speed (curl via interface)", GREEN if current == "speed" else WHITE, "2"),
                 Choice("back", "Cancel", WHITE, "0"),
             ]
         )
@@ -1194,6 +1194,8 @@ def _show_mullvad_relay_metric() -> None:
             return
         saved = service.save_settings(relay_metric=picked)
         _print(paint(f"  Relay metric set to {saved.get('relay_metric')}.", GREEN))
+        if picked == "speed":
+            _print(paint("  Speed ranking uses curl --interface <iface> (shared tunnel IP is ignored).", CYAN))
     finally:
         runtime.close()
 
@@ -1205,7 +1207,7 @@ def _show_mullvad_fallback(optimize: bool = False) -> None:
         changed = result.get("changed") or []
         failed = result.get("failed") or []
         skipped = result.get("skipped") or []
-        _print(kv("Mode", "optimize by speed" if optimize else "unhealthy only", CYAN))
+        _print(kv("Mode", "optimize by curl speed" if optimize else "unhealthy only", CYAN))
         _print(kv("Changed", str(len(changed)), GREEN if changed else WHITE))
         _print(kv("Failed", str(len(failed)), RED if failed else WHITE))
         _print(kv("Healthy", str(len(skipped)), WHITE))

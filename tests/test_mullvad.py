@@ -115,8 +115,9 @@ def test_pick_best_relay_prefers_measured_ping_over_owned_guess():
 
 
 def test_pick_best_relay_by_catalog_speed():
+    # Speed metric shortlists by ping; real Mbps is measured later via curl --interface.
     de = [row for row in RELAYS if row["country_code"] == "de"]
-    # Berlin has 10G, Frankfurt 1G — speed metric should prefer Berlin even if ping is worse.
+
     def probe(host, _port):
         latency = {"1.1.1.1": 10, "2.2.2.2": 80}.get(host)
         if latency is None:
@@ -126,7 +127,7 @@ def test_pick_best_relay_by_catalog_speed():
     best_ping = pick_best_relay(de, probe=probe, metric="ping")
     assert best_ping["hostname"] == "de-fra-wg-001"
     best_speed = pick_best_relay(de, probe=probe, metric="speed")
-    assert best_speed["hostname"] == "de-ber-wg-001"
+    assert best_speed["hostname"] == "de-fra-wg-001"
 
 
 def test_save_settings_relay_metric(tmp_path: Path):
@@ -135,6 +136,65 @@ def test_save_settings_relay_metric(tmp_path: Path):
     assert svc.relay_metric() == "speed"
     svc.save_settings(relay_metric="ping")
     assert svc.relay_metric() == "ping"
+
+
+def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
+    svc = _service(tmp_path)
+    dual = "10.64.0.2/32,fc00:bbbb:bbbb:bb01::2/128"
+    svc.save_settings(private_key=PRIV, address=dual, relay_metric="ping")
+    assert svc.settings()["address"] == dual
+    saved = svc.save_settings(relay_metric="speed")
+    assert saved["relay_metric"] == "speed"
+    assert saved["address"] == dual
+
+
+def test_normalize_tunnel_address_accepts_dual_stack():
+    from agent.support.mullvad import normalize_tunnel_address
+
+    assert "10.64.0.2/32" in normalize_tunnel_address("10.64.0.2/32,fc00::2/128")
+
+
+def test_fallback_by_speed_uses_curl_interface(tmp_path: Path, monkeypatch):
+    measured: list[str] = []
+
+    def runner(args, **_k):
+        joined = " ".join(str(a) for a in args)
+        if args[:2] == ["wg-quick", "strip"]:
+            return FakeProc(returncode=0, stdout="[Interface]\nPrivateKey=abc\n", stderr="")
+        if args[0] == "wg":
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[0] == "ip":
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[0] == "curl" and "--interface" in args:
+            iface = args[args.index("--interface") + 1]
+            measured.append(iface)
+            # Faster download on Berlin endpoint path after switch; encode via speed_download bytes/s
+            # de-ber is applied second in shortlist when current is fra — give higher speed when
+            # Endpoint would be 2.2.2.2; we approximate by call count.
+            speed = "2500000" if len(measured) >= 2 else "500000"
+            return FakeProc(returncode=0, stdout=f"200 {speed}", stderr="")
+        return FakeProc(returncode=1, stdout="", stderr="unexpected " + joined)
+
+    svc = _service(tmp_path, runner=runner)
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.0.2/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    svc.save_settings(relay_metric="speed")
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_iface_healthy", lambda _iface: True)
+
+    result = svc.fallback(country_code="de", optimize=True)
+    assert measured
+    assert all(name == "de" for name in measured)
+    assert result["changed"] or result["skipped"]
 
 
 def test_pick_best_relay_uses_catalog_when_tcp_closed():

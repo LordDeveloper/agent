@@ -100,3 +100,27 @@ def test_probe_region_node_skips_duplicate_exit_interface_check(_which):
     assert 'outbound' in result['checks']
     assert 'exit_interface' not in result['checks']
     assert calls == ['uk0']
+
+
+@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
+def test_curl_speed_mbps_binds_interface_name(_which):
+    seen = []
+
+    def fake_runner(cmd, **_kwargs):
+        seen.append(list(cmd))
+
+        class Result:
+            returncode = 0
+            stdout = '200 1250000'
+            stderr = ''
+
+        return Result()
+
+    ok, message, mbps = node_probe.curl_speed_mbps(interface='us', runner=fake_runner)
+    assert ok is True
+    assert mbps == 10.0
+    assert '10.0' in message or 'Mbps' in message
+    assert '--interface' in seen[0]
+    assert seen[0][seen[0].index('--interface') + 1] == 'us'
+    # Must not rewrite iface name to a shared tunnel IP.
+    assert '10.' not in seen[0][seen[0].index('--interface') + 1]
