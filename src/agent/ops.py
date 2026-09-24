@@ -9,7 +9,7 @@ from typing import Any
 
 from agent.errors import AgentError
 
-KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp")
+KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
 
 
 def which(cmd: str) -> str | None:
@@ -271,6 +271,44 @@ def install_l2tp() -> dict:
     return ensure_l2tp_ipsec_runtime(force_apt=False)
 
 
+def install_openvpn() -> dict:
+    """Install OpenVPN via apt when available."""
+    packages = ['openvpn', 'openssl']
+    have_bin = bool(which('openvpn'))
+    apt_log = ''
+    if not have_bin:
+        if not which('apt-get'):
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'apt-get missing; cannot install OpenVPN package',
+            )
+        run_cmd(['apt-get', 'update', '-y'], check=False)
+        proc = run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+        apt_log = ((proc.stdout or '') + (proc.stderr or ''))[-800:]
+        if proc.returncode != 0 and not which('openvpn'):
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'apt-get install failed for OpenVPN: ' + apt_log,
+            )
+    if not which('openvpn'):
+        raise AgentError('VALIDATION_ERROR', 'openvpn not available after install')
+
+    for path in (
+        Path('/etc/openvpn'),
+        Path('/etc/openvpn/server'),
+        Path('/etc/agent/bin/openvpn'),
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    return {
+        'core': 'openvpn',
+        'installed': True,
+        'packages': packages,
+        'message': 'installed' if not have_bin else 'already installed',
+        'apt_log': apt_log or None,
+    }
+
+
 def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:
     from agent.amnezia_release import amnezia_bundle_present, install_amnezia_bundle
 
@@ -290,6 +328,7 @@ INSTALLERS = {
     "wireguard": install_wireguard,
     "amnezia": install_amnezia,
     "l2tp": install_l2tp,
+    "openvpn": install_openvpn,
 }
 
 
@@ -333,6 +372,7 @@ def write_env_file(
             "WIREGUARD_CONFIG_DIR=/etc/wireguard",
             "AMNEZIA_CONFIG_DIR=/etc/amneziawg",
             "L2TP_CONFIG_DIR=/etc/agent/bin/l2tp",
+            "OPENVPN_CONFIG_DIR=/etc/agent/bin/openvpn",
             "",
         ]
     )

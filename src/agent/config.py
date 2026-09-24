@@ -32,6 +32,10 @@ class L2tpSettings(BaseModel):
     config_dir: str = "/etc/agent/bin/l2tp"
 
 
+class OpenVpnSettings(BaseModel):
+    config_dir: str = "/etc/agent/bin/openvpn"
+
+
 class AgentSettings(BaseSettings):
     """
     Flat .env keys (no nested prefixes):
@@ -75,6 +79,7 @@ class AgentSettings(BaseSettings):
     wireguard_config_dir: str = "/etc/wireguard"
     amnezia_config_dir: str = "/etc/amneziawg"
     l2tp_config_dir: str = "/etc/agent/bin/l2tp"
+    openvpn_config_dir: str = "/etc/agent/bin/openvpn"
     # Seconds between local volume-quota checks (0 disables). Cuts clients on the agent
     # before the Laravel panel polls, so overshoot stays near zero.
     quota_enforce_interval: float = 10.0
@@ -109,6 +114,10 @@ class AgentSettings(BaseSettings):
     @property
     def l2tp(self) -> L2tpSettings:
         return L2tpSettings(config_dir=self.l2tp_config_dir)
+
+    @property
+    def openvpn(self) -> OpenVpnSettings:
+        return OpenVpnSettings(config_dir=self.openvpn_config_dir)
 
     def cores(self) -> list[str]:
         return [part.strip() for part in self.enabled_cores.split(",") if part.strip()]

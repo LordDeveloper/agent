@@ -19,7 +19,7 @@ def bootstrap_enabled_cores(
     logger = log or logging.getLogger("app")
     enabled = set(settings.cores())
 
-    for key in ("xray", "wireguard", "amnezia", "l2tp"):
+    for key in ("xray", "wireguard", "amnezia", "l2tp", "openvpn"):
         if key not in enabled:
             continue
         driver = registry._drivers.get(key)
@@ -50,6 +50,12 @@ def bootstrap_enabled_cores(
                         driver.reconcile_runtime()
                     except Exception as exc:
                         logger.warning("supervisor l2tp companion reconcile failed: %s", exc)
+                    continue
+                logger.info("supervisor starting core=%s", key)
+                driver.enable()
+            elif key == "openvpn":
+                if driver.running():
+                    logger.info("supervisor core=%s already running", key)
                     continue
                 logger.info("supervisor starting core=%s", key)
                 driver.enable()

@@ -19,6 +19,7 @@ from agent.api.xray import router as xray_router
 from agent.api.wireguard import router as wireguard_router
 from agent.api.amnezia import router as amnezia_router
 from agent.api.l2tp import router as l2tp_router
+from agent.api.openvpn import router as openvpn_router
 from agent.api.tls import router as tls_router
 from agent.api.network import router as network_router
 from agent.api.mullvad import router as mullvad_router
@@ -150,6 +151,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(wireguard_router, prefix="/api/v1", dependencies=auth)
     app.include_router(amnezia_router, prefix="/api/v1", dependencies=auth)
     app.include_router(l2tp_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(openvpn_router, prefix="/api/v1", dependencies=auth)
     app.include_router(tls_router, prefix="/api/v1", dependencies=auth)
     app.include_router(network_router, prefix="/api/v1", dependencies=auth)
     app.include_router(mullvad_router, prefix="/api/v1", dependencies=auth)

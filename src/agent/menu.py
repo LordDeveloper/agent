@@ -109,6 +109,8 @@ def _core_installed(name: str) -> bool:
         return which("xl2tpd") is not None and (
             which("ipsec") is not None or Path("/usr/sbin/ipsec").is_file()
         )
+    if name == "openvpn":
+        return which("openvpn") is not None
     return False
 
 
@@ -117,6 +119,7 @@ _CORE_LABELS = {
     "wireguard": "WireGuard",
     "amnezia": "Amnezia",
     "l2tp": "L2TP",
+    "openvpn": "OpenVPN",
 }
 
 
@@ -439,6 +442,7 @@ def _cores_menu() -> None:
                 Choice("wireguard", "WireGuard", GREEN, "3"),
                 Choice("amnezia", "Amnezia", GREEN, "4"),
                 Choice("l2tp", "L2TP", GREEN, "5"),
+                Choice("openvpn", "OpenVPN", GREEN, "6"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -535,6 +539,7 @@ def _wizard() -> None:
             Choice("wireguard", "WireGuard", GREEN),
             Choice("amnezia", "Amnezia", BLUE),
             Choice("l2tp", "L2TP", GREEN),
+            Choice("openvpn", "OpenVPN", GREEN),
         ],
         selected={"xray"},
     )

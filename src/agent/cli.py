@@ -207,7 +207,7 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     token_in = input("Auth token [auto-generate]: ").strip()
     token = token_in or generate_token()
 
-    print("Available cores: xray, wireguard, amnezia")
+    print("Available cores: xray, wireguard, amnezia, l2tp, openvpn")
     cores_in = input("Enable cores [xray]: ").strip() or "xray"
     cores = [c.strip() for c in cores_in.split(",") if c.strip()]
     unknown = [c for c in cores if c not in KNOWN_CORES]
@@ -512,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="Show usage snapshot / online users")
     _env_flag(p_stats)
-    p_stats.add_argument("--core", default=None, help="Limit to one core (xray|wireguard|amnezia)")
+    p_stats.add_argument("--core", default=None, help="Limit to one core (xray|wireguard|amnezia|l2tp|openvpn)")
     p_stats.add_argument("--online-only", action="store_true", help="Only print online users")
     p_stats.add_argument(
         "--online-traffic",

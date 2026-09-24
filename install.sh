@@ -13,7 +13,7 @@ BINARY_SRC=""
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--with xray,wireguard,amnezia,l2tp] [--binary ./dist/agent] [--open-firewall] [--uninstall]
+Usage: install.sh [--with xray,wireguard,amnezia,l2tp,openvpn] [--binary ./dist/agent] [--open-firewall] [--uninstall]
 
 Deploys a local pre-built binary. For remote GitHub install use:
   scripts/get-agent.sh   # curl-friendly; supports private repos via GITHUB_TOKEN
@@ -89,6 +89,7 @@ XRAY_BINARY=/usr/local/bin/xray
 WIREGUARD_CONFIG_DIR=/etc/wireguard
 AMNEZIA_CONFIG_DIR=/etc/amneziawg
 L2TP_CONFIG_DIR=/etc/agent/bin/l2tp
+OPENVPN_CONFIG_DIR=/etc/agent/bin/openvpn
 EOF
   chmod 600 "$CONFIG_DIR/.env"
 else
@@ -159,6 +160,11 @@ install_core() {
       DEBIAN_FRONTEND=noninteractive apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y xl2tpd ppp strongswan strongswan-pki
       mkdir -p /etc/agent/bin/l2tp /etc/xl2tpd /etc/ppp
+      ;;
+    openvpn)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn openssl
+      mkdir -p /etc/agent/bin/openvpn /etc/openvpn/server
       ;;
   esac
 }

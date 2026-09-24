@@ -153,3 +153,34 @@ class L2tpUserPayload(BaseModel):
     max_connection: Optional[int] = None
     expires_at: Optional[str] = None
     exit_interface: Optional[str] = None
+
+
+class OpenVpnServerPayload(BaseModel):
+    model_config = {'extra': 'allow'}
+
+    id: Optional[int | str] = None
+    name: Optional[str] = None
+    listen_port: int = 1194
+    proto: Optional[str] = 'udp'
+    subnet: Optional[str] = None
+    tun_dev: Optional[str] = None
+    public_host: Optional[str] = None
+    users: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OpenVpnUserPayload(BaseModel):
+    model_config = {'extra': 'allow'}
+
+    id: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    address: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    volume: Optional[int] = None
+    incoming: Optional[int] = None
+    outgoing: Optional[int] = None
+    max_connection: Optional[int] = None
+    expires_at: Optional[str] = None
+    exit_interface: Optional[str] = None

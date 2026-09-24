@@ -5,11 +5,13 @@ ROUTE_SLUGS = {
     "wireguard": "wireguard",
     "amnezia": "amnezia",
     "l2tp": "l2tp",
+    "openvpn": "openvpn",
 }
 
 ALIASES = {
     "wg": "wireguard",
     "awg": "amnezia",
+    "ovpn": "openvpn",
 }
 
 SLUG_TO_CORE = {**{slug: core for core, slug in ROUTE_SLUGS.items()}, **ALIASES}

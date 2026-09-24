@@ -59,9 +59,11 @@ _MASQ_COMMENT_PREFIX = "netinja-egress-"
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
 _SYSCTL_DROPIN = Path("/etc/sysctl.d/99-netinja-peer-egress.conf")
-_EGRESS_CORES = ("wireguard", "amnezia", "l2tp")
+_EGRESS_CORES = ("wireguard", "amnezia", "l2tp", "openvpn")
 _PPP_TUNNEL = "ppp+"
+_OPENVPN_TUNNEL = "tun+"
 _L2TP_KIND = "server"
+_OPENVPN_KIND = "server"
 
 
 def _egress_comment_label(iface: str) -> str:
@@ -112,6 +114,11 @@ def all_tunnel_interface_names(store: Store) -> list[str]:
                 names.add(_PPP_TUNNEL)
                 names.update(live_ppp_interface_names())
             continue
+        if core == "openvpn":
+            if _openvpn_has_egress_users(store):
+                names.update(_openvpn_tunnel_names(store))
+                names.add(_OPENVPN_TUNNEL)
+            continue
         for row in store.list_docs(core, _IFACE_KIND):
             name = str(row.get("name") or "").strip()
             if name:
@@ -136,6 +143,31 @@ def _l2tp_has_egress_users(store: Store) -> bool:
     return False
 
 
+def _openvpn_has_egress_users(store: Store) -> bool:
+    for server in store.list_docs("openvpn", _OPENVPN_KIND):
+        for user in server.get("users") or []:
+            if not isinstance(user, dict) or not record_is_enabled(user):
+                continue
+            if normalize_exit_interface(user.get("exit_interface")) and peer_source_cidr(user.get("address")):
+                return True
+    return False
+
+
+def _openvpn_tunnel_names(store: Store) -> list[str]:
+    names: set[str] = set()
+    for server in store.list_docs("openvpn", _OPENVPN_KIND):
+        if not isinstance(server, dict):
+            continue
+        tun = str(server.get("tun_dev") or "").strip()
+        if tun:
+            names.add(tun)
+            continue
+        sid = server.get("id")
+        if sid is not None:
+            names.add(f"ovpn{sid}")
+    return sorted(names)
+
+
 def l2tp_servers_as_interfaces(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map L2TP server users into the interface/peers shape used by reconcile_core_egress."""
     peers: list[dict[str, Any]] = []
@@ -149,8 +181,30 @@ def l2tp_servers_as_interfaces(servers: list[dict[str, Any]]) -> list[dict[str, 
     return [{"name": _PPP_TUNNEL, "peers": peers}]
 
 
+def openvpn_servers_as_interfaces(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map OpenVPN server users into the interface/peers shape used by reconcile_core_egress."""
+    rows: list[dict[str, Any]] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        peers: list[dict[str, Any]] = []
+        for user in server.get("users") or []:
+            if not isinstance(user, dict):
+                continue
+            peers.append(dict(user))
+        tun = str(server.get("tun_dev") or "").strip() or f"ovpn{server.get('id') or 0}"
+        rows.append({"name": tun, "peers": peers})
+    if not rows:
+        return [{"name": _OPENVPN_TUNNEL, "peers": []}]
+    return rows
+
+
 def desired_rules_from_l2tp_servers(servers: list[dict[str, Any]]) -> list[dict[str, str | int]]:
     return desired_rules_from_interfaces(l2tp_servers_as_interfaces(servers))
+
+
+def desired_rules_from_openvpn_servers(servers: list[dict[str, Any]]) -> list[dict[str, str | int]]:
+    return desired_rules_from_interfaces(openvpn_servers_as_interfaces(servers))
 
 
 def peer_source_cidr(address: Any) -> str | None:
@@ -215,10 +269,15 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
     merged: list[dict[str, str | int]] = []
     seen: set[str] = set()
     for core in _EGRESS_CORES:
-        if core == "l2tp":
-            servers = store.list_docs(core, _L2TP_KIND)
+        if core in {"l2tp", "openvpn"}:
+            kind = _L2TP_KIND if core == "l2tp" else _OPENVPN_KIND
+            servers = store.list_docs(core, kind)
             if servers:
-                source = desired_rules_from_l2tp_servers(servers)
+                source = (
+                    desired_rules_from_l2tp_servers(servers)
+                    if core == "l2tp"
+                    else desired_rules_from_openvpn_servers(servers)
+                )
             else:
                 state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
                 source = []
@@ -630,6 +689,9 @@ def repair_peer_egress(
         if core == "l2tp":
             servers = store.list_docs(core, _L2TP_KIND)
             ifaces = l2tp_servers_as_interfaces(servers) if servers else []
+        elif core == "openvpn":
+            servers = store.list_docs(core, _OPENVPN_KIND)
+            ifaces = openvpn_servers_as_interfaces(servers) if servers else []
         else:
             ifaces = store.list_docs(core, _IFACE_KIND)
         state = store.get_doc(core, _STATE_KIND, _STATE_ID)
