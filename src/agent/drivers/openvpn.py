@@ -43,6 +43,13 @@ log = get_logger('openvpn')
 _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
 _SYSTEM_SERVER_ROOT = Path('/etc/openvpn/server')
+_RUNTIME_STATUS_ROOT = Path('/run/openvpn-server')
+_UNIT_DROPIN_DIR = Path('/etc/systemd/system/openvpn-server@.service.d')
+_UNIT_DROPIN = _UNIT_DROPIN_DIR / 'netinja.conf'
+_UNIT_DROPIN_BODY = """[Service]
+# Auth script forks python3; Debian package LimitNPROC=10 is too low.
+LimitNPROC=512
+"""
 
 
 def _gen_username(prefix: str = 'u') -> str:
@@ -109,10 +116,22 @@ class OpenVpnDriver(CoreDriver):
         return result
 
     def enable(self) -> dict[str, Any]:
+        servers = self.list_servers()
+        if not servers:
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'No OpenVPN server configured — create a server from the panel (or API) first, then Start',
+                400,
+            )
         self._apply_all_configs()
-        self._ensure_services(start=True)
+        units = self._ensure_services(start=True)
         self._sync_peer_egress()
-        return {'enabled': True, 'servers': len(self.list_servers())}
+        return {
+            'enabled': True,
+            'servers': len(self.list_servers()),
+            'units': units,
+            'running': self.running(),
+        }
 
     def disable(self) -> dict[str, Any]:
         for server in self.list_servers():
@@ -122,9 +141,16 @@ class OpenVpnDriver(CoreDriver):
         return {'enabled': False}
 
     def restart(self) -> dict[str, Any]:
+        servers = self.list_servers()
+        if not servers:
+            raise AgentError(
+                'VALIDATION_ERROR',
+                'No OpenVPN server configured — create a server from the panel (or API) first, then Restart',
+                400,
+            )
         self._apply_all_configs()
-        self._ensure_services(start=True, restart=True)
-        return {'restarted': True}
+        units = self._ensure_services(start=True, restart=True)
+        return {'restarted': True, 'units': units, 'running': self.running()}
 
     def list_servers(self) -> list[dict[str, Any]]:
         return self.store.list_docs(self.key, self._kind)
@@ -478,16 +504,28 @@ class OpenVpnDriver(CoreDriver):
 
         return online_traffic_from_snapshot(self)
 
+    def _status_log_paths(self, server: dict[str, Any]) -> list[Path]:
+        instance = instance_name_for_server(server)
+        return [
+            _RUNTIME_STATUS_ROOT / f'status-{instance}.log',
+            self._server_dir(server) / 'openvpn-status.log',
+        ]
+
     def sync_user_stats(self) -> None:
         sessions_by_user: dict[str, dict[str, Any]] = {}
         sessions_by_ip: dict[str, dict[str, Any]] = {}
         for server in self.list_servers():
-            status_path = self._server_dir(server) / 'openvpn-status.log'
-            if not status_path.is_file():
-                continue
-            try:
-                text = status_path.read_text(encoding='utf-8', errors='ignore')
-            except OSError:
+            text = ''
+            for status_path in self._status_log_paths(server):
+                if not status_path.is_file():
+                    continue
+                try:
+                    text = status_path.read_text(encoding='utf-8', errors='ignore')
+                except OSError:
+                    continue
+                if text.strip():
+                    break
+            if not text.strip():
                 continue
             for row in parse_status_v2(text):
                 username = str(row.get('username') or '').strip()
@@ -592,6 +630,27 @@ class OpenVpnDriver(CoreDriver):
         result = run(['systemctl', 'is-active', unit], check=False, timeout=10)
         return (result.stdout or '').strip() == 'active'
 
+    def _install_unit_dropin(self) -> None:
+        try:
+            _UNIT_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+            current = _UNIT_DROPIN.read_text(encoding='utf-8') if _UNIT_DROPIN.is_file() else ''
+            if current.strip() != _UNIT_DROPIN_BODY.strip():
+                _UNIT_DROPIN.write_text(_UNIT_DROPIN_BODY, encoding='utf-8')
+        except OSError as exc:
+            log.warning('openvpn unit drop-in write failed: %s', exc)
+
+    def _journal_snippet(self, unit: str, *, lines: int = 40) -> str:
+        result = run(
+            ['journalctl', '-u', unit, '-n', str(lines), '--no-pager', '-o', 'cat'],
+            check=False,
+            timeout=20,
+        )
+        text = ((result.stdout or '') + (result.stderr or '')).strip()
+        if text:
+            return text[-1200:]
+        status = run(['systemctl', 'status', unit, '--no-pager', '-l'], check=False, timeout=15)
+        return ((status.stdout or '') + (status.stderr or '')).strip()[-1200:]
+
     def _apply_all_configs(self) -> None:
         staging = self._staging_dir()
         staging.mkdir(parents=True, exist_ok=True)
@@ -666,17 +725,64 @@ class OpenVpnDriver(CoreDriver):
 
         self._sync_peer_egress()
 
-    def _ensure_services(self, *, start: bool, restart: bool = False) -> None:
+    def _ensure_services(self, *, start: bool, restart: bool = False) -> list[dict[str, Any]]:
+        """Enable+start each openvpn-server@ unit and fail loudly if not active."""
         if not start:
-            return
+            return []
+
+        self._install_unit_dropin()
         run(['systemctl', 'daemon-reload'], check=False, timeout=30)
-        for server in self.list_servers():
+
+        servers = self.list_servers()
+        if not servers:
+            return []
+
+        results: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for server in servers:
+            instance = instance_name_for_server(server)
+            conf_path = _SYSTEM_SERVER_ROOT / f'{instance}.conf'
             unit = self._unit_name(server)
-            run(['systemctl', 'enable', unit], check=False, timeout=30)
-            if restart:
-                run(['systemctl', 'restart', unit], check=False, timeout=60)
-            elif not self._unit_active(unit):
-                run(['systemctl', 'start', unit], check=False, timeout=60)
+            if not conf_path.is_file():
+                failures.append(f'{unit}: missing config {conf_path}')
+                results.append({'unit': unit, 'active': False, 'error': 'missing config'})
+                continue
+
+            run(['systemctl', 'unmask', unit], check=False, timeout=15)
+            enable = run(['systemctl', 'enable', unit], check=False, timeout=30)
+            if restart or self._unit_active(unit):
+                action = run(['systemctl', 'restart', unit], check=False, timeout=60)
+            else:
+                action = run(['systemctl', 'start', unit], check=False, timeout=60)
+
+            # Give Type=notify a moment to report ready.
+            for _ in range(8):
+                if self._unit_active(unit):
+                    break
+                time.sleep(0.25)
+
+            active = self._unit_active(unit)
+            row: dict[str, Any] = {
+                'unit': unit,
+                'active': active,
+                'enable_rc': enable.returncode,
+                'action_rc': action.returncode,
+            }
+            if not active:
+                detail = self._journal_snippet(unit)
+                stderr = ((action.stderr or '') + (action.stdout or '')).strip()
+                row['error'] = detail or stderr or 'unit not active'
+                failures.append(f"{unit}: {row['error']}")
+            results.append(row)
+
+        if failures:
+            joined = ' | '.join(failures)[:1500]
+            raise AgentError(
+                'EXEC_ERROR',
+                f'OpenVPN systemd start failed: {joined}',
+                500,
+            )
+        return results
 
     def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
         from agent.support.peer_egress import normalize_exit_interface

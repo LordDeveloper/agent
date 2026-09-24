@@ -160,7 +160,7 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
     }
 
 
-AUTH_SCRIPT = r'''#!/usr/bin/env python3
+AUTH_SCRIPT = r'''#!/usr/bin/python3
 """Netinja OpenVPN auth-user-pass-verify (via-env)."""
 from __future__ import annotations
 
@@ -229,6 +229,11 @@ def render_server_conf(
     server_dir: str | Path,
     auth_script: str | Path,
 ) -> str:
+    """Render server .conf for Debian/Ubuntu openvpn-server@ units.
+
+    Status file is left to systemd ExecStart (--status %t/openvpn-server/...),
+    which avoids nobody write failures under ProtectSystem.
+    """
     subnet = normalize_openvpn_subnet(str(server.get('subnet') or '10.8.0.0/24'))
     network = subnet.split('/')[0]
     netmask = openvpn_netmask(subnet)
@@ -238,8 +243,7 @@ def render_server_conf(
         proto = 'udp'
     tun = tun_dev_for_server(server)
     root = Path(server_dir)
-    status = root / 'openvpn-status.log'
-    management = root / 'management.sock'
+    script = Path(auth_script)
 
     lines = [
         '# Managed by Netinja Agent',
@@ -255,21 +259,17 @@ def render_server_conf(
         'dh none',
         f'tls-crypt {root / "tc.key"}',
         f'client-config-dir {root / "ccd"}',
+        'duplicate-cn',
         'username-as-common-name',
         'verify-client-cert none',
-        f'script-security 2',
-        f'auth-user-pass-verify {Path(auth_script)} via-env',
+        'script-security 2',
+        f'auth-user-pass-verify {script} via-env',
         'push "redirect-gateway def1 bypass-dhcp"',
         'push "dhcp-option DNS 1.1.1.1"',
         'push "dhcp-option DNS 8.8.8.8"',
         'keepalive 10 60',
         'persist-key',
         'persist-tun',
-        'user nobody',
-        'group nogroup',
-        f'status {status} 5',
-        f'status-version 2',
-        f'management {management} unix',
         'verb 3',
         'explicit-exit-notify 1' if proto == 'udp' else '# tcp mode',
     ]

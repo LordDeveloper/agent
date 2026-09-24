@@ -297,8 +297,21 @@ def install_openvpn() -> dict:
         Path('/etc/openvpn'),
         Path('/etc/openvpn/server'),
         Path('/etc/agent/bin/openvpn'),
+        Path('/etc/systemd/system/openvpn-server@.service.d'),
     ):
         path.mkdir(parents=True, exist_ok=True)
+
+    dropin = Path('/etc/systemd/system/openvpn-server@.service.d/netinja.conf')
+    body = (
+        '[Service]\n'
+        '# Auth script forks python3; Debian package LimitNPROC=10 is too low.\n'
+        'LimitNPROC=512\n'
+    )
+    try:
+        dropin.write_text(body, encoding='utf-8')
+        run_cmd(['systemctl', 'daemon-reload'], check=False)
+    except OSError:
+        pass
 
     return {
         'core': 'openvpn',
