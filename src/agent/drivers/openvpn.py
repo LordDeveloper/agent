@@ -333,9 +333,8 @@ class OpenVpnDriver(CoreDriver):
         server.setdefault('users', []).append(user)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self.audit.record('create', f'{self.key}/user/{user.get("id")}')
-        self._apply_all_configs()
+        self._apply_server_auth_files(server)
         self._sync_peer_egress()
-        self._ensure_services(start=True)
         return user
 
     def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -358,9 +357,8 @@ class OpenVpnDriver(CoreDriver):
                 self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                self._apply_all_configs()
+                self._apply_server_auth_files(server)
                 self._sync_peer_egress()
-                self._ensure_services(start=True)
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
@@ -372,9 +370,8 @@ class OpenVpnDriver(CoreDriver):
             raise AgentError('CLIENT_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
         server['users'] = filtered
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        self._apply_all_configs()
+        self._apply_server_auth_files(server)
         self._sync_peer_egress()
-        self._ensure_services(start=True)
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
@@ -556,17 +553,26 @@ class OpenVpnDriver(CoreDriver):
                 before_in = user.get('_raw_incoming')
                 before_out = user.get('_raw_outgoing')
                 if live:
-                    raw_in = int(live.get('bytes_received') or 0)
-                    raw_out = int(live.get('bytes_sent') or 0)
-                    prev_in = int(user.get('_raw_incoming') or 0)
-                    prev_out = int(user.get('_raw_outgoing') or 0)
-                    # OpenVPN status counters are session-local; accumulate deltas.
-                    if raw_in >= prev_in:
-                        user['incoming'] = int(user.get('incoming') or 0) + (raw_in - prev_in)
-                    if raw_out >= prev_out:
-                        user['outgoing'] = int(user.get('outgoing') or 0) + (raw_out - prev_out)
-                    user['_raw_incoming'] = raw_in
-                    user['_raw_outgoing'] = raw_out
+                    # OpenVPN CLIENT_LIST: Bytes Received = client→server (upload),
+                    # Bytes Sent = server→client (download). Panel convention matches WG:
+                    # incoming = download, outgoing = upload.
+                    raw_download = int(live.get('bytes_sent') or 0)
+                    raw_upload = int(live.get('bytes_received') or 0)
+                    prev_download = int(user.get('_raw_incoming') or 0)
+                    prev_upload = int(user.get('_raw_outgoing') or 0)
+                    # Session counters reset on reconnect; treat wrap as a fresh session total.
+                    if raw_download >= prev_download:
+                        delta_down = raw_download - prev_download
+                    else:
+                        delta_down = raw_download
+                    if raw_upload >= prev_upload:
+                        delta_up = raw_upload - prev_upload
+                    else:
+                        delta_up = raw_upload
+                    user['incoming'] = int(user.get('incoming') or 0) + delta_down
+                    user['outgoing'] = int(user.get('outgoing') or 0) + delta_up
+                    user['_raw_incoming'] = raw_download
+                    user['_raw_outgoing'] = raw_upload
                     user['online'] = True
                     user['connected_at'] = user.get('connected_at') or now
                     if live.get('real_address'):
@@ -687,6 +693,57 @@ class OpenVpnDriver(CoreDriver):
             return text[-1200:]
         status = run(['systemctl', 'status', unit, '--no-pager', '-l'], check=False, timeout=15)
         return ((status.stdout or '') + (status.stderr or '')).strip()[-1200:]
+
+    def _apply_server_auth_files(self, server: dict[str, Any]) -> None:
+        """Refresh passwd + CCD only (no PKI rewrite / service restart).
+
+        OpenVPN reads passwd via auth script and CCD on connect, so a full
+        config rewrite is unnecessary for user CRUD.
+        """
+        instance = instance_name_for_server(server)
+        server_dir = _SYSTEM_SERVER_ROOT / instance
+        ccd_dir = server_dir / 'ccd'
+        try:
+            server_dir.mkdir(parents=True, exist_ok=True)
+            ccd_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning('openvpn auth dir create failed: %s', exc)
+            return
+
+        passwd_path = server_dir / 'passwd'
+        try:
+            passwd_path.write_text(render_passwd([server]), encoding='utf-8')
+            passwd_path.chmod(0o640)
+        except OSError as exc:
+            log.warning('openvpn passwd write failed: %s', exc)
+        self._chown_openvpn_readable(passwd_path)
+
+        for stale in ccd_dir.glob('*'):
+            if stale.is_file():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+        subnet = str(server.get('subnet') or '')
+        for user in server.get('users') or []:
+            if not isinstance(user, dict) or not record_is_enabled(user):
+                continue
+            username = str(user.get('username') or '').strip()
+            if not username:
+                continue
+            content = render_ccd_file(user, subnet=subnet)
+            if content:
+                try:
+                    (ccd_dir / username).write_text(content, encoding='utf-8')
+                except OSError as exc:
+                    log.warning('openvpn ccd write failed for %s: %s', username, exc)
+
+        try:
+            ccd_dir.chmod(0o755)
+        except OSError:
+            pass
+        self._chown_openvpn_readable(ccd_dir)
 
     def _apply_all_configs(self) -> None:
         staging = self._staging_dir()

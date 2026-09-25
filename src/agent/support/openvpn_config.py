@@ -62,7 +62,7 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
     server_key = pki_dir / 'server.key'
     server_crt = pki_dir / 'server.crt'
     tls_crypt = pki_dir / 'tc.key'
-    dh = pki_dir / 'dh.pem'
+    # dh.pem unused: server conf uses `dh none` (ECDH). Never run openssl dhparam.
 
     if not ca_key.is_file() or not ca_crt.is_file():
         _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
@@ -143,12 +143,7 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
         except OSError:
             pass
 
-    # Optional DH for older clients; modern OpenVPN prefers ECDH.
-    if not dh.is_file():
-        try:
-            _run_openssl(['dhparam', '-out', str(dh), '2048'])
-        except AgentError:
-            dh.write_text('', encoding='utf-8')
+    # dh.pem is unused: server conf uses `dh none` (ECDH). Skip openssl dhparam.
 
     return {
         'ca_crt': ca_crt.read_text(encoding='utf-8'),
@@ -156,7 +151,7 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
         'server_crt': server_crt.read_text(encoding='utf-8'),
         'server_key': server_key.read_text(encoding='utf-8'),
         'tls_crypt': tls_crypt.read_text(encoding='utf-8') if tls_crypt.is_file() else '',
-        'dh_pem': dh.read_text(encoding='utf-8') if dh.is_file() else '',
+        'dh_pem': '',
     }
 
 
