@@ -313,36 +313,58 @@ def render_client_ovpn(
     return '\n'.join(blocks) + '\n'
 
 
+def _status_int(value: str) -> int:
+    text = str(value or '').strip()
+    return int(text) if text.isdigit() else 0
+
+
+def _status_field(parts: list[str], header_index: dict[str, int], name: str, fallback: int) -> str:
+    """Map a HEADER,CLIENT_LIST column onto a CLIENT_LIST row (header has an extra HEADER token)."""
+    index = header_index.get(name.lower())
+    if index is not None:
+        data_index = index - 1
+        if 0 <= data_index < len(parts):
+            return parts[data_index].strip()
+    if 0 <= fallback < len(parts):
+        return parts[fallback].strip()
+    return ''
+
+
 def parse_status_v2(text: str) -> list[dict[str, Any]]:
-    """Parse OpenVPN status-version 2 into session rows keyed by Common Name / Virtual Address."""
+    """Parse OpenVPN status-version 2 into session rows keyed by Common Name / Virtual Address.
+
+    OpenVPN 2.5+ inserts Virtual IPv6 Address before the byte counters. Fixed indexes then
+    treat upload as download and drop the real download column.
+    """
     rows: list[dict[str, Any]] = []
-    section = ''
+    header_index: dict[str, int] = {}
+    in_clients = False
     for raw in (text or '').splitlines():
         line = raw.strip()
         if not line:
             continue
         if line.startswith('HEADER,CLIENT_LIST'):
-            section = 'client'
+            header_index = {
+                part.strip().lower(): index
+                for index, part in enumerate(line.split(','))
+            }
+            in_clients = True
             continue
-        if line.startswith('HEADER,ROUTING_TABLE'):
-            section = 'routing'
+        if line.startswith('HEADER,') or line.startswith('GLOBAL') or line.startswith('END') or line.startswith('TITLE'):
+            in_clients = False
             continue
-        if line.startswith('GLOBAL') or line.startswith('END') or line.startswith('TITLE'):
-            section = ''
-            continue
-        if section != 'client' or not line.startswith('CLIENT_LIST,'):
+        if not in_clients or not line.startswith('CLIENT_LIST,'):
             continue
         parts = line.split(',')
-        # CLIENT_LIST,Common Name,Real Address,Virtual Address,Bytes Received,Bytes Sent,...
         if len(parts) < 6:
             continue
         rows.append(
             {
-                'username': parts[1].strip(),
-                'real_address': parts[2].strip(),
-                'virtual_address': parts[3].strip(),
-                'bytes_received': int(parts[4] or 0) if str(parts[4]).isdigit() else 0,
-                'bytes_sent': int(parts[5] or 0) if str(parts[5]).isdigit() else 0,
+                'username': _status_field(parts, header_index, 'common name', 1),
+                'real_address': _status_field(parts, header_index, 'real address', 2),
+                'virtual_address': _status_field(parts, header_index, 'virtual address', 3),
+                'bytes_received': _status_int(_status_field(parts, header_index, 'bytes received', 4)),
+                'bytes_sent': _status_int(_status_field(parts, header_index, 'bytes sent', 5)),
             }
         )
     return rows

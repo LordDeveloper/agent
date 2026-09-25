@@ -111,6 +111,19 @@ END
     assert len(rows) == 1
     assert rows[0]["username"] == "alice"
     assert rows[0]["bytes_received"] == 100
+    assert rows[0]["bytes_sent"] == 200
+
+
+def test_parse_status_v2_with_virtual_ipv6_column():
+    text = """
+HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher
+CLIENT_LIST,alice,1.2.3.4:1194,10.8.0.2,,10485760,31457280,2026-09-25 12:00:00,1,alice,0,0,AES-256-GCM
+"""
+    rows = parse_status_v2(text)
+    assert rows[0]["username"] == "alice"
+    assert rows[0]["virtual_address"] == "10.8.0.2"
+    assert rows[0]["bytes_received"] == 10_485_760
+    assert rows[0]["bytes_sent"] == 31_457_280
 
 
 def test_openvpn_crud_users(tmp_path: Path):
