@@ -140,10 +140,18 @@ def user_config(
     return {'success': True, **bundle}
 
 
+@router.get('/diagnose')
+def diagnose_user(address: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+    try:
+        report = openvpn.diagnose_address(address)
+    except ValueError as exc:
+        raise_agent_error('VALIDATION_ERROR', str(exc), 422)
+    return report
+
+
 @router.post('/backup')
 def backup(openvpn: OpenVpnDriver = Depends(get_openvpn)):
     return {'success': True, 'backup': openvpn.backup()}
-
 
 @router.post('/restore')
 def restore(body: dict[str, Any], openvpn: OpenVpnDriver = Depends(get_openvpn)):

@@ -77,6 +77,7 @@ class OpenVpnDriver(CoreDriver):
             'client_traffic',
             'ip_logs',
             'backup_restore',
+            'peer_diagnose',
             'peer_egress_routing',
         ]
 
@@ -451,6 +452,12 @@ class OpenVpnDriver(CoreDriver):
             'ovpn': ovpn,
             'text': ovpn,
         }
+
+    def diagnose_address(self, address: str) -> dict[str, Any]:
+        from agent.support.openvpn_diagnose import diagnose_user_address
+
+        self.sync_user_stats()
+        return diagnose_user_address(self.store, self.key, address)
 
     def usage_snapshot(self) -> UsageSnapshotModel:
         self.sync_user_stats()

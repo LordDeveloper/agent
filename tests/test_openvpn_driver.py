@@ -93,6 +93,9 @@ def test_render_server_conf_and_ovpn():
     assert "remote vpn.example.com 1194" in ovpn
     assert "<ca>" in ovpn
     assert "<tls-crypt>" in ovpn
+    assert "<auth-user-pass>" in ovpn
+    assert "alice" in ovpn
+    assert "pw" in ovpn
 
 
 def test_parse_status_v2():

@@ -302,7 +302,6 @@ def render_client_ovpn(
         'persist-key',
         'persist-tun',
         'remote-cert-tls server',
-        'auth-user-pass',
         'verb 3',
         '<ca>',
         ca_crt.strip(),
@@ -310,7 +309,11 @@ def render_client_ovpn(
     ]
     if tls_crypt.strip():
         blocks.extend(['<tls-crypt>', tls_crypt.strip(), '</tls-crypt>'])
-    # Inline credentials for panel convenience (optional auth file style).
+    if username:
+        # Inline credentials so OpenVPN Connect can import without a separate auth file.
+        blocks.extend(['<auth-user-pass>', username, password, '</auth-user-pass>'])
+    else:
+        blocks.append('auth-user-pass')
     blocks.extend(
         [
             f'# username: {username}',

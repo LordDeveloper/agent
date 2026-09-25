@@ -143,7 +143,13 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
     live = match.get('live')
     live_iface = match.get('live_interface')
     routing = dict(match.get('routing') or {})
-    is_l2tp = bool(user) and not peer
+    is_user_core = bool(user) and not peer
+    core_name = str(match.get('core') or '').strip().lower()
+    is_l2tp = is_user_core and (
+        core_name == 'l2tp'
+        or bool(entity.get('linked_peer_id'))
+        or isinstance(match.get('linked_peer'), dict)
+    )
 
     title = f'Match {index}/{total}'
     scope_label = str(
@@ -161,12 +167,12 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
     )
     lines = [f'── {title} · {scope_label} · {peer_label} ──', '']
 
-    section = 'User' if is_l2tp else 'Peer'
+    section = 'User' if is_user_core else 'Peer'
     lines.extend([
         section,
         f'  Address:      {match.get("address") or entity.get("address") or "-"}',
     ])
-    if is_l2tp or entity.get('username'):
+    if is_user_core or entity.get('username'):
         lines.append(f'  Username:     {entity.get("username") or "-"}')
     if entity.get('email'):
         lines.append(f'  Email:        {entity.get("email") or "-"}')
@@ -174,10 +180,15 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
         f'  Enabled:      {_yes_no(entity.get("is_enabled"))}',
         f'  Online:       {_yes_no(entity.get("online"))}',
     ])
-    if is_l2tp:
-        lines.append(f'  Linked peer:  {entity.get("linked_peer_id") or "-"}')
+    if is_user_core:
+        if is_l2tp:
+            lines.append(f'  Linked peer:  {entity.get("linked_peer_id") or "-"}')
         lines.append(f'  Exit iface:   {routing.get("exit_interface") or entity.get("exit_interface") or "-"}')
         lines.append(f'  CIDR:         {match.get("cidr") or routing.get("cidr") or "-"}')
+        if server.get('tun_dev') or routing.get('tun_interface'):
+            lines.append(
+                f'  TUN iface:    {server.get("tun_dev") or routing.get("tun_interface") or "-"}'
+            )
     else:
         lines.extend([
             f'  Public key:   {_truncate(str(entity.get("public_key") or "-"), 56)}',
@@ -219,13 +230,17 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
         'Live runtime',
         f'  Present:      {_yes_no(live is not None)}',
     ])
-    if is_l2tp:
+    if is_user_core:
         live_row = live if isinstance(live, dict) else {}
         lines.extend([
             f'  Interface:    {live_row.get("interface") or "-"}',
             f'  Interface up: {_yes_no(live_row.get("is_up"))}',
             f'  Online:       {_yes_no(live_row.get("online") or live_row.get("is_up"))}',
         ])
+        if live_row.get('real_address'):
+            lines.append(f'  Real addr:    {live_row.get("real_address")}')
+        if live_row.get('username'):
+            lines.append(f'  Common name:  {live_row.get("username")}')
     else:
         lines.extend([
             f'  Interface up: {_yes_no((live_iface or {}).get("is_up") if isinstance(live_iface, dict) else None)}',
