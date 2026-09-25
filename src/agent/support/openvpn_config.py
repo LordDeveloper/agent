@@ -160,40 +160,34 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
     }
 
 
-AUTH_SCRIPT = r'''#!/usr/bin/python3
-"""Netinja OpenVPN auth-user-pass-verify (via-env)."""
-from __future__ import annotations
+AUTH_SCRIPT = r'''#!/bin/sh
+# Netinja OpenVPN auth-user-pass-verify (via-file).
+# OpenVPN passes a temp file path whose first line is username and second is password.
+set -eu
+PASSWD="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/passwd"
+CREDS="${1:-}"
 
-import os
-import sys
-from pathlib import Path
+if [ -z "$CREDS" ] || [ ! -f "$CREDS" ] || [ ! -f "$PASSWD" ]; then
+  exit 1
+fi
 
-PASSWD = Path(__file__).resolve().parent / "passwd"
+username=$(sed -n '1p' "$CREDS" | tr -d '\r')
+password=$(sed -n '2p' "$CREDS" | tr -d '\r')
+if [ -z "$username" ]; then
+  exit 1
+fi
 
-
-def main() -> int:
-    username = (os.environ.get("username") or "").strip()
-    password = os.environ.get("password") or ""
-    if not username or not PASSWD.is_file():
-        return 1
-    try:
-        lines = PASSWD.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 1
-    for line in lines:
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        if " " not in text:
-            continue
-        user, secret = text.split(" ", 1)
-        if user == username and secret == password:
-            return 0
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    ''|\#*) continue ;;
+  esac
+  user=${line%% *}
+  secret=${line#* }
+  if [ "$user" = "$username" ] && [ "$secret" = "$password" ]; then
+    exit 0
+  fi
+done < "$PASSWD"
+exit 1
 '''
 
 
@@ -209,8 +203,8 @@ def render_passwd(servers: list[dict[str, Any]], *, server_id: Any = None) -> st
             password = str(user.get('password') or '')
             if not username:
                 continue
-            # Spaces in password would break the simple passwd format.
-            password = password.replace(' ', '')
+            # Passwords must not contain newlines; spaces are kept (reader splits on first space).
+            password = password.replace('\r', '').replace('\n', '')
             lines.append(f'{username} {password}')
     return '\n'.join(lines) + '\n'
 
@@ -263,7 +257,7 @@ def render_server_conf(
         'username-as-common-name',
         'verify-client-cert none',
         'script-security 2',
-        f'auth-user-pass-verify {script} via-env',
+        f'auth-user-pass-verify {script} via-file',
         'push "redirect-gateway def1 bypass-dhcp"',
         'push "dhcp-option DNS 1.1.1.1"',
         'push "dhcp-option DNS 8.8.8.8"',

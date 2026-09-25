@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import subprocess
@@ -633,6 +634,35 @@ class OpenVpnDriver(CoreDriver):
     def _unit_name(self, server: dict[str, Any]) -> str:
         return f"openvpn-server@{instance_name_for_server(server)}.service"
 
+    def _chown_openvpn_readable(self, path: Path) -> None:
+        """Make auth artifacts readable by the openvpn/nobody daemon user."""
+        try:
+            import grp
+            import pwd
+        except ImportError:
+            return
+
+        uid = -1
+        gid = -1
+        for user_name in ('openvpn', 'nobody'):
+            try:
+                uid = pwd.getpwnam(user_name).pw_uid
+                break
+            except KeyError:
+                continue
+        for group_name in ('openvpn', 'nogroup', 'nobody'):
+            try:
+                gid = grp.getgrnam(group_name).gr_gid
+                break
+            except KeyError:
+                continue
+        if uid < 0 and gid < 0:
+            return
+        try:
+            os.chown(path, uid if uid >= 0 else -1, gid if gid >= 0 else -1)
+        except OSError as exc:
+            log.warning('openvpn chown %s failed: %s', path, exc)
+
     def _unit_active(self, unit: str) -> bool:
         result = run(['systemctl', 'is-active', unit], check=False, timeout=10)
         return (result.stdout or '').strip() == 'active'
@@ -686,21 +716,37 @@ class OpenVpnDriver(CoreDriver):
                     except OSError:
                         pass
 
-            auth_script = server_dir / 'auth-verify.py'
+            auth_script = server_dir / 'auth-verify.sh'
             auth_script.write_text(AUTH_SCRIPT, encoding='utf-8')
             try:
                 auth_script.chmod(0o755)
             except OSError:
                 pass
+            # Remove legacy python verifier if present.
+            legacy = server_dir / 'auth-verify.py'
+            if legacy.is_file():
+                try:
+                    legacy.unlink()
+                except OSError:
+                    pass
 
-            (server_dir / 'passwd').write_text(
+            passwd_path = server_dir / 'passwd'
+            passwd_path.write_text(
                 render_passwd([server]),
                 encoding='utf-8',
             )
+            # openvpn may drop to nobody/openvpn before running auth scripts.
             try:
-                (server_dir / 'passwd').chmod(0o600)
+                passwd_path.chmod(0o640)
             except OSError:
                 pass
+            self._chown_openvpn_readable(passwd_path)
+            self._chown_openvpn_readable(auth_script)
+            try:
+                ccd_dir.chmod(0o755)
+            except OSError:
+                pass
+            self._chown_openvpn_readable(ccd_dir)
 
             # Refresh CCD: drop stale files then write enabled users.
             for stale in ccd_dir.glob('*'):

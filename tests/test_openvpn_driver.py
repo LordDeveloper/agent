@@ -83,6 +83,7 @@ def test_render_server_conf_and_ovpn():
     conf = render_server_conf(server, server_dir="/etc/openvpn/server/openvpn-1", auth_script="/auth.py")
     assert "dev ovpn1" in conf
     assert "auth-user-pass-verify" in conf
+    assert "via-file" in conf
     ovpn = render_client_ovpn(
         server,
         {"username": "alice", "password": "pw", "address": "10.8.0.2"},
