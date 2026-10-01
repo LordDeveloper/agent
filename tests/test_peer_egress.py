@@ -340,7 +340,77 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     )
     assert result["ok"] is True
     assert result["rules"] == 0
+    assert result.get("deferred") == 1
     assert ["ip", "rule", "add", "from", "10.90.68.3/32", "lookup", str(table)] not in commands
+    store.close()
+
+
+def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypatch):
+    """Missing exit must not delete the prior lookup rule (avoids region primary IP leak)."""
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+    live_rules: set[tuple[str, int]] = set()
+    usa_up = True
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "link", "show"] and args[3:] == ["usa"]:
+            if usa_up:
+                return _Result()
+            return _Result(returncode=1, stderr='Device "usa" does not exist.\n')
+        if args[:3] == ["ip", "rule", "add"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.add((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "rule", "del"] and "from" in args and "lookup" in args:
+            cidr = args[args.index("from") + 1]
+            table = int(args[args.index("lookup") + 1])
+            live_rules.discard((cidr, table))
+            return _Result()
+        if args[:3] == ["ip", "-j", "rule"]:
+            rows = [{"src": cidr.split("/", 1)[0], "table": table} for cidr, table in live_rules]
+            return _Result(stdout=json.dumps(rows))
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+    )
+
+    table = table_id_for_interface("usa")
+    first = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert first["ok"] is True
+    assert first["rules"] == 1
+    assert ("10.90.68.3/32", table) in live_rules
+
+    commands.clear()
+    usa_up = False
+    deferred = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert deferred["ok"] is True
+    assert deferred["rules"] == 1
+    assert deferred.get("deferred") == 1
+    assert ["ip", "rule", "del", "from", "10.90.68.3/32", "lookup", str(table)] not in commands
+    assert ["ip", "route", "flush", "table", str(table)] not in commands
+    assert ("10.90.68.3/32", table) in live_rules
+
+    state = store.get_doc("wireguard", "egress_state", "applied") or {}
+    assert state.get("rules") == [{"addr": "10.90.68.3", "table": table, "iface": "usa", "action": "lookup"}]
     store.close()
 
 
@@ -393,6 +463,10 @@ def test_render_apply_script_is_idempotent_shell():
     assert "_soften_rp_filter" in script
     assert "netinja-egress-eth1" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
+    assert "keeping existing rule" in script
+    # Failure path must not tear down the lookup rule (region IP leak).
+    else_idx = script.index("keeping existing rule")
+    assert f'ip rule del from "10.80.0.2/32" lookup {table}' not in script[else_idx:]
 
 
 def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):

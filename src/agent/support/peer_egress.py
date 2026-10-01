@@ -24,6 +24,13 @@ Repair scenario (handshake OK, RX≈0)
 POST /api/v1/network/egress/repair  →  repair_peer_egress()
 force-reconciles routing + firewall and restarts the oneshot apply unit.
 
+Missing exit interface (boot race / Mullvad down)
+-------------------------------------------------
+Never delete a peer's lookup rule just because ``exit_interface`` is briefly
+absent. Falling through to the main table SNAT's traffic out the region's
+primary internet IP. Retain the previous rule (and apply-script must not
+``ip rule del`` on failure); reinstall once the exit iface is warm again.
+
 Live apply must be idempotent:
   • ip rules: add/switch only when needed (stable pref per peer IP)
   • NAT/MSS: rebuild only when the exit set changes (never flush on no-op)
@@ -413,16 +420,28 @@ def render_apply_script(
         if iface:
             masq.add(iface)
         # Cold boot / PostUp: install table then rule with stable preference.
+        # Retry briefly for Mullvad exit tunnels that appear after network-online.
+        # NEVER delete the lookup rule on failure — that dumps traffic onto the
+        # region primary IP via the main routing table.
+        lines.append("_ready=0")
         lines.append(f'if _default_for_iface "{iface}" {table}; then')
+        lines.append("  _ready=1")
+        lines.append("else")
+        lines.append("  sleep 5")
+        lines.append(f'  if _default_for_iface "{iface}" {table}; then')
+        lines.append("    _ready=1")
+        lines.append("  fi")
+        lines.append("fi")
+        lines.append('if [ "$_ready" -eq 1 ]; then')
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
         lines.append(f'  ip rule del from "{cidr}" prohibit 2>/dev/null || true')
         lines.append(
             f'  ip rule add from "{cidr}" lookup {table} pref {pref} 2>/dev/null || true'
         )
         lines.append("else")
-        lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
         lines.append(
-            f'  echo "peer-egress: skipped {cidr} -> {iface} (interface missing or route failed)" >&2'
+            f'  echo "peer-egress: deferred {cidr} -> {iface} '
+            f'(interface missing or route failed; keeping existing rule)" >&2'
         )
         lines.append("fi")
 
@@ -669,16 +688,18 @@ def repair_peer_egress(
     *,
     data_dir: str | Path | None = None,
     runner: Runner | None = None,
+    force: bool = True,
 ) -> dict[str, Any]:
     """
     Full repair scenario owned by the agent:
 
       1) ip_forward + persist sysctl drop-in
       2) soften rp_filter on all / default
-      3) force-reconcile policy routing + NAT/FORWARD for every WG/Amnezia core
-      4) rewrite PostUp script and (re)start systemd oneshot
+      3) reconcile policy routing + NAT/FORWARD for every WG/Amnezia core
+      4) rewrite PostUp script and (re)start systemd oneshot when forced/changed
 
     Use after RX≈0 with healthy handshake, or after manual iptables experiments.
+    ``force=False`` is a soft heal (idempotent reinstall of missing rules only).
     """
     execute = runner or run
     _ensure_ip_forward(execute)
@@ -704,10 +725,10 @@ def repair_peer_egress(
             ifaces,
             runner=execute,
             data_dir=data_dir,
-            force=True,
+            force=force,
         )
 
-    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=True)
+    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=force)
     ok = all(bool(row.get("ok")) for row in cores.values()) if cores else True
     return {
         "ok": ok,
@@ -716,6 +737,7 @@ def repair_peer_egress(
         "persist": persist,
         "tunnels": all_tunnel_interface_names(store),
         "rules": len(all_desired_rules_from_store(store)),
+        "forced": force,
     }
 
 
@@ -759,6 +781,8 @@ def reconcile_core_egress(
 
     applied: list[dict[str, str | int]] = []
     switched: list[str] = []
+    deferred: list[str] = []
+    desired_addrs_all = {str(row["addr"]) for row in desired}
 
     # 1) Warm every desired exit table first (shared by many peers).
     warmed: set[tuple[str, int]] = set()
@@ -802,7 +826,32 @@ def reconcile_core_egress(
         table = int(row["table"])
         iface = str(row["iface"])
         if (iface, table) not in warmed:
-            log.warning("peer egress skipped %s: exit interface [%s] missing or route failed", cidr, iface)
+            # Keep the previous lookup (even if it targeted another exit) so we
+            # never dump this peer onto the main table / region primary IP.
+            if old and str(old.get("action") or "lookup") == "lookup" and int(old.get("table") or 0) > 0:
+                retained = {
+                    "addr": addr,
+                    "cidr": str(old.get("cidr") or cidr),
+                    "iface": str(old.get("iface") or ""),
+                    "table": int(old.get("table") or 0),
+                    "action": "lookup",
+                }
+                if retained["iface"]:
+                    applied.append(retained)
+                    deferred.append(addr)
+                    log.warning(
+                        "peer egress deferred %s: exit [%s] missing/route failed — retained [%s]",
+                        cidr,
+                        iface,
+                        retained["iface"],
+                    )
+                    continue
+            log.warning(
+                "peer egress skipped %s: exit interface [%s] missing or route failed (no prior rule to retain)",
+                cidr,
+                iface,
+            )
+            deferred.append(addr)
             continue
 
         switching = bool(old and (int(old["table"]) != table or str(old["iface"]) != iface or old_action != "lookup"))
@@ -816,6 +865,17 @@ def reconcile_core_egress(
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(cutover)],
             ):
                 log.warning("peer egress skipped %s: failed to add cutover rule → %s", cidr, iface)
+                if old and int(old.get("table") or 0) > 0 and str(old.get("iface") or ""):
+                    applied.append(
+                        {
+                            "addr": addr,
+                            "cidr": str(old.get("cidr") or cidr),
+                            "iface": str(old["iface"]),
+                            "table": int(old["table"]),
+                            "action": "lookup",
+                        }
+                    )
+                    deferred.append(addr)
                 continue
             old_table = int(old["table"])
             if old_table > 0:
@@ -830,6 +890,17 @@ def reconcile_core_egress(
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)],
             ):
                 log.warning("peer egress skipped %s: failed to add rule → %s", cidr, iface)
+                if old and int(old.get("table") or 0) > 0 and str(old.get("iface") or ""):
+                    applied.append(
+                        {
+                            "addr": addr,
+                            "cidr": str(old.get("cidr") or cidr),
+                            "iface": str(old["iface"]),
+                            "table": int(old["table"]),
+                            "action": "lookup",
+                        }
+                    )
+                    deferred.append(addr)
                 continue
         elif switching:
             old_table = int(old["table"])
@@ -846,7 +917,7 @@ def reconcile_core_egress(
     desired_keys = {(str(row["addr"]), int(row["table"]), str(row["iface"])) for row in applied}
     desired_addrs = {str(row["addr"]) for row in applied}
 
-    # 3) Remove rules for peers that left egress entirely (not a switch).
+    # 3) Remove rules for peers that left egress entirely (not a switch / defer).
     for row in prev_rules:
         addr = str(row.get("addr") or "")
         table = int(row.get("table") or 0)
@@ -856,6 +927,9 @@ def reconcile_core_egress(
             continue
         if addr in desired_addrs:
             # Already handled as atomic switch above.
+            continue
+        if addr in desired_addrs_all:
+            # Still desired but deferred (exit missing) — keep kernel rule.
             continue
         cidr = peer_source_cidr(addr) or f"{addr}/32"
         prev_action = str(row.get("action") or "lookup")
@@ -941,6 +1015,7 @@ def reconcile_core_egress(
         "rules": len(applied),
         "desired": len(desired),
         "switched": len(dict.fromkeys(switched)),
+        "deferred": len(dict.fromkeys(deferred)),
         "masq": masq_ifaces,
         "nat_rebuilt": nat_rebuilt,
         "forced": force,

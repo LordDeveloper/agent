@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from agent.logutil import get_logger
 from agent.support.mullvad import MullvadService
+from agent.support.peer_egress import repair_peer_egress
 
 if TYPE_CHECKING:
     from agent.config import AgentSettings
@@ -43,6 +44,26 @@ async def mullvad_worker_loop(
             failed = len(result.get("failed") or [])
             if changed or failed:
                 log.info("mullvad fallback changed=%s failed=%s", changed, failed)
+
+            # Soft-heal every cycle so a wiped policy-routing state recovers once
+            # exit ifaces are up again. Force only when exits were touched.
+            touched = bool(restored.get("restored") or changed)
+            try:
+                repair = await asyncio.to_thread(
+                    repair_peer_egress,
+                    store,
+                    data_dir=settings.data_dir,
+                    force=touched,
+                )
+                if touched or (repair.get("rules") or 0) == 0:
+                    log.info(
+                        "peer egress heal forced=%s rules=%s ok=%s",
+                        touched,
+                        repair.get("rules"),
+                        repair.get("ok"),
+                    )
+            except Exception:
+                log.exception("peer egress heal after mullvad cycle failed")
         except Exception:
             log.exception("mullvad fallback cycle failed")
 
