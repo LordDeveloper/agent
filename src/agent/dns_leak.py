@@ -74,8 +74,30 @@ def _interface_ipv4(addresses: list[str]) -> str | None:
     return None
 
 
+def _wg_conf_path(name: str) -> Path:
+    return Path('/etc/wireguard') / f'{name}.conf'
+
+
+def _is_mullvad_exit_interface(name: str) -> bool:
+    """Mullvad region exits use Table=off; they must not get client DNS DNAT/AdGuard.
+
+    Ads-block previously applied resolvectl dns off + DNAT on these exits, which
+    made host health probes (`curl --interface <exit>`) hang on DNS and flap nodes.
+    """
+    path = _wg_conf_path(name)
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')
+    except OSError:
+        return False
+    return bool(re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text))
+
+
 def _is_vpn_interface(row: dict[str, Any]) -> bool:
     name = str(row.get('name') or '').strip()
+    if not name or _is_mullvad_exit_interface(name):
+        return False
     link_type = str(row.get('link_type') or '').strip().lower()
     if link_type == 'wireguard':
         return True

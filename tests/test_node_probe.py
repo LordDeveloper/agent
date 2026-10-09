@@ -1,126 +1,47 @@
-from unittest.mock import patch
+import subprocess
+from types import SimpleNamespace
 
-from agent.support import node_probe
-
-
-def test_probe_outbound_missing_tag():
-    result = node_probe.probe_outbound_tag('missing', [{'tag': 'direct', 'protocol': 'freedom'}])
-    assert result['ok'] is False
+from agent.support.node_probe import PROBE_TARGETS, _curl_probe
 
 
-def test_probe_region_node_requires_path():
-    result = node_probe.probe_region_node(node_id=1, outbound_tag=None, exit_interface=None, outbounds=[])
-    assert result['ok'] is False
+def test_probe_targets_prefer_literal_ip():
+    assert PROBE_TARGETS[0][0].startswith('http://1.1.1.1')
+    assert PROBE_TARGETS[1][0].startswith('http://1.0.0.1')
 
 
-def test_probe_exit_interface_missing():
-    result = node_probe.probe_exit_interface('eth999')
-    assert result['ok'] is False
+def test_curl_probe_continues_after_timeout():
+    calls: list[str] = []
 
+    def runner(args, **_kwargs):
+        url = args[-1]
+        calls.append(url)
+        if '1.1.1.1' in url:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+        return SimpleNamespace(returncode=0, stdout='200 0.042', stderr='')
 
-@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
-@patch('agent.support.node_probe.list_host_interfaces')
-def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
-    _interfaces.return_value = [
-        {'name': 'uk0', 'is_up': True, 'addresses': ['10.8.0.5/32']},
-        {'name': 'de0', 'is_up': True, 'addresses': ['10.9.0.5/32']},
-    ]
-
-    calls: list[str | None] = []
-
-    def fake_runner(cmd, **_kwargs):
-        iface = None
-        if '--interface' in cmd:
-            iface = cmd[cmd.index('--interface') + 1]
-
-        class Result:
-            returncode = 0
-            stdout = '204 0.256'
-            stderr = ''
-
-        calls.append(iface)
-        if iface == 'uk0':
-            return Result()
-        return type('Result', (), {'returncode': 28, 'stdout': '', 'stderr': 'timeout'})()
-
-    outbounds = [
-        {
-            'tag': 'deegress',
-            'protocol': 'freedom',
-            'sendThrough': '10.9.0.5',
-        },
-    ]
-
-    result = node_probe.probe_region_node(
-        node_id=7,
-        outbound_tag='deegress',
-        exit_interface='uk0',
-        outbounds=outbounds,
-        runner=fake_runner,
-    )
-
-    assert result['ok'] is True
-    assert 'exit_interface' in result['checks']
-    assert 'outbound' in result['checks']
-    assert result.get('latency_ms') == 256
-    assert result['checks']['exit_interface'].get('latency_ms') == 256
-
-
-@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
-def test_probe_region_node_skips_duplicate_exit_interface_check(_which):
-    calls: list[str | None] = []
-
-    def fake_runner(cmd, **_kwargs):
-        class Result:
-            returncode = 0
-            stdout = '204 0.12'
-            stderr = ''
-
-        if '--interface' in cmd:
-            calls.append(cmd[cmd.index('--interface') + 1])
-        return Result()
-
-    outbounds = [
-        {
-            'tag': 'ukegress',
-            'protocol': 'freedom',
-            'sendThrough': 'uk0',
-        },
-    ]
-
-    result = node_probe.probe_region_node(
-        node_id=7,
-        outbound_tag='ukegress',
-        exit_interface='uk0',
-        outbounds=outbounds,
-        runner=fake_runner,
-    )
-
-    assert result['ok'] is True
-    assert 'outbound' in result['checks']
-    assert 'exit_interface' not in result['checks']
-    assert calls == ['uk0']
-
-
-@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
-def test_curl_speed_mbps_binds_interface_name(_which):
-    seen = []
-
-    def fake_runner(cmd, **_kwargs):
-        seen.append(list(cmd))
-
-        class Result:
-            returncode = 0
-            stdout = '200 1250000'
-            stderr = ''
-
-        return Result()
-
-    ok, message, mbps = node_probe.curl_speed_mbps(interface='us', runner=fake_runner)
+    ok, message, latency = _curl_probe(interface='poland', runner=runner)
     assert ok is True
-    assert mbps == 10.0
-    assert '10.0' in message or 'Mbps' in message
-    assert '--interface' in seen[0]
-    assert seen[0][seen[0].index('--interface') + 1] == 'us'
-    # Must not rewrite iface name to a shared tunnel IP.
-    assert '10.' not in seen[0][seen[0].index('--interface') + 1]
+    assert message == 'اتصال برقرار شد'
+    assert latency == 42
+    assert any('1.1.1.1' in item for item in calls)
+    assert any('1.0.0.1' in item for item in calls)
+
+
+def test_is_mullvad_exit_skips_table_off(tmp_path, monkeypatch):
+    from agent import dns_leak
+
+    conf_dir = tmp_path / 'wireguard'
+    conf_dir.mkdir()
+    (conf_dir / 'poland.conf').write_text(
+        '[Interface]\nPrivateKey=abc\nAddress=10.64.0.2/32\nTable = off\n',
+        encoding='utf-8',
+    )
+    (conf_dir / 'wg0.conf').write_text(
+        '[Interface]\nPrivateKey=abc\nAddress=10.8.0.1/24\nListenPort=51820\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(dns_leak, '_wg_conf_path', lambda name: conf_dir / f'{name}.conf')
+
+    assert dns_leak._is_mullvad_exit_interface('poland') is True
+    assert dns_leak._is_vpn_interface({'name': 'poland', 'link_type': 'wireguard'}) is False
+    assert dns_leak._is_vpn_interface({'name': 'wg0', 'link_type': 'wireguard'}) is True

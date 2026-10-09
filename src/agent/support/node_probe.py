@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import shutil
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -14,11 +15,13 @@ from agent.support.process import run
 
 Runner = Callable[..., Any]
 
-# Multiple targets improve reachability from restricted networks.
+# Prefer literal-IP targets first: after ads-block / AdGuard, host DNS on exit
+# ifaces can hang and curl --max-time may not abort getaddrinfo promptly.
 PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = (
-    ('http://connectivitycheck.gstatic.com/generate_204', frozenset({204})),
     ('http://1.1.1.1/cdn-cgi/trace', frozenset({200})),
+    ('http://1.0.0.1/cdn-cgi/trace', frozenset({200})),
     ('http://cp.cloudflare.com/cdn-cgi/trace', frozenset({200})),
+    ('http://connectivitycheck.gstatic.com/generate_204', frozenset({204})),
 )
 PROBE_TIMEOUT = 5
 CONNECT_TIMEOUT = 3
@@ -144,6 +147,7 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
 
     bind = _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
+    per_try_timeout = PROBE_TIMEOUT + CONNECT_TIMEOUT + 2
 
     for url, ok_codes in PROBE_TARGETS:
         cmd = [
@@ -163,7 +167,15 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
         if bind:
             cmd[1:1] = ['--interface', bind]
 
-        result = execute(cmd, check=False, timeout=PROBE_TIMEOUT + CONNECT_TIMEOUT + 2)
+        try:
+            result = execute(cmd, check=False, timeout=per_try_timeout)
+        except subprocess.TimeoutExpired:
+            errors.append(f'timeout after {per_try_timeout}s ({url})')
+            continue
+        except OSError as exc:
+            errors.append(str(exc) or 'curl OSError')
+            continue
+
         raw_code = getattr(result, 'returncode', 1)
         code = int(raw_code if raw_code is not None else 1)
         body = (getattr(result, 'stdout', '') or '').strip()
@@ -237,7 +249,13 @@ def curl_speed_mbps(
         '%{http_code} %{speed_download}',
         url,
     ]
-    result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
+    try:
+        result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
+    except subprocess.TimeoutExpired:
+        return False, f'timeout after {SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2}s', None
+    except OSError as exc:
+        return False, str(exc) or 'curl OSError', None
+
     raw_code = getattr(result, 'returncode', 1)
     code = int(raw_code if raw_code is not None else 1)
     body = (getattr(result, 'stdout', '') or '').strip()
