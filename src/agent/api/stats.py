@@ -24,7 +24,10 @@ def stats_online(
     registry: CoreRegistry = Depends(get_registry),
 ):
     try:
-        users = registry.online_users(resolve_core_key(core))
+        if core:
+            users = registry.online_users(resolve_core_key(core))
+        else:
+            users = registry.online_users_by_core()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "users": users}

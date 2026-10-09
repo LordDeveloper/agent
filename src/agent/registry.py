@@ -59,17 +59,40 @@ class CoreRegistry:
         if core:
             return self.get(core).online_users()
         users: list[str] = []
-        for driver in self._drivers.values():
-            users.extend(driver.online_users())
+        for rows in self.online_users_by_core().values():
+            users.extend(rows)
         return sorted(set(users))
+
+    def online_users_by_core(self) -> dict[str, list[str]]:
+        enabled = set(self.settings.cores())
+        out: dict[str, list[str]] = {}
+        for key, driver in self._drivers.items():
+            if enabled and key not in enabled:
+                out[key] = []
+                continue
+            try:
+                out[key] = driver.online_users()
+            except AgentError:
+                out[key] = []
+        return out
 
     def online_ips(self, core: str | None = None) -> dict[str, Any]:
         if core:
             return self.get(core).online_ips_map()
-        merged: dict[str, Any] = {}
-        for driver in self._drivers.values():
-            merged.update(driver.online_ips_map())
-        return merged
+        return self.online_ips_by_core()
+
+    def online_ips_by_core(self) -> dict[str, Any]:
+        enabled = set(self.settings.cores())
+        out: dict[str, Any] = {}
+        for key, driver in self._drivers.items():
+            if enabled and key not in enabled:
+                out[key] = {}
+                continue
+            try:
+                out[key] = driver.online_ips_map()
+            except AgentError:
+                out[key] = {}
+        return out
 
     def online_traffic(self, core: str | None = None) -> dict[str, dict[str, int]]:
         return collect_online_traffic(self, resolve_core_key(core) if core else None)
