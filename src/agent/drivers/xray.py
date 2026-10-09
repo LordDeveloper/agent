@@ -1514,10 +1514,47 @@ class XrayDriver(CoreDriver):
         if not self.running():
             return []
         users = self._api().online_users()
-        # Runtime reports the email alias; map it to canonical node_id so the
-        # panel online check matches the same key used for traffic billing.
+        alias = self._client_email_aliases()
+        return [alias.get(str(item), str(item)) for item in users]
+
+    def online_ips_map(self) -> dict[str, Any]:
+        if not self.running():
+            return {}
         try:
-            alias: dict[str, str] = {}
+            body = self._api().online_all()
+        except AgentError as exc:
+            if exc.status in (404, 405, 501):
+                raise AgentError(
+                    "UNSUPPORTED_CAPABILITY",
+                    "Xray online/all is not available",
+                    404,
+                ) from exc
+            raise
+
+        users = body.get("users") or []
+        if isinstance(users, dict):
+            rows = [{"email": key, "ips": value} for key, value in users.items()]
+        elif isinstance(users, list):
+            rows = [row for row in users if isinstance(row, dict)]
+        else:
+            rows = []
+
+        alias = self._client_email_aliases()
+        out: dict[str, Any] = {}
+        for row in rows:
+            email = str(row.get("email") or row.get("id") or "").strip()
+            if email == "":
+                continue
+            ips = row["ips"] if "ips" in row else row
+            out[email] = ips
+            cid = alias.get(email)
+            if cid and cid != email:
+                out[cid] = ips
+        return out
+
+    def _client_email_aliases(self) -> dict[str, str]:
+        alias: dict[str, str] = {}
+        try:
             for inbound in self.list_inbounds():
                 for row in (inbound.get("settings") or {}).get("clients") or []:
                     if not isinstance(row, dict):
@@ -1527,8 +1564,8 @@ class XrayDriver(CoreDriver):
                     if email and cid:
                         alias[email] = cid
         except Exception:
-            alias = {}
-        return [alias.get(str(item), str(item)) for item in users]
+            return {}
+        return alias
 
     def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot

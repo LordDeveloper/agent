@@ -30,6 +30,19 @@ def stats_online(
     return {"success": True, "users": users}
 
 
+@router.get("/stats/online/ips")
+def stats_online_ips(
+    core: str | None = Query(None),
+    registry: CoreRegistry = Depends(get_registry),
+):
+    """One snapshot of live client IPs for every online user (Xray online/all)."""
+    try:
+        users = registry.online_ips(resolve_core_key(core))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "users": users}
+
+
 @router.get("/stats/online/traffic")
 def stats_online_traffic(
     core: str | None = Query(None),

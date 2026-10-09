@@ -43,3 +43,6 @@ class CoreDriver(ABC):
     @abstractmethod
     def online_users(self) -> list[str]:
         ...
+
+    def online_ips_map(self) -> dict[str, Any]:
+        return {}

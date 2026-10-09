@@ -1,3 +1,5 @@
+from typing import Any
+
 from agent.audit import AuditLog
 from agent.config import AgentSettings
 from agent.db import Store
@@ -60,6 +62,14 @@ class CoreRegistry:
         for driver in self._drivers.values():
             users.extend(driver.online_users())
         return sorted(set(users))
+
+    def online_ips(self, core: str | None = None) -> dict[str, Any]:
+        if core:
+            return self.get(core).online_ips_map()
+        merged: dict[str, Any] = {}
+        for driver in self._drivers.values():
+            merged.update(driver.online_ips_map())
+        return merged
 
     def online_traffic(self, core: str | None = None) -> dict[str, dict[str, int]]:
         return collect_online_traffic(self, resolve_core_key(core) if core else None)
