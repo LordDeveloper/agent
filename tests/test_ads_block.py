@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent.ads_block import (
+    DEFAULT_ADS_USER_RULES,
+    _load_user_rules,
     ads_block_ensure,
     ads_block_prerequisites,
     ads_block_status,
@@ -14,6 +16,15 @@ from agent.ads_block import (
 class _Result(SimpleNamespace):
     def __init__(self, returncode: int = 0, stdout: str = '', stderr: str = ''):
         super().__init__(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_default_user_rules_include_iran_ad_networks(monkeypatch, tmp_path):
+    monkeypatch.setattr('agent.ads_block.ADS_LIST_PATH', tmp_path / 'missing-ads-blocklist.txt')
+    rules = _load_user_rules()
+    assert len(DEFAULT_ADS_USER_RULES) >= 40
+    assert '||yektanet.com^' in rules
+    assert '||doubleclick.net^' in rules
+    assert len(rules) >= len(DEFAULT_ADS_USER_RULES)
 
 
 def test_ads_block_status_reports_gateway_dns(monkeypatch):

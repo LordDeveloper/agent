@@ -30,6 +30,73 @@ log = get_logger('ads_block')
 
 ADS_LIST_PATH = Path('/var/lib/agent/ads-blocklist.txt')
 
+# Extra DNS rules layered on top of DEFAULT_FILTERS (AdGuard DNS syntax only).
+DEFAULT_ADS_USER_RULES: tuple[str, ...] = (
+    # Global trackers / ad CDNs
+    '||doubleclick.net^',
+    '||googlesyndication.com^',
+    '||googleadservices.com^',
+    '||pagead2.googlesyndication.com^',
+    '||adservice.google.com^',
+    '||securepubads.g.doubleclick.net^',
+    '||fundingchoicesmessages.google.com^',
+    '||ads.youtube.com^',
+    '||connect.facebook.net^',
+    '||pixel.facebook.com^',
+    '||an.facebook.com^',
+    '||ads.twitter.com^',
+    '||ads-api.twitter.com^',
+    '||static.ads-twitter.com^',
+    '||ads.linkedin.com^',
+    '||snap.licdn.com^',
+    '||ads.yahoo.com^',
+    '||adtech.yahooinc.com^',
+    '||advertising.com^',
+    '||adnxs.com^',
+    '||adsrvr.org^',
+    '||adform.net^',
+    '||outbrain.com^',
+    '||taboola.com^',
+    '||criteo.com^',
+    '||criteo.net^',
+    '||pubmatic.com^',
+    '||rubiconproject.com^',
+    '||openx.net^',
+    '||casalemedia.com^',
+    '||moatads.com^',
+    '||scorecardresearch.com^',
+    '||quantserve.com^',
+    '||hotjar.com^',
+    '||fullstory.com^',
+    '||mixpanel.com^',
+    '||segment.io^',
+    '||segment.com^',
+    '||amplitude.com^',
+    '||appsflyer.com^',
+    '||adjust.com^',
+    '||branch.io^',
+    '||amazon-adsystem.com^',
+    '||media.net^',
+    '||exoclick.com^',
+    '||propellerads.com^',
+    '||popads.net^',
+    '||popcash.net^',
+    '||adsterra.com^',
+    # Common Iranian ad / tracker networks
+    '||yektanet.com^',
+    '||cdn.yektanet.com^',
+    '||najva.com^',
+    '||mediaad.org^',
+    '||sanjagh.com^',
+    '||adivery.com^',
+    '||tapsell.ir^',
+    '||tapligh.com^',
+    '||sabavision.com^',
+    '||chabokan.net^',
+    '||adtrace.io^',
+    '||metrix.ir^',
+)
+
 Runner = Callable[..., Any]
 
 
@@ -47,6 +114,17 @@ def _require_root() -> None:
 def _load_user_rules() -> list[str]:
     rules: list[str] = []
     seen: set[str] = set()
+
+    def _add(rule: str) -> None:
+        text = str(rule or '').strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        rules.append(text)
+
+    for rule in DEFAULT_ADS_USER_RULES:
+        _add(rule)
+
     if not ADS_LIST_PATH.is_file():
         return rules
     try:
@@ -56,11 +134,10 @@ def _load_user_rules() -> list[str]:
                 continue
             if any(ch.isspace() for ch in domain):
                 continue
-            rule = f'||{domain}^'
-            if rule in seen:
-                continue
-            seen.add(rule)
-            rules.append(rule)
+            if domain.startswith('||') or domain.startswith('@@'):
+                _add(domain)
+            else:
+                _add(f'||{domain}^')
     except OSError:
         pass
     return rules

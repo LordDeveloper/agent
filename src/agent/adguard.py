@@ -46,6 +46,8 @@ LEGACY_DNSMASQ_ADS_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
 
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 
+# Strong DNS blocklists (AdGuard Home Hostlists Registry + StevenBlack).
+# Kept aggressive but short of HaGeZi Pro++ which breaks too many sites.
 DEFAULT_FILTERS = (
     {
         'enabled': True,
@@ -56,8 +58,50 @@ DEFAULT_FILTERS = (
     {
         'enabled': True,
         'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt',
-        'name': 'AdGuard DNS Popup Hosts filter',
+        'name': 'AdGuard DNS Popup Hosts',
         'id': 2,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_17.txt',
+        'name': 'AdGuard Tracking Protection',
+        'id': 3,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_42.txt',
+        'name': 'OISD Blocklist Big',
+        'id': 4,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_33.txt',
+        'name': 'HaGeZi Pro',
+        'id': 5,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_3.txt',
+        'name': "Peter Lowe's Ad and tracking server list",
+        'id': 6,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt',
+        'name': 'Malicious URL Blocklist',
+        'id': 7,
+    },
+    {
+        'enabled': True,
+        'url': 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+        'name': 'StevenBlack Unified hosts',
+        'id': 8,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_53.txt',
+        'name': 'AWAvenue Ads Rule',
+        'id': 9,
     },
 )
 
@@ -142,6 +186,7 @@ def render_adguard_config(
             '  file_enabled: false',
             'statistics:',
             '  enabled: false',
+            'filters_update_interval: 6',
             'filters:',
             filters_block,
             'whitelist_filters: []',
@@ -150,9 +195,10 @@ def render_adguard_config(
             'dhcp:',
             '  enabled: false',
             'filtering:',
-            '  blocking_mode: default',
+            # nxdomain is clearer for clients than null/default REFUSED.
+            '  blocking_mode: nxdomain',
             '  parental_enabled: false',
-            '  safebrowsing_enabled: false',
+            '  safebrowsing_enabled: true',
             '  filtering_enabled: ' + ('true' if filtering_enabled else 'false'),
             '  protection_enabled: ' + ('true' if filtering_enabled else 'false'),
             '  protection_disabled_until: null',
