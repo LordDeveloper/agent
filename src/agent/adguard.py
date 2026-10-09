@@ -170,10 +170,11 @@ def render_adguard_config(
         upstream_list = list(DEFAULT_UPSTREAM_DNS)
 
     rules = [str(item).strip() for item in (user_rules or []) if str(item).strip()]
-    if filtering_enabled:
-        allow = [rule for rule in CONNECTIVITY_ALLOW_RULES if rule not in rules]
-        rules = allow + rules
-    filters_block = _yaml_filters(DEFAULT_FILTERS) if filtering_enabled else '  []'
+    allow = [rule for rule in CONNECTIVITY_ALLOW_RULES if rule not in rules]
+    rules = allow + rules
+    # Keep filter URLs even when ads-block is off so AdGuard can cache lists.
+    # Toggling then only flips filtering_enabled — no stop/redownload/DNS gap.
+    filters_block = _yaml_filters(DEFAULT_FILTERS)
 
     return '\n'.join(
         [
@@ -408,6 +409,7 @@ def _render_agent_adguard_unit(binary: str, work_dir: str) -> str:
             'Type=simple',
             f'WorkingDirectory={work_dir}',
             f'ExecStart={binary} -c {work_dir}/AdGuardHome.yaml -w {work_dir} --no-check-update',
+            'ExecReload=/bin/kill -HUP $MAINPID',
             'Restart=on-failure',
             'RestartSec=3',
             '',
@@ -555,7 +557,43 @@ def cleanup_legacy_dnsmasq(*, runner: Runner | None = None) -> list[str]:
     return removed
 
 
-def ensure_adguard_service(*, runner: Runner | None = None, fix_resolved: bool = True) -> dict[str, Any]:
+def _yaml_bind_hosts(text: str) -> tuple[str, ...]:
+    hosts: list[str] = []
+    in_hosts = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == 'bind_hosts:':
+            in_hosts = True
+            continue
+        if not in_hosts:
+            continue
+        if stripped.startswith('- '):
+            hosts.append(stripped[2:].strip().strip("'\""))
+            continue
+        if stripped and not stripped.startswith('#'):
+            break
+    return tuple(hosts)
+
+
+def reload_adguard_config(*, runner: Runner | None = None) -> bool:
+    """Ask a running AdGuard to reread YAML without dropping port 53."""
+    execute = runner or run
+    if not adguard_service_active(runner=runner):
+        return False
+    if shutil.which('systemctl'):
+        proc = execute(['systemctl', 'reload', AGENT_ADGUARD_UNIT], check=False, timeout=30)
+        if getattr(proc, 'returncode', 1) == 0:
+            return True
+    proc = execute(['pkill', '-HUP', '-x', 'AdGuardHome'], check=False, timeout=10)
+    return getattr(proc, 'returncode', 1) == 0
+
+
+def ensure_adguard_service(
+    *,
+    runner: Runner | None = None,
+    fix_resolved: bool = True,
+    restart: bool = False,
+) -> dict[str, Any]:
     execute = runner or run
     actions: list[str] = []
     cleanup_legacy_dnsmasq(runner=runner)
@@ -616,9 +654,18 @@ def ensure_adguard_service(*, runner: Runner | None = None, fix_resolved: bool =
             actions.append('unmasked_adguard')
             unit_enabled = adguard_unit_enabled(runner=runner)
         execute(['systemctl', 'enable', unit], check=False, timeout=30)
-        execute(['systemctl', 'restart', unit], check=False, timeout=60)
-        if not adguard_service_active(runner=runner):
-            execute(['systemctl', 'start', unit], check=False, timeout=60)
+        already_active = adguard_service_active(runner=runner)
+        if restart or not already_active:
+            execute(
+                ['systemctl', 'restart' if restart and already_active else 'start', unit],
+                check=False,
+                timeout=60,
+            )
+            actions.append('restarted_adguard' if restart and already_active else 'started_adguard')
+            if not adguard_service_active(runner=runner):
+                execute(['systemctl', 'start', unit], check=False, timeout=60)
+        else:
+            actions.append('adguard_already_active')
 
     active = adguard_service_active(runner=runner)
     diagnostic = ''
@@ -669,7 +716,6 @@ def write_adguard_config(
     user_rules: list[str] | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
-    execute = runner or run
     content = render_adguard_config(
         bind_hosts,
         upstream=upstream,
@@ -679,17 +725,17 @@ def write_adguard_config(
     ADGUARD_WORK_DIR.mkdir(parents=True, exist_ok=True)
     previous = ADGUARD_CONFIG.read_text(encoding='utf-8') if ADGUARD_CONFIG.is_file() else ''
     written = previous != content
+    bind_hosts_changed = _yaml_bind_hosts(previous) != _yaml_bind_hosts(content)
 
-    # Only stop AdGuard when the config actually changes — a stop on every ensure
-    # briefly drops all VPN-client DNS and makes WireGuard clients reconnect.
+    # Never stop AdGuard to rewrite YAML — that drops VPN-client DNS and flaps
+    # WireGuard. Write in place; caller reloads (SIGHUP) or restarts only if bind hosts changed.
     if written:
-        if shutil.which('systemctl') and adguard_service_active(runner=runner):
-            execute(['systemctl', 'stop', AGENT_ADGUARD_UNIT], check=False, timeout=30)
         ADGUARD_CONFIG.write_text(content, encoding='utf-8')
 
     return {
         'config': str(ADGUARD_CONFIG),
         'written': written,
+        'bind_hosts_changed': bind_hosts_changed and written,
         'listen_addresses': sorted({str(item).strip() for item in bind_hosts if str(item).strip()}),
         'filtering_enabled': filtering_enabled,
         'upstream': list(upstream),
@@ -715,8 +761,26 @@ def ensure_adguard_resolver(
         user_rules=user_rules,
         runner=runner,
     )
-    service = ensure_adguard_service(runner=runner)
-    restarted = bool(service.get('active'))
+    written = bool(config_meta.get('written'))
+    bind_changed = bool(config_meta.get('bind_hosts_changed'))
+    already_active = adguard_service_active(runner=runner)
+
+    if already_active and written and not bind_changed and reload_adguard_config(runner=runner):
+        service = {
+            'active': True,
+            'reloaded': True,
+            'restarted': False,
+        }
+    elif already_active and not written:
+        service = {
+            'active': True,
+            'reloaded': False,
+            'restarted': False,
+            'skipped': True,
+        }
+    else:
+        service = ensure_adguard_service(runner=runner, restart=bind_changed)
+    restarted = bool(service.get('restarted') or (service.get('active') and not already_active))
 
     return {
         'config': config_meta['config'],

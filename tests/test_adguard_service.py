@@ -4,11 +4,13 @@ from types import SimpleNamespace
 
 from agent.adguard import (
     ADGUARD_CONFIG,
+    AGENT_ADGUARD_UNIT,
     AGENT_ADGUARD_UNIT_PATH,
     ADGUARD_UNIT_MARKER,
     ensure_adguard_service,
     ensure_adguard_systemd_unit,
     render_adguard_config,
+    write_adguard_config,
 )
 
 
@@ -44,8 +46,10 @@ def test_render_adguard_config_binds_vpn_gateway_and_enables_filters():
 def test_render_adguard_config_can_disable_filtering():
     conf = render_adguard_config(['10.80.0.1'], filtering_enabled=False)
     assert 'filtering_enabled: false' in conf
-    assert 'filters:\n  []' in conf
-    assert '@@||connectivitycheck.gstatic.com^' not in conf
+    assert 'protection_enabled: false' in conf
+    assert 'OISD Blocklist Big' in conf
+    assert '@@||connectivitycheck.gstatic.com^' in conf
+    assert 'filters:\n  []' not in conf
 
 
 def test_ensure_adguard_systemd_unit_creates_agent_unit(tmp_path, monkeypatch):
@@ -78,7 +82,9 @@ def test_ensure_adguard_systemd_unit_creates_agent_unit(tmp_path, monkeypatch):
     assert payload['unit'] == 'agent-adguard'
     assert payload['created'] is True
     assert unit_path.is_file()
-    assert 'AdGuardHome.yaml' in unit_path.read_text(encoding='utf-8')
+    unit_text = unit_path.read_text(encoding='utf-8')
+    assert 'AdGuardHome.yaml' in unit_text
+    assert 'ExecReload=/bin/kill -HUP $MAINPID' in unit_text
     assert marker_path.is_file()
     assert any(args[:3] == ['systemctl', 'daemon-reload'] for args in calls)
 
@@ -161,3 +167,58 @@ def test_ensure_adguard_service_does_not_touch_resolved_without_port_conflict(tm
     assert payload['active'] is False
     assert 'disabled_resolved_stub_listener' not in payload['actions']
     assert not dropin.is_file()
+
+
+def test_write_adguard_config_does_not_stop_running_service(tmp_path, monkeypatch):
+    work = tmp_path / 'work'
+    work.mkdir()
+    config = work / 'AdGuardHome.yaml'
+    monkeypatch.setattr('agent.adguard.ADGUARD_WORK_DIR', work)
+    monkeypatch.setattr('agent.adguard.ADGUARD_CONFIG', config)
+    monkeypatch.setattr('agent.adguard.adguard_service_active', lambda runner=None: True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _Result()
+
+    payload = write_adguard_config(['10.80.0.1'], filtering_enabled=True, runner=fake_run)
+
+    assert payload['written'] is True
+    assert config.is_file()
+    assert 'filtering_enabled: true' in config.read_text(encoding='utf-8')
+    assert not any(args[:3] == ['systemctl', 'stop', AGENT_ADGUARD_UNIT] for args in calls)
+
+
+def test_ensure_adguard_service_skips_restart_when_already_active(tmp_path, monkeypatch):
+    config = tmp_path / 'AdGuardHome.yaml'
+    config.write_text('dns:\n  bind_hosts:\n    - 10.80.0.1\n', encoding='utf-8')
+    marker = tmp_path / 'adguard-systemd-unit'
+    marker.write_text('agent-adguard', encoding='utf-8')
+
+    monkeypatch.setattr('agent.adguard.ADGUARD_CONFIG', config)
+    monkeypatch.setattr('agent.adguard.ADGUARD_BINARY', tmp_path / 'AdGuardHome')
+    monkeypatch.setattr('agent.adguard.ADGUARD_UNIT_MARKER', marker)
+    monkeypatch.setattr('agent.adguard.cleanup_legacy_dnsmasq', lambda runner=None: [])
+    monkeypatch.setattr('agent.adguard.shutil.which', lambda cmd: f'/usr/bin/{cmd}')
+    monkeypatch.setattr(
+        'agent.adguard.ensure_adguard_systemd_unit',
+        lambda runner=None: {'ok': True, 'unit': 'agent-adguard', 'created': False, 'installed': False},
+    )
+    monkeypatch.setattr('agent.adguard.adguard_service_active', lambda runner=None: True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:3] == ['systemctl', 'is-enabled', 'agent-adguard']:
+            return _Result(stdout='enabled\n')
+        return _Result()
+
+    payload = ensure_adguard_service(runner=fake_run)
+
+    assert payload['active'] is True
+    assert 'adguard_already_active' in payload['actions']
+    assert not any(args[:2] == ['systemctl', 'restart'] for args in calls)
+    assert not any(args[:2] == ['systemctl', 'stop'] for args in calls)
