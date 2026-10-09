@@ -1,4 +1,4 @@
-"""Ads-blocking DNS filter for WireGuard / Amnezia clients via AdGuard Home."""
+"""Ads-blocking DNS filter for WireGuard / Amnezia / L2TP / OpenVPN via AdGuard Home."""
 
 from __future__ import annotations
 
@@ -244,7 +244,7 @@ def ads_block_repair_service(*, runner: Runner | None = None) -> dict[str, Any]:
 
 
 def ads_block_install_prerequisites(*, runner: Runner | None = None) -> dict[str, Any]:
-    """Install AdGuard Home and dnsutils required for WireGuard ads blocking."""
+    """Install AdGuard Home and dnsutils required for VPN ads blocking."""
     _require_linux()
     _require_root()
 
@@ -441,10 +441,17 @@ def ads_block_disable(*, runner: Runner | None = None) -> dict[str, Any]:
         removed = True
 
     cleanup = teardown_vpn_dns_if_unused(runner=runner)
+    push: dict[str, Any] | None = None
+    if not cleanup.get('skipped'):
+        from agent.adguard import DEFAULT_UPSTREAM_DNS
+        from agent.dns_leak import sync_client_dns_push
+
+        push = sync_client_dns_push(list(DEFAULT_UPSTREAM_DNS), runner=runner)
 
     return {
         'ok': True,
         'removed': removed,
         'cleanup': cleanup,
+        'client_dns_push': push,
         **ads_block_status(runner=runner),
     }

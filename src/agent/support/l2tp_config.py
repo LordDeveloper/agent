@@ -240,6 +240,12 @@ def render_xl2tpd_conf(
 def render_ppp_options(*, templates: dict[str, Any] | None = None) -> str:
     tpl = normalize_templates(templates) if templates is not None else default_templates()
     text = str(tpl['ppp_options']).replace('\r\n', '\n').strip() + '\n'
+    try:
+        from agent.dns_leak import preferred_client_dns, rewrite_ms_dns_options
+
+        text = rewrite_ms_dns_options(text, preferred_client_dns())
+    except Exception:
+        pass
     return text
 
 

@@ -234,6 +234,15 @@ def render_server_conf(
     root = Path(server_dir)
     script = Path(auth_script)
 
+    try:
+        from agent.dns_leak import preferred_client_dns
+
+        dns_servers = preferred_client_dns()
+    except Exception:
+        dns_servers = ['1.1.1.1', '8.8.8.8']
+    if not dns_servers:
+        dns_servers = ['1.1.1.1', '8.8.8.8']
+
     lines = [
         '# Managed by Netinja Agent',
         f'port {port}',
@@ -254,14 +263,18 @@ def render_server_conf(
         'script-security 2',
         f'auth-user-pass-verify {script} via-file',
         'push "redirect-gateway def1 bypass-dhcp"',
-        'push "dhcp-option DNS 1.1.1.1"',
-        'push "dhcp-option DNS 8.8.8.8"',
-        'keepalive 10 60',
-        'persist-key',
-        'persist-tun',
-        'verb 3',
-        'explicit-exit-notify 1' if proto == 'udp' else '# tcp mode',
     ]
+    for dns in dns_servers[:2]:
+        lines.append(f'push "dhcp-option DNS {dns}"')
+    lines.extend(
+        [
+            'keepalive 10 60',
+            'persist-key',
+            'persist-tun',
+            'verb 3',
+            'explicit-exit-notify 1' if proto == 'udp' else '# tcp mode',
+        ]
+    )
     return '\n'.join(lines) + '\n'
 
 

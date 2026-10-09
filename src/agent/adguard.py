@@ -362,7 +362,7 @@ def isolate_vpn_interfaces_from_host_dns(
     actions: list[str] = []
     for row in interfaces:
         name = str(row.get('name') or '').strip()
-        if not name:
+        if not name or '+' in name or '*' in name:
             continue
         dns_proc = execute(['resolvectl', 'dns', name, 'off'], check=False, timeout=10)
         execute(['resolvectl', 'domain', name, 'off'], check=False, timeout=10)
