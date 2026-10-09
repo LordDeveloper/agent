@@ -22,11 +22,13 @@ def test_render_adguard_config_binds_vpn_gateway_and_enables_filters():
     assert "'10.80.0.1'" in conf
     assert 'filtering_enabled: true' in conf
     assert 'AdGuard DNS filter' in conf
-    assert 'OISD Blocklist Big' in conf
-    assert 'HaGeZi Pro' in conf
-    assert 'StevenBlack Unified hosts' in conf
+    assert 'AdGuard DNS Popup Hosts' in conf
+    assert 'AWAvenue Ads Rule' in conf
+    assert 'OISD Blocklist Big' not in conf
+    assert 'HaGeZi Pro' not in conf
     assert 'blocking_mode: nxdomain' in conf
-    assert 'safebrowsing_enabled: true' in conf
+    assert 'safebrowsing_enabled: false' in conf
+    assert 'rdns: false' in conf
     assert 'filters_update_interval: 6' in conf
     assert 'http:' in conf
     assert '127.0.0.1:3000' in conf

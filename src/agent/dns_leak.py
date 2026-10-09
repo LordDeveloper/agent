@@ -395,38 +395,41 @@ def render_apply_script(
         lines.append('fi')
         lines.append('')
 
-    lines.append('if command -v iptables >/dev/null 2>&1; then')
-    for row in interfaces:
-        name = str(row['name'])
-        gateway = str(row['gateway'])
-        comment = f'{COMMENT_PREFIX}{name}'.replace('+', 'x').replace('*', 'x')
-        lines.append(f'if _iface_ready "{name}"; then')
-        for proto in ('udp', 'tcp'):
-            lines.append(
-                f'  iptables -t nat -C PREROUTING -i "{name}" -p {proto} --dport 53 '
-                f'-m comment --comment "{comment}-{proto}" -j DNAT --to-destination {gateway}:53 '
-                f'2>/dev/null || iptables -t nat -A PREROUTING -i "{name}" -p {proto} --dport 53 '
-                f'-m comment --comment "{comment}-{proto}" -j DNAT --to-destination {gateway}:53'
-            )
-        if block_ipv6 and shutil.which('ip6tables') and not _is_wildcard_iface(name):
-            lines.append(
-                f'  ip6tables -C FORWARD -i "{name}" -m comment --comment "{comment}-no-v6" -j DROP '
-                f'2>/dev/null || ip6tables -A FORWARD -i "{name}" -m comment --comment "{comment}-no-v6" -j DROP'
-            )
-            lines.append(
-                f'  ip6tables -C FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP '
-                f'2>/dev/null || ip6tables -A FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP'
-            )
-        if not _is_wildcard_iface(name):
-            lines.append(
-                f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl dns "{name}" off 2>/dev/null || true; fi'
-            )
-            lines.append(
-                f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl domain "{name}" off 2>/dev/null || true; fi'
-            )
+    # Prefer nft exclusively when available. Applying both nft and iptables-nft
+    # double-DNATs DNS and confuses conntrack on some kernels.
+    if not shutil.which('nft'):
+        lines.append('if command -v iptables >/dev/null 2>&1; then')
+        for row in interfaces:
+            name = str(row['name'])
+            gateway = str(row['gateway'])
+            comment = f'{COMMENT_PREFIX}{name}'.replace('+', 'x').replace('*', 'x')
+            lines.append(f'if _iface_ready "{name}"; then')
+            for proto in ('udp', 'tcp'):
+                lines.append(
+                    f'  iptables -t nat -C PREROUTING -i "{name}" -p {proto} --dport 53 '
+                    f'-m comment --comment "{comment}-{proto}" -j DNAT --to-destination {gateway}:53 '
+                    f'2>/dev/null || iptables -t nat -A PREROUTING -i "{name}" -p {proto} --dport 53 '
+                    f'-m comment --comment "{comment}-{proto}" -j DNAT --to-destination {gateway}:53'
+                )
+            if block_ipv6 and shutil.which('ip6tables') and not _is_wildcard_iface(name):
+                lines.append(
+                    f'  ip6tables -C FORWARD -i "{name}" -m comment --comment "{comment}-no-v6" -j DROP '
+                    f'2>/dev/null || ip6tables -A FORWARD -i "{name}" -m comment --comment "{comment}-no-v6" -j DROP'
+                )
+                lines.append(
+                    f'  ip6tables -C FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP '
+                    f'2>/dev/null || ip6tables -A FORWARD -o "{name}" -m comment --comment "{comment}-no-v6-out" -j DROP'
+                )
+            if not _is_wildcard_iface(name):
+                lines.append(
+                    f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl dns "{name}" off 2>/dev/null || true; fi'
+                )
+                lines.append(
+                    f'  if command -v resolvectl >/dev/null 2>&1; then resolvectl domain "{name}" off 2>/dev/null || true; fi'
+                )
+            lines.append('fi')
         lines.append('fi')
-    lines.append('fi')
-    lines.append('')
+        lines.append('')
     lines.append('exit 0')
     return '\n'.join(lines) + '\n'
 

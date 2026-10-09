@@ -46,8 +46,8 @@ LEGACY_DNSMASQ_ADS_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
 
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 
-# Strong DNS blocklists (AdGuard Home Hostlists Registry + StevenBlack).
-# Kept aggressive but short of HaGeZi Pro++ which breaks too many sites.
+# Lean ads/tracker lists — aggressive sets (OISD Big / HaGeZi Pro / StevenBlack)
+# were blocking connectivity-check hosts and making WireGuard clients flap.
 DEFAULT_FILTERS = (
     {
         'enabled': True,
@@ -69,39 +69,15 @@ DEFAULT_FILTERS = (
     },
     {
         'enabled': True,
-        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_42.txt',
-        'name': 'OISD Blocklist Big',
-        'id': 4,
-    },
-    {
-        'enabled': True,
-        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_33.txt',
-        'name': 'HaGeZi Pro',
-        'id': 5,
-    },
-    {
-        'enabled': True,
         'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_3.txt',
         'name': "Peter Lowe's Ad and tracking server list",
-        'id': 6,
-    },
-    {
-        'enabled': True,
-        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt',
-        'name': 'Malicious URL Blocklist',
-        'id': 7,
-    },
-    {
-        'enabled': True,
-        'url': 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
-        'name': 'StevenBlack Unified hosts',
-        'id': 8,
+        'id': 4,
     },
     {
         'enabled': True,
         'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_53.txt',
         'name': 'AWAvenue Ads Rule',
-        'id': 9,
+        'id': 5,
     },
 )
 
@@ -198,7 +174,8 @@ def render_adguard_config(
             # nxdomain is clearer for clients than null/default REFUSED.
             '  blocking_mode: nxdomain',
             '  parental_enabled: false',
-            '  safebrowsing_enabled: true',
+            # Safebrowsing adds extra upstream lookups and latency on every query.
+            '  safebrowsing_enabled: false',
             '  filtering_enabled: ' + ('true' if filtering_enabled else 'false'),
             '  protection_enabled: ' + ('true' if filtering_enabled else 'false'),
             '  protection_disabled_until: null',
@@ -207,12 +184,13 @@ def render_adguard_config(
             '      time_zone: Local',
             '    ids: []',
             'clients:',
+            # Avoid rdns/arp/whois against VPN ifaces — adds noise on wg/ppp.
             '  runtime_sources:',
-            '    whois: true',
-            '    arp: true',
-            '    rdns: true',
-            '    dhcp: true',
-            '    hosts: true',
+            '    whois: false',
+            '    arp: false',
+            '    rdns: false',
+            '    dhcp: false',
+            '    hosts: false',
             '  persistent: []',
             'log:',
             '  enabled: false',
@@ -655,10 +633,11 @@ def write_adguard_config(
     previous = ADGUARD_CONFIG.read_text(encoding='utf-8') if ADGUARD_CONFIG.is_file() else ''
     written = previous != content
 
-    if shutil.which('systemctl') and adguard_service_active(runner=runner):
-        execute(['systemctl', 'stop', AGENT_ADGUARD_UNIT], check=False, timeout=30)
-
+    # Only stop AdGuard when the config actually changes — a stop on every ensure
+    # briefly drops all VPN-client DNS and makes WireGuard clients reconnect.
     if written:
+        if shutil.which('systemctl') and adguard_service_active(runner=runner):
+            execute(['systemctl', 'stop', AGENT_ADGUARD_UNIT], check=False, timeout=30)
         ADGUARD_CONFIG.write_text(content, encoding='utf-8')
 
     return {
