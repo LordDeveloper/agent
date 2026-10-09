@@ -138,6 +138,19 @@ def test_save_settings_relay_metric(tmp_path: Path):
     assert svc.relay_metric() == "ping"
 
 
+def test_save_settings_relay_mode_fixed(tmp_path: Path):
+    svc = _service(tmp_path)
+    svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="ping")
+    assert svc.relay_mode() == "auto"
+    saved = svc.save_settings(relay_mode="fixed")
+    assert saved["relay_mode"] == "fixed"
+    assert saved["selection_mode"] == "fixed"
+    assert svc.relay_mode() == "fixed"
+    saved = svc.save_settings(relay_metric="speed", relay_mode="auto")
+    assert saved["relay_metric"] == "speed"
+    assert saved["relay_mode"] == "auto"
+
+
 def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
     svc = _service(tmp_path)
     dual = "10.64.0.2/32,fc00:bbbb:bbbb:bb01::2/128"
@@ -145,6 +158,7 @@ def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
     assert svc.settings()["address"] == dual
     saved = svc.save_settings(relay_metric="speed")
     assert saved["relay_metric"] == "speed"
+    assert saved["relay_mode"] == "auto"
     assert saved["address"] == dual
 
 
@@ -502,8 +516,44 @@ def test_switch_relay_rewrites_peer(tmp_path: Path, monkeypatch):
     result = svc.switch_relay("de", "de-ber-wg-001")
     assert result["status"] == "changed"
     assert result["hostname"] == "de-ber-wg-001"
+    assert result.get("fixed") is False
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
+
+
+def test_switch_relay_fixed_sets_mode_and_skips_fallback(tmp_path: Path, monkeypatch):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
+    )
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.9.9/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
+    monkeypatch.setattr(svc, "_iface_healthy", lambda _iface: False)
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+
+    result = svc.switch_relay("de", "de-ber-wg-001", fixed=True)
+    assert result["status"] == "changed"
+    assert result["fixed"] is True
+    assert svc.relay_mode() == "fixed"
+    listed = svc.country_relays("de", ping=False)
+    assert listed["relay_mode"] == "fixed"
+    assert listed["current_fixed"] is True
+    assert listed["current_hostname"] == "de-ber-wg-001"
+
+    fallback = svc.fallback("de", optimize=True)
+    assert fallback["changed"] == []
+    assert fallback["skipped"]
+    assert "fixed" in str(fallback["skipped"][0].get("message") or "").lower()
 
 
 def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):

@@ -53,6 +53,10 @@ def mullvad_settings(body: dict[str, Any], request: Request):
             )
         if "relay_metric" in body and body.get("relay_metric") is not None:
             kwargs["relay_metric"] = str(body.get("relay_metric") or "")
+        if "relay_mode" in body and body.get("relay_mode") is not None:
+            kwargs["relay_mode"] = str(body.get("relay_mode") or "")
+        elif "selection_mode" in body and body.get("selection_mode") is not None:
+            kwargs["selection_mode"] = str(body.get("selection_mode") or "")
         if not kwargs:
             raise AgentError("VALIDATION_ERROR", "No settings provided", 422)
         payload = _service(request).save_settings(**kwargs)
@@ -74,7 +78,12 @@ def mullvad_ensure(country_code: str, request: Request):
 @router.post("/locations/{country_code}/relay")
 def mullvad_switch_relay(country_code: str, body: dict[str, Any], request: Request):
     try:
-        payload = _service(request).switch_relay(country_code, str(body.get("hostname") or ""))
+        fixed = bool(body.get("fixed") or body.get("pin") or body.get("pinned"))
+        payload = _service(request).switch_relay(
+            country_code,
+            str(body.get("hostname") or ""),
+            fixed=fixed,
+        )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

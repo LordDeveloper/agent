@@ -44,6 +44,9 @@ SETTINGS_ID = "account"
 RELAY_METRIC_PING = "ping"
 RELAY_METRIC_SPEED = "speed"
 RELAY_METRICS = {RELAY_METRIC_PING, RELAY_METRIC_SPEED}
+RELAY_MODE_AUTO = "auto"
+RELAY_MODE_FIXED = "fixed"
+RELAY_MODES = {RELAY_MODE_AUTO, RELAY_MODE_FIXED}
 PERSIST_UNIT_TEMPLATE = "agent-mullvad-wg@.service"
 PERSIST_HOLD_SCRIPT = Path("/var/lib/agent/mullvad-wg-hold.sh")
 PERSIST_UNIT_PATH = Path("/etc/systemd/system") / PERSIST_UNIT_TEMPLATE
@@ -324,6 +327,13 @@ def normalize_relay_metric(value: Any) -> str:
     return RELAY_METRIC_PING
 
 
+def normalize_relay_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"fixed", "pin", "pinned", "manual", "static"}:
+        return RELAY_MODE_FIXED
+    return RELAY_MODE_AUTO
+
+
 def relay_network_speed_mbps(row: dict[str, Any]) -> int:
     for key in ("network_port_speed", "network_port_speed_mbps", "speed"):
         raw = row.get(key)
@@ -426,6 +436,7 @@ def present_relay_row(
     ping_ms: int | None = None,
     measured: bool = False,
     current: bool = False,
+    fixed: bool = False,
     speed_mbps: float | int | None = None,
 ) -> dict[str, Any]:
     port_speed = relay_network_speed_mbps(row)
@@ -449,6 +460,7 @@ def present_relay_row(
         "ping_ms": ping_ms,
         "measured": bool(measured and ping_ms is not None),
         "current": bool(current),
+        "fixed": bool(fixed),
     }
 
 
@@ -566,6 +578,7 @@ class MullvadService:
         private_key = str(row.get("private_key") or "").strip()
         address = str(row.get("address") or "").strip()
         metric = normalize_relay_metric(row.get("relay_metric"))
+        mode = normalize_relay_mode(row.get("relay_mode") or row.get("selection_mode"))
         return {
             "private_key": private_key,
             "address": address,
@@ -573,10 +586,16 @@ class MullvadService:
             "key_preview": mask_key(private_key),
             "relay_metric": metric,
             "relay_metric_label": "سرعت واقعی (curl)" if metric == RELAY_METRIC_SPEED else "پینگ",
+            "relay_mode": mode,
+            "selection_mode": mode,
+            "relay_mode_label": "رله ثابت" if mode == RELAY_MODE_FIXED else "خودکار",
         }
 
     def relay_metric(self) -> str:
         return normalize_relay_metric(self.settings().get("relay_metric"))
+
+    def relay_mode(self) -> str:
+        return normalize_relay_mode(self.settings().get("relay_mode"))
 
     def save_settings(
         self,
@@ -584,25 +603,37 @@ class MullvadService:
         private_key: str | None = None,
         address: str | None = None,
         relay_metric: str | None = None,
+        relay_mode: str | None = None,
+        selection_mode: str | None = None,
     ) -> dict[str, Any]:
         current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         key = str(private_key if private_key is not None else current.get("private_key") or "").strip()
         if private_key is not None and not _WG_KEY_RE.match(key):
             raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
-        if private_key is None and not key and relay_metric is None:
+        mode_input = relay_mode if relay_mode is not None else selection_mode
+        if private_key is None and not key and relay_metric is None and mode_input is None:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
 
         metric = normalize_relay_metric(
             relay_metric if relay_metric is not None else current.get("relay_metric")
         )
+        mode = normalize_relay_mode(
+            mode_input if mode_input is not None else (current.get("relay_mode") or current.get("selection_mode"))
+        )
 
-        # Metric-only updates must not re-validate Address: exits share one key/IP and
+        # Metric/mode-only updates must not re-validate Address: exits share one key/IP and
         # configs often store dual-stack Address (IPv4,IPv6) that older code rejected.
-        if relay_metric is not None and private_key is None and address is None:
+        if (
+            (relay_metric is not None or mode_input is not None)
+            and private_key is None
+            and address is None
+        ):
             payload = {
                 "private_key": key,
                 "address": str(current.get("address") or "").strip(),
                 "relay_metric": metric,
+                "relay_mode": mode,
+                "selection_mode": mode,
             }
             self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
             return self.settings()
@@ -618,6 +649,8 @@ class MullvadService:
             "private_key": key,
             "address": addr,
             "relay_metric": metric,
+            "relay_mode": mode,
+            "selection_mode": mode,
         }
         self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
         return self.settings()
@@ -877,7 +910,9 @@ class MullvadService:
 
         bind = self.binding_for(code) or {}
         current_host = str(bind.get("hostname") or "").strip().lower()
+        current_fixed = bool(bind.get("fixed") or bind.get("pinned"))
         metric = self.relay_metric()
+        mode = self.relay_mode()
         rows: list[dict[str, Any]] = []
 
         ping_by_host: dict[str, int | None] = {}
@@ -900,12 +935,14 @@ class MullvadService:
         for _score, row in scored:
             host = str(row.get("hostname") or "").strip().lower()
             ping_ms = ping_by_host.get(host)
+            is_current = host == current_host
             rows.append(
                 present_relay_row(
                     row,
                     ping_ms=ping_ms,
                     measured=ping_ms is not None,
-                    current=host == current_host,
+                    current=is_current,
+                    fixed=bool(is_current and current_fixed),
                 )
             )
 
@@ -914,17 +951,29 @@ class MullvadService:
             "iface": str(bind.get("iface") or preferred_iface(code) or ""),
             "bound": bool(bind),
             "current_hostname": str(bind.get("hostname") or "") or None,
+            "current_fixed": current_fixed,
             "relay_metric": metric,
+            "relay_mode": mode,
+            "ping_via": "agent",
             "relays": rows,
         }
 
-    def switch_relay(self, country_code: str, hostname: str) -> dict[str, Any]:
+    def switch_relay(
+        self,
+        country_code: str,
+        hostname: str,
+        *,
+        fixed: bool = False,
+        pin: bool | None = None,
+    ) -> dict[str, Any]:
         code = str(country_code or "").strip().lower()
         host = str(hostname or "").strip()
         if not re.fullmatch(r"[a-z]{2}", code or ""):
             raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
         if not host:
             raise AgentError("VALIDATION_ERROR", "hostname is required", 422)
+
+        pin_fixed = bool(fixed if pin is None else pin)
 
         relays = self.fetch()
         self.refresh_bindings(relays)
@@ -955,14 +1004,28 @@ class MullvadService:
                 "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "last_error": "",
                 "manual_switch": True,
+                "fixed": pin_fixed,
+                "pinned": pin_fixed,
             },
         )
+        if pin_fixed:
+            self.save_settings(relay_mode=RELAY_MODE_FIXED)
         presented = self._present_binding(self.binding_for(code) or bind)
         return {
             **presented,
             "status": "changed" if previous.lower() != host.lower() else "ok",
             "previous_hostname": previous or None,
-            "message": f"switched to {host}" if previous.lower() != host.lower() else f"already on {host}",
+            "fixed": pin_fixed,
+            "relay_mode": self.relay_mode(),
+            "message": (
+                f"pinned to {host}"
+                if pin_fixed and previous.lower() != host.lower()
+                else (
+                    f"switched to {host}"
+                    if previous.lower() != host.lower()
+                    else (f"already pinned on {host}" if pin_fixed else f"already on {host}")
+                )
+            ),
         }
 
     def status(self) -> dict[str, Any]:
@@ -1001,6 +1064,13 @@ class MullvadService:
         presented = self._present_binding(bind)
         if not iface:
             return {**presented, "status": "failed", "message": "missing iface"}
+
+        if self.relay_mode() == RELAY_MODE_FIXED or bool(bind.get("fixed") or bind.get("pinned")):
+            return {
+                **presented,
+                "status": "ok",
+                "message": "fixed relay mode — automatic switch disabled",
+            }
 
         healthy = self._iface_up(iface) and self._iface_healthy(iface)
         if healthy and not optimize:
@@ -1092,6 +1162,8 @@ class MullvadService:
                         "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "last_error": "",
                         "manual_switch": False,
+                        "fixed": False,
+                        "pinned": False,
                     },
                 )
                 log.info("mullvad fallback country=%s iface=%s hostname=%s", code, iface, relay_host)
@@ -1221,6 +1293,8 @@ class MullvadService:
                         "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "last_error": "",
                         "manual_switch": False,
+                        "fixed": False,
+                        "pinned": False,
                     },
                 )
                 wait = float(getattr(self, "handshake_wait", 0) or 0)
@@ -1295,7 +1369,12 @@ class MullvadService:
                         iface=iface,
                         relay=current_relay,
                         adopted=bool(bind.get("adopted")),
-                        extra={"last_error": "", "manual_switch": False},
+                        extra={
+                            "last_error": "",
+                            "manual_switch": False,
+                            "fixed": False,
+                            "pinned": False,
+                        },
                     )
                 except AgentError:
                     pass
@@ -1319,6 +1398,8 @@ class MullvadService:
                         "last_fallback_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "last_error": "",
                         "manual_switch": False,
+                        "fixed": False,
+                        "pinned": False,
                     },
                 )
             except AgentError as exc:
@@ -1618,6 +1699,7 @@ class MullvadService:
             return
         if not private_key and not address:
             return
+        mode = normalize_relay_mode(current.get("relay_mode") or current.get("selection_mode"))
         self.store.put_doc(
             CORE,
             KIND_SETTINGS,
@@ -1626,6 +1708,8 @@ class MullvadService:
                 "private_key": str(current.get("private_key") or private_key),
                 "address": str(current.get("address") or address),
                 "relay_metric": normalize_relay_metric(current.get("relay_metric")),
+                "relay_mode": mode,
+                "selection_mode": mode,
             },
         )
 
@@ -1659,6 +1743,7 @@ class MullvadService:
         self.store.put_doc(CORE, KIND_LOCATION, country_code, payload)
 
     def _present_binding(self, bind: dict[str, Any]) -> dict[str, Any]:
+        fixed = bool(bind.get("fixed") or bind.get("pinned"))
         return {
             "country_code": str(bind.get("country_code") or ""),
             "country_name": str(bind.get("country_name") or ""),
@@ -1666,6 +1751,8 @@ class MullvadService:
             "hostname": str(bind.get("hostname") or "") or None,
             "endpoint": str(bind.get("endpoint") or "") or None,
             "adopted": bool(bind.get("adopted")),
+            "fixed": fixed,
+            "pinned": fixed,
             "last_fallback_at": bind.get("last_fallback_at"),
             "last_error": str(bind.get("last_error") or "") or None,
         }
