@@ -46,8 +46,8 @@ LEGACY_DNSMASQ_ADS_DROPIN = Path('/etc/dnsmasq.d/netinja-ads-block.conf')
 
 DEFAULT_UPSTREAM_DNS = ('1.1.1.1', '8.8.8.8')
 
-# Lean ads/tracker lists — aggressive sets (OISD Big / HaGeZi Pro / StevenBlack)
-# were blocking connectivity-check hosts and making WireGuard clients flap.
+# Strong DNS blocklists (AdGuard Home Hostlists Registry + StevenBlack).
+# HaGeZi Pro++ is skipped — it breaks too many sites.
 DEFAULT_FILTERS = (
     {
         'enabled': True,
@@ -69,16 +69,60 @@ DEFAULT_FILTERS = (
     },
     {
         'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_42.txt',
+        'name': 'OISD Blocklist Big',
+        'id': 4,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_33.txt',
+        'name': 'HaGeZi Pro',
+        'id': 5,
+    },
+    {
+        'enabled': True,
         'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_3.txt',
         'name': "Peter Lowe's Ad and tracking server list",
-        'id': 4,
+        'id': 6,
+    },
+    {
+        'enabled': True,
+        'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt',
+        'name': 'Malicious URL Blocklist',
+        'id': 7,
+    },
+    {
+        'enabled': True,
+        'url': 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+        'name': 'StevenBlack Unified hosts',
+        'id': 8,
     },
     {
         'enabled': True,
         'url': 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_53.txt',
         'name': 'AWAvenue Ads Rule',
-        'id': 5,
+        'id': 9,
     },
+)
+
+# Captive-portal / OS connectivity probes. Aggressive lists match these and
+# Android/iOS then mark the VPN as 'no internet', which flaps WireGuard.
+CONNECTIVITY_ALLOW_RULES: tuple[str, ...] = (
+    '@@||connectivitycheck.gstatic.com^',
+    '@@||connectivitycheck.android.com^',
+    '@@||clients3.google.com^',
+    '@@||captive.apple.com^',
+    '@@||www.apple.com^',
+    '@@||www.msftconnecttest.com^',
+    '@@||ipv6.msftconnecttest.com^',
+    '@@||dns.msftncsi.com^',
+    '@@||www.msftncsi.com^',
+    '@@||detectportal.firefox.com^',
+    '@@||nmcheck.gnome.org^',
+    '@@||network-test.debian.org^',
+    '@@||neverssl.com^',
+    '@@||captive.cloudflare.com^',
+    '@@||cp.cloudflare.com^',
 )
 
 
@@ -126,6 +170,9 @@ def render_adguard_config(
         upstream_list = list(DEFAULT_UPSTREAM_DNS)
 
     rules = [str(item).strip() for item in (user_rules or []) if str(item).strip()]
+    if filtering_enabled:
+        allow = [rule for rule in CONNECTIVITY_ALLOW_RULES if rule not in rules]
+        rules = allow + rules
     filters_block = _yaml_filters(DEFAULT_FILTERS) if filtering_enabled else '  []'
 
     return '\n'.join(
