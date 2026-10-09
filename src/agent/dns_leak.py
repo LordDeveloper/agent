@@ -375,6 +375,15 @@ def render_apply_script(
                 f'  nft add rule inet {NFT_TABLE} {NFT_CHAIN_PREROUTING} iifname "{nft_name}" '
                 f'tcp dport 53 dnat ip to {gateway}:53 comment "{comment}-tcp" 2>/dev/null || true'
             )
+            if not _is_wildcard_iface(name):
+                lines.append(
+                    f'  nft add rule inet {NFT_TABLE} {NFT_CHAIN_PREROUTING} iifname "{nft_name}" '
+                    f'meta nfproto ipv6 udp dport 53 drop comment "{comment}-no-v6-dns-udp" 2>/dev/null || true'
+                )
+                lines.append(
+                    f'  nft add rule inet {NFT_TABLE} {NFT_CHAIN_PREROUTING} iifname "{nft_name}" '
+                    f'meta nfproto ipv6 tcp dport 53 drop comment "{comment}-no-v6-dns-tcp" 2>/dev/null || true'
+                )
             if block_ipv6 and not _is_wildcard_iface(name):
                 lines.append(
                     f'  nft add rule inet {NFT_TABLE} {NFT_CHAIN_FORWARD} iifname "{nft_name}" '
@@ -411,6 +420,15 @@ def render_apply_script(
                     f'2>/dev/null || iptables -t nat -A PREROUTING -i "{name}" -p {proto} --dport 53 '
                     f'-m comment --comment "{comment}-{proto}" -j DNAT --to-destination {gateway}:53'
                 )
+            if not _is_wildcard_iface(name):
+                for proto in ('udp', 'tcp'):
+                    lines.append(
+                        f'  if command -v ip6tables >/dev/null 2>&1; then '
+                        f'ip6tables -t nat -C PREROUTING -i "{name}" -p {proto} --dport 53 '
+                        f'-m comment --comment "{comment}-no-v6-dns-{proto}" -j DROP '
+                        f'2>/dev/null || ip6tables -t nat -A PREROUTING -i "{name}" -p {proto} --dport 53 '
+                        f'-m comment --comment "{comment}-no-v6-dns-{proto}" -j DROP; fi'
+                    )
             if block_ipv6 and shutil.which('ip6tables') and not _is_wildcard_iface(name):
                 lines.append(
                     f'  ip6tables -C FORWARD -i "{name}" -m comment --comment "{comment}-no-v6" -j DROP '

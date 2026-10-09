@@ -128,3 +128,31 @@ def test_ads_block_ensure_writes_marker_and_configures_resolver(tmp_path, monkey
     assert resolver_calls[0].get('filtering_enabled') is True
     assert payload['dns'] == '10.80.0.1'
     assert payload['resolver']['resolver']['listen_addresses'] == ['10.80.0.1']
+
+
+def test_ads_block_ensure_skips_when_already_active(tmp_path, monkeypatch):
+    marker = tmp_path / 'ads-block-enabled'
+    marker.write_text('enabled\n', encoding='utf-8')
+    config = tmp_path / 'AdGuardHome.yaml'
+    config.write_text('filtering:\n  filtering_enabled: true\n', encoding='utf-8')
+    monkeypatch.setattr('agent.ads_block.ADS_ENABLED_MARKER', marker)
+    monkeypatch.setattr('agent.ads_block.ADGUARD_CONFIG', config)
+    monkeypatch.setattr('agent.ads_block._require_linux', lambda: None)
+    monkeypatch.setattr('agent.ads_block._require_root', lambda: None)
+    monkeypatch.setattr('agent.ads_block.adguard_service_active', lambda runner=None: True)
+    monkeypatch.setattr(
+        'agent.ads_block.ads_block_status',
+        lambda runner=None: {'ready': True, 'adguard_active': True, 'dns': '10.80.0.1'},
+    )
+
+    resolver_calls: list[dict] = []
+    monkeypatch.setattr(
+        'agent.ads_block.ensure_vpn_dns_resolver',
+        lambda **kwargs: resolver_calls.append(kwargs) or {},
+    )
+
+    payload = ads_block_ensure()
+
+    assert payload['skipped'] is True
+    assert payload['ok'] is True
+    assert resolver_calls == []

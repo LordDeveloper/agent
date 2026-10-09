@@ -200,7 +200,7 @@ def render_adguard_config(
             _yaml_list(upstream_list, indent=4),
             '  bootstrap_dns:',
             _yaml_list(upstream_list, indent=4),
-            '  cache_size: 4194304',
+            '  cache_size: 16777216',
             '  serve_plain_dns: true',
             '  hostsfile_enabled: false',
             'tls:',

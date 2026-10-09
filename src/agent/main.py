@@ -32,14 +32,28 @@ from agent.routing import ROUTE_SLUGS
 from agent.core_supervisor import bootstrap_enabled_cores
 from agent.errors import AgentError
 from agent.quota_enforcer import quota_enforcer_loop
+from agent.runtime import RuntimeTrace
 from agent.traffic.service import TrafficService
 from agent.traffic_worker import traffic_worker_loop
 
 log = get_logger("http")
 
 
+def _request_action(request: Request) -> str:
+    endpoint = request.scope.get("endpoint")
+    name = getattr(endpoint, "__name__", "") if callable(endpoint) else ""
+    if name:
+        return name
+    route = request.scope.get("route")
+    route_name = getattr(route, "name", "") if route is not None else ""
+    if route_name:
+        return str(route_name)
+    return f"{request.method}.{request.url.path}"
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        RuntimeTrace.start()
         started = time.perf_counter()
         client = request.client.host if request.client else "-"
         try:
@@ -49,25 +63,31 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
             if isinstance(exc, HTTPException):
                 raise
             log.exception(
-                "request failed method=%s path=%s client=%s duration_ms=%.1f",
+                "request failed method=%s path=%s client=%s duration_ms=%.1f runtime=%s",
                 request.method,
                 request.url.path,
                 client,
                 elapsed_ms,
+                RuntimeTrace.header() or "-",
             )
             raise
-
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        level = log.warning if response.status_code >= 400 else log.info
-        level(
-            "method=%s path=%s status=%s client=%s duration_ms=%.1f",
-            request.method,
-            request.url.path,
-            response.status_code,
-            client,
-            elapsed_ms,
-        )
-        return response
+        else:
+            RuntimeTrace.set_action(_request_action(request))
+            RuntimeTrace.apply(response)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            level = log.warning if response.status_code >= 400 else log.info
+            level(
+                "method=%s path=%s status=%s client=%s duration_ms=%.1f runtime=%s",
+                request.method,
+                request.url.path,
+                response.status_code,
+                client,
+                elapsed_ms,
+                response.headers.get(RuntimeTrace.header_name, "-"),
+            )
+            return response
+        finally:
+            RuntimeTrace.reset()
 
 
 def create_app(env_file: str | None = None) -> FastAPI:
@@ -190,10 +210,13 @@ def create_app(env_file: str | None = None) -> FastAPI:
         from agent.errors import ERROR_MAP, error_body
 
         status = int(exc.status or ERROR_MAP.get(exc.code, 400) or 400)
-        return JSONResponse(
+        response = JSONResponse(
             status_code=status,
             content=error_body(exc.code, exc.message),
         )
+        RuntimeTrace.set_action(_request_action(request))
+        RuntimeTrace.apply(response)
+        return response
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -207,13 +230,16 @@ def create_app(env_file: str | None = None) -> FastAPI:
             exc,
         )
         message = f"{type(exc).__name__}: {exc}".strip()[:400] or "Internal Server Error"
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={
                 "success": False,
                 "error": {"code": "INTERNAL_ERROR", "message": message},
             },
         )
+        RuntimeTrace.set_action(_request_action(request))
+        RuntimeTrace.apply(response)
+        return response
 
     return app
 

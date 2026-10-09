@@ -9,6 +9,7 @@ import httpx
 from agent.config import XraySettings
 from agent.errors import AgentError
 from agent.logutil import get_logger
+from agent.runtime import RuntimeTrace
 
 _log = get_logger("xray.http")
 
@@ -91,8 +92,9 @@ class XrayHttpClient:
         headers = {"Content-Type": "application/json"} if files is None and json_body is not None else None
         method_u = method.upper()
         route = f"{method_u} {path}"
+        span = RuntimeTrace.safe_name(f"xray.{method_u}.{path.rstrip('/').split('/')[-1] or 'root'}")
         try:
-            with self._lock:
+            with RuntimeTrace.span(span), self._lock:
                 response = self._client.request(
                     method,
                     path,

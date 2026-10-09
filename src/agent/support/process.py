@@ -5,6 +5,7 @@ import subprocess
 from typing import Any
 
 from agent.errors import AgentError
+from agent.runtime import RuntimeTrace, command_span_name
 
 
 def which(cmd: str) -> str | None:
@@ -18,14 +19,15 @@ def run(
     timeout: float = 30,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        check=check,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        input=input_text,
-    )
+    with RuntimeTrace.span(command_span_name(args)):
+        return subprocess.run(
+            args,
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
 
 
 def systemctl(action: str, unit: str) -> dict[str, Any]:

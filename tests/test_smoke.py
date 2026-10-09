@@ -84,6 +84,10 @@ def test_health_no_auth(client: TestClient):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["success"] is True
+    runtime = r.headers.get("x-runtime") or ""
+    assert "action=root_health" in runtime
+    assert "total=" in runtime
+    assert runtime.endswith("ms") or ";total=" in runtime
 
 
 def test_per_core_health_is_isolated(client: TestClient):

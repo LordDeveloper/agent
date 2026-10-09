@@ -20,6 +20,7 @@ from agent.support import normalize_peer, record_is_enabled
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.support.process import run
 from agent.logutil import get_logger
+from agent.runtime import RuntimeTrace
 
 _ONLINE_HANDSHAKE_SECONDS = 120
 _IP_WINDOW_SECONDS = 600
@@ -119,14 +120,15 @@ def recent_peer_ips(
 
 def _wg_pubkey(cli: str, private_key: str) -> str:
     try:
-        result = subprocess.run(
-            [cli, "pubkey"],
-            input=private_key,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
+        with RuntimeTrace.span("wg.pubkey"):
+            result = subprocess.run(
+                [cli, "pubkey"],
+                input=private_key,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
         return result.stdout.strip()
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
@@ -134,9 +136,11 @@ def _wg_pubkey(cli: str, private_key: str) -> str:
 
 def _wg_keypair(cli: str = "wg") -> tuple[str, str]:
     try:
-        priv = subprocess.run([cli, "genkey"], capture_output=True, text=True, timeout=5, check=True)
+        with RuntimeTrace.span("wg.genkey"):
+            priv = subprocess.run([cli, "genkey"], capture_output=True, text=True, timeout=5, check=True)
         private = priv.stdout.strip()
-        pub = subprocess.run([cli, "pubkey"], input=private, capture_output=True, text=True, timeout=5, check=True)
+        with RuntimeTrace.span("wg.pubkey"):
+            pub = subprocess.run([cli, "pubkey"], input=private, capture_output=True, text=True, timeout=5, check=True)
         public = pub.stdout.strip()
         if not private or not public:
             raise subprocess.CalledProcessError(1, cli)
@@ -1729,13 +1733,14 @@ class WireGuardDriver(CoreDriver):
         if not cli:
             return {}
         try:
-            result = subprocess.run(
-                [cli, "show", iface_name, "dump"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
+            with RuntimeTrace.span("wg.show"):
+                result = subprocess.run(
+                    [cli, "show", iface_name, "dump"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return {}
         if result.returncode != 0 or not result.stdout.strip():

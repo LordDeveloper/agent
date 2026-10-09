@@ -348,9 +348,32 @@ def ads_block_status(*, runner: Runner | None = None) -> dict[str, Any]:
     }
 
 
+def _ads_filter_already_active(*, runner: Runner | None = None) -> bool:
+    if not ADS_ENABLED_MARKER.is_file() or not ADGUARD_CONFIG.is_file():
+        return False
+    try:
+        text = ADGUARD_CONFIG.read_text(encoding='utf-8', errors='ignore')
+    except OSError:
+        return False
+    if 'filtering_enabled: true' not in text:
+        return False
+    return adguard_service_active(runner=runner)
+
+
 def ads_block_ensure(*, runner: Runner | None = None) -> dict[str, Any]:
     _require_linux()
     _require_root()
+
+    if _ads_filter_already_active(runner=runner):
+        status = ads_block_status(runner=runner)
+        status.update(
+            {
+                'ok': bool(status.get('ready') or status.get('adguard_active')),
+                'skipped': True,
+                'written': False,
+            }
+        )
+        return status
 
     from agent.adguard import install_adguard_binary
 

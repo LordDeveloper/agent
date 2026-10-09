@@ -81,3 +81,13 @@ def test_render_apply_script_supports_ppp_wildcard():
     )
     assert 'iifname "ppp*"' in script or '-i "ppp+"' in script
     assert '10.77.128.1:53' in script
+
+
+def test_render_apply_script_drops_ipv6_dns_on_named_iface():
+    script = dns_leak.render_apply_script(
+        [{'name': 'wg0', 'gateway': '10.80.0.1'}],
+        block_ipv6=False,
+    )
+    assert '10.80.0.1:53' in script
+    assert 'no-v6-dns' in script
+    assert 'no-v6-out' not in script
