@@ -685,6 +685,8 @@ class MullvadService:
                     "adopted": bool((bind or {}).get("adopted")),
                     "hostname": str((bind or {}).get("hostname") or "") or None,
                     "endpoint": str((bind or {}).get("endpoint") or "") or None,
+                    "fixed": bool((bind or {}).get("fixed") or (bind or {}).get("pinned")),
+                    "pinned": bool((bind or {}).get("fixed") or (bind or {}).get("pinned")),
                     "ping_ms": None,
                     "ping_ip": None,
                     "reachable": None,
@@ -1008,15 +1010,12 @@ class MullvadService:
                 "pinned": pin_fixed,
             },
         )
-        if pin_fixed:
-            self.save_settings(relay_mode=RELAY_MODE_FIXED)
         presented = self._present_binding(self.binding_for(code) or bind)
         return {
             **presented,
             "status": "changed" if previous.lower() != host.lower() else "ok",
             "previous_hostname": previous or None,
             "fixed": pin_fixed,
-            "relay_mode": self.relay_mode(),
             "message": (
                 f"pinned to {host}"
                 if pin_fixed and previous.lower() != host.lower()
@@ -1026,6 +1025,42 @@ class MullvadService:
                     else (f"already pinned on {host}" if pin_fixed else f"already on {host}")
                 )
             ),
+        }
+
+    def set_relay_fixed(self, country_code: str, fixed: bool) -> dict[str, Any]:
+        """Pin/unpin current relay for one country without changing the peer."""
+        code = str(country_code or "").strip().lower()
+        if not re.fullmatch(r"[a-z]{2}", code or ""):
+            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+
+        bind = self.binding_for(code)
+        if not bind:
+            raise AgentError("NOT_FOUND", f"No Mullvad binding for {code}; ensure the location first", 404)
+
+        hostname = str(bind.get("hostname") or "").strip()
+        if bool(fixed) and not hostname:
+            raise AgentError("VALIDATION_ERROR", f"No current relay to pin for {code}", 422)
+
+        iface = str(bind.get("iface") or "").strip()
+        pin_fixed = bool(fixed)
+        self._put_binding(
+            country_code=code,
+            iface=iface,
+            relay=None,
+            adopted=bool(bind.get("adopted")),
+            extra={
+                "hostname": hostname,
+                "fixed": pin_fixed,
+                "pinned": pin_fixed,
+                "last_error": "",
+            },
+        )
+        presented = self._present_binding(self.binding_for(code) or bind)
+        return {
+            **presented,
+            "status": "ok",
+            "fixed": pin_fixed,
+            "message": f"relay fixed on {hostname}" if pin_fixed else f"relay unfixed for {code}",
         }
 
     def status(self) -> dict[str, Any]:
@@ -1065,11 +1100,12 @@ class MullvadService:
         if not iface:
             return {**presented, "status": "failed", "message": "missing iface"}
 
-        if self.relay_mode() == RELAY_MODE_FIXED or bool(bind.get("fixed") or bind.get("pinned")):
+        # Per-country pin only — global relay_mode is metric selection (ping/speed), not lock-all.
+        if bool(bind.get("fixed") or bind.get("pinned")):
             return {
                 **presented,
                 "status": "ok",
-                "message": "fixed relay mode — automatic switch disabled",
+                "message": "fixed relay — automatic switch disabled for this node",
             }
 
         healthy = self._iface_up(iface) and self._iface_healthy(iface)

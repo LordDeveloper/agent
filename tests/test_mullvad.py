@@ -521,7 +521,7 @@ def test_switch_relay_rewrites_peer(tmp_path: Path, monkeypatch):
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
 
 
-def test_switch_relay_fixed_sets_mode_and_skips_fallback(tmp_path: Path, monkeypatch):
+def test_switch_relay_fixed_is_per_node_and_skips_fallback(tmp_path: Path, monkeypatch):
     svc = _service(
         tmp_path,
         probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
@@ -544,16 +544,23 @@ def test_switch_relay_fixed_sets_mode_and_skips_fallback(tmp_path: Path, monkeyp
     result = svc.switch_relay("de", "de-ber-wg-001", fixed=True)
     assert result["status"] == "changed"
     assert result["fixed"] is True
-    assert svc.relay_mode() == "fixed"
+    # Global metric mode stays auto — fixed is per binding.
+    assert svc.relay_mode() == "auto"
     listed = svc.country_relays("de", ping=False)
-    assert listed["relay_mode"] == "fixed"
     assert listed["current_fixed"] is True
     assert listed["current_hostname"] == "de-ber-wg-001"
+    assert svc.locations()["locations"]
+    de_row = next(row for row in svc.locations()["locations"] if row["country_code"] == "de")
+    assert de_row["fixed"] is True
 
     fallback = svc.fallback("de", optimize=True)
     assert fallback["changed"] == []
     assert fallback["skipped"]
     assert "fixed" in str(fallback["skipped"][0].get("message") or "").lower()
+
+    unfixed = svc.set_relay_fixed("de", False)
+    assert unfixed["fixed"] is False
+    assert svc.binding_for("de")["fixed"] is False
 
 
 def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):
