@@ -1,3 +1,4 @@
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -86,9 +87,13 @@ class AmneziaDriver(WireGuardDriver):
         obf = {**(iface.get("obfuscation") or {}), **(peer.get("obfuscation") or {})}
         extra = obfuscation_conf_lines(obf)
         base = bundle["config"]
-        needle = "DNS = 1.1.1.1\n"
-        if extra and needle in base:
-            bundle["config"] = base.replace(needle, needle + "\n".join(extra) + "\n", 1)
+        if extra and re.search(r"(?im)^DNS = .+$", base):
+            bundle["config"] = re.sub(
+                r"(?im)^DNS = .+$",
+                lambda match: match.group(0) + "\n" + "\n".join(extra),
+                base,
+                count=1,
+            )
         elif extra and "[Interface]" in base:
             head, tail = base.split("[Interface]", 1)
             iface_block, rest = tail.split("\n\n", 1) if "\n\n" in tail else (tail, "")

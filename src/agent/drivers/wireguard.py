@@ -1558,7 +1558,7 @@ class WireGuardDriver(CoreDriver):
             f"PrivateKey = {peer.get('private_key')}",
             f"Address = {peer.get('address')}/32",
             f"MTU = {self._client_mtu(peer)}",
-            "DNS = 1.1.1.1",
+            f"DNS = {self._client_dns(iface)}",
             "",
             "[Peer]",
             f"PublicKey = {iface.get('public_key')}",
@@ -1700,6 +1700,25 @@ class WireGuardDriver(CoreDriver):
 
             if changed:
                 self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+
+    def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
+        """AdGuard gateway when ads-block is on; otherwise a public resolver."""
+        try:
+            from agent.adguard import ADS_ENABLED_MARKER
+
+            if ADS_ENABLED_MARKER.is_file():
+                if iface:
+                    gateway = _interface_gateway_host(iface)
+                    if gateway:
+                        return gateway
+                from agent.dns_leak import preferred_client_dns
+
+                servers = [item for item in preferred_client_dns() if str(item).strip()]
+                if servers:
+                    return ", ".join(servers[:2])
+        except Exception:
+            pass
+        return "1.1.1.1"
 
     def _client_mtu(self, peer: dict[str, Any] | None = None) -> int:
         custom = (peer or {}).get("mtu")
