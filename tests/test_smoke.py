@@ -233,25 +233,25 @@ def test_disabled_core_routes_are_hidden(tmp_path, fake_xray):
     _clear_env()
 
 
-def test_stats_clients_traffic_delta_endpoint(client: TestClient):
+def test_stats_live_bundle(client: TestClient):
     headers = {"Authorization": "Bearer dev-token"}
-    r = client.get("/api/v1/stats/clients/traffic/delta", headers=headers)
+    r = client.get("/api/v1/stats/live", headers=headers)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["success"] is True
-    assert body["ack"] is False
-    assert "users" in body
-    assert "sampled_at" in body
-    assert "worker_lag_ms" in body
-
-
-def test_stats_clients_traffic_delta_passed_alias(client: TestClient):
-    headers = {"Authorization": "Bearer dev-token"}
-    r = client.get("/api/v1/stats/clients/traffic/delta?passed=true", headers=headers)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["success"] is True
-    assert body["ack"] is True
+    assert "cores" in body
+    assert isinstance(body["cores"], dict)
+    for key in ("xray", "wireguard"):
+        assert key in body["cores"]
+        core = body["cores"][key]
+        assert isinstance(core["online_users"], list)
+        assert isinstance(core["ips"], dict)
+        assert isinstance(core["traffic"], dict)
+        assert isinstance(core["snapshot"]["inbounds"], list)
+    assert isinstance(body["online"]["users"], dict)
+    assert isinstance(body["online_users"], list)
+    assert isinstance(body["snapshot"]["inbounds"], list)
+    assert isinstance(body["ips"], dict)
 
 
 def test_stats_clients_traffic_all_cores(client: TestClient):
@@ -263,6 +263,7 @@ def test_stats_clients_traffic_all_cores(client: TestClient):
     assert "online" in body
     assert "online_users" in body
     assert "snapshot" in body
+    assert "cores" in body
     assert isinstance(body["online"]["users"], dict)
     assert isinstance(body["online_users"], list)
     assert isinstance(body["snapshot"]["inbounds"], list)

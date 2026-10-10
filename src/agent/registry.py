@@ -12,7 +12,7 @@ from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError
 from agent.models import CoreInfo, UsageSnapshotModel
 from agent.routing import resolve_core_key
-from agent.support.online_traffic import collect_online_traffic
+from agent.support.online_traffic import collect_online_traffic, traffic_from_snapshot
 
 
 class CoreRegistry:
@@ -96,6 +96,70 @@ class CoreRegistry:
 
     def online_traffic(self, core: str | None = None) -> dict[str, dict[str, int]]:
         return collect_online_traffic(self, resolve_core_key(core) if core else None)
+
+    def live_stats(self) -> dict[str, Any]:
+        """One walk per enabled core: snapshot + online users + ips + traffic."""
+        enabled = set(self.settings.cores())
+        cores: dict[str, Any] = {}
+        flat_online_users: list[str] = []
+        flat_online_traffic: dict[str, dict[str, int]] = {}
+        flat_inbounds: list = []
+        flat_ips: dict[str, Any] = {}
+
+        for key, driver in self._drivers.items():
+            if enabled and key not in enabled:
+                cores[key] = self._empty_live_core()
+                continue
+
+            try:
+                snapshot = driver.usage_snapshot()
+            except AgentError:
+                cores[key] = self._empty_live_core()
+                continue
+
+            try:
+                online = list(driver.online_users())
+            except AgentError:
+                online = []
+
+            try:
+                ips = driver.online_ips_map()
+            except AgentError:
+                ips = {}
+
+            if not isinstance(ips, dict):
+                ips = {}
+
+            snapshot_dump = snapshot.model_dump()
+            traffic = traffic_from_snapshot(snapshot, online)
+            cores[key] = {
+                "online_users": online,
+                "ips": ips,
+                "traffic": traffic,
+                "snapshot": snapshot_dump,
+            }
+            flat_online_users.extend(online)
+            for email, row in traffic.items():
+                flat_online_traffic[str(email)] = row
+            flat_inbounds.extend(snapshot_dump.get("inbounds") or [])
+            for email, row in ips.items():
+                flat_ips[str(email)] = row
+
+        return {
+            "cores": cores,
+            "online_users": sorted(set(flat_online_users)),
+            "online": {"users": flat_online_traffic},
+            "snapshot": {"inbounds": flat_inbounds},
+            "ips": flat_ips,
+        }
+
+    def _empty_live_core(self) -> dict[str, Any]:
+        return {
+            "online_users": [],
+            "ips": {},
+            "traffic": {},
+            "snapshot": {"inbounds": []},
+        }
 
     def _info(self, driver: CoreDriver) -> CoreInfo:
         return CoreInfo(

@@ -70,6 +70,28 @@ def stats_snapshot(
     return {"success": True, **snapshot.model_dump()}
 
 
+def _live_payload(registry: CoreRegistry) -> dict[str, Any]:
+    return {"success": True, **registry.live_stats()}
+
+
+@router.get("/stats/live")
+def stats_live(registry: CoreRegistry = Depends(get_registry)):
+    """Snapshot + online users + IPs + traffic for every enabled core, one HTTP call."""
+    try:
+        return _live_payload(registry)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+
+
+@router.get("/stats/clients/traffic")
+def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
+    """Legacy alias of /stats/live (panel collectAllClientTraffic)."""
+    try:
+        return _live_payload(registry)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+
+
 @router.get("/stats/clients/traffic/pending")
 def stats_clients_traffic_pending(
     request: Request,
