@@ -1535,12 +1535,10 @@ class XrayDriver(CoreDriver):
         try:
             body = self._api().online_all()
         except AgentError as exc:
-            if exc.status in (404, 405, 501):
-                raise AgentError(
-                    "UNSUPPORTED_CAPABILITY",
-                    "Xray online/all is not available",
-                    404,
-                ) from exc
+            if exc.status in (404, 405, 501, 422):
+                # Older Xray builds lack online/all — assemble from iplist locally
+                # so panel still gets one bulk /stats/online/ips (or /stats/live) call.
+                return self._online_ips_map_from_iplist()
             raise
 
         users = body.get("users") or []
@@ -1558,6 +1556,29 @@ class XrayDriver(CoreDriver):
             if email == "":
                 continue
             ips = row["ips"] if "ips" in row else row
+            out[email] = ips
+            cid = alias.get(email)
+            if cid and cid != email:
+                out[cid] = ips
+        return out
+
+    def _online_ips_map_from_iplist(self) -> dict[str, Any]:
+        """Fallback when GET /api/stats/online/all is missing (localhost iplist loop)."""
+        try:
+            raw_users = self._api().online_users()
+        except AgentError:
+            return {}
+
+        alias = self._client_email_aliases()
+        out: dict[str, Any] = {}
+        for item in raw_users or []:
+            email = str(item).strip()
+            if email == "":
+                continue
+            try:
+                ips = self._api().online_ips(email)
+            except AgentError:
+                ips = []
             out[email] = ips
             cid = alias.get(email)
             if cid and cid != email:
