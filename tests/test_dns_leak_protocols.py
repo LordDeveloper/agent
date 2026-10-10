@@ -10,9 +10,14 @@ def test_is_vpn_interface_accepts_openvpn_and_l2tp_ppp(tmp_path, monkeypatch):
         '[Interface]\nPrivateKey=abc\nAddress=10.64.0.1/32\nTable=off\n',
         encoding='utf-8',
     )
-    monkeypatch.setattr(dns_leak, '_wg_conf_path', lambda name: conf_dir / f'{name}.conf')
+    monkeypatch.setattr(dns_leak, '_wg_conf_dirs', lambda: [conf_dir])
+    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda: set())
     monkeypatch.setattr(dns_leak, 'XL2TPD_CONF', tmp_path / 'xl2tpd.conf')
     (tmp_path / 'xl2tpd.conf').write_text('[lns default]\nlocal ip = 10.90.128.1\n', encoding='utf-8')
+    (conf_dir / 'wg0.conf').write_text(
+        '[Interface]\nPrivateKey=abc\nAddress=10.8.0.1/24\nListenPort=51820\n',
+        encoding='utf-8',
+    )
 
     assert dns_leak._is_vpn_interface({'name': 'poland', 'link_type': 'wireguard'}) is False
     assert dns_leak._is_vpn_interface({'name': 'wg0', 'link_type': 'wireguard'}) is True

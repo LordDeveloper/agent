@@ -83,24 +83,114 @@ def _interface_ipv4(addresses: list[str]) -> str | None:
     return None
 
 
+def _wg_conf_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for raw in (
+        os.environ.get('WIREGUARD_CONFIG_DIR'),
+        os.environ.get('AMNEZIA_CONFIG_DIR'),
+        '/etc/wireguard',
+        '/etc/amneziawg',
+    ):
+        text = str(raw or '').strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
 def _wg_conf_path(name: str) -> Path:
+    """Backward-compatible helper — first existing conf, else default path."""
+    for directory in _wg_conf_dirs():
+        path = directory / f'{name}.conf'
+        if path.is_file():
+            return path
     return Path('/etc/wireguard') / f'{name}.conf'
 
 
+def _read_wg_conf(name: str) -> str | None:
+    for directory in _wg_conf_dirs():
+        path = directory / f'{name}.conf'
+        if not path.is_file():
+            continue
+        try:
+            return path.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            continue
+    return None
+
+
+def _mullvad_bound_ifaces() -> set[str]:
+    """Iface names bound as Mullvad region exits in the Agent store."""
+    try:
+        from agent.config import AgentSettings
+        from agent.db import Store
+    except Exception:
+        return set()
+
+    names: set[str] = set()
+    store: Store | None = None
+    try:
+        settings = AgentSettings()
+        db_path = settings.resolve_db_path()
+        if not db_path.is_file():
+            return set()
+        store = Store(db_path)
+        for row in store.list_docs('mullvad', 'location'):
+            if not isinstance(row, dict):
+                continue
+            iface = str(row.get('iface') or '').strip()
+            if iface:
+                names.add(iface.lower())
+    except Exception:
+        return set()
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+    return names
+
+
 def _is_mullvad_exit_interface(name: str) -> bool:
-    """Mullvad region exits use Table=off; they must not get client DNS DNAT/AdGuard.
+    """Mullvad / region exits must never get client DNS DNAT/AdGuard.
 
     Ads-block previously applied resolvectl dns off + DNAT on these exits, which
-    made host health probes (`curl --interface <exit>`) hang on DNS and flap nodes.
+    made host health probes (`curl --interface <exit>`) hang and flap nodes.
+    Detection is layered: store bindings, Table=off, or exit-style conf (no ListenPort).
     """
-    path = _wg_conf_path(name)
-    if not path.is_file():
+    lowered = str(name or '').strip().lower()
+    if not lowered:
         return False
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except OSError:
+    if lowered in _mullvad_bound_ifaces():
+        return True
+
+    text = _read_wg_conf(name)
+    if not text:
         return False
-    return bool(re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text))
+    if re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text):
+        return True
+    # Mullvad exits (and other egress tunnels) have a Peer Endpoint but no ListenPort.
+    # Client-facing VPN servers always listen — only those should get AdGuard/DNAT.
+    has_listen = bool(re.search(r'(?im)^\s*ListenPort\s*=', text))
+    has_endpoint = bool(re.search(r'(?im)^\s*Endpoint\s*=', text))
+    return has_endpoint and not has_listen
+
+
+def _is_client_wireguard_server(name: str) -> bool:
+    """True only for WireGuard/Amnezia interfaces that accept VPN clients."""
+    if _is_mullvad_exit_interface(name):
+        return False
+    text = _read_wg_conf(name)
+    if text is None:
+        # No conf on disk — trust classic server names only (wg0/awg0), never pl/sw/de.
+        lowered = name.lower()
+        return lowered.startswith('wg') or lowered.startswith('awg')
+    if re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text):
+        return False
+    return bool(re.search(r'(?im)^\s*ListenPort\s*=', text))
 
 
 def _is_wildcard_iface(name: str) -> bool:
@@ -133,11 +223,9 @@ def _is_vpn_interface(row: dict[str, Any]) -> bool:
     if not name or name == DNS_DUMMY_IFACE or _is_mullvad_exit_interface(name):
         return False
     link_type = str(row.get('link_type') or '').strip().lower()
-    if link_type == 'wireguard':
-        return True
     lowered = name.lower()
-    if lowered.startswith('wg') or lowered.startswith('awg'):
-        return True
+    if link_type == 'wireguard' or lowered.startswith('wg') or lowered.startswith('awg'):
+        return _is_client_wireguard_server(name)
     if _OPENVPN_NAME_RE.match(lowered) or (link_type in {'tun', 'tun6'} and lowered.startswith('ovpn')):
         return True
     if _PPP_NAME_RE.match(lowered):

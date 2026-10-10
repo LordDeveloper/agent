@@ -38,14 +38,24 @@ def test_is_mullvad_exit_skips_table_off(tmp_path, monkeypatch):
         '[Interface]\nPrivateKey=abc\nAddress=10.64.0.2/32\nTable = off\n',
         encoding='utf-8',
     )
+    (conf_dir / 'pl.conf').write_text(
+        '[Interface]\nPrivateKey=abc\nAddress=10.64.0.2/32\n\n'
+        '[Peer]\nPublicKey=xyz\nEndpoint=1.2.3.4:51820\nAllowedIPs=0.0.0.0/0\n',
+        encoding='utf-8',
+    )
     (conf_dir / 'wg0.conf').write_text(
         '[Interface]\nPrivateKey=abc\nAddress=10.8.0.1/24\nListenPort=51820\n',
         encoding='utf-8',
     )
-    monkeypatch.setattr(dns_leak, '_wg_conf_path', lambda name: conf_dir / f'{name}.conf')
+    monkeypatch.setattr(dns_leak, '_wg_conf_dirs', lambda: [conf_dir])
+    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda: {'sw'})
 
     assert dns_leak._is_mullvad_exit_interface('poland') is True
+    assert dns_leak._is_mullvad_exit_interface('pl') is True  # exit-style: Endpoint, no ListenPort
+    assert dns_leak._is_mullvad_exit_interface('sw') is True  # store binding
     assert dns_leak._is_vpn_interface({'name': 'poland', 'link_type': 'wireguard'}) is False
+    assert dns_leak._is_vpn_interface({'name': 'pl', 'link_type': 'wireguard'}) is False
+    assert dns_leak._is_vpn_interface({'name': 'sw', 'link_type': 'wireguard'}) is False
     assert dns_leak._is_vpn_interface({'name': 'wg0', 'link_type': 'wireguard'}) is True
 
 

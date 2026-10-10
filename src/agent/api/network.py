@@ -77,6 +77,10 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
     for row in result.get("nodes") or []:
         if not isinstance(row, dict) or row.get("ok"):
             continue
+        message = str(row.get("message") or "").lower()
+        # Timeouts are often ads-block/DNS side-effects — do not thrash Mullvad relays.
+        if "timeout" in message:
+            continue
         raw = by_id.get(str(row.get("id")))
         iface = ""
         if isinstance(raw, dict):

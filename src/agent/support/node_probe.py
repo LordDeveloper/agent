@@ -15,16 +15,16 @@ from agent.support.process import run
 
 Runner = Callable[..., Any]
 
-# Prefer literal-IP targets first: after ads-block / AdGuard, host DNS on exit
-# ifaces can hang and curl --max-time may not abort getaddrinfo promptly.
+# IP-literal targets ONLY. Hostname probes + ads-block/resolvectl on exit ifaces
+# can hang getaddrinfo longer than the panel HTTP timeout, which surfaces as
+# "اتصال شبکه به Agent برقرار نشد" for that region node.
 PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = (
     ('http://1.1.1.1/cdn-cgi/trace', frozenset({200})),
     ('http://1.0.0.1/cdn-cgi/trace', frozenset({200})),
-    ('http://cp.cloudflare.com/cdn-cgi/trace', frozenset({200})),
-    ('http://connectivitycheck.gstatic.com/generate_204', frozenset({204})),
+    ('http://8.8.8.8/', frozenset({200, 301, 302, 404})),
 )
-PROBE_TIMEOUT = 5
-CONNECT_TIMEOUT = 3
+PROBE_TIMEOUT = 4
+CONNECT_TIMEOUT = 2
 BIND_ERROR_CODES = frozenset({45, 55})
 
 # Small Cloudflare download used to rank Mullvad relays by real egress throughput.
