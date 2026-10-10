@@ -311,6 +311,20 @@ def render_client_ovpn(
     ]
     if tls_crypt.strip():
         blocks.extend(['<tls-crypt>', tls_crypt.strip(), '</tls-crypt>'])
+    # When ads-block / DNS leak is active, embed AdGuard gateway DNS in the
+    # client profile (server push alone is easy to miss after an early ensure).
+    try:
+        from agent.adguard import ADS_ENABLED_MARKER
+        from agent.dns_leak import preferred_client_dns
+
+        if ADS_ENABLED_MARKER.is_file():
+            for dns in preferred_client_dns()[:1]:
+                dns = str(dns).strip()
+                if dns:
+                    blocks.append(f'dhcp-option DNS {dns}')
+                    break
+    except Exception:
+        pass
     # Bare auth-user-pass keeps username/password editable in OpenVPN Connect.
     # Credentials stay in comments + Telegram caption — never lock them into the profile.
     blocks.append('auth-user-pass')

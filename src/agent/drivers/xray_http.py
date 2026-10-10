@@ -697,10 +697,25 @@ class XrayHttpClient:
 
     def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
         """Atomically replace routing.rules. Omit balancers to keep existing ones."""
-        body: dict[str, Any] = {"rules": rules}
-        body.update({k: v for k, v in routing_extras.items() if v is not None})
-        # Never wipe balancers accidentally — only send when caller provides them.
-        return self.post("/api/rules/replace", body)
+        allowed = {"domainStrategy", "domainMatcher", "balancers"}
+        extras = {
+            key: value
+            for key, value in routing_extras.items()
+            if value is not None and key in allowed
+        }
+        routing: dict[str, Any] = dict(extras)
+        routing["rules"] = list(rules)
+        # Prefer wrapped form (same as /api/rules/add). Flat body is accepted by
+        # newer builds; older ones sometimes return invalid_json on flat payloads.
+        try:
+            return self.post("/api/rules/replace", {"routing": routing})
+        except AgentError as exc:
+            message = (exc.message or "").lower()
+            if exc.status != 400 and "invalid_json" not in message and "incomplete json" not in message:
+                raise
+            flat: dict[str, Any] = {"rules": list(rules)}
+            flat.update(extras)
+            return self.post("/api/rules/replace", flat)
 
     def block_source_ips(
         self,

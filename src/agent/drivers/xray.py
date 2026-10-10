@@ -1395,13 +1395,25 @@ class XrayDriver(CoreDriver):
         try:
             result = self._api().replace_rules(list(rules), **extras)
         except AgentError as exc:
-            # Older Xray builds lack /api/rules/replace — fall back to config section write.
-            if exc.status not in {404, 405, 501}:
-                # Also treat "unknown path" style validation as missing endpoint.
-                message = (exc.message or "").lower()
-                if "not found" not in message and "unknown" not in message and exc.status != 422:
-                    raise
-            routing = dict(extras)
+            # Older/buggy Xray builds: missing replace route, or replace returns
+            # invalid_json / empty body — fall back to config section write.
+            message = (exc.message or "").lower()
+            missing = exc.status in {404, 405, 501} or "not found" in message or "unknown" in message
+            broken_body = (
+                exc.status in {400, 422}
+                and (
+                    "invalid_json" in message
+                    or "incomplete json" in message
+                    or "empty or incomplete" in message
+                )
+            )
+            if not missing and not broken_body:
+                raise
+            routing = {
+                key: value
+                for key, value in extras.items()
+                if key in {"domainStrategy", "domainMatcher", "balancers"} and value is not None
+            }
             routing["rules"] = list(rules)
             result = self.replace_section("routing", routing)
         elapsed_ms = int((time.perf_counter() - started) * 1000)

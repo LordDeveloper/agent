@@ -365,12 +365,37 @@ def ads_block_ensure(*, runner: Runner | None = None) -> dict[str, Any]:
     _require_root()
 
     if _ads_filter_already_active(runner=runner):
+        # Still refresh VPN DNS bind/DNAT + OpenVPN/L2TP client DNS push.
+        # Otherwise a later OpenVPN server can keep pushing 1.1.1.1 forever
+        # while AdGuard was enabled earlier for WireGuard.
+        push: dict[str, Any] | None = None
+        resolver: dict[str, Any] | None = None
+        try:
+            vpn_ifaces = discover_vpn_interfaces(runner=runner)
+            if vpn_ifaces:
+                resolver = ensure_vpn_dns_resolver(
+                    interfaces=vpn_ifaces,
+                    block_ipv6=False,
+                    filtering_enabled=True,
+                    user_rules=_load_user_rules(),
+                    runner=runner,
+                )
+                push = resolver.get('client_dns_push') if isinstance(resolver, dict) else None
+            else:
+                from agent.dns_leak import preferred_client_dns, sync_client_dns_push
+
+                push = sync_client_dns_push(preferred_client_dns(runner=runner), runner=runner)
+        except Exception as exc:
+            log.warning('ads_block ensure: refresh client DNS push failed: %s', exc)
+
         status = ads_block_status(runner=runner)
         status.update(
             {
                 'ok': bool(status.get('ready') or status.get('adguard_active')),
                 'skipped': True,
                 'written': False,
+                'client_dns_push': push,
+                'resolver': resolver,
             }
         )
         return status
