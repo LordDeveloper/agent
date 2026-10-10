@@ -311,11 +311,9 @@ def render_client_ovpn(
     ]
     if tls_crypt.strip():
         blocks.extend(['<tls-crypt>', tls_crypt.strip(), '</tls-crypt>'])
-    if username:
-        # Inline credentials so OpenVPN Connect can import without a separate auth file.
-        blocks.extend(['<auth-user-pass>', username, password, '</auth-user-pass>'])
-    else:
-        blocks.append('auth-user-pass')
+    # Bare auth-user-pass keeps username/password editable in OpenVPN Connect.
+    # Credentials stay in comments + Telegram caption — never lock them into the profile.
+    blocks.append('auth-user-pass')
     blocks.extend(
         [
             f'# username: {username}',

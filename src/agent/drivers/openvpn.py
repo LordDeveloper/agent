@@ -447,6 +447,8 @@ class OpenVpnDriver(CoreDriver):
             'username': str(user.get('username') or ''),
             'password': str(user.get('password') or ''),
             'assigned_ip': str(user.get('address') or ''),
+            'ca_crt': pki.get('ca_crt') or '',
+            'tls_crypt': pki.get('tls_crypt') or '',
             'ovpn': ovpn,
             'text': ovpn,
         }
