@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import ipaddress
 import shutil
+import socket
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
+from urllib.parse import urlparse
 
 from agent.errors import AgentError
 from agent.support.host_interfaces import list_host_interfaces
@@ -33,9 +37,108 @@ SPEED_TEST_URL = 'https://speed.cloudflare.com/__down?bytes=2000000'
 SPEED_CONNECT_TIMEOUT = 4
 SPEED_MAX_TIME = 12
 
+# Mullvad exits use Table=off: peer traffic works via policy routing, but host
+# curl --interface needs a temporary /32 via that device. Serialize installs so
+# parallel admin probes do not thrash the same destinations across ifaces.
+_probe_route_lock = threading.Lock()
+
 
 def _runner(runner: Runner | None) -> Runner:
     return runner or run
+
+
+def _url_host(url: str) -> str | None:
+    try:
+        host = urlparse(str(url or '')).hostname
+    except ValueError:
+        return None
+    text = str(host or '').strip()
+    return text or None
+
+
+def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for host in hosts:
+        text = str(host or '').strip()
+        if not text:
+            continue
+        try:
+            ip = str(ipaddress.ip_address(text))
+            if ':' in ip:
+                continue
+            if ip not in seen:
+                seen.add(ip)
+                resolved.append(ip)
+            continue
+        except ValueError:
+            pass
+        try:
+            infos = socket.getaddrinfo(text, None, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            continue
+        for info in infos:
+            addr = str(info[4][0] if info and info[4] else '').strip()
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            resolved.append(addr)
+    return resolved
+
+
+def _ip_route_replace_dev(dest: str, iface: str, *, runner: Runner) -> bool:
+    result = runner(
+        ['ip', 'route', 'replace', f'{dest}/32', 'dev', iface],
+        check=False,
+        timeout=5,
+    )
+    code = getattr(result, 'returncode', 1)
+    return int(0 if code is None else code) == 0
+
+
+def _ip_route_del_dev(dest: str, iface: str, *, runner: Runner) -> None:
+    runner(
+        ['ip', 'route', 'del', f'{dest}/32', 'dev', iface],
+        check=False,
+        timeout=5,
+    )
+
+
+@contextmanager
+def _host_routes_for_iface(
+    iface: str | None,
+    destinations: list[str],
+    *,
+    runner: Runner | None = None,
+) -> Iterator[None]:
+    """Install temporary /32 routes so curl --interface works with Table=off WG."""
+    bind = str(iface or '').strip()
+    execute = _runner(runner)
+    if not bind or _looks_like_ip(bind) or not shutil.which('ip'):
+        yield
+        return
+
+    hosts = _resolve_ipv4_hosts(destinations)
+    if not hosts:
+        yield
+        return
+
+    with _probe_route_lock:
+        installed: list[str] = []
+        for dest in hosts:
+            try:
+                if _ip_route_replace_dev(dest, bind, runner=execute):
+                    installed.append(dest)
+            except Exception:
+                continue
+        try:
+            yield
+        finally:
+            for dest in installed:
+                try:
+                    _ip_route_del_dev(dest, bind, runner=execute)
+                except Exception:
+                    pass
 
 
 def _interface_row(name: str, *, runner: Runner | None = None) -> dict[str, Any] | None:
@@ -148,49 +251,51 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
     bind = _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
     per_try_timeout = PROBE_TIMEOUT + CONNECT_TIMEOUT + 2
+    destinations = [host for url, _codes in PROBE_TARGETS if (host := _url_host(url))]
 
-    for url, ok_codes in PROBE_TARGETS:
-        cmd = [
-            'curl',
-            '-4',
-            '--connect-timeout',
-            str(CONNECT_TIMEOUT),
-            '--max-time',
-            str(PROBE_TIMEOUT),
-            '-sS',
-            '-o',
-            '/dev/null',
-            '-w',
-            '%{http_code} %{time_total}',
-            url,
-        ]
-        if bind:
-            cmd[1:1] = ['--interface', bind]
+    with _host_routes_for_iface(bind, destinations, runner=execute):
+        for url, ok_codes in PROBE_TARGETS:
+            cmd = [
+                'curl',
+                '-4',
+                '--connect-timeout',
+                str(CONNECT_TIMEOUT),
+                '--max-time',
+                str(PROBE_TIMEOUT),
+                '-sS',
+                '-o',
+                '/dev/null',
+                '-w',
+                '%{http_code} %{time_total}',
+                url,
+            ]
+            if bind:
+                cmd[1:1] = ['--interface', bind]
 
-        try:
-            result = execute(cmd, check=False, timeout=per_try_timeout)
-        except subprocess.TimeoutExpired:
-            errors.append(f'timeout after {per_try_timeout}s ({url})')
-            continue
-        except OSError as exc:
-            errors.append(str(exc) or 'curl OSError')
-            continue
+            try:
+                result = execute(cmd, check=False, timeout=per_try_timeout)
+            except subprocess.TimeoutExpired:
+                errors.append(f'timeout after {per_try_timeout}s ({url})')
+                continue
+            except OSError as exc:
+                errors.append(str(exc) or 'curl OSError')
+                continue
 
-        raw_code = getattr(result, 'returncode', 1)
-        code = int(raw_code if raw_code is not None else 1)
-        body = (getattr(result, 'stdout', '') or '').strip()
-        stderr = (getattr(result, 'stderr', '') or '').strip()
+            raw_code = getattr(result, 'returncode', 1)
+            code = int(raw_code if raw_code is not None else 1)
+            body = (getattr(result, 'stdout', '') or '').strip()
+            stderr = (getattr(result, 'stderr', '') or '').strip()
 
-        if code == 0:
-            http_code, latency_ms = _parse_curl_write_out(body)
-            if http_code in ok_codes:
-                return True, 'اتصال برقرار شد', latency_ms
-            errors.append(f'HTTP {http_code or "?"}')
-            continue
+            if code == 0:
+                http_code, latency_ms = _parse_curl_write_out(body)
+                if http_code in ok_codes:
+                    return True, 'اتصال برقرار شد', latency_ms
+                errors.append(f'HTTP {http_code or "?"}')
+                continue
 
-        errors.append(stderr or f'curl exit {code}')
-        if code in BIND_ERROR_CODES or 'bind' in stderr.lower() or 'interface' in stderr.lower():
-            break
+            errors.append(stderr or f'curl exit {code}')
+            if code in BIND_ERROR_CODES or 'bind' in stderr.lower() or 'interface' in stderr.lower():
+                break
 
     detail = errors[-1] if errors else 'اتصال برقرار نشد'
     return False, detail, None
@@ -233,6 +338,8 @@ def curl_speed_mbps(
     if not bind:
         return False, 'نام اینترفیس مشخص نیست', None
 
+    host = _url_host(url)
+    destinations = [host] if host else []
     cmd = [
         'curl',
         '-4',
@@ -249,12 +356,13 @@ def curl_speed_mbps(
         '%{http_code} %{speed_download}',
         url,
     ]
-    try:
-        result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
-    except subprocess.TimeoutExpired:
-        return False, f'timeout after {SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2}s', None
-    except OSError as exc:
-        return False, str(exc) or 'curl OSError', None
+    with _host_routes_for_iface(bind, destinations, runner=execute):
+        try:
+            result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
+        except subprocess.TimeoutExpired:
+            return False, f'timeout after {SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2}s', None
+        except OSError as exc:
+            return False, str(exc) or 'curl OSError', None
 
     raw_code = getattr(result, 'returncode', 1)
     code = int(raw_code if raw_code is not None else 1)
@@ -273,8 +381,6 @@ def curl_speed_mbps(
 
 
 def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str, int | None]:
-    import socket
-
     host = str(host or '').strip()
     if not host or port <= 0:
         return False, 'آدرس/پورت نامعتبر', None

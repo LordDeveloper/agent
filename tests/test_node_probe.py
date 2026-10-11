@@ -11,22 +11,43 @@ def test_probe_targets_prefer_literal_ip():
     assert PROBE_TARGETS[1][0].startswith('http://1.0.0.1')
 
 
-def test_curl_probe_continues_after_timeout():
-    calls: list[str] = []
+def test_curl_probe_continues_after_timeout(monkeypatch):
+    calls: list[list[str]] = []
 
     def runner(args, **_kwargs):
-        url = args[-1]
-        calls.append(url)
+        row = list(args)
+        calls.append(row)
+        if row and row[0] == 'ip':
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        url = row[-1] if row else ''
         if '1.1.1.1' in url:
             raise subprocess.TimeoutExpired(cmd=args, timeout=10)
         return SimpleNamespace(returncode=0, stdout='200 0.042', stderr='')
 
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.1.1.1', '1.0.0.1', '8.8.8.8'])
     ok, message, latency = _curl_probe(interface='poland', runner=runner)
     assert ok is True
     assert message == 'اتصال برقرار شد'
     assert latency == 42
-    assert any('1.1.1.1' in item for item in calls)
-    assert any('1.0.0.1' in item for item in calls)
+    curl_urls = [row[-1] for row in calls if row and row[0] == 'curl']
+    assert any('1.1.1.1' in item for item in curl_urls)
+    assert any('1.0.0.1' in item for item in curl_urls)
+    assert any(row[:3] == ['ip', 'route', 'replace'] and 'poland' in row for row in calls)
+    assert any(row[:3] == ['ip', 'route', 'del'] and 'poland' in row for row in calls)
+
+
+def test_host_routes_skipped_for_ip_bind(monkeypatch):
+    calls: list[list[str]] = []
+
+    def runner(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout='200 0.01', stderr='')
+
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    ok, _message, _latency = _curl_probe(interface='10.64.0.2', runner=runner)
+    assert ok is True
+    assert not any(row and row[0] == 'ip' for row in calls)
 
 
 def test_is_mullvad_exit_skips_table_off(tmp_path, monkeypatch):
@@ -213,7 +234,7 @@ def test_probe_prefers_exit_interface_over_shared_mullvad_ip(_interfaces, _which
 
 
 @patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
-def test_curl_speed_mbps_binds_interface_name(_which):
+def test_curl_speed_mbps_binds_interface_name(_which, monkeypatch):
     seen = []
 
     def fake_runner(cmd, **_kwargs):
@@ -226,11 +247,15 @@ def test_curl_speed_mbps_binds_interface_name(_which):
 
         return Result()
 
+    monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.2.3.4'])
     ok, message, mbps = node_probe.curl_speed_mbps(interface='us', runner=fake_runner)
     assert ok is True
     assert mbps == 10.0
     assert '10.0' in message or 'Mbps' in message
-    assert '--interface' in seen[0]
-    assert seen[0][seen[0].index('--interface') + 1] == 'us'
+    curl_cmds = [row for row in seen if row and row[0] == 'curl']
+    assert curl_cmds
+    assert '--interface' in curl_cmds[0]
+    assert curl_cmds[0][curl_cmds[0].index('--interface') + 1] == 'us'
     # Must not rewrite iface name to a shared tunnel IP.
-    assert '10.' not in seen[0][seen[0].index('--interface') + 1]
+    assert '10.' not in curl_cmds[0][curl_cmds[0].index('--interface') + 1]
+    assert any(row[:3] == ['ip', 'route', 'replace'] and 'us' in row for row in seen)
