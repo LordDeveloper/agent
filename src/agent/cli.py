@@ -451,6 +451,128 @@ def cmd_client_diagnose(args: argparse.Namespace) -> int:
         runtime.close()
 
 
+def _mullvad_service(args: argparse.Namespace):
+    from agent.support.mullvad import MullvadService
+
+    runtime = open_runtime(getattr(args, "env_file", None))
+    service = MullvadService(runtime.store, config_dir=runtime.settings.wireguard_config_dir)
+    return runtime, service
+
+
+def cmd_mullvad_status(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        _print_json({"success": True, **service.status(probe=bool(getattr(args, "probe", False)))})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_settings_get(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        settings = service.settings()
+        public = {k: v for k, v in settings.items() if k != "private_key"}
+        _print_json({"success": True, "settings": public})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_settings_set(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        kwargs: dict = {}
+        if getattr(args, "private_key", None) is not None:
+            kwargs["private_key"] = str(args.private_key)
+        if getattr(args, "address", None) is not None:
+            kwargs["address"] = str(args.address)
+        if getattr(args, "relay_metric", None) is not None:
+            kwargs["relay_metric"] = str(args.relay_metric)
+        if getattr(args, "auto_fallback", None) is not None:
+            kwargs["auto_fallback"] = bool(args.auto_fallback)
+        if not kwargs:
+            raise AgentError("VALIDATION_ERROR", "Provide --private-key, --address, --metric, and/or --auto-fallback")
+        saved = service.save_settings(**kwargs)
+        public = {k: v for k, v in saved.items() if k != "private_key"}
+        _print_json({"success": True, "settings": public})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_auto_fallback(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        action = str(getattr(args, "auto_fallback_command", "") or "").strip().lower()
+        if action in {"status", "show", ""}:
+            settings = service.settings()
+            _print_json({
+                "success": True,
+                "auto_fallback": bool(settings.get("auto_fallback", True)),
+                "settings": {k: v for k, v in settings.items() if k != "private_key"},
+            })
+            return 0
+        enabled = action in {"on", "enable", "enabled", "true", "1"}
+        if action not in {"on", "off", "enable", "disable", "enabled", "disabled", "true", "false", "1", "0"}:
+            raise AgentError("VALIDATION_ERROR", "Use: agent mullvad auto-fallback on|off|status")
+        if action in {"off", "disable", "disabled", "false", "0"}:
+            enabled = False
+        saved = service.save_settings(auto_fallback=enabled)
+        _print_json({
+            "success": True,
+            "auto_fallback": bool(saved.get("auto_fallback")),
+            "message": "auto fallback enabled" if enabled else "auto fallback disabled",
+        })
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_service(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        action = str(getattr(args, "service_action", "") or "").strip().lower()
+        iface = str(getattr(args, "iface", "") or "").strip()
+        if iface:
+            payload = service.control_tunnel(iface, action)
+        else:
+            payload = service.control_tunnels(action)
+        _print_json({"success": True, **payload})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_fallback(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        country = str(getattr(args, "country", "") or "").strip() or None
+        payload = service.fallback(country, optimize=bool(getattr(args, "optimize", False)))
+        _print_json({"success": True, **payload})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_restore(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        _print_json({"success": True, **service.restore_interfaces()})
+    finally:
+        runtime.close()
+    return 0
+
+
+def cmd_mullvad_ensure(args: argparse.Namespace) -> int:
+    runtime, service = _mullvad_service(args)
+    try:
+        _print_json({"success": True, **service.ensure(str(args.country))})
+    finally:
+        runtime.close()
+    return 0
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     # Prefer tokens already in the process env; otherwise load /etc/agent/.env.
     from dotenv import load_dotenv
@@ -711,6 +833,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="Domain to resolve (default: doubleclick.net)",
     )
     p_ads_test.set_defaults(func=cmd_ads_block_test)
+
+    p_mullvad = sub.add_parser("mullvad", help="Mullvad exit tunnels (account, status, service, fallback)")
+    mullvad_sub = p_mullvad.add_subparsers(dest="mullvad_command", required=True)
+
+    p_mv_status = mullvad_sub.add_parser("status", help="Show Mullvad account + tunnel/service status")
+    _env_flag(p_mv_status)
+    p_mv_status.add_argument("--probe", action="store_true", help="Also run curl egress probes (slower)")
+    p_mv_status.set_defaults(func=cmd_mullvad_status)
+
+    p_mv_settings = mullvad_sub.add_parser("settings", help="Show or update Mullvad account settings")
+    mv_settings_sub = p_mv_settings.add_subparsers(dest="mullvad_settings_command", required=True)
+    p_mv_settings_get = mv_settings_sub.add_parser("get", help="Show current settings (key masked)")
+    _env_flag(p_mv_settings_get)
+    p_mv_settings_get.set_defaults(func=cmd_mullvad_settings_get)
+    p_mv_settings_set = mv_settings_sub.add_parser("set", help="Set private key / address / metric / auto-fallback")
+    _env_flag(p_mv_settings_set)
+    p_mv_settings_set.add_argument("--private-key", dest="private_key", default=None, help="WireGuard private key")
+    p_mv_settings_set.add_argument(
+        "--address",
+        default=None,
+        help="Tunnel Address (e.g. 10.69.169.66/32,fc00:bbbb:bbbb:bb01::6:a941/128)",
+    )
+    p_mv_settings_set.add_argument("--metric", dest="relay_metric", choices=["ping", "speed"], default=None)
+    p_mv_settings_set.add_argument(
+        "--auto-fallback",
+        dest="auto_fallback",
+        choices=["on", "off"],
+        default=None,
+        help="Enable/disable automatic relay fallback worker",
+    )
+    def _mv_settings_set(args: argparse.Namespace) -> int:
+        if args.auto_fallback is not None:
+            args.auto_fallback = args.auto_fallback == "on"
+        return cmd_mullvad_settings_set(args)
+
+    p_mv_settings_set.set_defaults(func=_mv_settings_set)
+
+    p_mv_auto = mullvad_sub.add_parser("auto-fallback", help="Enable/disable/show automatic fallback")
+    _env_flag(p_mv_auto)
+    p_mv_auto.add_argument(
+        "auto_fallback_command",
+        nargs="?",
+        default="status",
+        choices=["on", "off", "status", "enable", "disable"],
+        help="on|off|status (default: status)",
+    )
+    p_mv_auto.set_defaults(func=cmd_mullvad_auto_fallback)
+
+    p_mv_service = mullvad_sub.add_parser("service", help="Start/stop/restart Mullvad exit units")
+    _env_flag(p_mv_service)
+    p_mv_service.add_argument("service_action", choices=["start", "stop", "restart"])
+    p_mv_service.add_argument("--iface", default=None, help="Single iface (default: all bound exits)")
+    p_mv_service.set_defaults(func=cmd_mullvad_service)
+
+    p_mv_fallback = mullvad_sub.add_parser("fallback", help="Run relay fallback now")
+    _env_flag(p_mv_fallback)
+    p_mv_fallback.add_argument("--country", default=None, help="Limit to one country code")
+    p_mv_fallback.add_argument("--optimize", action="store_true", help="Re-rank even healthy exits")
+    p_mv_fallback.set_defaults(func=cmd_mullvad_fallback)
+
+    p_mv_restore = mullvad_sub.add_parser("restore", help="Bring downed Mullvad exits back up")
+    _env_flag(p_mv_restore)
+    p_mv_restore.set_defaults(func=cmd_mullvad_restore)
+
+    p_mv_ensure = mullvad_sub.add_parser("ensure", help="Ensure a country exit exists")
+    _env_flag(p_mv_ensure)
+    p_mv_ensure.add_argument("country", help="ISO country code (e.g. de, se, pl)")
+    p_mv_ensure.set_defaults(func=cmd_mullvad_ensure)
 
     p_peer = sub.add_parser("peer", help="WireGuard / Amnezia peer diagnostics")
     peer_sub = p_peer.add_subparsers(dest="peer_command", required=True)

@@ -57,6 +57,18 @@ def mullvad_settings(body: dict[str, Any], request: Request):
             kwargs["relay_mode"] = str(body.get("relay_mode") or "")
         elif "selection_mode" in body and body.get("selection_mode") is not None:
             kwargs["selection_mode"] = str(body.get("selection_mode") or "")
+        if "auto_fallback" in body and body.get("auto_fallback") is not None:
+            raw = body.get("auto_fallback")
+            if isinstance(raw, bool):
+                kwargs["auto_fallback"] = raw
+            else:
+                text = str(raw).strip().lower()
+                if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+                    kwargs["auto_fallback"] = True
+                elif text in {"0", "false", "no", "off", "disable", "disabled"}:
+                    kwargs["auto_fallback"] = False
+                else:
+                    raise AgentError("VALIDATION_ERROR", "auto_fallback must be true/false", 422)
         if not kwargs:
             raise AgentError("VALIDATION_ERROR", "No settings provided", 422)
         payload = _service(request).save_settings(**kwargs)

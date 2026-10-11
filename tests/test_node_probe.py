@@ -162,6 +162,57 @@ def test_probe_region_node_skips_duplicate_exit_interface_check(_which):
 
 
 @patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
+@patch('agent.support.node_probe.list_host_interfaces')
+def test_probe_prefers_exit_interface_over_shared_mullvad_ip(_interfaces, _which):
+    """Mullvad exits share one Address — curl must bind iface name, not the IP."""
+    shared = '10.64.0.2'
+    _interfaces.return_value = [
+        {'name': 'de', 'is_up': True, 'addresses': [f'{shared}/32']},
+        {'name': 'se', 'is_up': True, 'addresses': [f'{shared}/32']},
+        {'name': 'nl', 'is_up': True, 'addresses': [f'{shared}/32']},
+    ]
+
+    calls: list[str | None] = []
+
+    def fake_runner(cmd, **_kwargs):
+        iface = None
+        if '--interface' in cmd:
+            iface = cmd[cmd.index('--interface') + 1]
+        calls.append(iface)
+        url = cmd[-1] if cmd else ''
+
+        class Result:
+            returncode = 0 if iface == 'se' else 28
+            stdout = '200 0.08' if iface == 'se' and ('1.1.1.1' in url or '1.0.0.1' in url) else ''
+            stderr = '' if iface == 'se' else 'timeout'
+
+        return Result()
+
+    outbounds = [
+        {
+            'tag': 'region-node-se',
+            'protocol': 'freedom',
+            'sendThrough': shared,
+        },
+    ]
+
+    result = node_probe.probe_region_node(
+        node_id=3,
+        outbound_tag='region-node-se',
+        exit_interface='se',
+        outbounds=outbounds,
+        runner=fake_runner,
+    )
+
+    assert result['ok'] is True
+    assert all(item == 'se' for item in calls if item)
+    assert 'se' in calls
+    # Shared IP must not suppress the named exit probe.
+    assert 'exit_interface' in result['checks']
+    assert result['checks']['outbound'].get('interface') == 'se'
+
+
+@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
 def test_curl_speed_mbps_binds_interface_name(_which):
     seen = []
 

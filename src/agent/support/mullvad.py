@@ -579,6 +579,7 @@ class MullvadService:
         address = str(row.get("address") or "").strip()
         metric = normalize_relay_metric(row.get("relay_metric"))
         mode = normalize_relay_mode(row.get("relay_mode") or row.get("selection_mode"))
+        auto_fallback = self._coerce_auto_fallback(row.get("auto_fallback"), default=True)
         return {
             "private_key": private_key,
             "address": address,
@@ -589,6 +590,8 @@ class MullvadService:
             "relay_mode": mode,
             "selection_mode": mode,
             "relay_mode_label": "رله ثابت" if mode == RELAY_MODE_FIXED else "خودکار",
+            "auto_fallback": auto_fallback,
+            "auto_fallback_label": "روشن" if auto_fallback else "خاموش",
         }
 
     def relay_metric(self) -> str:
@@ -596,6 +599,22 @@ class MullvadService:
 
     def relay_mode(self) -> str:
         return normalize_relay_mode(self.settings().get("relay_mode"))
+
+    def auto_fallback_enabled(self) -> bool:
+        return bool(self.settings().get("auto_fallback", True))
+
+    @staticmethod
+    def _coerce_auto_fallback(value: Any, *, default: bool = True) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
 
     def save_settings(
         self,
@@ -605,13 +624,22 @@ class MullvadService:
         relay_metric: str | None = None,
         relay_mode: str | None = None,
         selection_mode: str | None = None,
+        auto_fallback: bool | None = None,
     ) -> dict[str, Any]:
         current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         key = str(private_key if private_key is not None else current.get("private_key") or "").strip()
         if private_key is not None and not _WG_KEY_RE.match(key):
             raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
         mode_input = relay_mode if relay_mode is not None else selection_mode
-        if private_key is None and not key and relay_metric is None and mode_input is None:
+        if (
+            private_key is None
+            and address is None
+            and relay_metric is None
+            and mode_input is None
+            and auto_fallback is None
+        ):
+            raise AgentError("VALIDATION_ERROR", "No Mullvad settings provided", 422)
+        if private_key is None and not key and address is None and auto_fallback is None and relay_metric is None and mode_input is None:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
 
         metric = normalize_relay_metric(
@@ -620,11 +648,15 @@ class MullvadService:
         mode = normalize_relay_mode(
             mode_input if mode_input is not None else (current.get("relay_mode") or current.get("selection_mode"))
         )
+        auto = (
+            bool(auto_fallback)
+            if auto_fallback is not None
+            else self._coerce_auto_fallback(current.get("auto_fallback"), default=True)
+        )
 
-        # Metric/mode-only updates must not re-validate Address: exits share one key/IP and
-        # configs often store dual-stack Address (IPv4,IPv6) that older code rejected.
+        # Lightweight updates (metric / mode / auto_fallback) must not re-validate Address.
         if (
-            (relay_metric is not None or mode_input is not None)
+            (relay_metric is not None or mode_input is not None or auto_fallback is not None)
             and private_key is None
             and address is None
         ):
@@ -634,6 +666,7 @@ class MullvadService:
                 "relay_metric": metric,
                 "relay_mode": mode,
                 "selection_mode": mode,
+                "auto_fallback": auto,
             }
             self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
             return self.settings()
@@ -651,6 +684,7 @@ class MullvadService:
             "relay_metric": metric,
             "relay_mode": mode,
             "selection_mode": mode,
+            "auto_fallback": auto,
         }
         self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
         result = self.settings()

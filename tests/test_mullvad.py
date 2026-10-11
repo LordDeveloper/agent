@@ -138,6 +138,20 @@ def test_save_settings_relay_metric(tmp_path: Path):
     assert svc.relay_metric() == "ping"
 
 
+def test_save_settings_auto_fallback(tmp_path: Path):
+    svc = _service(tmp_path)
+    svc.save_settings(private_key=PRIV, address="10.64.0.2/32")
+    assert svc.auto_fallback_enabled() is True
+    saved = svc.save_settings(auto_fallback=False)
+    assert saved["auto_fallback"] is False
+    assert svc.auto_fallback_enabled() is False
+    # Lightweight flag flip must keep account fields.
+    assert saved["address"] == "10.64.0.2/32"
+    saved = svc.save_settings(auto_fallback=True)
+    assert saved["auto_fallback"] is True
+    assert svc.auto_fallback_enabled() is True
+
+
 def test_save_settings_relay_mode_fixed(tmp_path: Path):
     svc = _service(tmp_path)
     svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="ping")

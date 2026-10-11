@@ -334,6 +334,62 @@ def _resolve_bind_interface(outbound: dict[str, Any]) -> str:
     return ''
 
 
+def _looks_like_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(str(value or '').strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _interfaces_sharing_address(address: str, *, runner: Runner | None = None) -> list[str]:
+    needle = str(address or '').strip()
+    if not needle:
+        return []
+    try:
+        needle_ip = str(ipaddress.ip_address(needle))
+    except ValueError:
+        return []
+
+    names: list[str] = []
+    for row in list_host_interfaces(runner=runner):
+        name = str(row.get('name') or '').strip()
+        if not name:
+            continue
+        for item in row.get('addresses') or []:
+            text = str(item or '').strip()
+            if not text:
+                continue
+            host = text.split('/', 1)[0].strip()
+            try:
+                if str(ipaddress.ip_address(host)) == needle_ip:
+                    names.append(name)
+                    break
+            except ValueError:
+                continue
+    return names
+
+
+def _prefer_named_bind(
+    bind: str | None,
+    preferred_iface: str | None,
+    *,
+    runner: Runner | None = None,
+) -> str:
+    """Prefer WireGuard iface name over a shared Mullvad tunnel IP for curl --interface."""
+    preferred = str(preferred_iface or '').strip()
+    current = str(bind or '').strip()
+    if preferred:
+        return preferred
+    if not current or not _looks_like_ip(current):
+        return current
+    owners = _interfaces_sharing_address(current, runner=runner)
+    if len(owners) == 1:
+        return owners[0]
+    # Shared Address across Mullvad exits — IP bind is ambiguous.
+    return current
+
+
 def _should_skip_exit_interface_check(
     outbound_tag: str | None,
     exit_interface: str | None,
@@ -341,6 +397,7 @@ def _should_skip_exit_interface_check(
     *,
     runner: Runner | None = None,
 ) -> bool:
+    """Skip duplicate exit probe only when outbound already binds the same iface *name*."""
     tag = str(outbound_tag or '').strip()
     iface = str(exit_interface or '').strip()
     if not tag or not iface:
@@ -355,7 +412,12 @@ def _should_skip_exit_interface_check(
         return False
 
     bind = _resolve_bind_interface(outbound)
-    return _bind_targets_equivalent(bind, iface, runner=runner)
+    if not bind:
+        return False
+    # sendThrough=shared Mullvad IP must NOT skip the named exit_interface probe.
+    if _looks_like_ip(bind):
+        return False
+    return bind == iface
 
 
 def probe_exit_interface(name: str, *, runner: Runner | None = None) -> dict[str, Any]:
@@ -398,8 +460,24 @@ def probe_outbound_tag(
         return {'ok': False, 'message': 'اوتباند blackhole است'}
 
     if protocol == 'freedom':
+        if not bind_iface and not str(fallback_interface or '').strip():
+            return {'ok': False, 'message': 'اوتباند freedom بدون sendThrough/interface قابل تست نیست'}
+        # Mullvad exits share one tunnel Address — always probe by iface name when known.
+        bind_iface = _prefer_named_bind(bind_iface, fallback_interface, runner=runner)
         if not bind_iface:
             return {'ok': False, 'message': 'اوتباند freedom بدون sendThrough/interface قابل تست نیست'}
+        if _looks_like_ip(bind_iface):
+            owners = _interfaces_sharing_address(bind_iface, runner=runner)
+            if len(owners) > 1:
+                return {
+                    'ok': False,
+                    'message': (
+                        f'sendThrough={bind_iface} روی چند اینترفیس مشترک است '
+                        f'({", ".join(owners[:6])}); exit_interface لازم است'
+                    ),
+                    'protocol': protocol,
+                    'interface': bind_iface,
+                }
         ok, message, latency_ms = _curl_probe(interface=bind_iface, runner=runner)
         result: dict[str, Any] = {
             'ok': ok,

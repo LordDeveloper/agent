@@ -1,4 +1,5 @@
 from typing import Any
+import threading
 
 from fastapi import APIRouter, Request
 
@@ -11,6 +12,10 @@ from agent.support.host_interfaces import list_host_interfaces
 log = get_logger("network")
 
 router = APIRouter(prefix="/network", tags=["network"])
+
+_probe_fallback_lock = threading.Lock()
+_probe_fallback_pending: set[str] = set()
+_probe_fallback_running = False
 
 
 @router.get("/interfaces")
@@ -45,6 +50,55 @@ def ads_block_disable():
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **result}
+
+
+def _schedule_probe_fallbacks(ifaces: list[str], *, store: Store, settings: Any) -> None:
+    """Coalesce concurrent probe failures into one fallback worker (avoid thrash)."""
+    global _probe_fallback_running
+
+    cleaned = [str(name or "").strip() for name in ifaces if str(name or "").strip()]
+    if not cleaned:
+        return
+
+    with _probe_fallback_lock:
+        _probe_fallback_pending.update(cleaned)
+        if _probe_fallback_running:
+            return
+        _probe_fallback_running = True
+
+    def _run_fallback() -> None:
+        global _probe_fallback_running
+        from agent.support.mullvad import MullvadService
+
+        service = MullvadService(store, config_dir=settings.wireguard_config_dir)
+        try:
+            if not service.auto_fallback_enabled():
+                log.debug("mullvad probe fallback skipped — auto_fallback disabled")
+                with _probe_fallback_lock:
+                    _probe_fallback_pending.clear()
+                return
+        except Exception:
+            log.exception("mullvad auto_fallback flag read failed; continuing probe fallback")
+
+        while True:
+            with _probe_fallback_lock:
+                batch = sorted(_probe_fallback_pending)
+                _probe_fallback_pending.clear()
+                if not batch:
+                    _probe_fallback_running = False
+                    return
+
+            for iface in batch:
+                try:
+                    result = service.fallback_iface(iface)
+                    if result and result.get("status") == "changed":
+                        log.info("mullvad probe fallback iface=%s %s", iface, result.get("message"))
+                    elif result and result.get("status") == "failed":
+                        log.warning("mullvad probe fallback iface=%s %s", iface, result.get("message"))
+                except Exception:
+                    log.exception("mullvad probe fallback failed iface=%s", iface)
+
+    threading.Thread(target=_run_fallback, daemon=True, name="mullvad-probe-fallback").start()
 
 
 @router.post("/nodes/probe")
@@ -87,30 +141,11 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
             failed.append(iface)
 
     if failed:
-        import threading
-
-        store = request.app.state.store
-        settings = request.app.state.settings
-
-        def _run_fallback() -> None:
-            from agent.support.mullvad import MullvadService
-
-            service = MullvadService(store, config_dir=settings.wireguard_config_dir)
-            seen: set[str] = set()
-            for iface in failed:
-                if iface in seen:
-                    continue
-                seen.add(iface)
-                try:
-                    result = service.fallback_iface(iface)
-                    if result and result.get("status") == "changed":
-                        log.info("mullvad probe fallback iface=%s %s", iface, result.get("message"))
-                    elif result and result.get("status") == "failed":
-                        log.warning("mullvad probe fallback iface=%s %s", iface, result.get("message"))
-                except Exception:
-                    log.exception("mullvad probe fallback failed iface=%s", iface)
-
-        threading.Thread(target=_run_fallback, daemon=True).start()
+        _schedule_probe_fallbacks(
+            failed,
+            store=request.app.state.store,
+            settings=request.app.state.settings,
+        )
 
     return {"success": True, **result}
 

@@ -40,11 +40,22 @@ async def mullvad_worker_loop(
                     restored.get("restored"),
                     restored.get("failed"),
                 )
-            result = await asyncio.to_thread(service.fallback)
-            changed = len(result.get("changed") or [])
-            failed = len(result.get("failed") or [])
-            if changed or failed:
-                log.info("mullvad fallback changed=%s failed=%s", changed, failed)
+
+            changed = 0
+            auto_fallback = True
+            try:
+                auto_fallback = bool(await asyncio.to_thread(service.auto_fallback_enabled))
+            except Exception:
+                log.exception("mullvad auto_fallback flag read failed; assuming enabled")
+
+            if auto_fallback:
+                result = await asyncio.to_thread(service.fallback)
+                changed = len(result.get("changed") or [])
+                failed = len(result.get("failed") or [])
+                if changed or failed:
+                    log.info("mullvad fallback changed=%s failed=%s", changed, failed)
+            else:
+                log.debug("mullvad auto fallback disabled — restore only")
 
             # Soft-heal every cycle so a wiped policy-routing state recovers once
             # exit ifaces are up again. Force only when exits were touched.

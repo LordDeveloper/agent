@@ -1101,22 +1101,28 @@ def _mullvad_menu() -> None:
         render_header("Mullvad")
         picked = select(
             [
-                Choice("key", "Set private key", GREEN, "1"),
+                Choice("account", "Account (private key / Address)", GREEN, "1"),
                 Choice("status", "Status", CYAN, "2"),
-                Choice("metric", "Relay pick metric (ping/speed)", MAGENTA, "3"),
-                Choice("fallback", "Run fallback now", YELLOW, "4"),
-                Choice("optimize", "Optimize to best relay", YELLOW, "5"),
-                Choice("switch", "Switch relay manually", GREEN, "6"),
-                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "7"),
+                Choice("service", "Service (start / stop / restart)", MAGENTA, "3"),
+                Choice("auto", "Auto fallback on/off", YELLOW, "4"),
+                Choice("metric", "Relay pick metric (ping/speed)", WHITE, "5"),
+                Choice("fallback", "Run fallback now", YELLOW, "6"),
+                Choice("optimize", "Optimize to best relay", YELLOW, "7"),
+                Choice("switch", "Switch relay manually", GREEN, "8"),
+                Choice("refresh", "Refresh catalog / adopt interfaces", WHITE, "9"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
-        if picked == "key":
-            _run_action("Mullvad private key", _show_mullvad_set_key)
+        if picked == "account":
+            _run_action("Mullvad account", _show_mullvad_set_account)
         elif picked == "status":
             _run_action("Mullvad status", _show_mullvad_status)
+        elif picked == "service":
+            _mullvad_service_menu()
+        elif picked == "auto":
+            _run_action("Mullvad auto fallback", _show_mullvad_auto_fallback)
         elif picked == "metric":
             _run_action("Mullvad relay metric", _show_mullvad_relay_metric)
         elif picked == "fallback":
@@ -1138,23 +1144,36 @@ def _mullvad_runtime_service():
     return runtime, service
 
 
-def _show_mullvad_set_key() -> None:
+def _show_mullvad_set_account() -> None:
     from agent.support.mullvad import mask_key
 
     runtime, service = _mullvad_runtime_service()
     try:
         current = service.settings()
         preview = current.get("key_preview") or "not set"
+        current_addr = str(current.get("address") or "").strip()
         _print(kv("Current key", preview, CYAN))
-        _print(kv("Address", current.get("address") or "from existing Mullvad iface", WHITE))
-        value = prompt_text("Private key")
-        if not value:
-            _print(paint("  Cancelled.", YELLOW))
+        _print(kv("Current Address", current_addr or "not set", WHITE))
+        _print(kv("Auto fallback", "on" if current.get("auto_fallback", True) else "off", GREEN if current.get("auto_fallback", True) else YELLOW))
+        value = prompt_text("Private key (Enter to keep)")
+        address = prompt_text("Address (Enter to keep)", default=current_addr or "")
+        kwargs = {}
+        if value:
+            kwargs["private_key"] = value
+        if address and address.strip() != current_addr:
+            kwargs["address"] = address.strip()
+        elif address and not current_addr:
+            kwargs["address"] = address.strip()
+        if not kwargs:
+            _print(paint("  Nothing changed.", YELLOW))
             return
-        saved = service.save_settings(private_key=value)
-        _print(paint("  Private key saved.", GREEN))
+        saved = service.save_settings(**kwargs)
+        prop = saved.get("propagated") or {}
+        _print(paint("  Account saved.", GREEN))
         _print(kv("Key", mask_key(saved.get("private_key") or ""), WHITE))
         _print(kv("Address", saved.get("address") or "-", WHITE))
+        if prop:
+            _print(kv("Updated ifaces", str(prop.get("updated_count") or 0), CYAN))
     finally:
         runtime.close()
 
@@ -1167,18 +1186,120 @@ def _show_mullvad_status() -> None:
         _print(kv("Private key", "set" if settings.get("has_private_key") else "missing", GREEN if settings.get("has_private_key") else YELLOW))
         _print(kv("Address", settings.get("address") or "-", WHITE))
         _print(kv("Relay metric", settings.get("relay_metric") or "ping", CYAN))
+        auto = bool(settings.get("auto_fallback", True))
+        _print(kv("Auto fallback", "on" if auto else "off", GREEN if auto else YELLOW))
         tunnels = payload.get("tunnels") or []
         if not tunnels:
             _print(paint("  No adopted/created Mullvad exits yet.", DIM))
             return
         for row in tunnels:
-            tone = GREEN if row.get("healthy") else (YELLOW if row.get("up") else RED)
+            tone = GREEN if row.get("healthy") or row.get("handshake") else (YELLOW if row.get("up") else RED)
             host = row.get("hostname") or "-"
+            state = row.get("service_state") or ("up" if row.get("up") else "down")
             _print(paint(
                 f"  {row.get('iface') or '-'}  {row.get('country_code')}  {host}  "
-                f"{'up' if row.get('up') else 'down'}  {row.get('message') or ''}",
+                f"{state}  {row.get('message') or ''}",
                 tone,
             ))
+    finally:
+        runtime.close()
+
+
+def _mullvad_service_menu() -> None:
+    while True:
+        render_header("Mullvad · Service")
+        picked = select(
+            [
+                Choice("status", "Refresh status", CYAN, "1"),
+                Choice("start", "Start all", GREEN, "2"),
+                Choice("restart", "Restart all", YELLOW, "3"),
+                Choice("stop", "Stop all", RED, "4"),
+                Choice("one", "Control one iface", MAGENTA, "5"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("Mullvad status", _show_mullvad_status)
+        elif picked in {"start", "stop", "restart"}:
+            _run_action(f"Mullvad service {picked}", lambda action=picked: _show_mullvad_service_bulk(action))
+        elif picked == "one":
+            _run_action("Mullvad service iface", _show_mullvad_service_one)
+
+
+def _show_mullvad_service_bulk(action: str) -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        result = service.control_tunnels(action)
+        _print(kv("Action", action, CYAN))
+        _print(kv("OK", str(result.get("count") or 0), GREEN))
+        _print(kv("Failed", str(result.get("failed_count") or 0), RED if result.get("failed_count") else WHITE))
+        for row in result.get("results") or []:
+            _print(paint(f"  {row.get('iface')}: {row.get('message')}", GREEN if row.get("ok") else RED))
+        for row in result.get("errors") or []:
+            _print(paint(f"  {row.get('iface')}: {row.get('error')}", RED))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_service_one() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        tunnels = (service.status().get("tunnels") or [])
+        if not tunnels:
+            _print(paint("  No Mullvad tunnels.", YELLOW))
+            return
+        choices = []
+        for index, row in enumerate(tunnels, start=1):
+            iface = str(row.get("iface") or "")
+            label = f"{iface}  {row.get('country_code') or '-'}  {row.get('service_state') or '-'}"
+            choices.append(Choice(iface, label, WHITE, str(index)))
+        choices.append(Choice("back", "Cancel", WHITE, "0"))
+        iface = select(choices)
+        if iface in {None, "back"}:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        action = select(
+            [
+                Choice("start", "Start", GREEN, "1"),
+                Choice("restart", "Restart", YELLOW, "2"),
+                Choice("stop", "Stop", RED, "3"),
+                Choice("back", "Cancel", WHITE, "0"),
+            ]
+        )
+        if action in {None, "back"}:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        result = service.control_tunnel(iface, action)
+        _print(paint(f"  {result.get('message')}", GREEN if result.get("ok") else RED))
+    finally:
+        runtime.close()
+
+
+def _show_mullvad_auto_fallback() -> None:
+    runtime, service = _mullvad_runtime_service()
+    try:
+        current = bool(service.settings().get("auto_fallback", True))
+        _print(kv("Current", "on" if current else "off", GREEN if current else YELLOW))
+        picked = select(
+            [
+                Choice("on", "Enable automatic fallback", GREEN if current else WHITE, "1"),
+                Choice("off", "Disable automatic fallback", YELLOW if not current else WHITE, "2"),
+                Choice("back", "Cancel", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            _print(paint("  Cancelled.", YELLOW))
+            return
+        saved = service.save_settings(auto_fallback=(picked == "on"))
+        enabled = bool(saved.get("auto_fallback"))
+        _print(paint(
+            "  Auto fallback enabled — worker may switch unhealthy relays."
+            if enabled
+            else "  Auto fallback disabled — worker only restores downed interfaces.",
+            GREEN if enabled else YELLOW,
+        ))
     finally:
         runtime.close()
 
