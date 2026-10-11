@@ -101,6 +101,19 @@ def _schedule_probe_fallbacks(ifaces: list[str], *, store: Store, settings: Any)
     threading.Thread(target=_run_fallback, daemon=True, name="mullvad-probe-fallback").start()
 
 
+def _coerce_probe_fallback(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @router.post("/nodes/probe")
 def probe_region_nodes(body: dict[str, Any], request: Request):
     from agent.drivers.xray import XrayDriver
@@ -109,6 +122,10 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
     nodes = body.get("nodes") or []
     if not isinstance(nodes, list):
         raise_agent_error("VALIDATION_ERROR", "nodes must be an array", 422)
+
+    # Admin panel traffic tests pass fallback=false so false timeouts do not thrash relays.
+    # Region monitor / ops probes keep the default (true) so dead exits still recover.
+    schedule_fallback = _coerce_probe_fallback(body.get("fallback"), default=True)
 
     outbounds: list[dict[str, Any]] = []
     registry = request.app.state.registry
@@ -126,26 +143,27 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
 
-    failed: list[str] = []
-    by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict)}
-    for row in result.get("nodes") or []:
-        if not isinstance(row, dict) or row.get("ok"):
-            continue
-        raw = by_id.get(str(row.get("id")))
-        iface = ""
-        if isinstance(raw, dict):
-            iface = str(raw.get("exit_interface") or "").strip()
-        # Dead exits (incl. timeout / no handshake) should still trigger fallback.
-        # Fixed relays remain pinned inside MullvadService.fallback_iface.
-        if iface:
-            failed.append(iface)
+    if schedule_fallback:
+        failed: list[str] = []
+        by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict)}
+        for row in result.get("nodes") or []:
+            if not isinstance(row, dict) or row.get("ok"):
+                continue
+            raw = by_id.get(str(row.get("id")))
+            iface = ""
+            if isinstance(raw, dict):
+                iface = str(raw.get("exit_interface") or "").strip()
+            # Dead exits (incl. timeout / no handshake) should still trigger fallback.
+            # Fixed relays remain pinned inside MullvadService.fallback_iface.
+            if iface:
+                failed.append(iface)
 
-    if failed:
-        _schedule_probe_fallbacks(
-            failed,
-            store=request.app.state.store,
-            settings=request.app.state.settings,
-        )
+        if failed:
+            _schedule_probe_fallbacks(
+                failed,
+                store=request.app.state.store,
+                settings=request.app.state.settings,
+            )
 
     return {"success": True, **result}
 

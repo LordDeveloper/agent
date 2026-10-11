@@ -9,6 +9,13 @@ from agent.support.node_probe import PROBE_TARGETS, _curl_probe
 def test_probe_targets_prefer_literal_ip():
     assert PROBE_TARGETS[0][0].startswith('http://1.1.1.1')
     assert PROBE_TARGETS[1][0].startswith('http://1.0.0.1')
+    assert len(PROBE_TARGETS) >= 4
+
+
+def test_rotated_probe_targets_shifts_start():
+    rotated = node_probe._rotated_probe_targets(1)
+    assert rotated[0][0] == PROBE_TARGETS[1][0]
+    assert rotated[-1][0] == PROBE_TARGETS[0][0]
 
 
 def test_curl_probe_continues_after_timeout(monkeypatch):

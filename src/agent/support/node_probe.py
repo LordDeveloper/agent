@@ -26,8 +26,11 @@ PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = (
     ('http://1.1.1.1/cdn-cgi/trace', frozenset({200})),
     ('http://1.0.0.1/cdn-cgi/trace', frozenset({200})),
     ('http://8.8.8.8/', frozenset({200, 301, 302, 404})),
+    ('http://8.8.4.4/', frozenset({200, 301, 302, 404})),
+    ('http://9.9.9.9/', frozenset({200, 301, 302, 404})),
+    ('http://208.67.222.222/', frozenset({200, 301, 302, 404})),
 )
-PROBE_TIMEOUT = 4
+PROBE_TIMEOUT = 3
 CONNECT_TIMEOUT = 2
 BIND_ERROR_CODES = frozenset({45, 55})
 
@@ -38,9 +41,30 @@ SPEED_CONNECT_TIMEOUT = 4
 SPEED_MAX_TIME = 12
 
 # Mullvad exits use Table=off: peer traffic works via policy routing, but host
-# curl --interface needs a temporary /32 via that device. Serialize installs so
-# parallel admin probes do not thrash the same destinations across ifaces.
-_probe_route_lock = threading.Lock()
+# curl --interface needs a temporary /32 via that device. Lock per destination so
+# parallel probes can proceed on distinct IPs without thrashing the same route.
+_probe_route_locks_guard = threading.Lock()
+_probe_route_locks: dict[str, threading.Lock] = {}
+
+
+def _route_lock_for(dest: str) -> threading.Lock:
+    key = str(dest or '').strip() or '*'
+    with _probe_route_locks_guard:
+        lock = _probe_route_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _probe_route_locks[key] = lock
+        return lock
+
+
+def _rotated_probe_targets(start_index: int = 0) -> list[tuple[str, frozenset[int]]]:
+    targets = list(PROBE_TARGETS)
+    if not targets:
+        return []
+    offset = int(start_index or 0) % len(targets)
+    if offset <= 0:
+        return targets
+    return targets[offset:] + targets[:offset]
 
 
 def _runner(runner: Runner | None) -> Runner:
@@ -123,22 +147,28 @@ def _host_routes_for_iface(
         yield
         return
 
-    with _probe_route_lock:
-        installed: list[str] = []
-        for dest in hosts:
+    # Acquire destination locks in sorted order to avoid deadlocks across threads.
+    ordered = sorted(set(hosts))
+    locks = [_route_lock_for(dest) for dest in ordered]
+    for lock in locks:
+        lock.acquire()
+    installed: list[str] = []
+    try:
+        for dest in ordered:
             try:
                 if _ip_route_replace_dev(dest, bind, runner=execute):
                     installed.append(dest)
             except Exception:
                 continue
-        try:
-            yield
-        finally:
-            for dest in installed:
-                try:
-                    _ip_route_del_dev(dest, bind, runner=execute)
-                except Exception:
-                    pass
+        yield
+    finally:
+        for dest in installed:
+            try:
+                _ip_route_del_dev(dest, bind, runner=execute)
+            except Exception:
+                pass
+        for lock in reversed(locks):
+            lock.release()
 
 
 def _interface_row(name: str, *, runner: Runner | None = None) -> dict[str, Any] | None:
@@ -243,7 +273,12 @@ def _parse_curl_write_out(body: str) -> tuple[int, int | None]:
     return http_code, latency_ms
 
 
-def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -> tuple[bool, str, int | None]:
+def _curl_probe(
+    *,
+    interface: str | None = None,
+    runner: Runner | None = None,
+    start_index: int = 0,
+) -> tuple[bool, str, int | None]:
     execute = _runner(runner)
     if not shutil.which('curl'):
         return False, 'curl در Agent موجود نیست', None
@@ -251,10 +286,12 @@ def _curl_probe(*, interface: str | None = None, runner: Runner | None = None) -
     bind = _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
     per_try_timeout = PROBE_TIMEOUT + CONNECT_TIMEOUT + 2
-    destinations = [host for url, _codes in PROBE_TARGETS if (host := _url_host(url))]
+    targets = _rotated_probe_targets(start_index)
 
-    with _host_routes_for_iface(bind, destinations, runner=execute):
-        for url, ok_codes in PROBE_TARGETS:
+    # Install one /32 at a time so parallel probes on different IPs can overlap.
+    for url, ok_codes in targets:
+        host = _url_host(url)
+        with _host_routes_for_iface(bind, [host] if host else [], runner=execute):
             cmd = [
                 'curl',
                 '-4',
@@ -526,7 +563,12 @@ def _should_skip_exit_interface_check(
     return bind == iface
 
 
-def probe_exit_interface(name: str, *, runner: Runner | None = None) -> dict[str, Any]:
+def probe_exit_interface(
+    name: str,
+    *,
+    runner: Runner | None = None,
+    start_index: int = 0,
+) -> dict[str, Any]:
     iface = str(name or '').strip()
     if not iface:
         return {'ok': False, 'message': 'exit_interface تنظیم نشده'}
@@ -537,7 +579,7 @@ def probe_exit_interface(name: str, *, runner: Runner | None = None) -> dict[str
     if row.get('is_up') is False:
         return {'ok': False, 'message': f'اینترفیس {iface} down است'}
 
-    ok, message, latency_ms = _curl_probe(interface=iface, runner=runner)
+    ok, message, latency_ms = _curl_probe(interface=iface, runner=runner, start_index=start_index)
     result: dict[str, Any] = {'ok': ok, 'message': message, 'interface': iface}
     if latency_ms is not None:
         result['latency_ms'] = latency_ms
@@ -550,6 +592,7 @@ def probe_outbound_tag(
     *,
     fallback_interface: str | None = None,
     runner: Runner | None = None,
+    start_index: int = 0,
 ) -> dict[str, Any]:
     needle = str(tag or '').strip()
     if not needle:
@@ -584,7 +627,11 @@ def probe_outbound_tag(
                     'protocol': protocol,
                     'interface': bind_iface,
                 }
-        ok, message, latency_ms = _curl_probe(interface=bind_iface, runner=runner)
+        ok, message, latency_ms = _curl_probe(
+            interface=bind_iface,
+            runner=runner,
+            start_index=start_index,
+        )
         result: dict[str, Any] = {
             'ok': ok,
             'message': message,
@@ -622,6 +669,7 @@ def probe_region_node(
     exit_interface: str | None = None,
     outbounds: list[dict[str, Any]] | None = None,
     runner: Runner | None = None,
+    start_index: int = 0,
 ) -> dict[str, Any]:
     checks: dict[str, Any] = {}
     outcomes: list[bool] = []
@@ -637,6 +685,7 @@ def probe_region_node(
             outbounds,
             fallback_interface=exit_interface,
             runner=runner,
+            start_index=start_index,
         )
         outcomes.append(bool(checks['outbound'].get('ok')))
         message = str(checks['outbound'].get('message') or '').strip()
@@ -649,7 +698,11 @@ def probe_region_node(
         outbounds,
         runner=runner,
     ):
-        checks['exit_interface'] = probe_exit_interface(exit_interface, runner=runner)
+        checks['exit_interface'] = probe_exit_interface(
+            exit_interface,
+            runner=runner,
+            start_index=start_index,
+        )
         outcomes.append(bool(checks['exit_interface'].get('ok')))
         message = str(checks['exit_interface'].get('message') or '').strip()
         if message:
@@ -704,21 +757,24 @@ def probe_region_nodes(
             'summary': {'total': 0, 'passed': 0, 'failed': 0},
         }
 
-    def _probe_item(item: dict[str, Any]) -> dict[str, Any]:
+    def _probe_item(item: dict[str, Any], index: int) -> dict[str, Any]:
         return probe_region_node(
             node_id=item.get('id'),
             outbound_tag=item.get('outbound_tag'),
             exit_interface=item.get('exit_interface'),
             outbounds=outbounds,
             runner=runner,
+            start_index=index,
         )
 
-    max_workers = min(8, len(valid_nodes))
+    # Cap concurrency to the number of distinct probe IPs so route installs overlap
+    # without stampeding the same destination across Mullvad Table=off exits.
+    max_workers = min(len(PROBE_TARGETS), len(valid_nodes), 6)
     rows: list[dict[str, Any] | None] = [None] * len(valid_nodes)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
-            pool.submit(_probe_item, item): index
+            pool.submit(_probe_item, item, index): index
             for index, item in enumerate(valid_nodes)
         }
         for future, index in future_map.items():
