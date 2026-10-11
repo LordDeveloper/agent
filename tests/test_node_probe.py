@@ -59,7 +59,7 @@ def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monke
 
     monkeypatch.setattr(node_probe.time, 'time', lambda: 1700000050)
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
-    monkeypatch.setattr(node_probe, '_tcp_probe', lambda host, port, timeout=5.0: (True, 'TCP متصل شد', 42))
+    monkeypatch.setattr(node_probe, '_iface_ping_ms', lambda *a, **k: 42)
 
     result = node_probe.probe_exit_interface('de', runner=runner)
     assert result['ok'] is True
@@ -68,10 +68,27 @@ def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monke
     assert 'handshake' in result['message']
 
 
-def test_parse_wg_endpoint_ipv4():
-    assert node_probe._parse_wg_endpoint('1.2.3.4:51820') == ('1.2.3.4', 51820)
-    assert node_probe._parse_wg_endpoint('[2001:db8::1]:51820') == ('2001:db8::1', 51820)
-    assert node_probe._parse_wg_endpoint('(none)') is None
+def test_iface_ping_ms_uses_ping_dash_i(monkeypatch):
+    calls: list[list[str]] = []
+
+    def runner(args, **_kwargs):
+        row = list(args)
+        calls.append(row)
+        if row and row[0] == 'ip':
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        return SimpleNamespace(
+            returncode=0,
+            stdout='64 bytes from 8.8.8.8: icmp_seq=1 ttl=50 time=27.4 ms\n',
+            stderr='',
+        )
+
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    assert node_probe._iface_ping_ms('de', runner=runner) == 27
+    ping_cmds = [row for row in calls if row and row[0] == 'ping']
+    assert ping_cmds
+    assert '-I' in ping_cmds[0]
+    assert ping_cmds[0][ping_cmds[0].index('-I') + 1] == 'de'
+    assert ping_cmds[0][-1] == '8.8.8.8'
 
 
 def test_curl_probe_continues_after_timeout(monkeypatch):
@@ -160,7 +177,7 @@ def test_probe_exit_interface_missing():
 
 @patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
 @patch('agent.support.node_probe.list_host_interfaces')
-def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
+def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which, monkeypatch):
     _interfaces.return_value = [
         {'name': 'uk0', 'is_up': True, 'addresses': ['10.8.0.5/32']},
         {'name': 'de0', 'is_up': True, 'addresses': ['10.9.0.5/32']},
@@ -184,6 +201,8 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
             return Result()
         return type('Result', (), {'returncode': 28, 'stdout': '', 'stderr': 'timeout'})()
 
+    monkeypatch.setattr(node_probe, '_iface_ping_ms', lambda *a, **k: 27)
+
     outbounds = [
         {
             'tag': 'deegress',
@@ -204,8 +223,9 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
     # Outbound already prefers exit_interface name — no duplicate exit curl.
     assert 'outbound' in result['checks']
     assert 'exit_interface' not in result['checks']
-    assert result.get('latency_ms') == 256
-    assert result['checks']['outbound'].get('latency_ms') == 256
+    # Panel ping comes from ping -I, not curl time_total.
+    assert result.get('latency_ms') == 27
+    assert result['checks']['outbound'].get('latency_ms') == 27
     assert 'uk0' in calls
 
 

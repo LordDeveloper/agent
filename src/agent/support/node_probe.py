@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import shutil
 import socket
 import subprocess
@@ -51,6 +52,10 @@ BIND_ERROR_CODES = frozenset({45, 55})
 # Mullvad/WG exits: host curl can flake on Table=off while the tunnel still carries peers.
 # A recent handshake means the interface is online for panel health.
 HANDSHAKE_ONLINE_MAX_AGE = 180
+
+# Panel ping is always ICMP via the exit iface (not curl time_total).
+PING_TARGET = '8.8.8.8'
+PING_WAIT_SECONDS = 2
 
 # Small Cloudflare download used to rank Mullvad relays by real egress throughput.
 # Bind by WireGuard interface NAME — never by tunnel IP (shared across exits).
@@ -134,75 +139,60 @@ def _wg_has_recent_handshake(
     return age <= max(1, int(max_age))
 
 
-def _parse_wg_endpoint(raw: str) -> tuple[str, int] | None:
-    text = str(raw or '').strip()
-    if not text or text in {'(none)', 'none'}:
-        return None
-    if text.startswith('['):
-        # [2001:db8::1]:51820
-        if ']:' not in text:
-            return None
-        host, port_text = text[1:].rsplit(']:', 1)
-    else:
-        if text.count(':') != 1:
-            # Ambiguous IPv6 without brackets — skip.
-            if text.count(':') > 1:
-                return None
-            return None
-        host, port_text = text.rsplit(':', 1)
-    host = host.strip()
-    try:
-        port = int(port_text.strip())
-    except ValueError:
-        return None
-    if not host or port <= 0 or port > 65535:
-        return None
-    return host, port
+_PING_TIME_RE = re.compile(
+    r'(?:time|rtt)[=<>]\s*([0-9]+(?:\.[0-9]+)?)\s*ms',
+    re.IGNORECASE,
+)
 
 
-def _wg_peer_endpoint(iface: str, *, runner: Runner | None = None) -> tuple[str, int] | None:
-    name = str(iface or '').strip()
-    if not name or _looks_like_ip(name) or not shutil.which('wg'):
+def _iface_ping_ms(
+    interface: str | None,
+    *,
+    runner: Runner | None = None,
+    target: str = PING_TARGET,
+) -> int | None:
+    """Panel ping: ``ping -I <iface> 8.8.8.8`` (with temp /32 for Table=off)."""
+    bind = _resolve_curl_bind(interface, runner=runner)
+    dest = str(target or '').strip() or PING_TARGET
+    if not bind or not dest or not shutil.which('ping'):
         return None
+
     execute = _runner(runner)
+    cmd = ['ping', '-4', '-n', '-c', '1', '-W', str(PING_WAIT_SECONDS), '-I', bind, dest]
+    # Named ifaces with Table=off need a host route so ICMP leaves via that device.
+    route_iface = None if _looks_like_ip(bind) else bind
     try:
-        result = execute(['wg', 'show', name, 'endpoints'], check=False, timeout=5)
+        with _host_routes_for_iface(route_iface, [dest], runner=execute):
+            result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    raw_code = getattr(result, 'returncode', 1)
-    if int(0 if raw_code is None else raw_code) != 0:
+
+    body = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
+    match = _PING_TIME_RE.search(body)
+    if not match:
         return None
-    for line in (getattr(result, 'stdout', '') or '').splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        parsed = _parse_wg_endpoint(parts[-1])
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _wg_endpoint_latency_ms(iface: str, *, runner: Runner | None = None) -> int | None:
-    """TCP RTT to the WireGuard peer endpoint — usable when host egress curl flakes."""
-    endpoint = _wg_peer_endpoint(iface, runner=runner)
-    if endpoint is None:
+    try:
+        return max(1, int(round(float(match.group(1)))))
+    except ValueError:
         return None
-    host, port = endpoint
-    ok, _message, latency_ms = _tcp_probe(host, port, timeout=3.0)
-    return latency_ms if ok else None
 
 
-def _handshake_online_result(iface: str, *, runner: Runner | None = None) -> dict[str, Any]:
+def _handshake_online_result(
+    iface: str,
+    *,
+    runner: Runner | None = None,
+    latency_ms: int | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         'ok': True,
         'message': 'تونل آنلاین (handshake)',
         'interface': iface,
         'via': 'handshake',
     }
-    latency_ms = _wg_endpoint_latency_ms(iface, runner=runner)
-    if latency_ms is not None:
-        result['latency_ms'] = latency_ms
-        result['message'] = 'تونل آنلاین (handshake + پینگ رله)'
+    ping_ms = latency_ms if latency_ms is not None else _iface_ping_ms(iface, runner=runner)
+    if ping_ms is not None:
+        result['latency_ms'] = ping_ms
+        result['message'] = 'تونل آنلاین (handshake)'
     return result
 
 
@@ -740,23 +730,29 @@ def probe_exit_interface(
     if row.get('is_up') is False:
         return {'ok': False, 'message': f'اینترفیس {iface} down است'}
 
-    ok, message, latency_ms = _curl_probe(interface=iface, runner=runner, start_index=start_index)
+    # Traffic path = curl; panel ping = ping -I (never curl time_total).
+    ok, message, _curl_latency = _curl_probe(interface=iface, runner=runner, start_index=start_index)
+    ping_ms = _iface_ping_ms(iface, runner=runner)
+
     if ok:
-        result: dict[str, Any] = {
+        row: dict[str, Any] = {
             'ok': True,
             'message': message,
             'interface': iface,
             'via': 'egress',
         }
-        if latency_ms is not None:
-            result['latency_ms'] = latency_ms
-        return result
+        if ping_ms is not None:
+            row['latency_ms'] = ping_ms
+        return row
 
     # Curl egress flake on Table=off Mullvad — recent handshake = interface online.
     if _wg_has_recent_handshake(iface, runner=runner):
-        return _handshake_online_result(iface, runner=runner)
+        return _handshake_online_result(iface, runner=runner, latency_ms=ping_ms)
 
-    return {'ok': False, 'message': message, 'interface': iface}
+    failed: dict[str, Any] = {'ok': False, 'message': message, 'interface': iface}
+    if ping_ms is not None:
+        failed['latency_ms'] = ping_ms
+    return failed
 
 
 def probe_outbound_tag(
@@ -800,34 +796,39 @@ def probe_outbound_tag(
                     'protocol': protocol,
                     'interface': bind_iface,
                 }
-        ok, message, latency_ms = _curl_probe(
+        ok, message, _curl_latency = _curl_probe(
             interface=bind_iface,
             runner=runner,
             start_index=start_index,
         )
+        ping_ms = _iface_ping_ms(bind_iface, runner=runner)
+
         if ok:
-            result: dict[str, Any] = {
+            row = {
                 'ok': True,
                 'message': message,
                 'protocol': protocol,
                 'interface': bind_iface,
                 'via': 'egress',
             }
-            if latency_ms is not None:
-                result['latency_ms'] = latency_ms
-            return result
+            if ping_ms is not None:
+                row['latency_ms'] = ping_ms
+            return row
 
         if not _looks_like_ip(bind_iface) and _wg_has_recent_handshake(bind_iface, runner=runner):
-            row = _handshake_online_result(bind_iface, runner=runner)
+            row = _handshake_online_result(bind_iface, runner=runner, latency_ms=ping_ms)
             row['protocol'] = protocol
             return row
 
-        return {
+        failed = {
             'ok': False,
             'message': message,
             'protocol': protocol,
             'interface': bind_iface,
         }
+        if ping_ms is not None:
+            failed['latency_ms'] = ping_ms
+        return failed
 
     if protocol in {'dns', 'loopback'}:
         return {'ok': True, 'message': f'اوتباند {protocol} — بدون تست egress', 'protocol': protocol}
