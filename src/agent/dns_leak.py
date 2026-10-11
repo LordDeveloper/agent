@@ -121,21 +121,46 @@ def _read_wg_conf(name: str) -> str | None:
     return None
 
 
-def _mullvad_bound_ifaces() -> set[str]:
-    """Iface names bound as Mullvad region exits in the Agent store."""
-    try:
-        from agent.config import AgentSettings
-        from agent.db import Store
-    except Exception:
-        return set()
+_MULLVAD_IFACE_CACHE: set[str] | None = None
+_MULLVAD_IFACE_CACHE_AT = 0.0
+_MULLVAD_IFACE_CACHE_TTL = 30.0
+
+
+def _mullvad_bound_ifaces(*, force: bool = False) -> set[str]:
+    """Iface names bound as Mullvad region exits in the Agent store.
+
+    Cached: v0.4.65 opened a fresh Store per interface check and thrashed SQLite
+    so the Mullvad restore/fallback worker could not refresh tunnels (no handshake).
+    """
+    import time
+
+    global _MULLVAD_IFACE_CACHE, _MULLVAD_IFACE_CACHE_AT
+    now = time.monotonic()
+    if (
+        not force
+        and _MULLVAD_IFACE_CACHE is not None
+        and (now - _MULLVAD_IFACE_CACHE_AT) < _MULLVAD_IFACE_CACHE_TTL
+    ):
+        return set(_MULLVAD_IFACE_CACHE)
 
     names: set[str] = set()
+    try:
+        from agent.config import load_settings
+        from agent.db import Store
+    except Exception:
+        _MULLVAD_IFACE_CACHE = set()
+        _MULLVAD_IFACE_CACHE_AT = now
+        return set()
+
     store: Store | None = None
     try:
-        settings = AgentSettings()
+        settings = load_settings()
         db_path = settings.resolve_db_path()
         if not db_path.is_file():
+            _MULLVAD_IFACE_CACHE = set()
+            _MULLVAD_IFACE_CACHE_AT = now
             return set()
+        # Read-only snapshot via a short-lived connection; never hold across calls.
         store = Store(db_path)
         for row in store.list_docs('mullvad', 'location'):
             if not isinstance(row, dict):
@@ -144,17 +169,29 @@ def _mullvad_bound_ifaces() -> set[str]:
             if iface:
                 names.add(iface.lower())
     except Exception:
-        return set()
+        names = set(_MULLVAD_IFACE_CACHE or ())
     finally:
         if store is not None:
             try:
                 store.close()
             except Exception:
                 pass
-    return names
+
+    _MULLVAD_IFACE_CACHE = set(names)
+    _MULLVAD_IFACE_CACHE_AT = now
+    return set(names)
 
 
-def _is_mullvad_exit_interface(name: str) -> bool:
+def _wg_conf_is_exit(text: str) -> bool:
+    if re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text):
+        return True
+    # Mullvad exits have a Peer Endpoint but no ListenPort.
+    has_listen = bool(re.search(r'(?im)^\s*ListenPort\s*=', text))
+    has_endpoint = bool(re.search(r'(?im)^\s*Endpoint\s*=', text))
+    return has_endpoint and not has_listen
+
+
+def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> bool:
     """Mullvad / region exits must never get client DNS DNAT/AdGuard.
 
     Ads-block previously applied resolvectl dns off + DNAT on these exits, which
@@ -164,31 +201,50 @@ def _is_mullvad_exit_interface(name: str) -> bool:
     lowered = str(name or '').strip().lower()
     if not lowered:
         return False
-    if lowered in _mullvad_bound_ifaces():
+    bound_names = _mullvad_bound_ifaces() if bound is None else bound
+    if lowered in bound_names:
         return True
 
     text = _read_wg_conf(name)
     if not text:
         return False
-    if re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text):
-        return True
-    # Mullvad exits (and other egress tunnels) have a Peer Endpoint but no ListenPort.
-    # Client-facing VPN servers always listen — only those should get AdGuard/DNAT.
-    has_listen = bool(re.search(r'(?im)^\s*ListenPort\s*=', text))
-    has_endpoint = bool(re.search(r'(?im)^\s*Endpoint\s*=', text))
-    return has_endpoint and not has_listen
+    return _wg_conf_is_exit(text)
 
 
-def _is_client_wireguard_server(name: str) -> bool:
+def _mullvad_exit_gateway_ips(*, bound: set[str] | None = None) -> set[str]:
+    """Tunnel Address IPs used by Mullvad exits — never bind AdGuard here."""
+    ips: set[str] = set()
+    bound_names = _mullvad_bound_ifaces() if bound is None else bound
+    names = set(bound_names)
+    for directory in _wg_conf_dirs():
+        if not directory.is_dir():
+            continue
+        for path in directory.glob('*.conf'):
+            try:
+                text = path.read_text(encoding='utf-8', errors='ignore')
+            except OSError:
+                continue
+            if not _wg_conf_is_exit(text):
+                continue
+            names.add(path.stem.lower())
+            for match in re.finditer(r'(?im)^\s*Address\s*=\s*(.+)$', text):
+                for part in str(match.group(1) or '').split(','):
+                    host = part.strip().split('/', 1)[0].strip()
+                    if host:
+                        ips.add(host)
+    return ips
+
+
+def _is_client_wireguard_server(name: str, *, bound: set[str] | None = None) -> bool:
     """True only for WireGuard/Amnezia interfaces that accept VPN clients."""
-    if _is_mullvad_exit_interface(name):
+    if _is_mullvad_exit_interface(name, bound=bound):
         return False
     text = _read_wg_conf(name)
     if text is None:
         # No conf on disk — trust classic server names only (wg0/awg0), never pl/sw/de.
         lowered = name.lower()
         return lowered.startswith('wg') or lowered.startswith('awg')
-    if re.search(r'(?im)^\s*Table\s*=\s*off\s*$', text):
+    if _wg_conf_is_exit(text):
         return False
     return bool(re.search(r'(?im)^\s*ListenPort\s*=', text))
 
@@ -218,14 +274,26 @@ def _looks_like_l2tp_address(text: str) -> bool:
     return int(ip.packed[2]) >= 128
 
 
-def _is_vpn_interface(row: dict[str, Any]) -> bool:
+def _is_vpn_interface(
+    row: dict[str, Any],
+    *,
+    bound: set[str] | None = None,
+    mullvad_gateways: set[str] | None = None,
+) -> bool:
     name = str(row.get('name') or '').strip()
-    if not name or name == DNS_DUMMY_IFACE or _is_mullvad_exit_interface(name):
+    if not name or name == DNS_DUMMY_IFACE or _is_mullvad_exit_interface(name, bound=bound):
         return False
     link_type = str(row.get('link_type') or '').strip().lower()
     lowered = name.lower()
     if link_type == 'wireguard' or lowered.startswith('wg') or lowered.startswith('awg'):
-        return _is_client_wireguard_server(name)
+        if not _is_client_wireguard_server(name, bound=bound):
+            return False
+        # Shared Mullvad tunnel Address must never be treated as client VPN DNS.
+        if mullvad_gateways:
+            gateway = _interface_ipv4(list(row.get('addresses') or []))
+            if gateway and gateway in mullvad_gateways:
+                return False
+        return True
     if _OPENVPN_NAME_RE.match(lowered) or (link_type in {'tun', 'tun6'} and lowered.startswith('ovpn')):
         return True
     if _PPP_NAME_RE.match(lowered):
@@ -344,12 +412,15 @@ def discover_vpn_interfaces(*, runner: Runner | None = None) -> list[dict[str, A
     rows: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     seen_gateways: set[str] = set()
+    # One store snapshot per discover pass — never reopen SQLite per iface.
+    bound = _mullvad_bound_ifaces()
+    mullvad_gateways = _mullvad_exit_gateway_ips(bound=bound)
 
     for item in list_host_interfaces(runner=runner):
-        if not _is_vpn_interface(item):
+        if not _is_vpn_interface(item, bound=bound, mullvad_gateways=mullvad_gateways):
             continue
         gateway = _interface_ipv4(list(item.get('addresses') or []))
-        if not gateway:
+        if not gateway or gateway in mullvad_gateways:
             continue
         name = str(item['name'])
         rows.append(
@@ -801,6 +872,52 @@ def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> 
     }
 
 
+def _filter_client_vpn_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop Mullvad exits / shared exit Addresses from ads/dns targets."""
+    bound = _mullvad_bound_ifaces()
+    mullvad_gateways = _mullvad_exit_gateway_ips(bound=bound)
+    out: list[dict[str, Any]] = []
+    for row in targets:
+        name = str(row.get('name') or '').strip()
+        gateway = str(row.get('gateway') or '').strip()
+        if not gateway:
+            continue
+        if name and _is_mullvad_exit_interface(name, bound=bound):
+            continue
+        if gateway in mullvad_gateways:
+            continue
+        out.append(row)
+    return out
+
+
+def cleanup_mullvad_exit_dns_artifacts(*, runner: Runner | None = None) -> list[str]:
+    """Undo leftover resolvectl dns/domain off on Mullvad exits (breaks handshake/egress)."""
+    execute = runner or run
+    if not shutil.which('resolvectl'):
+        return []
+    actions: list[str] = []
+    bound = _mullvad_bound_ifaces()
+    names: set[str] = set(bound)
+    for directory in _wg_conf_dirs():
+        if not directory.is_dir():
+            continue
+        for path in directory.glob('*.conf'):
+            try:
+                text = path.read_text(encoding='utf-8', errors='ignore')
+            except OSError:
+                continue
+            if _wg_conf_is_exit(text):
+                names.add(path.stem.lower())
+    for name in sorted(names):
+        if not name or '+' in name or '*' in name:
+            continue
+        # revert clears dns/domain overrides that ads-block may have left behind
+        proc = execute(['resolvectl', 'revert', name], check=False, timeout=10)
+        if getattr(proc, 'returncode', 1) == 0:
+            actions.append(f'resolvectl_revert:{name}')
+    return actions
+
+
 def ensure_vpn_dns_resolver(
     *,
     interfaces: list[dict[str, Any]] | None = None,
@@ -826,6 +943,15 @@ def ensure_vpn_dns_resolver(
                 'VPN interface list has no IPv4 gateway addresses',
             )
 
+    targets = _filter_client_vpn_targets(targets)
+    if not targets:
+        raise AgentError(
+            'VALIDATION_ERROR',
+            'No client VPN interfaces left after excluding Mullvad exits',
+        )
+
+    exit_cleanup = cleanup_mullvad_exit_dns_artifacts(runner=runner)
+
     upstream = tuple(upstream_dns or DEFAULT_UPSTREAM_DNS)
     ads_filtering = ADS_ENABLED_MARKER.is_file() if filtering_enabled is None else bool(filtering_enabled)
     gateways = [str(row.get('gateway') or '').strip() for row in targets if str(row.get('gateway') or '').strip()]
@@ -838,6 +964,8 @@ def ensure_vpn_dns_resolver(
         runner=runner,
     )
     resolver['bind_addresses'] = bind
+    if exit_cleanup:
+        resolver['exit_dns_cleanup'] = exit_cleanup
     host_dns = isolate_vpn_interfaces_from_host_dns(targets, runner=runner)
     if host_dns:
         resolver['host_dns_isolated'] = host_dns

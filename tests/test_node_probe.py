@@ -48,7 +48,7 @@ def test_is_mullvad_exit_skips_table_off(tmp_path, monkeypatch):
         encoding='utf-8',
     )
     monkeypatch.setattr(dns_leak, '_wg_conf_dirs', lambda: [conf_dir])
-    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda: {'sw'})
+    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda *a, **k: {'sw'})
 
     assert dns_leak._is_mullvad_exit_interface('poland') is True
     assert dns_leak._is_mullvad_exit_interface('pl') is True  # exit-style: Endpoint, no ListenPort

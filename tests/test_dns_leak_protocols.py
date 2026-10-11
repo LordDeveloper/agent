@@ -11,7 +11,7 @@ def test_is_vpn_interface_accepts_openvpn_and_l2tp_ppp(tmp_path, monkeypatch):
         encoding='utf-8',
     )
     monkeypatch.setattr(dns_leak, '_wg_conf_dirs', lambda: [conf_dir])
-    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda: set())
+    monkeypatch.setattr(dns_leak, '_mullvad_bound_ifaces', lambda *a, **k: set())
     monkeypatch.setattr(dns_leak, 'XL2TPD_CONF', tmp_path / 'xl2tpd.conf')
     (tmp_path / 'xl2tpd.conf').write_text('[lns default]\nlocal ip = 10.90.128.1\n', encoding='utf-8')
     (conf_dir / 'wg0.conf').write_text(
@@ -51,7 +51,7 @@ def test_discover_includes_configured_l2tp_and_openvpn(tmp_path, monkeypatch):
             {'name': 'wg0', 'link_type': 'wireguard', 'addresses': ['10.77.0.1/16'], 'is_up': True, 'state': 'UP'},
         ],
     )
-    monkeypatch.setattr(dns_leak, '_is_mullvad_exit_interface', lambda name: False)
+    monkeypatch.setattr(dns_leak, '_is_mullvad_exit_interface', lambda name, **k: False)
 
     rows = dns_leak.discover_vpn_interfaces()
     by_name = {row['name']: row['gateway'] for row in rows}
