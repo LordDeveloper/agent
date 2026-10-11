@@ -43,9 +43,9 @@ PROBE_URLS: tuple[str, ...] = (
 PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = tuple(
     (url, frozenset(range(100, 600))) for url in PROBE_URLS
 )
-PROBE_TIMEOUT = 2
-CONNECT_TIMEOUT = 2
-MAX_PROBE_ATTEMPTS = 2
+PROBE_TIMEOUT = 4
+CONNECT_TIMEOUT = 3
+MAX_PROBE_ATTEMPTS = 3
 MAX_PROBE_WORKERS = 12
 BIND_ERROR_CODES = frozenset({45, 55})
 
@@ -136,12 +136,18 @@ def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
     return resolved
 
 
-def _ip_route_replace_dev(dest: str, iface: str, *, runner: Runner) -> bool:
-    result = runner(
-        ['ip', 'route', 'replace', f'{dest}/32', 'dev', iface],
-        check=False,
-        timeout=5,
-    )
+def _ip_route_replace_dev(
+    dest: str,
+    iface: str,
+    *,
+    runner: Runner,
+    src: str | None = None,
+) -> bool:
+    cmd = ['ip', 'route', 'replace', f'{dest}/32', 'dev', iface]
+    source = str(src or '').strip()
+    if source and _looks_like_ip(source):
+        cmd.extend(['src', source])
+    result = runner(cmd, check=False, timeout=5)
     code = getattr(result, 'returncode', 1)
     return int(0 if code is None else code) == 0
 
@@ -152,6 +158,12 @@ def _ip_route_del_dev(dest: str, iface: str, *, runner: Runner) -> None:
         check=False,
         timeout=5,
     )
+
+
+def _curl_interface_arg(bind: str | None) -> str | None:
+    """Return curl --interface value. Keep bare names for older curl compatibility."""
+    text = str(bind or '').strip()
+    return text or None
 
 
 @contextmanager
@@ -179,10 +191,11 @@ def _host_routes_for_iface(
     for lock in locks:
         lock.acquire()
     installed: list[str] = []
+    src = next(iter(sorted(_interface_addresses(bind, runner=execute))), None)
     try:
         for dest in ordered:
             try:
-                if _ip_route_replace_dev(dest, bind, runner=execute):
+                if _ip_route_replace_dev(dest, bind, runner=execute, src=src):
                     installed.append(dest)
             except Exception:
                 continue
@@ -332,13 +345,14 @@ def _curl_probe(
                 '%{http_code} %{time_total}',
                 url,
             ]
-            if bind:
-                cmd[1:1] = ['--interface', bind]
+            curl_bind = _curl_interface_arg(bind)
+            if curl_bind:
+                cmd[1:1] = ['--interface', curl_bind]
 
             try:
                 result = execute(cmd, check=False, timeout=per_try_timeout)
             except subprocess.TimeoutExpired:
-                errors.append(f'timeout after {per_try_timeout}s ({url})')
+                errors.append(f'Connection timed out after {per_try_timeout}s ({url})')
                 continue
             except OSError as exc:
                 errors.append(str(exc) or 'curl OSError')
@@ -356,7 +370,11 @@ def _curl_probe(
                 errors.append(f'HTTP {http_code or "?"}')
                 continue
 
-            errors.append(stderr or f'curl exit {code}')
+            # Normalize curl 28 so the panel can show a clear timeout label.
+            if code == 28 or 'timed out' in stderr.lower() or 'timeout' in stderr.lower():
+                errors.append(stderr or f'Connection timed out (curl exit {code})')
+            else:
+                errors.append(stderr or f'curl exit {code}')
             if code in BIND_ERROR_CODES or 'bind' in stderr.lower() or 'interface' in stderr.lower():
                 break
 
@@ -566,7 +584,12 @@ def _should_skip_exit_interface_check(
     *,
     runner: Runner | None = None,
 ) -> bool:
-    """Skip duplicate exit probe only when outbound already binds the same iface *name*."""
+    """Skip duplicate exit probe when outbound already curls the same named iface.
+
+    Mullvad freedom outbounds often use a shared tunnel Address as sendThrough; the
+    outbound probe prefers exit_interface as --interface, so a second exit_interface
+    curl only doubles load and creates false timeouts under parallel batch probes.
+    """
     tag = str(outbound_tag or '').strip()
     iface = str(exit_interface or '').strip()
     if not tag or not iface:
@@ -581,12 +604,11 @@ def _should_skip_exit_interface_check(
         return False
 
     bind = _resolve_bind_interface(outbound)
-    if not bind:
+    if not bind and not iface:
         return False
-    # sendThrough=shared Mullvad IP must NOT skip the named exit_interface probe.
-    if _looks_like_ip(bind):
-        return False
-    return bind == iface
+
+    preferred = _prefer_named_bind(bind, iface, runner=runner)
+    return preferred == iface
 
 
 def probe_exit_interface(

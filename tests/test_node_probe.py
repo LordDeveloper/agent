@@ -169,10 +169,12 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which):
     )
 
     assert result['ok'] is True
-    assert 'exit_interface' in result['checks']
+    # Outbound already prefers exit_interface name — no duplicate exit curl.
     assert 'outbound' in result['checks']
+    assert 'exit_interface' not in result['checks']
     assert result.get('latency_ms') == 256
-    assert result['checks']['exit_interface'].get('latency_ms') == 256
+    assert result['checks']['outbound'].get('latency_ms') == 256
+    assert 'uk0' in calls
 
 
 @patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
@@ -259,8 +261,8 @@ def test_probe_prefers_exit_interface_over_shared_mullvad_ip(_interfaces, _which
     assert result['ok'] is True
     assert all(item == 'se' for item in calls if item)
     assert 'se' in calls
-    # Shared IP must not suppress the named exit probe.
-    assert 'exit_interface' in result['checks']
+    # One curl via named iface is enough — duplicate exit_interface probe skipped.
+    assert 'exit_interface' not in result['checks']
     assert result['checks']['outbound'].get('interface') == 'se'
 
 
