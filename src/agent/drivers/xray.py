@@ -1392,26 +1392,32 @@ class XrayDriver(CoreDriver):
         """Atomically replace routing.rules (native API when available, else config section)."""
         extras = dict(routing_extras or {})
         started = time.perf_counter()
-        # Always persist via config section. Xray /api/rules/replace is flaky on
-        # several custom builds (invalid_json / empty body) and region node moves
-        # must not depend on it.
-        routing = {
-            key: value
-            for key, value in extras.items()
-            if key in {"domainStrategy", "domainMatcher", "balancers"} and value is not None
-        }
-        routing["rules"] = list(rules)
+        # Prefer native /api/rules/replace — full config import validates+reloads Xray
+        # and made region sync / panel ops feel stuck after v0.4.64.
         try:
-            result = self.replace_section("routing", routing)
-        except AgentError:
-            # Last resort: native replace (older agents / section write unavailable).
-            try:
-                result = self._api().replace_rules(list(rules), **{
-                    k: v for k, v in extras.items()
-                    if k in {"domainStrategy", "domainMatcher", "balancers"} and v is not None
-                })
-            except AgentError:
+            result = self._api().replace_rules(list(rules), **extras)
+        except AgentError as exc:
+            # Older/buggy Xray builds: missing replace route, or replace returns
+            # invalid_json / empty body — fall back to config section write.
+            message = (exc.message or "").lower()
+            missing = exc.status in {404, 405, 501} or "not found" in message or "unknown" in message
+            broken_body = (
+                exc.status in {400, 422}
+                and (
+                    "invalid_json" in message
+                    or "incomplete json" in message
+                    or "empty or incomplete" in message
+                )
+            )
+            if not missing and not broken_body:
                 raise
+            routing = {
+                key: value
+                for key, value in extras.items()
+                if key in {"domainStrategy", "domainMatcher", "balancers"} and value is not None
+            }
+            routing["rules"] = list(rules)
+            result = self.replace_section("routing", routing)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.audit.record(
             "update",
