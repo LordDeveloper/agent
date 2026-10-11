@@ -49,19 +49,29 @@ def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monke
 
     def runner(args, **_kwargs):
         row = list(args)
-        if row[:3] == ['wg', 'show', 'de']:
+        if row[:4] == ['wg', 'show', 'de', 'latest-handshakes']:
             return SimpleNamespace(returncode=0, stdout='peer 1700000000\n', stderr='')
+        if row[:4] == ['wg', 'show', 'de', 'endpoints']:
+            return SimpleNamespace(returncode=0, stdout='peer 193.32.249.69:51820\n', stderr='')
         if row and row[0] == 'ip':
             return SimpleNamespace(returncode=0, stdout='', stderr='')
         return SimpleNamespace(returncode=28, stdout='', stderr='Connection timed out')
 
     monkeypatch.setattr(node_probe.time, 'time', lambda: 1700000050)
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(node_probe, '_tcp_probe', lambda host, port, timeout=5.0: (True, 'TCP متصل شد', 42))
 
     result = node_probe.probe_exit_interface('de', runner=runner)
     assert result['ok'] is True
     assert result.get('via') == 'handshake'
+    assert result.get('latency_ms') == 42
     assert 'handshake' in result['message']
+
+
+def test_parse_wg_endpoint_ipv4():
+    assert node_probe._parse_wg_endpoint('1.2.3.4:51820') == ('1.2.3.4', 51820)
+    assert node_probe._parse_wg_endpoint('[2001:db8::1]:51820') == ('2001:db8::1', 51820)
+    assert node_probe._parse_wg_endpoint('(none)') is None
 
 
 def test_curl_probe_continues_after_timeout(monkeypatch):

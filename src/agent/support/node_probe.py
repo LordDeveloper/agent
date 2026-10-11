@@ -134,13 +134,76 @@ def _wg_has_recent_handshake(
     return age <= max(1, int(max_age))
 
 
-def _handshake_online_result(iface: str) -> dict[str, Any]:
-    return {
+def _parse_wg_endpoint(raw: str) -> tuple[str, int] | None:
+    text = str(raw or '').strip()
+    if not text or text in {'(none)', 'none'}:
+        return None
+    if text.startswith('['):
+        # [2001:db8::1]:51820
+        if ']:' not in text:
+            return None
+        host, port_text = text[1:].rsplit(']:', 1)
+    else:
+        if text.count(':') != 1:
+            # Ambiguous IPv6 without brackets — skip.
+            if text.count(':') > 1:
+                return None
+            return None
+        host, port_text = text.rsplit(':', 1)
+    host = host.strip()
+    try:
+        port = int(port_text.strip())
+    except ValueError:
+        return None
+    if not host or port <= 0 or port > 65535:
+        return None
+    return host, port
+
+
+def _wg_peer_endpoint(iface: str, *, runner: Runner | None = None) -> tuple[str, int] | None:
+    name = str(iface or '').strip()
+    if not name or _looks_like_ip(name) or not shutil.which('wg'):
+        return None
+    execute = _runner(runner)
+    try:
+        result = execute(['wg', 'show', name, 'endpoints'], check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw_code = getattr(result, 'returncode', 1)
+    if int(0 if raw_code is None else raw_code) != 0:
+        return None
+    for line in (getattr(result, 'stdout', '') or '').splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        parsed = _parse_wg_endpoint(parts[-1])
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _wg_endpoint_latency_ms(iface: str, *, runner: Runner | None = None) -> int | None:
+    """TCP RTT to the WireGuard peer endpoint — usable when host egress curl flakes."""
+    endpoint = _wg_peer_endpoint(iface, runner=runner)
+    if endpoint is None:
+        return None
+    host, port = endpoint
+    ok, _message, latency_ms = _tcp_probe(host, port, timeout=3.0)
+    return latency_ms if ok else None
+
+
+def _handshake_online_result(iface: str, *, runner: Runner | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
         'ok': True,
         'message': 'تونل آنلاین (handshake)',
         'interface': iface,
         'via': 'handshake',
     }
+    latency_ms = _wg_endpoint_latency_ms(iface, runner=runner)
+    if latency_ms is not None:
+        result['latency_ms'] = latency_ms
+        result['message'] = 'تونل آنلاین (handshake + پینگ رله)'
+    return result
 
 
 def _runner(runner: Runner | None) -> Runner:
@@ -691,7 +754,7 @@ def probe_exit_interface(
 
     # Curl egress flake on Table=off Mullvad — recent handshake = interface online.
     if _wg_has_recent_handshake(iface, runner=runner):
-        return _handshake_online_result(iface)
+        return _handshake_online_result(iface, runner=runner)
 
     return {'ok': False, 'message': message, 'interface': iface}
 
@@ -755,7 +818,7 @@ def probe_outbound_tag(
             return result
 
         if not _looks_like_ip(bind_iface) and _wg_has_recent_handshake(bind_iface, runner=runner):
-            row = _handshake_online_result(bind_iface)
+            row = _handshake_online_result(bind_iface, runner=runner)
             row['protocol'] = protocol
             return row
 
