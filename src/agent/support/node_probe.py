@@ -22,16 +22,31 @@ Runner = Callable[..., Any]
 # IP-literal targets ONLY. Hostname probes + ads-block/resolvectl on exit ifaces
 # can hang getaddrinfo longer than the panel HTTP timeout, which surfaces as
 # "اتصال شبکه به Agent برقرار نشد" for that region node.
-PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = (
-    ('http://1.1.1.1/cdn-cgi/trace', frozenset({200})),
-    ('http://1.0.0.1/cdn-cgi/trace', frozenset({200})),
-    ('http://8.8.8.8/', frozenset({200, 301, 302, 404})),
-    ('http://8.8.4.4/', frozenset({200, 301, 302, 404})),
-    ('http://9.9.9.9/', frozenset({200, 301, 302, 404})),
-    ('http://208.67.222.222/', frozenset({200, 301, 302, 404})),
+#
+# Many distinct IPs let parallel node probes install non-conflicting /32 routes.
+# Any HTTP status (incl. 301/302) proves egress — redirects are success, not failure.
+PROBE_URLS: tuple[str, ...] = (
+    'http://1.1.1.1/cdn-cgi/trace',
+    'http://1.0.0.1/cdn-cgi/trace',
+    'http://8.8.8.8/',
+    'http://8.8.4.4/',
+    'http://9.9.9.9/',
+    'http://149.112.112.112/',
+    'http://208.67.222.222/',
+    'http://208.67.220.220/',
+    'http://94.140.14.14/',
+    'http://94.140.15.15/',
+    'http://185.228.168.9/',
+    'http://76.76.2.0/',
 )
-PROBE_TIMEOUT = 3
+# Back-compat for tests / imports that still reference PROBE_TARGETS.
+PROBE_TARGETS: tuple[tuple[str, frozenset[int]], ...] = tuple(
+    (url, frozenset(range(100, 600))) for url in PROBE_URLS
+)
+PROBE_TIMEOUT = 2
 CONNECT_TIMEOUT = 2
+MAX_PROBE_ATTEMPTS = 2
+MAX_PROBE_WORKERS = 12
 BIND_ERROR_CODES = frozenset({45, 55})
 
 # Small Cloudflare download used to rank Mullvad relays by real egress throughput.
@@ -57,14 +72,25 @@ def _route_lock_for(dest: str) -> threading.Lock:
         return lock
 
 
-def _rotated_probe_targets(start_index: int = 0) -> list[tuple[str, frozenset[int]]]:
-    targets = list(PROBE_TARGETS)
-    if not targets:
+def _rotated_probe_urls(start_index: int = 0, *, limit: int | None = None) -> list[str]:
+    urls = list(PROBE_URLS)
+    if not urls:
         return []
-    offset = int(start_index or 0) % len(targets)
-    if offset <= 0:
-        return targets
-    return targets[offset:] + targets[:offset]
+    offset = int(start_index or 0) % len(urls)
+    rotated = urls[offset:] + urls[:offset] if offset > 0 else urls
+    if limit is None or limit <= 0:
+        return rotated
+    return rotated[:limit]
+
+
+def _rotated_probe_targets(start_index: int = 0) -> list[tuple[str, frozenset[int]]]:
+    """Legacy helper kept for tests — prefer _rotated_probe_urls."""
+    return [(url, frozenset(range(100, 600))) for url in _rotated_probe_urls(start_index)]
+
+
+def _http_code_means_egress(http_code: int) -> bool:
+    """Any real HTTP status means the packet left via the bound interface."""
+    return 100 <= int(http_code or 0) < 600
 
 
 def _runner(runner: Runner | None) -> Runner:
@@ -286,10 +312,10 @@ def _curl_probe(
     bind = _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
     per_try_timeout = PROBE_TIMEOUT + CONNECT_TIMEOUT + 2
-    targets = _rotated_probe_targets(start_index)
+    urls = _rotated_probe_urls(start_index, limit=MAX_PROBE_ATTEMPTS)
 
     # Install one /32 at a time so parallel probes on different IPs can overlap.
-    for url, ok_codes in targets:
+    for url in urls:
         host = _url_host(url)
         with _host_routes_for_iface(bind, [host] if host else [], runner=execute):
             cmd = [
@@ -325,7 +351,7 @@ def _curl_probe(
 
             if code == 0:
                 http_code, latency_ms = _parse_curl_write_out(body)
-                if http_code in ok_codes:
+                if _http_code_means_egress(http_code):
                     return True, 'اتصال برقرار شد', latency_ms
                 errors.append(f'HTTP {http_code or "?"}')
                 continue
@@ -767,9 +793,9 @@ def probe_region_nodes(
             start_index=index,
         )
 
-    # Cap concurrency to the number of distinct probe IPs so route installs overlap
-    # without stampeding the same destination across Mullvad Table=off exits.
-    max_workers = min(len(PROBE_TARGETS), len(valid_nodes), 6)
+    # Parallel across nodes; each node starts on a different probe IP so /32 route
+    # locks rarely contend (Table=off Mullvad exits need host routes per dest).
+    max_workers = min(MAX_PROBE_WORKERS, len(PROBE_URLS), len(valid_nodes))
     rows: list[dict[str, Any] | None] = [None] * len(valid_nodes)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

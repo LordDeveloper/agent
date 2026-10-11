@@ -10,12 +10,36 @@ def test_probe_targets_prefer_literal_ip():
     assert PROBE_TARGETS[0][0].startswith('http://1.1.1.1')
     assert PROBE_TARGETS[1][0].startswith('http://1.0.0.1')
     assert len(PROBE_TARGETS) >= 4
+    assert len(node_probe.PROBE_URLS) >= 8
 
 
 def test_rotated_probe_targets_shifts_start():
     rotated = node_probe._rotated_probe_targets(1)
     assert rotated[0][0] == PROBE_TARGETS[1][0]
     assert rotated[-1][0] == PROBE_TARGETS[0][0]
+
+
+def test_curl_probe_accepts_http_301(monkeypatch):
+    def runner(args, **_kwargs):
+        row = list(args)
+        if row and row[0] == 'ip':
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        return SimpleNamespace(returncode=0, stdout='301 0.055', stderr='')
+
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.1.1.1'])
+    ok, message, latency = _curl_probe(interface='de', runner=runner)
+    assert ok is True
+    assert message == 'اتصال برقرار شد'
+    assert latency == 55
+
+
+def test_http_code_means_egress_includes_redirects():
+    assert node_probe._http_code_means_egress(200)
+    assert node_probe._http_code_means_egress(301)
+    assert node_probe._http_code_means_egress(302)
+    assert node_probe._http_code_means_egress(404)
+    assert not node_probe._http_code_means_egress(0)
 
 
 def test_curl_probe_continues_after_timeout(monkeypatch):
