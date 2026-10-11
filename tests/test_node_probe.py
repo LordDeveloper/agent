@@ -42,6 +42,28 @@ def test_http_code_means_egress_includes_redirects():
     assert not node_probe._http_code_means_egress(0)
 
 
+@patch('agent.support.node_probe.shutil.which', return_value='/usr/bin/curl')
+@patch('agent.support.node_probe.list_host_interfaces')
+def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monkeypatch):
+    _interfaces.return_value = [{'name': 'de', 'is_up': True, 'addresses': ['10.64.0.2/32']}]
+
+    def runner(args, **_kwargs):
+        row = list(args)
+        if row[:3] == ['wg', 'show', 'de']:
+            return SimpleNamespace(returncode=0, stdout='peer 1700000000\n', stderr='')
+        if row and row[0] == 'ip':
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        return SimpleNamespace(returncode=28, stdout='', stderr='Connection timed out')
+
+    monkeypatch.setattr(node_probe.time, 'time', lambda: 1700000050)
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+
+    result = node_probe.probe_exit_interface('de', runner=runner)
+    assert result['ok'] is True
+    assert result.get('via') == 'handshake'
+    assert 'handshake' in result['message']
+
+
 def test_curl_probe_continues_after_timeout(monkeypatch):
     calls: list[list[str]] = []
 

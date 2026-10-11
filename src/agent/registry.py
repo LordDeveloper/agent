@@ -97,6 +97,26 @@ class CoreRegistry:
     def online_traffic(self, core: str | None = None) -> dict[str, dict[str, int]]:
         return collect_online_traffic(self, resolve_core_key(core) if core else None)
 
+    def online_traffic_by_core(self) -> dict[str, dict[str, dict[str, int]]]:
+        enabled = set(self.settings.cores())
+        out: dict[str, dict[str, dict[str, int]]] = {}
+        for key, driver in self._drivers.items():
+            if enabled and key not in enabled:
+                out[key] = {}
+                continue
+            try:
+                fn = getattr(driver, "online_traffic", None)
+                if callable(fn):
+                    rows = fn()
+                else:
+                    from agent.support.online_traffic import online_traffic_from_snapshot
+
+                    rows = online_traffic_from_snapshot(driver)
+                out[key] = rows if isinstance(rows, dict) else {}
+            except AgentError:
+                out[key] = {}
+        return out
+
     def live_stats(self) -> dict[str, Any]:
         """One walk per enabled core: snapshot + online users + ips + traffic."""
         enabled = set(self.settings.cores())

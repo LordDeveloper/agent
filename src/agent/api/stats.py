@@ -23,13 +23,17 @@ def stats_online(
     core: str | None = Query(None),
     registry: CoreRegistry = Depends(get_registry),
 ):
+    """Online users for every enabled core (live-stats shape).
+
+    Always ``{"xray": [...], "wireguard": [...], ...}``. Optional ``core`` is
+    ignored for response shape so panels never fan out per-core HTTP calls.
+    """
     try:
-        if core:
-            users = registry.online_users(resolve_core_key(core))
-        else:
-            users = registry.online_users_by_core()
+        users = registry.online_users_by_core()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    # Keep query param for older clients; do not change the global payload shape.
+    _ = resolve_core_key(core)
     return {"success": True, "users": users}
 
 
@@ -38,11 +42,12 @@ def stats_online_ips(
     core: str | None = Query(None),
     registry: CoreRegistry = Depends(get_registry),
 ):
-    """One snapshot of live client IPs for every online user (Xray online/all)."""
+    """Live client IPs for every enabled core: ``{"xray": {...}, "wireguard": {...}}``."""
     try:
-        users = registry.online_ips(resolve_core_key(core))
+        users = registry.online_ips_by_core()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    _ = resolve_core_key(core)
     return {"success": True, "users": users}
 
 
@@ -51,6 +56,7 @@ def stats_online_traffic(
     core: str | None = Query(None),
     registry: CoreRegistry = Depends(get_registry),
 ):
+    """Per-core when ``core`` is set; otherwise flat merge (panel traffic billing)."""
     try:
         users = registry.online_traffic(resolve_core_key(core))
     except AgentError as exc:

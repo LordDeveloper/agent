@@ -48,6 +48,9 @@ CONNECT_TIMEOUT = 3
 MAX_PROBE_ATTEMPTS = 3
 MAX_PROBE_WORKERS = 12
 BIND_ERROR_CODES = frozenset({45, 55})
+# Mullvad/WG exits: host curl can flake on Table=off while the tunnel still carries peers.
+# A recent handshake means the interface is online for panel health.
+HANDSHAKE_ONLINE_MAX_AGE = 180
 
 # Small Cloudflare download used to rank Mullvad relays by real egress throughput.
 # Bind by WireGuard interface NAME — never by tunnel IP (shared across exits).
@@ -91,6 +94,53 @@ def _rotated_probe_targets(start_index: int = 0) -> list[tuple[str, frozenset[in
 def _http_code_means_egress(http_code: int) -> bool:
     """Any real HTTP status means the packet left via the bound interface."""
     return 100 <= int(http_code or 0) < 600
+
+
+def _wg_latest_handshake(iface: str, *, runner: Runner | None = None) -> int | None:
+    name = str(iface or '').strip()
+    if not name or _looks_like_ip(name) or not shutil.which('wg'):
+        return None
+    execute = _runner(runner)
+    try:
+        result = execute(['wg', 'show', name, 'latest-handshakes'], check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw_code = getattr(result, 'returncode', 1)
+    if int(0 if raw_code is None else raw_code) != 0:
+        return None
+    newest = 0
+    for line in (getattr(result, 'stdout', '') or '').splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            ts = int(parts[-1])
+        except ValueError:
+            continue
+        newest = max(newest, ts)
+    return newest or None
+
+
+def _wg_has_recent_handshake(
+    iface: str,
+    *,
+    runner: Runner | None = None,
+    max_age: int = HANDSHAKE_ONLINE_MAX_AGE,
+) -> bool:
+    handshake = _wg_latest_handshake(iface, runner=runner)
+    if not handshake or int(handshake) <= 0:
+        return False
+    age = max(0, int(time.time()) - int(handshake))
+    return age <= max(1, int(max_age))
+
+
+def _handshake_online_result(iface: str) -> dict[str, Any]:
+    return {
+        'ok': True,
+        'message': 'تونل آنلاین (handshake)',
+        'interface': iface,
+        'via': 'handshake',
+    }
 
 
 def _runner(runner: Runner | None) -> Runner:
@@ -628,10 +678,22 @@ def probe_exit_interface(
         return {'ok': False, 'message': f'اینترفیس {iface} down است'}
 
     ok, message, latency_ms = _curl_probe(interface=iface, runner=runner, start_index=start_index)
-    result: dict[str, Any] = {'ok': ok, 'message': message, 'interface': iface}
-    if latency_ms is not None:
-        result['latency_ms'] = latency_ms
-    return result
+    if ok:
+        result: dict[str, Any] = {
+            'ok': True,
+            'message': message,
+            'interface': iface,
+            'via': 'egress',
+        }
+        if latency_ms is not None:
+            result['latency_ms'] = latency_ms
+        return result
+
+    # Curl egress flake on Table=off Mullvad — recent handshake = interface online.
+    if _wg_has_recent_handshake(iface, runner=runner):
+        return _handshake_online_result(iface)
+
+    return {'ok': False, 'message': message, 'interface': iface}
 
 
 def probe_outbound_tag(
@@ -680,15 +742,29 @@ def probe_outbound_tag(
             runner=runner,
             start_index=start_index,
         )
-        result: dict[str, Any] = {
-            'ok': ok,
+        if ok:
+            result: dict[str, Any] = {
+                'ok': True,
+                'message': message,
+                'protocol': protocol,
+                'interface': bind_iface,
+                'via': 'egress',
+            }
+            if latency_ms is not None:
+                result['latency_ms'] = latency_ms
+            return result
+
+        if not _looks_like_ip(bind_iface) and _wg_has_recent_handshake(bind_iface, runner=runner):
+            row = _handshake_online_result(bind_iface)
+            row['protocol'] = protocol
+            return row
+
+        return {
+            'ok': False,
             'message': message,
             'protocol': protocol,
             'interface': bind_iface,
         }
-        if latency_ms is not None:
-            result['latency_ms'] = latency_ms
-        return result
 
     if protocol in {'dns', 'loopback'}:
         return {'ok': True, 'message': f'اوتباند {protocol} — بدون تست egress', 'protocol': protocol}
