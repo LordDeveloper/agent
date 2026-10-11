@@ -31,9 +31,9 @@ def mullvad_country_relays(country_code: str, request: Request, ping: bool = Tru
 
 
 @router.get("/status")
-def mullvad_status(request: Request):
+def mullvad_status(request: Request, probe: bool = False):
     try:
-        payload = _service(request).status()
+        payload = _service(request).status(probe=bool(probe))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

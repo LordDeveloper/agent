@@ -189,10 +189,10 @@ def test_save_settings_propagates_private_key_to_bound_ifaces(tmp_path: Path, mo
     assert parsed["interface"]["Address"] == "10.64.0.2/32"
 
 
-def test_apply_relay_prefers_settings_private_key(tmp_path: Path, monkeypatch):
-    new_key = "J" * 42 + "A="
+def test_apply_relay_keeps_conf_private_key(tmp_path: Path, monkeypatch):
+    settings_key = "J" * 42 + "A="
     svc = _service(tmp_path)
-    svc.save_settings(private_key=new_key, address="10.64.0.2/32")
+    svc.save_settings(private_key=settings_key, address="10.64.0.2/32")
     path = tmp_path / "wg" / "de.conf"
     path.write_text(
         dump_wg_conf(
@@ -207,7 +207,8 @@ def test_apply_relay_prefers_settings_private_key(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(svc, "_ensure_persist_unit", lambda _iface: {"ok": True})
     svc._apply_relay("de", RELAYS[1])  # berlin
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
-    assert parsed["interface"]["PrivateKey"] == new_key
+    # Fallback/relay switch must not stomp the working conf key with settings.
+    assert parsed["interface"]["PrivateKey"] == PRIV
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
 
 

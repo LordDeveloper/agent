@@ -669,17 +669,27 @@ class MullvadService:
         private_key: str | None = None,
         address: str | None = None,
     ) -> dict[str, Any]:
-        """Rewrite PrivateKey/Address on all bound Mullvad exit confs and reload live ifaces."""
-        key = str(private_key or "").strip()
-        addr = str(address or "").strip()
+        """Rewrite account fields on bound exit confs.
+
+        Only fields explicitly passed are written. Address-only updates must never
+        pull settings.private_key and stomp working conf keys (that killed handshakes).
+        """
+        explicit_key = private_key is not None
+        explicit_addr = address is not None
+        key = str(private_key or "").strip() if explicit_key else ""
+        addr = str(address or "").strip() if explicit_addr else ""
         if addr:
             addr = normalize_tunnel_address(addr) or addr
-        if not key and not addr:
-            settings = self.settings()
-            key = str(settings.get("private_key") or "").strip()
-            addr = str(settings.get("address") or "").strip()
-        if not key:
+        if explicit_key and not key:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
+        if not explicit_key and not explicit_addr:
+            return {
+                "updated": [],
+                "failed": [],
+                "skipped": [],
+                "updated_count": 0,
+                "failed_count": 0,
+            }
 
         updated: list[str] = []
         failed: list[dict[str, str]] = []
@@ -695,14 +705,24 @@ class MullvadService:
             try:
                 parsed = read_conf(path) or {"interface": {}, "peers": []}
                 interface = dict(parsed.get("interface") or {})
-                interface["PrivateKey"] = key
-                if addr:
+                before_key = str(interface.get("PrivateKey") or "").strip()
+                before_addr = str(interface.get("Address") or "").strip()
+                changed = False
+                if explicit_key and before_key != key:
+                    interface["PrivateKey"] = key
+                    changed = True
+                if explicit_addr and addr and before_addr != addr:
                     interface["Address"] = addr
+                    changed = True
                 if "Table" not in interface:
                     interface["Table"] = "off"
+                    changed = True
+                if not changed:
+                    skipped.append(iface)
+                    continue
                 peers = [dict(peer) for peer in (parsed.get("peers") or []) if isinstance(peer, dict)]
                 path.write_text(dump_wg_conf({"interface": interface, "peers": peers}), encoding="utf-8")
-                # Reload live tunnel so handshake uses the new account key immediately.
+                # Reload only when conf actually changed.
                 self._sync_iface(iface, path)
                 try:
                     self._ensure_persist_unit(iface)
@@ -1128,17 +1148,28 @@ class MullvadService:
             "message": f"relay fixed on {hostname}" if pin_fixed else f"relay unfixed for {code}",
         }
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, probe: bool = False) -> dict[str, Any]:
+        """Service snapshot for the panel.
+
+        Default is lightweight (link + handshake + unit) — full curl egress on every
+        tunnel made panel calls hit 504 during auto-update / busy Agent.
+        Pass probe=True only when an explicit health check is requested.
+        """
         self.refresh_bindings()
         rows = []
         for bind in self.bindings():
             iface = str(bind.get("iface") or "")
+            up = bool(iface and self._iface_up(iface))
+            handshake = self._latest_handshake(iface) if up else None
+            has_handshake = bool(handshake and int(handshake) > 0)
             ok = False
             message = "interface down"
             latency = None
-            up = bool(iface and self._iface_up(iface))
-            if up:
+            if up and probe:
                 ok, message, latency = self.egress_probe(interface=iface, runner=self.runner)
+            elif up:
+                ok = has_handshake
+                message = "handshake ok" if has_handshake else "waiting for handshake"
             unit = self._unit_status(iface) if iface else {
                 "unit": None,
                 "active": False,
@@ -1150,6 +1181,8 @@ class MullvadService:
                     **self._present_binding(bind),
                     "up": up,
                     "healthy": ok,
+                    "handshake": has_handshake,
+                    "handshake_at": handshake,
                     "message": message if up else (unit.get("state") or message),
                     "latency_ms": latency,
                     "unit": unit.get("unit"),
@@ -1160,7 +1193,7 @@ class MullvadService:
             )
         settings = self.settings()
         settings.pop("private_key", None)
-        return {"settings": settings, "tunnels": rows}
+        return {"settings": settings, "tunnels": rows, "probed": bool(probe)}
 
     def control_tunnel(self, iface: str, action: str) -> dict[str, Any]:
         """Start / stop / restart one Mullvad exit (systemd unit + live WireGuard iface)."""
@@ -1205,20 +1238,8 @@ class MullvadService:
         if not path.is_file():
             raise AgentError("NOT_FOUND", f"Mullvad conf missing for {name}", 404)
 
-        # Prefer account settings over stale conf PrivateKey.
-        settings = self.settings()
-        account_key = str(settings.get("private_key") or "").strip()
-        if account_key:
-            parsed = read_conf(path) or {"interface": {}, "peers": []}
-            interface = dict(parsed.get("interface") or {})
-            if str(interface.get("PrivateKey") or "").strip() != account_key:
-                interface["PrivateKey"] = account_key
-                addr = str(settings.get("address") or interface.get("Address") or "").strip()
-                if addr:
-                    interface["Address"] = normalize_tunnel_address(addr) or addr
-                peers = [dict(peer) for peer in (parsed.get("peers") or []) if isinstance(peer, dict)]
-                path.write_text(dump_wg_conf({"interface": interface, "peers": peers}), encoding="utf-8")
-
+        # Never rewrite PrivateKey here — conf on disk is source of truth for start/restart.
+        # Explicit key rotation goes through save_settings → propagate_account only.
         self._ensure_persist_unit(name)
         self._sync_iface(name, path)
         start = self.runner(["systemctl", "start", instance], check=False, timeout=30)
@@ -1706,9 +1727,10 @@ class MullvadService:
         path = conf_path(self.config_dir, iface)
         parsed = read_conf(path) or {"interface": {}, "peers": []}
         interface = dict(parsed.get("interface") or {})
-        # Account settings win — conf may still hold a rotated-out PrivateKey.
-        private_key = str(settings.get("private_key") or interface.get("PrivateKey") or "").strip()
-        address = str(settings.get("address") or interface.get("Address") or "").strip()
+        # Conf on disk wins. Fallback/probe must never stomp a working PrivateKey with a
+        # stale settings copy — that is what killed Mullvad handshakes after v0.4.68.
+        private_key = str(interface.get("PrivateKey") or settings.get("private_key") or "").strip()
+        address = str(interface.get("Address") or settings.get("address") or "").strip()
         if not private_key:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
         if not address:
@@ -1743,13 +1765,19 @@ class MullvadService:
             self._ensure_persist_unit(iface)
         except Exception as exc:
             log.warning("mullvad persist unit failed iface=%s: %s", iface, exc)
-        if not settings.get("private_key") or not settings.get("address"):
-            self.store.put_doc(
-                CORE,
-                KIND_SETTINGS,
-                SETTINGS_ID,
-                {"private_key": private_key, "address": interface["Address"]},
-            )
+        # Seed account settings from conf only when missing — never wipe relay_metric.
+        current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+        if not str(current.get("private_key") or "").strip() or not str(current.get("address") or "").strip():
+            seeded = dict(current) if isinstance(current, dict) else {}
+            seeded["private_key"] = str(current.get("private_key") or private_key)
+            seeded["address"] = str(current.get("address") or interface["Address"])
+            if "relay_metric" not in seeded:
+                seeded["relay_metric"] = normalize_relay_metric(settings.get("relay_metric"))
+            if "relay_mode" not in seeded and "selection_mode" not in seeded:
+                mode = normalize_relay_mode(settings.get("relay_mode") or settings.get("selection_mode"))
+                seeded["relay_mode"] = mode
+                seeded["selection_mode"] = mode
+            self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, seeded)
 
     def restore_interfaces(self) -> dict[str, Any]:
         restored: list[str] = []
