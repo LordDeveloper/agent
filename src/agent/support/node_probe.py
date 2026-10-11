@@ -53,8 +53,9 @@ BIND_ERROR_CODES = frozenset({45, 55})
 # A recent handshake means the interface is online for panel health.
 HANDSHAKE_ONLINE_MAX_AGE = 180
 
-# Panel ping is always ICMP via the exit iface (not curl time_total).
-PING_TARGET = '8.8.8.8'
+# Panel ping prefers the WireGuard/Mullvad peer (relay) IP: ping -I <iface> <relay>.
+# Fallback only when the iface has no endpoint (non-WG exits).
+PING_FALLBACK_TARGET = '8.8.8.8'
 PING_WAIT_SECONDS = 2
 
 # Small Cloudflare download used to rank Mullvad relays by real egress throughput.
@@ -145,36 +146,135 @@ _PING_TIME_RE = re.compile(
 )
 
 
-def _iface_ping_ms(
-    interface: str | None,
-    *,
-    runner: Runner | None = None,
-    target: str = PING_TARGET,
-) -> int | None:
-    """Panel ping: ``ping -I <iface> 8.8.8.8`` (with temp /32 for Table=off)."""
-    bind = _resolve_curl_bind(interface, runner=runner)
-    dest = str(target or '').strip() or PING_TARGET
-    if not bind or not dest or not shutil.which('ping'):
+def _parse_wg_endpoint(raw: str) -> tuple[str, int] | None:
+    text = str(raw or '').strip()
+    if not text or text in {'(none)', 'none'}:
         return None
-
-    execute = _runner(runner)
-    cmd = ['ping', '-4', '-n', '-c', '1', '-W', str(PING_WAIT_SECONDS), '-I', bind, dest]
-    # Named ifaces with Table=off need a host route so ICMP leaves via that device.
-    route_iface = None if _looks_like_ip(bind) else bind
+    if text.startswith('['):
+        if ']:' not in text:
+            return None
+        host, port_text = text[1:].rsplit(']:', 1)
+    else:
+        if text.count(':') != 1:
+            if text.count(':') > 1:
+                return None
+            return None
+        host, port_text = text.rsplit(':', 1)
+    host = host.strip()
     try:
-        with _host_routes_for_iface(route_iface, [dest], runner=execute):
-            result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
+        port = int(port_text.strip())
+    except ValueError:
+        return None
+    if not host or port <= 0 or port > 65535:
+        return None
+    return host, port
+
+
+def _wg_relay_ipv4(iface: str | None, *, runner: Runner | None = None) -> str | None:
+    """Peer/relay IPv4 from ``wg show <iface> endpoints``."""
+    name = str(iface or '').strip()
+    if not name or _looks_like_ip(name) or not shutil.which('wg'):
+        return None
+    execute = _runner(runner)
+    try:
+        result = execute(['wg', 'show', name, 'endpoints'], check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
+    raw_code = getattr(result, 'returncode', 1)
+    if int(0 if raw_code is None else raw_code) != 0:
+        return None
+    for line in (getattr(result, 'stdout', '') or '').splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        parsed = _parse_wg_endpoint(parts[-1])
+        if parsed is None:
+            continue
+        host, _port = parsed
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv4Address):
+            return str(ip)
+    return None
 
-    body = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
-    match = _PING_TIME_RE.search(body)
+
+def _parse_ping_ms(body: str) -> int | None:
+    match = _PING_TIME_RE.search(body or '')
     if not match:
         return None
     try:
         return max(1, int(round(float(match.group(1)))))
     except ValueError:
         return None
+
+
+def _run_ping_ms(
+    dest: str,
+    *,
+    interface: str | None = None,
+    runner: Runner | None = None,
+    via_iface_route: bool = False,
+) -> int | None:
+    if not dest or not shutil.which('ping'):
+        return None
+    execute = _runner(runner)
+    cmd = ['ping', '-4', '-n', '-c', '1', '-W', str(PING_WAIT_SECONDS)]
+    bind = str(interface or '').strip()
+    if bind:
+        cmd.extend(['-I', bind])
+    cmd.append(dest)
+
+    try:
+        if via_iface_route and bind and not _looks_like_ip(bind):
+            with _host_routes_for_iface(bind, [dest], runner=execute):
+                result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
+        else:
+            result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    body = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
+    return _parse_ping_ms(body)
+
+
+def _iface_ping_ms(
+    interface: str | None,
+    *,
+    runner: Runner | None = None,
+    target: str | None = None,
+) -> int | None:
+    """Panel ping: ``ping -I <iface> <relay-ip>`` (prefer WG peer endpoint).
+
+    Relay IP is reached via WAN — do not install a Table=off /32 via the WG iface
+    (that would try to reach the peer through the tunnel). Fallback ``8.8.8.8``
+    still uses a temp host route so ICMP egresses through the exit iface.
+    """
+    bind = _resolve_curl_bind(interface, runner=runner)
+    if not bind:
+        return None
+
+    explicit = str(target or '').strip()
+    relay = explicit or _wg_relay_ipv4(bind if not _looks_like_ip(bind) else str(interface or ''), runner=runner)
+
+    if relay:
+        # Best path: ping the node's own Mullvad/WG relay.
+        latency = _run_ping_ms(relay, interface=bind, runner=runner, via_iface_route=False)
+        if latency is not None:
+            return latency
+        # Some hosts reject -I on WG for endpoint probes — plain ping to relay.
+        latency = _run_ping_ms(relay, interface=None, runner=runner, via_iface_route=False)
+        if latency is not None:
+            return latency
+
+    # Non-WG / missing endpoint: egress ping through the iface to a public IP.
+    return _run_ping_ms(
+        PING_FALLBACK_TARGET,
+        interface=bind,
+        runner=runner,
+        via_iface_route=True,
+    )
 
 
 def _handshake_online_result(

@@ -68,17 +68,19 @@ def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monke
     assert 'handshake' in result['message']
 
 
-def test_iface_ping_ms_uses_ping_dash_i(monkeypatch):
+def test_iface_ping_ms_prefers_wg_relay_ip(monkeypatch):
     calls: list[list[str]] = []
 
     def runner(args, **_kwargs):
         row = list(args)
         calls.append(row)
+        if row[:4] == ['wg', 'show', 'de', 'endpoints']:
+            return SimpleNamespace(returncode=0, stdout='peer 193.32.249.69:51820\n', stderr='')
         if row and row[0] == 'ip':
             return SimpleNamespace(returncode=0, stdout='', stderr='')
         return SimpleNamespace(
             returncode=0,
-            stdout='64 bytes from 8.8.8.8: icmp_seq=1 ttl=50 time=27.4 ms\n',
+            stdout='64 bytes from 193.32.249.69: icmp_seq=1 ttl=50 time=27.4 ms\n',
             stderr='',
         )
 
@@ -88,7 +90,15 @@ def test_iface_ping_ms_uses_ping_dash_i(monkeypatch):
     assert ping_cmds
     assert '-I' in ping_cmds[0]
     assert ping_cmds[0][ping_cmds[0].index('-I') + 1] == 'de'
-    assert ping_cmds[0][-1] == '8.8.8.8'
+    assert ping_cmds[0][-1] == '193.32.249.69'
+    # Relay ping must not install a /32 via the WG iface (peer is on WAN).
+    assert not any(row[:3] == ['ip', 'route', 'replace'] for row in calls)
+
+
+def test_parse_wg_endpoint_ipv4():
+    assert node_probe._parse_wg_endpoint('1.2.3.4:51820') == ('1.2.3.4', 51820)
+    assert node_probe._parse_wg_endpoint('[2001:db8::1]:51820') == ('2001:db8::1', 51820)
+    assert node_probe._parse_wg_endpoint('(none)') is None
 
 
 def test_curl_probe_continues_after_timeout(monkeypatch):
