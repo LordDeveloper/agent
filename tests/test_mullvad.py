@@ -383,7 +383,7 @@ def test_fallback_switches_when_relay_tcp_probe_fails(tmp_path: Path, monkeypatc
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
 
 
-def test_fallback_ignores_handshake_when_egress_is_down(tmp_path: Path, monkeypatch):
+def test_fallback_skips_when_handshake_is_recent(tmp_path: Path, monkeypatch):
     svc = _service(
         tmp_path,
         probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
@@ -404,9 +404,12 @@ def test_fallback_ignores_handshake_when_egress_is_down(tmp_path: Path, monkeypa
     monkeypatch.setattr(svc, "_latest_handshake", lambda _iface: int(__import__("time").time()))
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
     result = svc.fallback("de")
-    assert result["changed"]
+    assert result["changed"] == []
+    assert result["failed"] == []
+    assert result["skipped"]
+    assert "handshake" in str(result["skipped"][0].get("message") or "").lower()
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
-    assert parsed["peers"][0]["PublicKey"] == PUB_BER
+    assert parsed["peers"][0]["PublicKey"] == PUB_FRA
 
 
 def test_fallback_iface_uses_country_from_iface_name(tmp_path: Path, monkeypatch):

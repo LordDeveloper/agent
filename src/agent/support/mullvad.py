@@ -1353,6 +1353,15 @@ class MullvadService:
                 "message": "fixed relay — automatic switch disabled for this node",
             }
 
+        # Recent handshake = tunnel is exchanging data. Curl egress often flakes under
+        # ads/dns/load; switching relays then kills traffic about one worker cycle later.
+        if self._iface_up(iface) and not optimize and self._has_recent_handshake(iface, max_age=180):
+            return {
+                **presented,
+                "status": "ok",
+                "message": "handshake recent — skip fallback",
+            }
+
         healthy = self._iface_up(iface) and self._iface_healthy(iface)
         if healthy and not optimize:
             return {**presented, "status": "ok", "message": "healthy"}
@@ -1932,6 +1941,13 @@ class MullvadService:
             return True
         log.info("mullvad egress down iface=%s: %s", iface, message)
         return False
+
+    def _has_recent_handshake(self, iface: str, *, max_age: int = 180) -> bool:
+        handshake = self._latest_handshake(iface)
+        if not handshake or int(handshake) <= 0:
+            return False
+        age = max(0, int(time.time()) - int(handshake))
+        return age <= max(1, int(max_age))
 
     def _latest_handshake(self, iface: str) -> int | None:
         result = self.runner(["wg", "show", iface, "latest-handshakes"], check=False, timeout=5)

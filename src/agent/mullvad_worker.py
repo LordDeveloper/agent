@@ -19,7 +19,8 @@ async def mullvad_worker_loop(
     settings: AgentSettings,
     stop_event: asyncio.Event,
 ) -> None:
-    interval = max(15.0, float(getattr(settings, "mullvad_fallback_interval", 30.0) or 0))
+    # Default 90s: the previous 30s cycle thrashed exits (probe flake → relay switch → no data).
+    interval = max(60.0, float(getattr(settings, "mullvad_fallback_interval", 90.0) or 0))
     log.info("mullvad fallback worker started interval=%ss", interval)
     service = MullvadService(store, config_dir=settings.wireguard_config_dir)
 
