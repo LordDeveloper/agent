@@ -162,6 +162,55 @@ def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
     assert saved["address"] == dual
 
 
+def test_save_settings_propagates_private_key_to_bound_ifaces(tmp_path: Path, monkeypatch):
+    new_key = "H" * 42 + "A="
+    svc = _service(tmp_path)
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.0.2/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    svc.refresh_bindings()
+    synced: list[str] = []
+    monkeypatch.setattr(svc, "_sync_iface", lambda iface, _path: synced.append(iface))
+    monkeypatch.setattr(svc, "_ensure_persist_unit", lambda _iface: {"ok": True})
+
+    saved = svc.save_settings(private_key=new_key, address="10.64.0.2/32")
+    assert saved["has_private_key"] is True
+    assert saved["propagated"]["updated"] == ["de"]
+    assert synced == ["de"]
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["interface"]["PrivateKey"] == new_key
+    assert parsed["interface"]["Address"] == "10.64.0.2/32"
+
+
+def test_apply_relay_prefers_settings_private_key(tmp_path: Path, monkeypatch):
+    new_key = "J" * 42 + "A="
+    svc = _service(tmp_path)
+    svc.save_settings(private_key=new_key, address="10.64.0.2/32")
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.64.0.2/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "1.1.1.1:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
+    monkeypatch.setattr(svc, "_ensure_persist_unit", lambda _iface: {"ok": True})
+    svc._apply_relay("de", RELAYS[1])  # berlin
+    parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
+    assert parsed["interface"]["PrivateKey"] == new_key
+    assert parsed["peers"][0]["PublicKey"] == PUB_BER
+
+
 def test_normalize_tunnel_address_accepts_dual_stack():
     from agent.support.mullvad import normalize_tunnel_address
 

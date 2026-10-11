@@ -62,8 +62,35 @@ def mullvad_settings(body: dict[str, Any], request: Request):
         payload = _service(request).save_settings(**kwargs)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
+    propagated = payload.pop("propagated", None) if isinstance(payload, dict) else None
     public = {k: v for k, v in payload.items() if k != "private_key"}
-    return {"success": True, "settings": public}
+    response: dict[str, Any] = {"success": True, "settings": public}
+    if isinstance(propagated, dict):
+        response["propagated"] = propagated
+    return response
+
+
+@router.post("/tunnels/{iface}/service")
+def mullvad_tunnel_service(iface: str, body: dict[str, Any], request: Request):
+    try:
+        payload = _service(request).control_tunnel(iface, str(body.get("action") or ""))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
+@router.post("/service")
+def mullvad_service_bulk(body: dict[str, Any], request: Request):
+    try:
+        raw_ifaces = body.get("ifaces") or body.get("interfaces") or []
+        ifaces = [str(item) for item in raw_ifaces] if isinstance(raw_ifaces, list) else None
+        payload = _service(request).control_tunnels(
+            str(body.get("action") or ""),
+            ifaces=ifaces,
+        )
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
 
 
 @router.post("/locations/{country_code}/ensure")

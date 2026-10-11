@@ -653,7 +653,72 @@ class MullvadService:
             "selection_mode": mode,
         }
         self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
-        return self.settings()
+        result = self.settings()
+        # Changing account key/IP must rewrite every bound exit conf + live iface.
+        # Previously only the store doc changed, so poland/pl/sw kept the old PrivateKey.
+        if private_key is not None or address is not None:
+            result["propagated"] = self.propagate_account(
+                private_key=key if private_key is not None else None,
+                address=addr if address is not None else None,
+            )
+        return result
+
+    def propagate_account(
+        self,
+        *,
+        private_key: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, Any]:
+        """Rewrite PrivateKey/Address on all bound Mullvad exit confs and reload live ifaces."""
+        key = str(private_key or "").strip()
+        addr = str(address or "").strip()
+        if addr:
+            addr = normalize_tunnel_address(addr) or addr
+        if not key and not addr:
+            settings = self.settings()
+            key = str(settings.get("private_key") or "").strip()
+            addr = str(settings.get("address") or "").strip()
+        if not key:
+            raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
+
+        updated: list[str] = []
+        failed: list[dict[str, str]] = []
+        skipped: list[str] = []
+        for bind in self.bindings():
+            iface = normalize_exit_interface(str(bind.get("iface") or ""))
+            if not iface:
+                continue
+            path = conf_path(self.config_dir, iface)
+            if not path.is_file():
+                skipped.append(iface)
+                continue
+            try:
+                parsed = read_conf(path) or {"interface": {}, "peers": []}
+                interface = dict(parsed.get("interface") or {})
+                interface["PrivateKey"] = key
+                if addr:
+                    interface["Address"] = addr
+                if "Table" not in interface:
+                    interface["Table"] = "off"
+                peers = [dict(peer) for peer in (parsed.get("peers") or []) if isinstance(peer, dict)]
+                path.write_text(dump_wg_conf({"interface": interface, "peers": peers}), encoding="utf-8")
+                # Reload live tunnel so handshake uses the new account key immediately.
+                self._sync_iface(iface, path)
+                try:
+                    self._ensure_persist_unit(iface)
+                except Exception as exc:
+                    log.warning("mullvad persist after key propagate failed iface=%s: %s", iface, exc)
+                updated.append(iface)
+            except Exception as exc:
+                log.warning("mullvad propagate account failed iface=%s: %s", iface, exc)
+                failed.append({"iface": iface, "error": str(exc)})
+        return {
+            "updated": updated,
+            "failed": failed,
+            "skipped": skipped,
+            "updated_count": len(updated),
+            "failed_count": len(failed),
+        }
 
     def bindings(self) -> list[dict[str, Any]]:
         rows = []
@@ -1071,20 +1136,179 @@ class MullvadService:
             ok = False
             message = "interface down"
             latency = None
-            if iface and self._iface_up(iface):
+            up = bool(iface and self._iface_up(iface))
+            if up:
                 ok, message, latency = self.egress_probe(interface=iface, runner=self.runner)
+            unit = self._unit_status(iface) if iface else {
+                "unit": None,
+                "active": False,
+                "enabled": False,
+                "state": "missing",
+            }
             rows.append(
                 {
                     **self._present_binding(bind),
-                    "up": self._iface_up(iface) if iface else False,
+                    "up": up,
                     "healthy": ok,
-                    "message": message,
+                    "message": message if up else (unit.get("state") or message),
                     "latency_ms": latency,
+                    "unit": unit.get("unit"),
+                    "unit_active": bool(unit.get("active")),
+                    "unit_enabled": bool(unit.get("enabled")),
+                    "service_state": unit.get("state") or ("running" if up else "stopped"),
                 }
             )
         settings = self.settings()
         settings.pop("private_key", None)
         return {"settings": settings, "tunnels": rows}
+
+    def control_tunnel(self, iface: str, action: str) -> dict[str, Any]:
+        """Start / stop / restart one Mullvad exit (systemd unit + live WireGuard iface)."""
+        name = normalize_exit_interface(str(iface or ""))
+        if not name:
+            raise AgentError("VALIDATION_ERROR", "Invalid Mullvad interface", 422)
+        verb = str(action or "").strip().lower()
+        if verb not in {"start", "stop", "restart"}:
+            raise AgentError("VALIDATION_ERROR", "action must be start, stop, or restart", 422)
+
+        bind = next(
+            (
+                row
+                for row in self.bindings()
+                if normalize_exit_interface(str(row.get("iface") or "")) == name
+            ),
+            None,
+        )
+        path = conf_path(self.config_dir, name)
+        instance = f"agent-mullvad-wg@{name}.service"
+
+        if verb == "stop":
+            self.runner(["systemctl", "stop", instance], check=False, timeout=30)
+            self.runner(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
+            unit = self._unit_status(name)
+            return {
+                "ok": True,
+                "iface": name,
+                "action": "stop",
+                "up": self._iface_up(name),
+                "unit": unit.get("unit"),
+                "unit_active": bool(unit.get("active")),
+                "service_state": unit.get("state"),
+                "message": f"stopped {name}",
+                "binding": self._present_binding(bind) if bind else {"iface": name},
+            }
+
+        if verb == "restart":
+            self.runner(["systemctl", "stop", instance], check=False, timeout=30)
+            self.runner(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
+
+        if not path.is_file():
+            raise AgentError("NOT_FOUND", f"Mullvad conf missing for {name}", 404)
+
+        # Prefer account settings over stale conf PrivateKey.
+        settings = self.settings()
+        account_key = str(settings.get("private_key") or "").strip()
+        if account_key:
+            parsed = read_conf(path) or {"interface": {}, "peers": []}
+            interface = dict(parsed.get("interface") or {})
+            if str(interface.get("PrivateKey") or "").strip() != account_key:
+                interface["PrivateKey"] = account_key
+                addr = str(settings.get("address") or interface.get("Address") or "").strip()
+                if addr:
+                    interface["Address"] = normalize_tunnel_address(addr) or addr
+                peers = [dict(peer) for peer in (parsed.get("peers") or []) if isinstance(peer, dict)]
+                path.write_text(dump_wg_conf({"interface": interface, "peers": peers}), encoding="utf-8")
+
+        self._ensure_persist_unit(name)
+        self._sync_iface(name, path)
+        start = self.runner(["systemctl", "start", instance], check=False, timeout=30)
+        unit = self._unit_status(name)
+        started = bool(unit.get("active")) or self._iface_up(name)
+        if not started and getattr(start, "returncode", 1) != 0:
+            raise AgentError(
+                "EXEC_ERROR",
+                self._proc_err(start, f"failed to start {instance}"),
+                500,
+            )
+        return {
+            "ok": True,
+            "iface": name,
+            "action": verb,
+            "up": self._iface_up(name),
+            "unit": unit.get("unit"),
+            "unit_active": bool(unit.get("active")),
+            "service_state": unit.get("state"),
+            "message": f"{verb}ed {name}",
+            "binding": self._present_binding(bind) if bind else {"iface": name},
+        }
+
+    def control_tunnels(self, action: str, *, ifaces: list[str] | None = None) -> dict[str, Any]:
+        verb = str(action or "").strip().lower()
+        if verb not in {"start", "stop", "restart"}:
+            raise AgentError("VALIDATION_ERROR", "action must be start, stop, or restart", 422)
+        wanted = {
+            normalize_exit_interface(str(name or ""))
+            for name in (ifaces or [])
+            if normalize_exit_interface(str(name or ""))
+        }
+        targets = []
+        for bind in self.bindings():
+            iface = normalize_exit_interface(str(bind.get("iface") or ""))
+            if not iface:
+                continue
+            if wanted and iface not in wanted:
+                continue
+            targets.append(iface)
+        if not targets and wanted:
+            raise AgentError("NOT_FOUND", "No matching Mullvad tunnels", 404)
+
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for iface in targets:
+            try:
+                results.append(self.control_tunnel(iface, verb))
+            except AgentError as exc:
+                errors.append({"iface": iface, "error": exc.message})
+            except Exception as exc:
+                errors.append({"iface": iface, "error": str(exc)})
+        return {
+            "ok": errors == [],
+            "action": verb,
+            "results": results,
+            "errors": errors,
+            "count": len(results),
+            "failed_count": len(errors),
+        }
+
+    def _unit_status(self, iface: str) -> dict[str, Any]:
+        name = normalize_exit_interface(str(iface or ""))
+        instance = f"agent-mullvad-wg@{name}.service" if name else None
+        if not name or shutil.which("systemctl") is None:
+            return {
+                "unit": instance,
+                "active": False,
+                "enabled": False,
+                "state": "unavailable",
+            }
+        active = self.runner(["systemctl", "is-active", instance], check=False, timeout=10)
+        enabled = self.runner(["systemctl", "is-enabled", instance], check=False, timeout=10)
+        active_out = (getattr(active, "stdout", "") or "").strip().lower()
+        enabled_out = (getattr(enabled, "stdout", "") or "").strip().lower()
+        is_active = getattr(active, "returncode", 1) == 0 or active_out == "active"
+        is_enabled = getattr(enabled, "returncode", 1) == 0 or enabled_out in {
+            "enabled",
+            "enabled-runtime",
+            "static",
+            "alias",
+            "indirect",
+        }
+        state = active_out or ("running" if is_active else "stopped")
+        return {
+            "unit": instance,
+            "active": is_active,
+            "enabled": is_enabled,
+            "state": state,
+        }
 
     def _fallback_one(
         self,
@@ -1482,8 +1706,9 @@ class MullvadService:
         path = conf_path(self.config_dir, iface)
         parsed = read_conf(path) or {"interface": {}, "peers": []}
         interface = dict(parsed.get("interface") or {})
-        private_key = str(interface.get("PrivateKey") or settings.get("private_key") or "").strip()
-        address = str(interface.get("Address") or settings.get("address") or "").strip()
+        # Account settings win — conf may still hold a rotated-out PrivateKey.
+        private_key = str(settings.get("private_key") or interface.get("PrivateKey") or "").strip()
+        address = str(settings.get("address") or interface.get("Address") or "").strip()
         if not private_key:
             raise AgentError("VALIDATION_ERROR", "Mullvad private key is not set", 422)
         if not address:
