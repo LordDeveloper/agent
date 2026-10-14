@@ -117,7 +117,12 @@ def test_traffic_service_migrates_legacy_email_rows_to_client_id(tmp_path):
         "uplink": 100,
         "downlink": 200,
     }
-    assert traffic.pending_payload()["users"].get("legacy@example.com") is None
+    assert traffic.pending_payload()["users"]["legacy@example.com"] == {
+        "core": "xray",
+        "uplink": 100,
+        "downlink": 200,
+    }
+    assert store.get_traffic_pending("xray", "legacy@example.com") is None
     assert store.get_traffic_ack("xray", "legacy@example.com") is None
     assert store.get_traffic_ack("xray", "uuid-new") == {
         "incoming": 800,
@@ -125,7 +130,7 @@ def test_traffic_service_migrates_legacy_email_rows_to_client_id(tmp_path):
     }
 
 
-def test_wireguard_stale_handshake_does_not_create_pending(tmp_path):
+def test_wireguard_stale_handshake_still_tracks_pending(tmp_path):
     store = Store(tmp_path / "agent.db")
     traffic = TrafficService(store)
     stale = int(time.time()) - 300
@@ -143,61 +148,49 @@ def test_wireguard_stale_handshake_does_not_create_pending(tmp_path):
     client.incoming = 1_148
     stats = traffic.sample_all(registry)
 
-    assert stats["stale_handshake"] == 1
+    assert stats["pending"] == 1
+    assert traffic.pending_payload()["users"]["peer-1"]["downlink"] == 148
+    assert traffic.pending_payload()["users"]["wg@example.com"]["downlink"] == 148
+
+
+def test_ack_clients_accepts_email_alias(tmp_path):
+    store = Store(tmp_path / "agent.db")
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="uuid-mail", email="alias@example.com", incoming=100, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    traffic.sample_all(registry)
+    client.incoming = 400
+    traffic.sample_all(registry)
+    traffic.pending_payload()
+
+    acked, not_found = traffic.ack_clients(["alias@example.com"])
+    assert acked == ["alias@example.com"]
+    assert not_found == []
     assert traffic.pending_payload()["users"] == {}
 
 
-def test_wireguard_fresh_handshake_still_tracks_pending(tmp_path):
+def test_ack_uses_get_snapshot_so_later_growth_stays_queued(tmp_path):
     store = Store(tmp_path / "agent.db")
     traffic = TrafficService(store)
-    fresh = int(time.time()) - 30
-    client = ClientUsageModel(
-        id="peer-2",
-        email="live@example.com",
-        incoming=1_000,
-        outgoing=500,
-        handshake_at=fresh,
-    )
+    client = ClientUsageModel(id="uuid-snap", email="snap@example.com", incoming=1_000, outgoing=0)
     driver = FakeDriver([client])
-    registry = FakeRegistry(["wireguard"], driver)
+    registry = FakeRegistry(["xray"], driver)
 
     traffic.sample_all(registry)
-    client.incoming = 1_500
-    stats = traffic.sample_all(registry)
+    client.incoming = 1_100
+    traffic.sample_all(registry)
+    payload = traffic.pending_payload()
+    assert payload["users"]["uuid-snap"]["downlink"] == 100
 
-    assert stats.get("pending", 0) >= 1 or "peer-2" in traffic.pending_payload()["users"]
-    assert traffic.pending_payload()["users"]["peer-2"]["downlink"] == 500
+    client.incoming = 1_250
+    traffic.sample_all(registry)
 
-
-def test_wireguard_stale_handshake_freezes_existing_pending(tmp_path):
-    store = Store(tmp_path / "agent.db")
-    traffic = TrafficService(store)
-    fresh = int(time.time()) - 30
-    client = ClientUsageModel(
-        id="peer-3",
-        email="freeze@example.com",
-        incoming=1_000,
-        outgoing=0,
-        handshake_at=fresh,
-    )
-    driver = FakeDriver([client])
-    registry = FakeRegistry(["wireguard"], driver)
+    acked, not_found = traffic.ack_clients(["uuid-snap"])
+    assert acked == ["uuid-snap"]
+    assert not_found == []
 
     traffic.sample_all(registry)
-    client.incoming = 1_400
-    traffic.sample_all(registry)
-    assert traffic.pending_payload()["users"]["peer-3"]["downlink"] == 400
-
-    client.handshake_at = int(time.time()) - 300
-    client.incoming = 1_548
-    stats = traffic.sample_all(registry)
-
-    assert stats["pending_frozen"] == 1
-    pending = traffic.pending_payload()["users"]["peer-3"]
-    assert pending["downlink"] == 400
-
-    traffic.ack_clients(["peer-3"])
-    client.incoming = 1_600
-    stats = traffic.sample_all(registry)
-    assert stats["stale_handshake"] == 1
-    assert traffic.pending_payload()["users"] == {}
+    leftover = traffic.pending_payload()["users"]["uuid-snap"]
+    assert leftover["downlink"] == 150

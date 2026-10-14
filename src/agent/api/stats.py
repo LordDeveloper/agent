@@ -104,16 +104,13 @@ def stats_clients_traffic_pending(
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
-    Pending byte deltas since the last panel ack (live growth only).
+    Unacked traffic queue for all cores. Not gated on online/handshake.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
-      1. Worker/sample stores ``pending = current_cumulative - ack``.
-      2. Panel bills only forward growth (or discards historical backlog > cap).
-      3. Panel must POST ``/pending/ack`` after bill *or* absorb/baseline so
-         the next sample starts from "now" and never replays old pending.
-
-    Keys in ``users`` are canonical client ids (panel ``node_id``). The traffic
-    worker keeps updating pending rows until each client is acked via POST.
+      1. Worker keeps ``pending = current_cumulative - ack`` until POST ack.
+      2. GET samples, returns the queue, and snapshots watermarks.
+      3. Panel bills those bytes, then POST ``/pending/ack`` with node_id and/or
+         email so only growth after the GET snapshot remains queued.
     """
     registry: CoreRegistry = request.app.state.registry
     traffic.sample_all(registry)
@@ -133,13 +130,12 @@ def stats_clients_traffic_pending_ack(
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
-    Ack clients whose pending volume was applied *or intentionally discarded*
-    on the panel.
+    Reset pending for clients the panel already persisted.
 
-    Advances traffic_ack to the sampled cumulative counters and clears pending
-    so only future consumption appears on the next GET.
+    Advances traffic_ack to the GET snapshot (not a later worker sample) so
+    bytes that arrived between GET and ACK stay in the next queue cycle.
 
-    Body: ``{"clients": ["node-id-1", "node-id-2"]}`` — canonical ids only.
+    Body: ``{"clients": ["node-id-or-email", ...]}``.
     """
     raw = body.get("clients")
     if raw is None:
