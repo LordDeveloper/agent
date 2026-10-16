@@ -1,3 +1,5 @@
+import time
+
 import httpx
 
 from agent.config import XraySettings
@@ -13,6 +15,40 @@ class _OfflineIplistTransport(httpx.BaseTransport):
                 json={"message": "user>>>uuid>>>online not found"},
             )
         return httpx.Response(404, json={"message": "404 page not found"})
+
+
+class _StaleIplistTransport(httpx.BaseTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/stats/online/iplist":
+            now = time.time()
+            return httpx.Response(
+                200,
+                json={
+                    "ips": {
+                        "5.116.96.198": int(now - 3600),
+                        "83.121.27.148": int(now - 5),
+                    }
+                },
+            )
+        return httpx.Response(404, json={"message": "404 page not found"})
+
+
+def test_online_ips_drops_stale_last_seen():
+    settings = XraySettings(
+        api_base="http://127.0.0.1:8080",
+        username="",
+        password="",
+        binary="xray",
+        config="/tmp/xray.json",
+        timeout=5.0,
+        connect_timeout=1.0,
+    )
+    client = XrayHttpClient(settings, transport=_StaleIplistTransport())
+
+    assert client.online_ips("uuid") == ["83.121.27.148"]
+    seen = client.online_ip_last_seen("uuid")
+    assert list(seen) == ["83.121.27.148"]
+    assert seen["83.121.27.148"] > 1_000_000_000
 
 
 def test_online_ips_offline_user_returns_empty_list():

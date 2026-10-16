@@ -1,6 +1,8 @@
 from agent.support.quota import (
+    apply_quota_meta,
     has_volume_quota,
     quota_exceeded,
+    quota_meta_from_client,
     reseed_baseline_if_stale,
     seed_ahead_baseline,
     seed_stale_zero_baseline,
@@ -156,3 +158,35 @@ def test_seed_stale_zero_baseline_heals_legacy_raw_kernel_baseline():
     assert client["_incoming"] == 66_505_328_660
     assert client["_outgoing"] == 5_403_803_980
     assert quota_exceeded(client, 66_505_328_660, 5_403_803_980) is False
+
+
+def test_quota_meta_round_trip_restores_volume_stripped_by_xray():
+    synced = {
+        "id": "node-1",
+        "email": "user@example",
+        "volume": 50 * 1024**3,
+        "_incoming": 1000,
+        "_outgoing": 2000,
+        "expires_at": "2030-01-01T00:00:00+00:00",
+        "max_connection": 3,
+        "is_enabled": True,
+    }
+    meta = quota_meta_from_client(synced)
+    stored = {"id": "node-1", "email": "user@example", "is_enabled": True}
+    apply_quota_meta(stored, meta, include_flags=True)
+
+    assert stored["volume"] == 50 * 1024**3
+    assert stored["_incoming"] == 1000
+    assert stored["_outgoing"] == 2000
+    assert stored["expires_at"].startswith("2030-01-01")
+    assert stored["max_connection"] == 3
+    assert has_volume_quota(stored) is True
+
+
+def test_quota_meta_clears_volume_for_unlimited():
+    client = {"id": "node-1", "email": "user@example", "volume": 1024, "is_enabled": True}
+    meta = quota_meta_from_client({"id": "node-1", "email": "user@example", "is_enabled": True})
+    apply_quota_meta(client, meta, include_flags=False)
+
+    assert "volume" not in client
+    assert has_volume_quota(client) is False

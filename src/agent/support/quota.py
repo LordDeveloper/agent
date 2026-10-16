@@ -310,3 +310,82 @@ def _enforce_l2tp(driver: Any) -> int:
         disabled += len(to_disable)
 
     return disabled
+
+
+def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
+    """Panel quota fields to keep beside an Xray user.
+
+    Xray's users API only accepts protocol fields, so volume never survives
+    on the inbound user unless the agent stores it separately.
+    """
+    cid = str(client.get("id") or "").strip()
+    email = str(client.get("email") or "").strip()
+    volume = client.get("volume") if "volume" in client else None
+    try:
+        volume = int(volume) if volume is not None else None
+    except (TypeError, ValueError):
+        volume = None
+    if volume is not None and volume <= 0:
+        volume = None
+
+    meta: dict[str, Any] = {
+        "id": cid,
+        "email": email,
+        "volume": volume,
+    }
+    for key in ("_incoming", "_outgoing"):
+        if key in client:
+            try:
+                meta[key] = int(client.get(key) or 0)
+            except (TypeError, ValueError):
+                meta[key] = 0
+    if "expires_at" in client:
+        meta["expires_at"] = client.get("expires_at")
+    if "max_connection" in client and client.get("max_connection") is not None:
+        try:
+            meta["max_connection"] = int(client.get("max_connection") or 0)
+        except (TypeError, ValueError):
+            meta["max_connection"] = 0
+    if "is_enabled" in client:
+        meta["is_enabled"] = bool(client.get("is_enabled"))
+    return meta
+
+
+def apply_quota_meta(client: dict[str, Any], meta: dict[str, Any], *, include_flags: bool = False) -> None:
+    """Merge a stored quota record onto a client read from Xray."""
+    if not meta:
+        return
+
+    if "volume" in meta:
+        volume = meta.get("volume")
+        if volume is None:
+            client.pop("volume", None)
+        else:
+            try:
+                volume = int(volume)
+            except (TypeError, ValueError):
+                volume = 0
+            if volume > 0:
+                client["volume"] = volume
+            else:
+                client.pop("volume", None)
+
+    for key in ("_incoming", "_outgoing"):
+        if key in meta and meta[key] is not None:
+            try:
+                client[key] = int(meta[key])
+            except (TypeError, ValueError):
+                continue
+
+    if not include_flags:
+        return
+
+    if "expires_at" in meta:
+        client["expires_at"] = meta.get("expires_at")
+    if meta.get("max_connection") is not None and "max_connection" in meta:
+        try:
+            client["max_connection"] = int(meta.get("max_connection") or 0)
+        except (TypeError, ValueError):
+            pass
+    if "is_enabled" in meta and meta.get("is_enabled") is not None:
+        client["is_enabled"] = bool(meta.get("is_enabled"))

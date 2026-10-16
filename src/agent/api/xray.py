@@ -224,7 +224,7 @@ def diagnose_client(
 @router.get("/clients/{email}/ips")
 def client_ips(email: str, xray: XrayDriver = Depends(get_xray)):
     try:
-        ips = xray.client_ips(email)
+        ips = xray.client_ip_last_seen(email)
     except AgentError as exc:
         # Offline users are reported as 404 by Xray online/iplist — treat as [].
         message = str(exc.message or "").lower()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from threading import Lock
 from typing import Any
 
@@ -12,6 +13,84 @@ from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
 
 _log = get_logger("xray.http")
+
+# Xray iplist keeps addresses after the session ends. lastSeen older than this
+# is not a live connection (carrier flaps / leftover rows).
+ONLINE_IP_MAX_AGE_SECONDS = 60
+
+
+def ip_last_seen_unix(value: Any) -> float | None:
+    """Unix seconds from an iplist lastSeen value. Milliseconds are scaled down."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("lastSeen", "last_seen", "connected_at", "time", "timestamp", "seconds"):
+            if key in value and value[key] not in (None, ""):
+                return ip_last_seen_unix(value[key])
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    seen = float(value)
+    if seen <= 0:
+        return None
+    if seen > 10_000_000_000:
+        seen = seen / 1000.0
+    return seen
+
+
+def is_fresh_ip_last_seen(
+    value: Any,
+    *,
+    now: float | None = None,
+    max_age: float = ONLINE_IP_MAX_AGE_SECONDS,
+) -> bool:
+    seen = ip_last_seen_unix(value)
+    if seen is None:
+        return False
+    current = time.time() if now is None else float(now)
+    age = current - seen
+    return -30.0 <= age <= max_age
+
+
+def _is_ip_last_seen_map(ips: dict[Any, Any]) -> bool:
+    sample = next(iter(ips.values()), None)
+    if isinstance(sample, bool) or sample is None:
+        return False
+    if isinstance(sample, (int, float)):
+        return True
+    if isinstance(sample, str):
+        return ip_last_seen_unix(sample) is not None
+    if isinstance(sample, dict):
+        return ip_last_seen_unix(sample) is not None
+    return False
+
+
+def retain_fresh_online_ips(
+    ips: Any,
+    *,
+    now: float | None = None,
+    max_age: float = ONLINE_IP_MAX_AGE_SECONDS,
+) -> Any:
+    """Drop iplist entries whose lastSeen is older than max_age.
+
+    A list of bare IP strings has no timestamp and is returned unchanged.
+    """
+    if not isinstance(ips, dict) or not ips or not _is_ip_last_seen_map(ips):
+        return ips
+    current = time.time() if now is None else float(now)
+    return {
+        str(ip): seen
+        for ip, seen in ips.items()
+        if is_fresh_ip_last_seen(seen, now=current, max_age=max_age)
+    }
 
 
 def format_xray_api_error(
@@ -211,7 +290,12 @@ class XrayHttpClient:
 
         Xray returns 404 ``...>>>online not found`` when the user is offline.
         That is a normal empty result, not a missing config.
+        iplist rows whose lastSeen is older than a minute are omitted.
         """
+        return list(self.online_ip_last_seen(email).keys())
+
+    def online_ip_last_seen(self, email: str) -> dict[str, Any]:
+        """Fresh iplist rows as ``{ip: lastSeen}``. Stale rows are omitted."""
         try:
             body = self.get("/api/stats/online/iplist", params={"email": email})
         except AgentError as exc:
@@ -221,14 +305,12 @@ class XrayHttpClient:
                 or exc.code == "USER_OFFLINE"
                 or "online not found" in message
             ):
-                return []
+                return {}
             raise
-        ips = body.get("ips") or {}
+        ips = retain_fresh_online_ips(body.get("ips") or {})
         if isinstance(ips, dict):
-            return list(ips.keys())
-        if isinstance(ips, list):
-            return [str(i) for i in ips]
-        return []
+            return {str(ip): seen for ip, seen in ips.items() if str(ip).strip()}
+        return {}
 
     def online_all(self, emails: list[str] | None = None) -> dict[str, Any]:
         params = [("email", email) for email in emails] if emails else None

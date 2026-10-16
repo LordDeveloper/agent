@@ -15,10 +15,11 @@ from agent.audit import AuditLog
 from agent.config import AgentSettings, XraySettings
 from agent.db import Store
 from agent.drivers.base import CoreDriver
-from agent.drivers.xray_http import XrayHttpClient
+from agent.drivers.xray_http import XrayHttpClient, retain_fresh_online_ips
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_xray_client, record_is_enabled, xray_protocol_user
+from agent.support.quota import apply_quota_meta, quota_meta_from_client
 from agent.support.config_validate import (
     validate_xray_config,
     validate_xray_config_mutation,
@@ -43,6 +44,7 @@ from agent.xray_service import api_base_from_config, xray_auth_from_config
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
 _CLIENT_BATCH_MAX = 200
+_QUOTA_KIND = "client_quota"
 _log = get_logger("xray")
 
 
@@ -516,7 +518,9 @@ class XrayDriver(CoreDriver):
         return inbound
 
     def list_inbounds(self) -> list[dict[str, Any]]:
-        return [self._normalize(row) for row in self._api().list_inbounds()]
+        inbounds = [self._normalize(row) for row in self._api().list_inbounds()]
+        self._overlay_quota(inbounds, include_flags=False)
+        return inbounds
 
     def sync_proxy_protocol_forwarders(self) -> dict[str, Any]:
         try:
@@ -672,13 +676,13 @@ class XrayDriver(CoreDriver):
                 continue
             client = self._find_client(inbound, key)
             if client is not None:
-                return normalize_xray_client(client)
+                return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
 
         try:
             inbound = self.get_inbound(inbound_id)
             client = self._find_client(inbound, key)
             if client is not None:
-                return normalize_xray_client(client)
+                return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
         except AgentError:
             pass
 
@@ -938,6 +942,8 @@ class XrayDriver(CoreDriver):
                 _flush("edit", to_edit, edit_meta)
                 _flush("add", to_add, add_meta)
 
+            self._save_client_quotas(applied)
+
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.audit.record(
             "update",
@@ -1008,14 +1014,19 @@ class XrayDriver(CoreDriver):
                 try:
                     self._api().remove_users(tag, remove_emails)
                     succeeded = len(remove_emails)
+                    self._forget_client_quotas(remove_emails + id_keys)
                 except AgentError as exc:
+                    forgotten: list[str] = []
                     for email in remove_emails:
                         try:
                             self._api().remove_users(tag, [email])
                             succeeded += 1
+                            forgotten.append(email)
                         except AgentError as row_exc:
                             failed += 1
                             errors.append({"email": email, "message": row_exc.message})
+                    if forgotten:
+                        self._forget_client_quotas(forgotten + id_keys)
                     if succeeded == 0 and not errors:
                         raise exc
 
@@ -1032,6 +1043,75 @@ class XrayDriver(CoreDriver):
             "errors": errors,
             "ms": elapsed_ms,
         }
+
+    def _save_client_quotas(self, clients: list[dict[str, Any]]) -> None:
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            meta = quota_meta_from_client(client)
+            doc_id = str(meta.get("id") or meta.get("email") or "").strip()
+            if not doc_id:
+                continue
+            self.store.put_doc(self.key, _QUOTA_KIND, doc_id, meta)
+            email = str(meta.get("email") or "").strip()
+            cid = str(meta.get("id") or "").strip()
+            if cid and email and email != cid:
+                self.store.delete_doc(self.key, _QUOTA_KIND, email)
+
+    def _forget_client_quotas(self, keys: list[str]) -> None:
+        wanted = {str(key).strip() for key in keys if str(key).strip()}
+        if not wanted:
+            return
+        for row in self.store.list_docs(self.key, _QUOTA_KIND):
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            email = str(row.get("email") or "").strip()
+            doc_id = cid or email
+            if doc_id and (cid in wanted or email in wanted or doc_id in wanted):
+                self.store.delete_doc(self.key, _QUOTA_KIND, doc_id)
+
+    def _quota_index(self) -> dict[str, dict[str, Any]]:
+        index: dict[str, dict[str, Any]] = {}
+        try:
+            rows = self.store.list_docs(self.key, _QUOTA_KIND)
+        except Exception:
+            return index
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            email = str(row.get("email") or "").strip()
+            if cid:
+                index[f"i:{cid}"] = row
+            if email:
+                index[f"e:{email}"] = row
+        return index
+
+    def _with_stored_quota(self, client: dict[str, Any], *, include_flags: bool) -> dict[str, Any]:
+        index = self._quota_index()
+        cid = str(client.get("id") or "").strip()
+        email = str(client.get("email") or "").strip()
+        meta = index.get(f"i:{cid}") if cid else None
+        if meta is None and email:
+            meta = index.get(f"e:{email}")
+        if meta:
+            apply_quota_meta(client, meta, include_flags=include_flags)
+        return client
+
+    def _overlay_quota(self, inbounds: list[dict[str, Any]], *, include_flags: bool) -> None:
+        index = self._quota_index()
+        if not index:
+            return
+        for inbound in inbounds:
+            for client in self._clients_of(inbound):
+                cid = str(client.get("id") or "").strip()
+                email = str(client.get("email") or "").strip()
+                meta = index.get(f"i:{cid}") if cid else None
+                if meta is None and email:
+                    meta = index.get(f"e:{email}")
+                if meta:
+                    apply_quota_meta(client, meta, include_flags=include_flags)
 
     def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
         """Repair blank Shadowsocks cipher keys left by legacy broken inbounds."""
@@ -1117,6 +1197,10 @@ class XrayDriver(CoreDriver):
         # Xray reports currently-online IPs, not an accumulating log.
         # Do not hide live addresses after a "clear" — the bot needs them for device lists.
         return self._api().online_ips(email)
+
+    def client_ip_last_seen(self, email: str) -> dict[str, Any]:
+        """``{ip: lastSeen}`` for sessions Xray still considers online."""
+        return self._api().online_ip_last_seen(email)
 
     def clear_client_ips(self, email: str) -> bool:
         return True
@@ -1557,7 +1641,7 @@ class XrayDriver(CoreDriver):
             email = str(row.get("email") or row.get("id") or "").strip()
             if email == "":
                 continue
-            ips = row["ips"] if "ips" in row else row
+            ips = retain_fresh_online_ips(row["ips"] if "ips" in row else row)
             out[email] = ips
             cid = alias.get(email)
             if cid and cid != email:
