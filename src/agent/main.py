@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -35,6 +36,7 @@ from agent.quota_enforcer import quota_enforcer_loop
 from agent.runtime import RuntimeTrace
 from agent.traffic.service import TrafficService
 from agent.traffic_worker import traffic_worker_loop
+from agent.whoami_hit import WhoamiHitService
 
 log = get_logger("http")
 
@@ -135,6 +137,8 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 mullvad_worker_loop(store, settings, stop_mullvad),
             )
 
+        app.state.whoami.start_if_configured()
+
         yield
 
         stop_mullvad.set()
@@ -149,6 +153,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
         from agent.support.proxy_protocol_forwarder import stop_forwarders
 
         stop_forwarders(settings)
+        app.state.whoami.stop()
         app_log.info("agent stopping")
         store.close()
 
@@ -159,6 +164,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.state.errors = errors
     app.state.registry = registry
     app.state.traffic = traffic
+    app.state.whoami = WhoamiHitService(Path(settings.data_dir) / "whoami-webhook.key")
     app.add_middleware(CoreErrorCaptureMiddleware)
     app.add_middleware(RequestLogMiddleware)
 

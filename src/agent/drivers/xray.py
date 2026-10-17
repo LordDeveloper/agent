@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1529,6 +1530,18 @@ class XrayDriver(CoreDriver):
 
     def add_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         return self._api().add_rules(rules)
+
+    def append_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
+        """Xray POST /api/rules/add?should_append=true. Never replaces the rule list."""
+        result = self._api().add_rules(rules, should_append=True)
+        self.restrict_config_permissions()
+        self.audit.record("update", "xray/rules/append", f"count={len(rules)}")
+        return result if isinstance(result, dict) else {"ok": True}
+
+    def restrict_config_permissions(self) -> None:
+        path = Path(self.settings.xray.config)
+        if path.is_file():
+            os.chmod(path, 0o600)
 
     def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {"updated": 0}
