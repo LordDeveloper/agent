@@ -161,6 +161,59 @@ def normalize_xray_client(payload: dict[str, Any]) -> dict[str, Any]:
     return client
 
 
+def xray_client_rows(inbound: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows from settings.clients and settings.users, one per email or id.
+
+    VLESS stores both arrays. Reading only the first non-empty list hides a
+    second copy, so one email can remain after a protocol move.
+    """
+    settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for key in ("clients", "users"):
+        for row in settings.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            email = str(row.get("email") or "").strip()
+            cid = str(row.get("id") or "").strip()
+            marker = ("e", email) if email else (("i", cid) if cid else ("o", str(id(row))))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            rows.append(row)
+    return rows
+
+
+def emails_on_other_inbounds(
+    config: dict[str, Any],
+    emails: set[str],
+    keep_tag: str,
+) -> dict[str, list[str]]:
+    """Tags, other than keep_tag, that still hold one of these emails."""
+    wanted = {str(email).strip() for email in emails if str(email).strip()}
+    keep = str(keep_tag or "").strip()
+    if not wanted:
+        return {}
+
+    found: dict[str, list[str]] = {}
+    for inbound in config.get("inbounds") or []:
+        if not isinstance(inbound, dict):
+            continue
+        tag = str(inbound.get("tag") or "").strip()
+        if not tag or tag == keep:
+            continue
+        hit: list[str] = []
+        seen_emails: set[str] = set()
+        for row in xray_client_rows(inbound):
+            email = str(row.get("email") or "").strip()
+            if email in wanted and email not in seen_emails:
+                seen_emails.add(email)
+                hit.append(email)
+        if hit:
+            found[tag] = hit
+    return found
+
+
 _VLESS_FLOWS = {"", "xtls-rprx-vision"}
 _DEFAULT_SHADOWSOCKS_AEAD_METHOD = "chacha20-ietf-poly1305"
 _NETINJA_CLIENT_KEYS = {

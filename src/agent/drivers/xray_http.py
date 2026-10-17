@@ -393,9 +393,9 @@ class XrayHttpClient:
 
     @staticmethod
     def _inbound_clients(inbound: dict[str, Any]) -> list[dict[str, Any]]:
-        settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else {}
-        rows = settings.get("clients") or settings.get("users") or []
-        return [dict(row) for row in rows if isinstance(row, dict)]
+        from agent.support import xray_client_rows
+
+        return [dict(row) for row in xray_client_rows(inbound)]
 
     @staticmethod
     def _strip_panel_inbound_fields(inbound: dict[str, Any]) -> dict[str, Any]:
@@ -556,19 +556,31 @@ class XrayHttpClient:
             for key, value in inbound_settings.items():
                 if key not in {"clients", "users"}:
                     settings[key] = value
-        merged = extras + list(by_id.values())
-        seen: set[int] = set()
+        # One email → one row. by_id keeps every uuid, so a protocol move that
+        # stored a second id under the same email would otherwise be written back.
         deduped: list[dict[str, Any]] = []
-        for row in merged:
+        seen: set[int] = set()
+        for row in extras:
             marker = id(row)
             if marker in seen:
                 continue
             seen.add(marker)
             deduped.append(row)
         for row in by_email.values():
-            if id(row) not in seen:
-                seen.add(id(row))
-                deduped.append(row)
+            marker = id(row)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(row)
+        for row in by_id.values():
+            email = self._client_email(row)
+            if email and by_email.get(email) is not row:
+                continue
+            marker = id(row)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(row)
         settings["clients"] = deduped
         settings["users"] = deduped
         if proto == "vless":

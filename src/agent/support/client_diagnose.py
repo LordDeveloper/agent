@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.support import normalize_xray_client, record_is_enabled
+from agent.support import normalize_xray_client, record_is_enabled, xray_client_rows
 from agent.support.disable_reason import explain_disabled
 from agent.support.quota import has_volume_quota, quota_exceeded
 
@@ -30,9 +30,7 @@ def _find_client_in_inbound(inbound: dict[str, Any], client_key: str) -> dict[st
     if not key:
         return None
 
-    settings = inbound.get('settings') or {}
-    rows = settings.get('clients') or settings.get('users') or []
-    for row in rows:
+    for row in xray_client_rows(inbound):
         if not isinstance(row, dict):
             continue
         if str(row.get('id') or '').strip() == key or str(row.get('email') or '').strip() == key:

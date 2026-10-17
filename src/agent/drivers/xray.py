@@ -18,7 +18,13 @@ from agent.drivers.base import CoreDriver
 from agent.drivers.xray_http import XrayHttpClient, retain_fresh_online_ips
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.support import normalize_xray_client, record_is_enabled, xray_protocol_user
+from agent.support import (
+    emails_on_other_inbounds,
+    normalize_xray_client,
+    record_is_enabled,
+    xray_client_rows,
+    xray_protocol_user,
+)
 from agent.support.quota import apply_quota_meta, quota_meta_from_client
 from agent.support.config_validate import (
     validate_xray_config,
@@ -349,9 +355,7 @@ class XrayDriver(CoreDriver):
 
     @staticmethod
     def _clients_of(inbound: dict[str, Any]) -> list[dict[str, Any]]:
-        settings = inbound.get("settings") or {}
-        rows = settings.get("clients") or settings.get("users") or []
-        return [row for row in rows if isinstance(row, dict)]
+        return xray_client_rows(inbound)
 
     @classmethod
     def _clients_count(cls, inbound: dict[str, Any]) -> int:
@@ -745,6 +749,12 @@ class XrayDriver(CoreDriver):
         inbound = self._ensure_shadowsocks_method(inbound)
         tag = str(inbound["tag"])
         protocol = self._protocol_of(inbound)
+        # Protocol change keeps the email and adds a new uuid on another inbound.
+        # Drop that email everywhere else first, or the old protocol stays usable.
+        self._release_emails_from_other_inbounds(
+            [str(raw.get("email") or "") for raw in clients if isinstance(raw, dict)],
+            tag,
+        )
         started = time.perf_counter()
         succeeded = 0
         failed = 0
@@ -1171,17 +1181,74 @@ class XrayDriver(CoreDriver):
         rows = result.get("clients") or []
         return rows[0] if rows else merged
 
+    def _disk_email(self, inbound_id: int | str, tag: str, client_key: str) -> str:
+        """Email for this client in config.json when the live list missed the row."""
+        key = str(client_key or "").strip()
+        if not key:
+            return ""
+        try:
+            config = self.read_config()
+        except AgentError:
+            return ""
+        for inbound in config.get("inbounds") or []:
+            if not isinstance(inbound, dict):
+                continue
+            inbound_tag = str(inbound.get("tag") or "").strip()
+            if inbound_tag != tag and str(inbound.get("id") or "") != str(inbound_id):
+                continue
+            for row in xray_client_rows(inbound):
+                cid = str(row.get("id") or "").strip()
+                email = str(row.get("email") or "").strip()
+                if key == cid or key == email:
+                    return email or key
+        return ""
+
+    def _release_emails_from_other_inbounds(self, emails: list[str], keep_tag: str) -> None:
+        """Remove these emails from every inbound except keep_tag.
+
+        One local config read. remove_users runs only for tags that still have
+        a matching row, so a normal upsert does not walk the live API.
+        """
+        try:
+            config = self.read_config()
+        except AgentError:
+            return
+        plan = emails_on_other_inbounds(config, set(emails), keep_tag)
+        for tag, found in plan.items():
+            for offset in range(0, len(found), _CLIENT_BATCH_MAX):
+                chunk = found[offset : offset + _CLIENT_BATCH_MAX]
+                try:
+                    self._api().remove_users(tag, chunk)
+                except AgentError as exc:
+                    message = str(exc.message or "").lower()
+                    if int(exc.status or 0) == 404 or "not found" in message:
+                        continue
+                    raise
+
     def delete_client(self, inbound_id: int | str, client_key: str) -> bool:
         inbound = self.get_inbound(inbound_id)
+        tag = str(inbound.get("tag") or self.inbound_tag(inbound_id))
         current = self._find_client(inbound, client_key)
-        if current is None:
+        email = str((current or {}).get("email") or "").strip()
+        if not email:
+            email = self._disk_email(inbound_id, tag, client_key)
+        if current is None and not email:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
-        email = str(current.get("email") or client_key)
+        if not email:
+            email = str(client_key)
         result = self.batch_remove_clients(inbound_id, emails=[email])
         if result.get("failed") and result.get("succeeded", 0) == 0:
-            errors = result.get("errors") or []
-            message = errors[0].get("message") if errors else "client delete failed"
-            raise AgentError("VALIDATION_ERROR", str(message), 422)
+            try:
+                self._api().remove_users(tag, [email])
+            except AgentError as exc:
+                message = str(exc.message or "").lower()
+                missing = int(exc.status or 0) == 404 or "not found" in message
+                if missing and current is None:
+                    raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404) from exc
+                errors = result.get("errors") or []
+                detail = errors[0].get("message") if errors else exc.message
+                raise AgentError("VALIDATION_ERROR", str(detail), 422) from exc
+        self._release_emails_from_other_inbounds([email], tag)
         return True
 
     def reset_client_traffic(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
