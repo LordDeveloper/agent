@@ -46,7 +46,7 @@ from agent.support.proxy_protocol_forwarder import (
     stop_forwarders,
     sync_forwarders_from_inbounds,
 )
-from agent.xray_service import api_base_from_config, xray_auth_from_config
+from agent.xray_service import api_base_from_config, describe_httpapi_guard, xray_auth_from_config
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
@@ -1542,6 +1542,20 @@ class XrayDriver(CoreDriver):
         path = Path(self.settings.xray.config)
         if path.is_file():
             os.chmod(path, 0o600)
+
+    def httpapi_guard(self) -> dict[str, Any]:
+        path = Path(self.settings.xray.config)
+        httpapi: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = {}
+            raw = data.get("httpapi") if isinstance(data, dict) else None
+            if isinstance(raw, dict):
+                httpapi = raw
+        base = self.settings.xray
+        return describe_httpapi_guard(httpapi, base.username, base.password)
 
     def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {"updated": 0}

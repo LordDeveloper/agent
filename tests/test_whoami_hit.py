@@ -1,4 +1,5 @@
 from agent.whoami_hit import HOST, PORT, decide, destination_is_check_host, http_response
+from agent.xray_service import describe_httpapi_guard
 
 SECRET = "test-secret-value-with-32-bytes-min"
 
@@ -58,3 +59,16 @@ def test_only_the_check_host_is_stored_and_rate_limited():
     assert stored["inbound_tag"] == "inbound-1"
     assert empty["store"] is False
     assert limited["store"] is False
+
+
+def test_agent_credentials_count_as_httpapi_auth_without_revealing_them():
+    guard = describe_httpapi_guard(
+        {"listen": "127.0.0.1:8080", "username": "", "password": ""},
+        "agent-user",
+        "agent-password",
+    )
+
+    assert guard["auth_configured"] is True
+    assert guard["listen"] == "127.0.0.1:8080"
+    assert "agent-password" not in guard.values()
+    assert describe_httpapi_guard({"listen": "127.0.0.1:8080"}, "", "")["auth_configured"] is False

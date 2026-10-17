@@ -418,6 +418,15 @@ def replace_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_x
     return {"success": True, **result}
 
 
+@router.get("/httpapi/guard")
+def httpapi_guard(xray: XrayDriver = Depends(get_xray)):
+    try:
+        guard = xray.httpapi_guard()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **guard}
+
+
 @router.post("/routing/rules/append")
 def append_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
     rules = body.get("rules") or []
