@@ -43,6 +43,8 @@ log = get_logger('openvpn')
 
 _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
+# Lifetime counters are owned by sync_user_stats. A panel push must not rewrite them.
+_USAGE_COUNTER_KEYS = frozenset({'incoming', 'outgoing', '_incoming', '_outgoing'})
 _SYSTEM_SERVER_ROOT = Path('/etc/openvpn/server')
 _RUNTIME_STATUS_ROOT = Path('/run/openvpn-server')
 _UNIT_DROPIN_DIR = Path('/etc/systemd/system/openvpn-server@.service.d')
@@ -344,7 +346,7 @@ class OpenVpnDriver(CoreDriver):
                 merged = deepcopy(user)
                 normalized = normalize_peer(payload)
                 for key, value in normalized.items():
-                    if key in _IMMUTABLE_USER_KEYS:
+                    if key in _IMMUTABLE_USER_KEYS or key in _USAGE_COUNTER_KEYS:
                         continue
                     merged[key] = value
                 merged['username'] = user.get('username')
@@ -584,9 +586,10 @@ class OpenVpnDriver(CoreDriver):
                             logs.append(real)
                             user['ip_logs'] = logs[-20:]
                 else:
+                    # Keep _raw. A missed status row (CCD rewrite) must not make the
+                    # next sample add the same session bytes again. A real reconnect
+                    # still counts via the raw < prev branch.
                     user['online'] = False
-                    user['_raw_incoming'] = 0
-                    user['_raw_outgoing'] = 0
                 if (
                     user.get('online') != before_online
                     or user.get('_raw_incoming') != before_in
