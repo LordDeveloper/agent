@@ -760,6 +760,151 @@ class XrayDriver(CoreDriver):
                 by_id[cid] = client
         return by_email, by_id
 
+    def _index_user_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        by_email: dict[str, dict[str, Any]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
+        for user in rows:
+            if not isinstance(user, dict):
+                continue
+            email = str(user.get("email") or "").strip()
+            cid = str(user.get("id") or user.get("uuid") or "").strip()
+            if email:
+                by_email[email] = user
+            if cid:
+                by_id[cid] = user
+        return by_email, by_id
+
+    def _visible_user_index(self, tag: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Users the panel GET can see: inbound client list and the users API."""
+        by_email: dict[str, dict[str, Any]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
+        try:
+            for inbound in self._api().list_inbounds():
+                if str(inbound.get("tag") or "").strip() != tag:
+                    continue
+                extra_email, extra_id = self._index_user_rows(self._clients_of(inbound))
+                by_email.update(extra_email)
+                by_id.update(extra_id)
+                break
+        except AgentError:
+            pass
+        try:
+            extra_email, extra_id = self._index_user_rows(self._api().list_users(tag))
+            by_email.update(extra_email)
+            by_id.update(extra_id)
+        except AgentError:
+            pass
+        return by_email, by_id
+
+    @staticmethod
+    def _client_uuid_visible(
+        client: dict[str, Any],
+        by_id: dict[str, dict[str, Any]],
+        by_email: dict[str, dict[str, Any]],
+    ) -> bool:
+        cid = str(client.get("id") or "").strip()
+        email = str(client.get("email") or "").strip()
+        if cid:
+            return cid in by_id
+        return bool(email and email in by_email)
+
+    def _commit_clients_to_inbound(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+        *,
+        protocol: str,
+        inbound_settings: dict[str, Any] | None,
+    ) -> None:
+        """Write uuids into the inbound document when users/add leaves them out."""
+        current: dict[str, Any] | None = None
+        for row in self._api().list_inbounds():
+            if str(row.get("tag") or "").strip() == tag:
+                current = row
+                break
+        if current is None:
+            raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found", 404)
+
+        by_email, by_id = self._index_user_rows(self._clients_of(current))
+        try:
+            extra_email, extra_id = self._index_user_rows(self._api().list_users(tag))
+        except AgentError:
+            extra_email, extra_id = {}, {}
+        for email, row in extra_email.items():
+            by_email.setdefault(email, row)
+        for cid, row in extra_id.items():
+            by_id.setdefault(cid, row)
+
+        for raw in clients:
+            if not isinstance(raw, dict):
+                continue
+            native = xray_protocol_user(protocol, raw, inbound_settings=inbound_settings)
+            email = str(native.get("email") or "").strip()
+            cid = str(native.get("id") or "").strip()
+            stale = by_email.get(email) if email else None
+            stale_id = str((stale or {}).get("id") or "").strip()
+            if stale is not None and cid and stale_id and stale_id != cid:
+                by_email.pop(email, None)
+                by_id.pop(stale_id, None)
+            if cid and cid in by_id:
+                old_email = str(by_id[cid].get("email") or "").strip()
+                if old_email:
+                    by_email.pop(old_email, None)
+                by_id.pop(cid, None)
+            if email:
+                by_email[email] = native
+            if cid:
+                by_id[cid] = native
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in list(by_email.values()) + list(by_id.values()):
+            marker = id(row)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(row)
+
+        settings = dict(current.get("settings") or {})
+        if isinstance(inbound_settings, dict):
+            for key, value in inbound_settings.items():
+                if key not in {"clients", "users"}:
+                    settings[key] = value
+        settings["clients"] = deduped
+        settings["users"] = deduped
+        if str(protocol or "").lower() == "vless":
+            settings.setdefault("decryption", "none")
+
+        payload = dict(current)
+        for key in (
+            "id",
+            "remark",
+            "is_enabled",
+            "enable",
+            "expiryTime",
+            "expires_at",
+            "total",
+            "up",
+            "down",
+            "incoming",
+            "outgoing",
+            "format",
+            "preserve_clients",
+            "reset_clients",
+        ):
+            payload.pop(key, None)
+        stream = payload.get("streamSettings")
+        if isinstance(stream, dict):
+            stream = dict(stream)
+            stream.pop("domainSettings", None)
+            payload["streamSettings"] = stream
+        payload["tag"] = tag
+        payload["protocol"] = str(current.get("protocol") or protocol)
+        payload["settings"] = settings
+        self._api().edit_inbounds([payload], preserve_clients=False)
+
     def _apply_clients_parallel(
         self,
         op: str,
@@ -817,57 +962,69 @@ class XrayDriver(CoreDriver):
                     succeeded += 1
                     applied.append(client)
 
-        try:
-            live = self._api().list_users(tag)
-        except AgentError:
-            return succeeded, failed, errors, applied
-
-        live_keys: set[str] = set()
-        for user in live:
-            if not isinstance(user, dict):
-                continue
-            email = str(user.get("email") or "").strip()
-            cid = str(user.get("id") or "").strip()
-            if email:
-                live_keys.add(email)
-            if cid:
-                live_keys.add(cid)
-
+        # An add/edit HTTP 200 is not enough. Xray often reports succeeded while
+        # the panel uuid is still absent, and an email-only hit is a different client.
+        applied_ids = {id(client) for client in applied}
+        pending = [(row, client) for row, client in zip(rows, meta) if id(client) in applied_ids]
+        by_email, by_id = self._visible_user_index(tag)
         missing: list[tuple[dict[str, Any], dict[str, Any]]] = []
         kept: list[dict[str, Any]] = []
-        rows_by_email = {str(client.get("email") or ""): row for row, client in zip(rows, meta)}
-        for client in applied:
+        for row, client in pending:
+            if self._client_uuid_visible(client, by_id, by_email):
+                kept.append(client)
+                continue
             email = str(client.get("email") or "").strip()
             cid = str(client.get("id") or "").strip()
-            if (email and email in live_keys) or (cid and cid in live_keys):
-                kept.append(client)
-                continue
-            row = rows_by_email.get(email)
-            if row is None:
-                kept.append(client)
-                continue
-            missing.append((row, client))
-
-        if not missing:
-            return succeeded, failed, errors, applied
-
-        for row, client in missing:
-            email = str(client.get("email") or "")
+            stale = by_email.get(email) if email else None
+            stale_id = str((stale or {}).get("id") or (stale or {}).get("uuid") or "").strip()
+            if email and stale is not None and cid and stale_id != cid:
+                try:
+                    self._api().remove_users(tag, [email])
+                except AgentError as exc:
+                    if not _is_missing_user_error(exc):
+                        pass
             try:
                 call("add", row)
-                live_keys.add(email)
-                cid = str(client.get("id") or "").strip()
-                if cid:
-                    live_keys.add(cid)
-                kept.append(client)
+            except AgentError:
+                pass
+            missing.append((row, client))
+
+        if missing:
+            by_email, by_id = self._visible_user_index(tag)
+            still: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for row, client in missing:
+                if self._client_uuid_visible(client, by_id, by_email):
+                    kept.append(client)
+                else:
+                    still.append((row, client))
+            missing = still
+
+        commit_error: str | None = None
+        if missing:
+            try:
+                self._commit_clients_to_inbound(
+                    tag,
+                    [row for row, _client in missing],
+                    protocol=protocol,
+                    inbound_settings=inbound_settings if isinstance(inbound_settings, dict) else None,
+                )
             except AgentError as exc:
+                commit_error = exc.message
+            by_email, by_id = self._visible_user_index(tag)
+            for _row, client in missing:
+                email = str(client.get("email") or "")
+                if self._client_uuid_visible(client, by_id, by_email):
+                    kept.append(client)
+                    continue
                 succeeded -= 1
                 failed += 1
-                errors.append({"email": email, "message": exc.message})
-            except Exception as exc:  # noqa: BLE001
-                succeeded -= 1
-                failed += 1
-                errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+                errors.append(
+                    {
+                        "email": email,
+                        "id": str(client.get("id") or ""),
+                        "message": commit_error or "client was not created on the inbound",
+                    }
+                )
 
         return max(0, succeeded), failed, errors, kept
 
@@ -981,8 +1138,24 @@ class XrayDriver(CoreDriver):
                         inbound_settings=inbound.get("settings"),
                     )
                     if existing is not None:
-                        to_edit.append(native)
-                        edit_meta.append(client)
+                        existing_id = str(existing.get("id") or "").strip()
+                        # Edit keeps the old uuid. The panel looks the client up
+                        # by node_id, so an email hit with another id must be replaced.
+                        if cid and existing_id and existing_id != cid:
+                            stale_email = str(existing.get("email") or email).strip()
+                            if stale_email:
+                                try:
+                                    self._api().remove_users(tag, [stale_email])
+                                except AgentError as exc:
+                                    if not _is_missing_user_error(exc):
+                                        failed += 1
+                                        errors.append({"email": email, "id": cid, "message": exc.message})
+                                        continue
+                            to_add.append(native)
+                            add_meta.append(client)
+                        else:
+                            to_edit.append(native)
+                            edit_meta.append(client)
                     else:
                         to_add.append(native)
                         add_meta.append(client)

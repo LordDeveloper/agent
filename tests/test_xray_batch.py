@@ -345,6 +345,54 @@ def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: T
     assert "two@x" in emails
 
 
+def test_lying_add_still_writes_the_uuid_onto_the_inbound(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """users/add can return success and insert nothing. The uuid must still land."""
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(30, 3046)).status_code == 200
+
+    def add_reports_success_but_writes_nothing(tag, clients, **kwargs):
+        return {"succeeded": len(clients), "failed": 0}
+
+    fake_xray.add_users = add_reports_success_but_writes_nothing
+    node_id = "876f18a0-644b-401b-a61a-a1064db044bf"
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/30/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": node_id, "email": "TEY8ECJn", "is_enabled": True}]},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["failed"] == 0, created.text
+    assert created.json()["succeeded"] == 1
+
+    found = client.get(f"/api/v1/cores/xray/inbounds/30/clients/{node_id}", headers=headers)
+    assert found.status_code == 200, found.text
+    assert found.json()["client"]["id"] == node_id
+
+
+def test_batch_fails_when_the_uuid_is_still_missing(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(31, 3047)).status_code == 200
+
+    fake_xray.add_users = lambda tag, clients, **kwargs: {"succeeded": len(clients), "failed": 0}
+    fake_xray.edit_inbounds = lambda inbounds, preserve_clients=None: {"status": "ok"}
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/31/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": "876f18a0-644b-401b-a61a-a1064db044bf",
+                "email": "TEY8ECJn",
+                "is_enabled": True,
+            }],
+        },
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["succeeded"] == 0
+    assert body["failed"] == 1
+
+
 def test_get_client_finds_user_that_inbounds_list_omits(client: TestClient, fake_xray: FakeXrayHttpClient):
     """users/add can leave the uuid out of inbounds/list. GET must still see it."""
     headers = {"Authorization": "Bearer dev-token"}
