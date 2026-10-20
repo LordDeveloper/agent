@@ -814,6 +814,35 @@ class XrayDriver(CoreDriver):
         return by_email, by_id
 
     @staticmethod
+    def _response_client(
+        self,
+        client: dict[str, Any],
+        by_email: dict[str, dict[str, Any]],
+        by_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Return the identity the server actually stored.
+
+        Shadowsocks often has no uuid. GET then only works with the email, so
+        the panel can replace node_id with that key.
+        """
+        email = str(client.get("email") or "").strip()
+        cid = str(client.get("id") or "").strip()
+        row = by_email.get(email) if email else None
+        if row is None and cid:
+            row = by_id.get(cid)
+        if not isinstance(row, dict):
+            return client
+        live_id = str(row.get("id") or row.get("uuid") or "").strip()
+        live_email = str(row.get("email") or "").strip()
+        stamped = dict(client)
+        if live_id:
+            stamped["id"] = live_id
+        elif live_email:
+            stamped["id"] = live_email
+        if live_email:
+            stamped["email"] = live_email
+        return stamped
+
     def _client_uuid_visible(
         client: dict[str, Any],
         by_id: dict[str, dict[str, Any]],
@@ -997,7 +1026,7 @@ class XrayDriver(CoreDriver):
         kept: list[dict[str, Any]] = []
         for row, client in pending:
             if self._client_uuid_visible(client, by_id, by_email):
-                kept.append(client)
+                kept.append(self._response_client(client, by_email, by_id))
                 continue
             email = str(client.get("email") or "").strip()
             cid = str(client.get("id") or "").strip()
@@ -1040,7 +1069,7 @@ class XrayDriver(CoreDriver):
             for _row, client in missing:
                 email = str(client.get("email") or "")
                 if self._client_uuid_visible(client, by_id, by_email):
-                    kept.append(client)
+                    kept.append(self._response_client(client, by_email, by_id))
                     continue
                 succeeded -= 1
                 failed += 1
@@ -1379,7 +1408,8 @@ class XrayDriver(CoreDriver):
                     seen.add(target)
                     remove_emails.append(target)
             for cid in id_keys:
-                row = by_id.get(cid)
+                # Panel prune sends the email as an id when the SS user has no uuid.
+                row = by_id.get(cid) or by_email.get(cid)
                 if row is None:
                     failed += 1
                     errors.append({"email": cid, "message": "client not found"})
