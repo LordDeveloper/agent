@@ -96,9 +96,14 @@ def describe_httpapi_guard(httpapi: dict[str, Any] | None, username: str, passwo
     block = httpapi if isinstance(httpapi, dict) else {}
     resolved_user = str(block.get("username") or username or "").strip()
     resolved_password = str(block.get("password") or password or "").strip()
+    listen = str(block.get("listen") or "").strip()
     return {
-        "listen": str(block.get("listen") or ""),
+        "listen": listen,
         "auth_configured": bool(resolved_user and resolved_password),
+        "has_agent_credentials": bool(str(username or "").strip() and str(password or "").strip()),
+        "has_config_credentials": bool(
+            str(block.get("username") or "").strip() and str(block.get("password") or "").strip()
+        ),
     }
 
 

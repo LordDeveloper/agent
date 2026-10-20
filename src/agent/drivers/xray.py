@@ -916,12 +916,23 @@ class XrayDriver(CoreDriver):
                             applied.extend(
                                 [row for row in meta if str(row.get("email") or "") not in failed_emails]
                             )
-                        if op in {"edit", "upsert"} and failed_emails:
+                        missing_emails = {
+                            str(err.get("email") or "")
+                            for err in (result.get("errors") or [])
+                            if isinstance(err, dict)
+                            and (
+                                "not found" in str(err.get("message") or "").lower()
+                                or "does not exist" in str(err.get("message") or "").lower()
+                                or "doesn't exist" in str(err.get("message") or "").lower()
+                            )
+                            and str(err.get("email") or "")
+                        }
+                        if op in {"edit", "upsert"} and missing_emails:
                             retry_rows = []
                             retry_meta = []
                             for row, client in zip(rows, meta):
                                 email = str(client.get("email") or "")
-                                if email and email in failed_emails:
+                                if email and email in missing_emails:
                                     retry_rows.append(row)
                                     retry_meta.append(client)
                             if retry_rows:
