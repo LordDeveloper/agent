@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from threading import Lock
 from typing import Any
 
 
 class FakeXrayHttpClient:
     def __init__(self, settings=None, transport=None):
         self.settings = settings
+        self._lock = Lock()
         self._inbounds: list[dict[str, Any]] = []
         self._outbounds: list[dict[str, Any]] = [
             {"protocol": "freedom", "tag": "direct"},
@@ -74,26 +76,28 @@ class FakeXrayHttpClient:
         return {"status": "ok"}
 
     def add_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-        for inbound in self._inbounds:
-            if inbound.get("tag") == tag:
-                inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
-                return {"succeeded": len(clients), "failed": 0, "added_users": len(clients)}
-        raise RuntimeError(f"inbound {tag} missing")
+        with self._lock:
+            for inbound in self._inbounds:
+                if inbound.get("tag") == tag:
+                    inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
+                    return {"succeeded": len(clients), "failed": 0, "added_users": len(clients)}
+            raise RuntimeError(f"inbound {tag} missing")
 
     def edit_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-        for inbound in self._inbounds:
-            if inbound.get("tag") != tag:
-                continue
-            existing = inbound.setdefault("settings", {}).setdefault("clients", [])
-            by_email = {str(c.get("email")): i for i, c in enumerate(existing)}
-            for client in clients:
-                email = str(client.get("email"))
-                if email in by_email:
-                    existing[by_email[email]] = deepcopy(client)
-                else:
-                    existing.append(deepcopy(client))
-            return {"succeeded": len(clients), "failed": 0, "updated_users": len(clients)}
-        raise RuntimeError(f"inbound {tag} missing")
+        with self._lock:
+            for inbound in self._inbounds:
+                if inbound.get("tag") != tag:
+                    continue
+                existing = inbound.setdefault("settings", {}).setdefault("clients", [])
+                by_email = {str(c.get("email")): i for i, c in enumerate(existing)}
+                for client in clients:
+                    email = str(client.get("email"))
+                    if email in by_email:
+                        existing[by_email[email]] = deepcopy(client)
+                    else:
+                        existing.append(deepcopy(client))
+                return {"succeeded": len(clients), "failed": 0, "updated_users": len(clients)}
+            raise RuntimeError(f"inbound {tag} missing")
 
     def upsert_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         return self.edit_users(tag, clients, **kwargs)
@@ -111,14 +115,15 @@ class FakeXrayHttpClient:
         raise RuntimeError(f"inbound {tag} missing")
 
     def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
-        for inbound in self._inbounds:
-            if inbound.get("tag") != tag:
-                continue
-            users = inbound.get("settings", {}).get("clients", [])
-            if email:
-                return [u for u in users if str(u.get("email")) == email]
-            return deepcopy(users)
-        return []
+        with self._lock:
+            for inbound in self._inbounds:
+                if inbound.get("tag") != tag:
+                    continue
+                users = inbound.get("settings", {}).get("clients", [])
+                if email:
+                    return [u for u in users if str(u.get("email")) == email]
+                return deepcopy(users)
+            return []
 
     def list_outbounds(self) -> list[dict[str, Any]]:
         return deepcopy(self._outbounds)

@@ -310,6 +310,41 @@ def test_batch_upsert_creates_missing_client_without_relying_on_xray_upsert(clie
     assert "missing@x" in emails
 
 
+def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(28, 3044)).status_code == 200
+
+    sizes: list[int] = []
+    real_add = fake_xray.add_users
+
+    def add_users(tag, clients, **kwargs):
+        sizes.append(len(clients))
+        if len(clients) != 1:
+            return {"succeeded": len(clients), "failed": 0}
+        return real_add(tag, clients, **kwargs)
+
+    fake_xray.add_users = add_users
+
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/28/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [
+                {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "email": "one@x", "is_enabled": True},
+                {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "email": "two@x", "is_enabled": True},
+            ],
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["failed"] == 0
+    assert sizes and all(size == 1 for size in sizes)
+    listed = client.get("/api/v1/cores/xray/inbounds/28", headers=headers)
+    emails = [row["email"] for row in listed.json()["inbound"]["settings"]["clients"]]
+    assert "one@x" in emails
+    assert "two@x" in emails
+
+
 def test_replace_routing_rules(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     fake_xray._rules = [{"tag": "old", "outboundTag": "direct"}]

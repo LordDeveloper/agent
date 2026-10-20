@@ -738,6 +738,117 @@ class XrayDriver(CoreDriver):
                 by_id[cid] = client
         return by_email, by_id
 
+    def _apply_clients_parallel(
+        self,
+        op: str,
+        tag: str,
+        rows: list[dict[str, Any]],
+        meta: list[dict[str, Any]],
+        *,
+        protocol: str,
+        inbound_settings: Any,
+    ) -> tuple[int, int, list[dict[str, str]], list[dict[str, Any]]]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def call(kind: str, row: dict[str, Any]) -> None:
+            kwargs = {
+                "protocol": protocol,
+                "inbound_settings": inbound_settings,
+                "atomic": False,
+            }
+            if kind == "add":
+                self._api().add_users(tag, [row], **kwargs)
+            else:
+                self._api().edit_users(tag, [row], **kwargs)
+
+        def one(row: dict[str, Any], client: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+            try:
+                call(op if op != "upsert" else "add", row)
+                return client, None
+            except AgentError as exc:
+                try:
+                    if op in {"edit", "upsert"} and _is_missing_user_error(exc):
+                        call("add", row)
+                        return client, None
+                    if op == "add" and _is_existing_user_error(exc):
+                        call("edit", row)
+                        return client, None
+                except AgentError as recover_exc:
+                    return client, recover_exc.message
+                return client, exc.message
+            except Exception as exc:  # noqa: BLE001
+                return client, f"{type(exc).__name__}: {exc}"
+
+        succeeded = 0
+        failed = 0
+        errors: list[dict[str, str]] = []
+        applied: list[dict[str, Any]] = []
+        workers = min(16, max(1, len(rows)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(one, row, client) for row, client in zip(rows, meta)]
+            for future in as_completed(futures):
+                client, message = future.result()
+                if message:
+                    failed += 1
+                    errors.append({"email": str(client.get("email") or ""), "message": message})
+                else:
+                    succeeded += 1
+                    applied.append(client)
+
+        try:
+            live = self._api().list_users(tag)
+        except AgentError:
+            return succeeded, failed, errors, applied
+
+        live_keys: set[str] = set()
+        for user in live:
+            if not isinstance(user, dict):
+                continue
+            email = str(user.get("email") or "").strip()
+            cid = str(user.get("id") or "").strip()
+            if email:
+                live_keys.add(email)
+            if cid:
+                live_keys.add(cid)
+
+        missing: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        kept: list[dict[str, Any]] = []
+        rows_by_email = {str(client.get("email") or ""): row for row, client in zip(rows, meta)}
+        for client in applied:
+            email = str(client.get("email") or "").strip()
+            cid = str(client.get("id") or "").strip()
+            if (email and email in live_keys) or (cid and cid in live_keys):
+                kept.append(client)
+                continue
+            row = rows_by_email.get(email)
+            if row is None:
+                kept.append(client)
+                continue
+            missing.append((row, client))
+
+        if not missing:
+            return succeeded, failed, errors, applied
+
+        for row, client in missing:
+            email = str(client.get("email") or "")
+            try:
+                call("add", row)
+                live_keys.add(email)
+                cid = str(client.get("id") or "").strip()
+                if cid:
+                    live_keys.add(cid)
+                kept.append(client)
+            except AgentError as exc:
+                succeeded -= 1
+                failed += 1
+                errors.append({"email": email, "message": exc.message})
+            except Exception as exc:  # noqa: BLE001
+                succeeded -= 1
+                failed += 1
+                errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+
+        return max(0, succeeded), failed, errors, kept
+
     def add_client(self, inbound_id: int | str, client: dict[str, Any]) -> dict[str, Any]:
         result = self.batch_clients(inbound_id, [client], mode="upsert")
         if result.get("failed"):
@@ -870,92 +981,22 @@ class XrayDriver(CoreDriver):
                     self._validate_config_mutation(
                         lambda cfg, _rows=rows: self._merge_clients_in_config(cfg, tag, _rows),
                     )
-                    if op == "add":
-                        result = self._api().add_users(
-                            tag,
-                            rows,
-                            protocol=protocol,
-                            inbound_settings=inbound.get("settings"),
-                            atomic=atomic,
-                        )
-                    elif op == "upsert":
-                        result = self._api().upsert_users(
-                            tag,
-                            rows,
-                            protocol=protocol,
-                            inbound_settings=inbound.get("settings"),
-                            atomic=atomic,
-                        )
-                    else:
-                        result = self._api().edit_users(
-                            tag,
-                            rows,
-                            protocol=protocol,
-                            inbound_settings=inbound.get("settings"),
-                            atomic=atomic,
-                        )
-                    if isinstance(result, dict) and ("failed" in result or "errors" in result):
-                        batch_ok = int(result.get("succeeded") or 0)
-                        batch_fail = int(result.get("failed") or 0)
-                        succeeded += batch_ok
-                        failed += batch_fail
-                        for err in result.get("errors") or []:
-                            if isinstance(err, dict):
-                                errors.append(
-                                    {
-                                        "email": str(err.get("email") or ""),
-                                        "message": str(err.get("message") or "failed"),
-                                    }
-                                )
-                        failed_emails = {
-                            str(err.get("email") or "")
-                            for err in (result.get("errors") or [])
-                            if isinstance(err, dict)
-                        }
-                        if batch_ok:
-                            applied.extend(
-                                [row for row in meta if str(row.get("email") or "") not in failed_emails]
-                            )
-                        missing_emails = {
-                            str(err.get("email") or "")
-                            for err in (result.get("errors") or [])
-                            if isinstance(err, dict)
-                            and (
-                                "not found" in str(err.get("message") or "").lower()
-                                or "does not exist" in str(err.get("message") or "").lower()
-                                or "doesn't exist" in str(err.get("message") or "").lower()
-                            )
-                            and str(err.get("email") or "")
-                        }
-                        if op in {"edit", "upsert"} and missing_emails:
-                            retry_rows = []
-                            retry_meta = []
-                            for row, client in zip(rows, meta):
-                                email = str(client.get("email") or "")
-                                if email and email in missing_emails:
-                                    retry_rows.append(row)
-                                    retry_meta.append(client)
-                            if retry_rows:
-                                try:
-                                    self._api().add_users(
-                                        tag,
-                                        retry_rows,
-                                        protocol=protocol,
-                                        inbound_settings=inbound.get("settings"),
-                                        atomic=False,
-                                    )
-                                    succeeded += len(retry_meta)
-                                    failed = max(0, failed - len(retry_meta))
-                                    applied.extend(retry_meta)
-                                    errors[:] = [
-                                        err for err in errors
-                                        if str(err.get("email") or "") not in {str(c.get("email") or "") for c in retry_meta}
-                                    ]
-                                except AgentError:
-                                    pass
-                        return
-                    succeeded += len(meta)
-                    applied.extend(meta)
+                    # Panel sends one bulk body. Apply each user on its own Xray
+                    # call, in parallel. A single users/add or users/upsert can
+                    # report succeeded while leaving that uuid out of the config.
+                    part_ok, part_fail, part_errors, part_applied = self._apply_clients_parallel(
+                        op,
+                        tag,
+                        rows,
+                        meta,
+                        protocol=protocol,
+                        inbound_settings=inbound.get("settings"),
+                    )
+                    succeeded += part_ok
+                    failed += part_fail
+                    errors.extend(part_errors)
+                    applied.extend(part_applied)
+                    return
                 except AgentError as exc:
                     if exc.status == 413:
                         failed += len(meta)
