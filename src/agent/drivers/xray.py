@@ -813,7 +813,6 @@ class XrayDriver(CoreDriver):
             pass
         return by_email, by_id
 
-    @staticmethod
     def _response_client(
         self,
         client: dict[str, Any],
@@ -844,6 +843,7 @@ class XrayDriver(CoreDriver):
         return stamped
 
     def _client_uuid_visible(
+        self,
         client: dict[str, Any],
         by_id: dict[str, dict[str, Any]],
         by_email: dict[str, dict[str, Any]],
@@ -1049,7 +1049,7 @@ class XrayDriver(CoreDriver):
             still: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for row, client in missing:
                 if self._client_uuid_visible(client, by_id, by_email):
-                    kept.append(client)
+                    kept.append(self._response_client(client, by_email, by_id))
                 else:
                     still.append((row, client))
             missing = still
