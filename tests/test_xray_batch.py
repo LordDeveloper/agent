@@ -345,6 +345,29 @@ def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: T
     assert "two@x" in emails
 
 
+def test_get_client_finds_user_that_inbounds_list_omits(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """users/add can leave the uuid out of inbounds/list. GET must still see it."""
+    headers = {"Authorization": "Bearer dev-token"}
+    fake_xray.users_hidden_from_inbound_list = True
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(29, 3045)).status_code == 200
+
+    node_id = "876f18a0-644b-401b-a61a-a1064db044bf"
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/29/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": node_id, "email": "TEY8ECJn", "is_enabled": True}]},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["failed"] == 0
+
+    listed = client.get("/api/v1/cores/xray/inbounds/29", headers=headers)
+    assert listed.json()["inbound"]["settings"]["clients"] == []
+
+    found = client.get(f"/api/v1/cores/xray/inbounds/29/clients/{node_id}", headers=headers)
+    assert found.status_code == 200, found.text
+    assert found.json()["client"]["id"] == node_id
+
+
 def test_replace_routing_rules(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     fake_xray._rules = [{"tag": "old", "outboundTag": "direct"}]

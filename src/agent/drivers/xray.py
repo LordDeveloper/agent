@@ -708,11 +708,33 @@ class XrayDriver(CoreDriver):
         except AgentError:
             pass
 
+        # users/add updates the users API. inbounds/list and config.json can
+        # omit that row, so a client that is live still looked missing here.
+        live = self._find_live_user(tag, key)
+        if live is not None:
+            return self._with_stored_quota(normalize_xray_client(live), include_flags=True)
+
         stored = self._find_disabled_client(key)
         if stored is not None:
             return stored
 
         raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
+
+    def _find_live_user(self, tag: str, key: str) -> dict[str, Any] | None:
+        try:
+            users = self._api().list_users(tag)
+        except AgentError:
+            return None
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            cid = str(user.get("id") or user.get("uuid") or "").strip()
+            email = str(user.get("email") or "").strip()
+            if key == cid or key == email:
+                if not user.get("id") and cid:
+                    user = {**user, "id": cid}
+                return user
+        return None
 
     def diagnose_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
         from agent.support.client_diagnose import diagnose_xray_client, diagnose_xray_clients_by_key

@@ -22,6 +22,9 @@ class FakeXrayHttpClient:
         self._ips: dict[str, list[str]] = {}
         self._user_traffic: dict[str, dict[str, int]] = {}
         self._inbound_traffic: dict[str, dict[str, int]] = {}
+        # When set, users/add lands only in the users API. inbounds/list omits them.
+        self.users_hidden_from_inbound_list = False
+        self._hidden_users: dict[str, list[dict[str, Any]]] = {}
 
     def close(self) -> None:
         return None
@@ -42,7 +45,13 @@ class FakeXrayHttpClient:
         return {"status": "ok"}
 
     def list_inbounds(self) -> list[dict[str, Any]]:
-        return deepcopy(self._inbounds)
+        rows = deepcopy(self._inbounds)
+        if self.users_hidden_from_inbound_list:
+            for row in rows:
+                settings = row.setdefault("settings", {})
+                settings["clients"] = []
+                settings.pop("users", None)
+        return rows
 
     def add_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
         for inbound in inbounds:
@@ -77,6 +86,10 @@ class FakeXrayHttpClient:
 
     def add_users(self, tag: str, clients: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         with self._lock:
+            if self.users_hidden_from_inbound_list:
+                bucket = self._hidden_users.setdefault(tag, [])
+                bucket.extend(deepcopy(clients))
+                return {"succeeded": len(clients), "failed": 0, "added_users": len(clients)}
             for inbound in self._inbounds:
                 if inbound.get("tag") == tag:
                     inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
@@ -116,6 +129,11 @@ class FakeXrayHttpClient:
 
     def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
+            if self.users_hidden_from_inbound_list:
+                users = list(self._hidden_users.get(tag) or [])
+                if email:
+                    return [u for u in users if str(u.get("email")) == email]
+                return deepcopy(users)
             for inbound in self._inbounds:
                 if inbound.get("tag") != tag:
                     continue
