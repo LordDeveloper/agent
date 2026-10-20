@@ -345,6 +345,51 @@ def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: T
     assert "two@x" in emails
 
 
+def test_shadowsocks_user_without_uuid_counts_as_created(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """SS AEAD users are email+password. A panel uuid must not be reported missing."""
+    headers = {"Authorization": "Bearer dev-token"}
+    inbound = _sample_inbound(32, 8388)
+    inbound["protocol"] = "shadowsocks"
+    inbound["settings"] = {
+        "clients": [{
+            "email": "b4ljdBNh",
+            "password": "secret-pass",
+            "method": "chacha20-ietf-poly1305",
+        }],
+        "network": "tcp,udp",
+    }
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=inbound).status_code == 200
+
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/32/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": "876f18a0-644b-401b-a61a-a1064db044bf",
+                "email": "b4ljdBNh",
+                "password": "secret-pass",
+                "method": "chacha20-ietf-poly1305",
+                "is_enabled": True,
+            }],
+        },
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["failed"] == 0, body
+    assert body["succeeded"] == 1
+    emails = [
+        row.get("email")
+        for inbound_row in fake_xray.list_inbounds()
+        if inbound_row.get("tag") == "inbound-32"
+        for row in (inbound_row.get("settings") or {}).get("clients") or []
+    ]
+    assert emails.count("b4ljdBNh") == 1
+
+    found = client.get("/api/v1/cores/xray/inbounds/32/clients/b4ljdBNh", headers=headers)
+    assert found.status_code == 200, found.text
+
+
 def test_lying_add_still_writes_the_uuid_onto_the_inbound(client: TestClient, fake_xray: FakeXrayHttpClient):
     """users/add can return success and insert nothing. The uuid must still land."""
     headers = {"Authorization": "Bearer dev-token"}

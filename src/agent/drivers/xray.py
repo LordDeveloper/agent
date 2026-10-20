@@ -675,9 +675,20 @@ class XrayDriver(CoreDriver):
 
     def _find_client(self, inbound: dict[str, Any], client_key: str) -> dict[str, Any] | None:
         for client in self._clients_of(inbound):
-            if str(client.get("id")) == client_key or str(client.get("email")) == client_key:
+            if self._row_matches_key(client, client_key):
                 return client
         return None
+
+    @staticmethod
+    def _row_matches_key(client: dict[str, Any], key: str) -> bool:
+        # VLESS/VMess use id. Shadowsocks and Trojan use email, and the panel
+        # node_id is often stored only as the user password.
+        return key in {
+            str(client.get("id") or "").strip(),
+            str(client.get("uuid") or "").strip(),
+            str(client.get("email") or "").strip(),
+            str(client.get("password") or "").strip(),
+        }
 
     def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
         """Return client metadata from config.json (includes disabled / quota rows)."""
@@ -730,7 +741,8 @@ class XrayDriver(CoreDriver):
                 continue
             cid = str(user.get("id") or user.get("uuid") or "").strip()
             email = str(user.get("email") or "").strip()
-            if key == cid or key == email:
+            password = str(user.get("password") or "").strip()
+            if key in {cid, email, password}:
                 if not user.get("id") and cid:
                     user = {**user, "id": cid}
                 return user
@@ -770,10 +782,13 @@ class XrayDriver(CoreDriver):
                 continue
             email = str(user.get("email") or "").strip()
             cid = str(user.get("id") or user.get("uuid") or "").strip()
+            password = str(user.get("password") or "").strip()
             if email:
                 by_email[email] = user
             if cid:
                 by_id[cid] = user
+            elif password:
+                by_id[password] = user
         return by_email, by_id
 
     def _visible_user_index(self, tag: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -806,9 +821,20 @@ class XrayDriver(CoreDriver):
     ) -> bool:
         cid = str(client.get("id") or "").strip()
         email = str(client.get("email") or "").strip()
-        if cid:
-            return cid in by_id
-        return bool(email and email in by_email)
+        password = str(client.get("password") or "").strip()
+        if cid and cid in by_id:
+            return True
+        if password and password in by_id:
+            return True
+        row = by_email.get(email) if email else None
+        if row is None:
+            return False
+        # Shadowsocks and Trojan have no uuid on the user. An email hit is this
+        # client. A VLESS row with a different id is a different client.
+        live_id = str(row.get("id") or row.get("uuid") or "").strip()
+        if not live_id:
+            return True
+        return bool(cid) and live_id == cid
 
     def _commit_clients_to_inbound(
         self,
@@ -977,7 +1003,7 @@ class XrayDriver(CoreDriver):
             cid = str(client.get("id") or "").strip()
             stale = by_email.get(email) if email else None
             stale_id = str((stale or {}).get("id") or (stale or {}).get("uuid") or "").strip()
-            if email and stale is not None and cid and stale_id != cid:
+            if email and stale is not None and cid and stale_id and stale_id != cid:
                 try:
                     self._api().remove_users(tag, [email])
                 except AgentError as exc:
