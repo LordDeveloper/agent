@@ -362,8 +362,7 @@ def xray_protocol_user(
             user["method"] = method
         elif password and not _shadowsocks_inbound_is_2022(inbound_settings):
             user["method"] = _DEFAULT_SHADOWSOCKS_AEAD_METHOD
-        if not record_is_enabled(row):
-            user["enable"] = False
+        user["enable"] = bool(record_is_enabled(row))
         return user
 
     cleaned = {k: v for k, v in row.items() if k not in _NETINJA_CLIENT_KEYS and v is not None and v != ""}

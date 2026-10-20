@@ -1171,13 +1171,14 @@ class XrayDriver(CoreDriver):
                         # Keep a user that is already on the inbound, marked disabled.
                         # Deleting it made diagnose report CLIENT_NOT_FOUND while
                         # status still read the leftover disabled record.
+                        # A client that was never created stays absent.
                         client["is_enabled"] = False
                         prior = self._find_disabled_client(cid or email)
-                        self._remember_disabled_client(inbound_id, tag, client)
                         if existing is None and prior is None:
                             succeeded += 1
                             applied.append(client)
                             continue
+                        self._remember_disabled_client(inbound_id, tag, client)
                         native = xray_protocol_user(
                             protocol,
                             client,
@@ -1185,6 +1186,9 @@ class XrayDriver(CoreDriver):
                         )
                         native["enable"] = False
                         native["is_enabled"] = False
+                        reason = str(client.get("disabled_reason") or "").strip()
+                        if reason:
+                            native["disabled_reason"] = reason
                         if existing is not None:
                             to_edit.append(native)
                             edit_meta.append(client)
@@ -1194,11 +1198,19 @@ class XrayDriver(CoreDriver):
                         continue
 
                     self._raise_zero_baseline_to_live(client)
+                    client["is_enabled"] = True
                     native = xray_protocol_user(
                         protocol,
                         client,
                         inbound_settings=inbound.get("settings"),
                     )
+                    native["enable"] = True
+                    native["is_enabled"] = True
+                    self._forget_disabled_keys([
+                        cid,
+                        email,
+                        str(client.get("password") or ""),
+                    ])
                     if existing is not None:
                         existing_id = str(existing.get("id") or "").strip()
                         # Edit keeps the old uuid. The panel looks the client up
@@ -1528,10 +1540,13 @@ class XrayDriver(CoreDriver):
                 continue
             cid = str(client.get("id") or "").strip()
             email = str(client.get("email") or "").strip()
+            password = str(client.get("password") or "").strip()
             if cid:
                 keys.append(cid)
             if email:
                 keys.append(email)
+            if password:
+                keys.append(password)
         self._forget_disabled_keys(keys)
 
     def _forget_disabled_keys(self, keys: list[str]) -> None:
@@ -1541,8 +1556,9 @@ class XrayDriver(CoreDriver):
         for row in self._disabled_docs():
             cid = str(row.get("id") or "").strip()
             email = str(row.get("email") or "").strip()
+            password = str(row.get("password") or "").strip()
             doc_id = cid or email
-            if doc_id and (cid in wanted or email in wanted or doc_id in wanted):
+            if doc_id and (cid in wanted or email in wanted or password in wanted or doc_id in wanted):
                 self.store.delete_doc(self.key, _DISABLED_KIND, doc_id)
 
     def present_inbounds(self, inbounds: list[dict[str, Any]]) -> list[dict[str, Any]]:

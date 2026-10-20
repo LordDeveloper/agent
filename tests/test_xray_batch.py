@@ -391,6 +391,70 @@ def test_shadowsocks_user_without_uuid_counts_as_created(client: TestClient, fak
     assert found.status_code == 200, found.text
 
 
+def test_healthy_shadowsocks_sync_enables_the_core_user(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """A successful enabled sync must replace a leftover disabled store row."""
+    headers = {"Authorization": "Bearer dev-token"}
+    inbound = _sample_inbound(33, 53740)
+    inbound["protocol"] = "shadowsocks"
+    inbound["settings"] = {
+        "clients": [{
+            "email": "b4ljdBNh",
+            "password": "secret-pass",
+            "method": "chacha20-ietf-poly1305",
+            "enable": False,
+        }],
+        "network": "tcp,udp",
+    }
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=inbound).status_code == 200
+
+    disabled = client.post(
+        "/api/v1/cores/xray/inbounds/33/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "email": "b4ljdBNh",
+                "password": "secret-pass",
+                "method": "chacha20-ietf-poly1305",
+                "is_enabled": False,
+            }],
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["failed"] == 0, disabled.text
+
+    enabled = client.post(
+        "/api/v1/cores/xray/inbounds/33/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": "876f18a0-644b-401b-a61a-a1064db044bf",
+                "email": "b4ljdBNh",
+                "password": "secret-pass",
+                "method": "chacha20-ietf-poly1305",
+                "is_enabled": True,
+            }],
+        },
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["failed"] == 0, enabled.text
+
+    live = [
+        row
+        for inbound_row in fake_xray.list_inbounds()
+        if inbound_row.get("tag") == "inbound-33"
+        for row in (inbound_row.get("settings") or {}).get("clients") or []
+        if row.get("email") == "b4ljdBNh"
+    ]
+    assert len(live) == 1
+    assert live[0].get("enable") is True
+
+    found = client.get("/api/v1/cores/xray/inbounds/33/clients/b4ljdBNh", headers=headers)
+    assert found.status_code == 200, found.text
+    assert found.json()["client"]["is_enabled"] is True
+
+
 def test_lying_add_still_writes_the_uuid_onto_the_inbound(client: TestClient, fake_xray: FakeXrayHttpClient):
     """users/add can return success and insert nothing. The uuid must still land."""
     headers = {"Authorization": "Bearer dev-token"}
