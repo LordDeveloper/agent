@@ -1168,22 +1168,29 @@ class XrayDriver(CoreDriver):
                         continue
 
                     if not record_is_enabled(client):
-                        # Cut the live user so traffic stops, but keep a disabled
-                        # record. Volume exhaustion used to vanish the client, so
-                        # renewal and panel sync only saw CLIENT_NOT_FOUND.
+                        # Keep a user that is already on the inbound, marked disabled.
+                        # Deleting it made diagnose report CLIENT_NOT_FOUND while
+                        # status still read the leftover disabled record.
+                        client["is_enabled"] = False
                         prior = self._find_disabled_client(cid or email)
-                        if existing is not None or prior is not None:
-                            if existing is not None:
-                                try:
-                                    self._api().remove_users(tag, [str(existing.get("email") or email)])
-                                except AgentError as exc:
-                                    if not _is_missing_user_error(exc):
-                                        failed += 1
-                                        errors.append({"email": email, "message": exc.message})
-                                        continue
-                            self._remember_disabled_client(inbound_id, tag, client)
-                        succeeded += 1
-                        applied.append(client)
+                        self._remember_disabled_client(inbound_id, tag, client)
+                        if existing is None and prior is None:
+                            succeeded += 1
+                            applied.append(client)
+                            continue
+                        native = xray_protocol_user(
+                            protocol,
+                            client,
+                            inbound_settings=inbound.get("settings"),
+                        )
+                        native["enable"] = False
+                        native["is_enabled"] = False
+                        if existing is not None:
+                            to_edit.append(native)
+                            edit_meta.append(client)
+                        else:
+                            to_add.append(native)
+                            add_meta.append(client)
                         continue
 
                     self._raise_zero_baseline_to_live(client)
