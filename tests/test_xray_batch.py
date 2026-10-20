@@ -223,6 +223,93 @@ def test_update_missing_client_upserts_instead_of_404(client: TestClient):
     assert clients == []
 
 
+def test_disabling_existing_client_keeps_it_visible_until_reenabled(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(26, 2943)).status_code == 200
+    client_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    seeded = client.post(
+        "/api/v1/cores/xray/inbounds/26/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{"id": client_id, "email": "stay@x", "is_enabled": True, "volume": 1000}],
+        },
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    disabled = client.post(
+        "/api/v1/cores/xray/inbounds/26/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": client_id,
+                "email": "stay@x",
+                "is_enabled": False,
+                "disabled_reason": "quota_exceeded",
+                "volume": 1,
+            }],
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    live = fake_xray._inbounds[0]["settings"]["clients"]
+    assert live == []
+
+    listed = client.get("/api/v1/cores/xray/inbounds/26", headers=headers)
+    clients = listed.json()["inbound"]["settings"]["clients"]
+    assert len(clients) == 1, clients
+    assert clients[0]["id"] == client_id
+    assert clients[0]["is_enabled"] is False, clients[0]
+    assert clients[0]["disabled_reason"] == "quota_exceeded"
+
+    record = client.get(f"/api/v1/cores/xray/inbounds/26/clients/{client_id}", headers=headers)
+    assert record.status_code == 200, record.text
+    assert record.json()["client"]["email"] == "stay@x"
+    assert record.json()["client"]["is_enabled"] is False
+
+    enabled = client.put(
+        f"/api/v1/cores/xray/inbounds/26/clients/{client_id}",
+        headers=headers,
+        json={"id": client_id, "email": "stay@x", "is_enabled": True, "volume": 5_000_000_000},
+    )
+    assert enabled.status_code == 200, enabled.text
+    live = fake_xray._inbounds[0]["settings"]["clients"]
+    assert [row["email"] for row in live] == ["stay@x"]
+    listed = client.get("/api/v1/cores/xray/inbounds/26", headers=headers)
+    clients = listed.json()["inbound"]["settings"]["clients"]
+    assert len(clients) == 1
+    assert clients[0]["is_enabled"] is True
+
+
+def test_batch_upsert_creates_missing_client_without_relying_on_xray_upsert(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """Xray users/upsert may report success without inserting. Bulk apply must still add."""
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(27, 3043)).status_code == 200
+
+    def upsert_reports_success_but_writes_nothing(tag, clients, **kwargs):
+        return {"succeeded": len(clients), "failed": 0}
+
+    fake_xray.upsert_users = upsert_reports_success_but_writes_nothing
+
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/27/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "email": "missing@x",
+                "is_enabled": True,
+            }],
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["failed"] == 0
+    listed = client.get("/api/v1/cores/xray/inbounds/27", headers=headers)
+    emails = [row["email"] for row in listed.json()["inbound"]["settings"]["clients"]]
+    assert "missing@x" in emails
+
+
 def test_replace_routing_rules(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     fake_xray._rules = [{"tag": "old", "outboundTag": "direct"}]

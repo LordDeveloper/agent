@@ -103,8 +103,10 @@ class FakeXrayHttpClient:
         for inbound in self._inbounds:
             if inbound.get("tag") != tag:
                 continue
-            clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-            inbound["settings"]["clients"] = [c for c in clients if str(c.get("email")) not in email_set]
+            settings = inbound.setdefault("settings", {})
+            for key in ("clients", "users"):
+                rows = settings.get(key) or []
+                settings[key] = [c for c in rows if str(c.get("email")) not in email_set]
             return {"succeeded": len(emails), "failed": 0, "removed_users": len(emails)}
         raise RuntimeError(f"inbound {tag} missing")
 

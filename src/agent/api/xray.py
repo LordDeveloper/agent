@@ -48,7 +48,7 @@ def xray_status(xray: XrayDriver = Depends(get_xray)):
 @router.get("/inbounds")
 def list_inbounds(xray: XrayDriver = Depends(get_xray)):
     try:
-        inbounds = xray.list_inbounds()
+        inbounds = xray.present_inbounds(xray.list_inbounds())
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "inbounds": inbounds}
@@ -57,7 +57,7 @@ def list_inbounds(xray: XrayDriver = Depends(get_xray)):
 @router.get("/inbounds/{inbound_id}")
 def get_inbound(inbound_id: str, xray: XrayDriver = Depends(get_xray)):
     try:
-        inbound = xray.get_inbound(inbound_id)
+        inbound = xray.present_inbounds([xray.get_inbound(inbound_id)])[0]
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "inbound": inbound}
@@ -422,6 +422,15 @@ def replace_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_x
 def httpapi_guard(xray: XrayDriver = Depends(get_xray)):
     try:
         guard = xray.httpapi_guard()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **guard}
+
+
+@router.post("/httpapi/ensure-auth")
+def ensure_httpapi_auth(xray: XrayDriver = Depends(get_xray)):
+    try:
+        guard = xray.ensure_httpapi_auth()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **guard}

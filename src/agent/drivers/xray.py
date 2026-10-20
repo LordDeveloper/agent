@@ -26,6 +26,7 @@ from agent.support import (
     xray_client_rows,
     xray_protocol_user,
 )
+from agent.support.disable_reason import mark_panel_disabled
 from agent.support.quota import apply_quota_meta, quota_meta_from_client
 from agent.support.config_validate import (
     validate_xray_config,
@@ -52,7 +53,20 @@ _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
 _CLIENT_BATCH_MAX = 200
 _QUOTA_KIND = "client_quota"
+_DISABLED_KIND = "xray_disabled_client"
 _log = get_logger("xray")
+
+
+def _is_missing_user_error(exc: AgentError) -> bool:
+    message = str(exc.message or "").lower()
+    return int(exc.status or 0) == 404 or "not found" in message or "does not exist" in message or "doesn't exist" in message
+
+
+def _is_existing_user_error(exc: AgentError) -> bool:
+    message = str(exc.message or "").lower()
+    if _is_missing_user_error(exc):
+        return False
+    return "already" in message or "duplicate" in message or "exist" in message
 
 
 class XrayDriver(CoreDriver):
@@ -672,7 +686,10 @@ class XrayDriver(CoreDriver):
             raise AgentError("VALIDATION_ERROR", "client key is required", 422)
 
         tag = self.inbound_tag(inbound_id)
-        config = self.read_config()
+        try:
+            config = self.read_config()
+        except AgentError:
+            config = {}
         for inbound in config.get("inbounds") or []:
             if not isinstance(inbound, dict):
                 continue
@@ -690,6 +707,10 @@ class XrayDriver(CoreDriver):
                 return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
         except AgentError:
             pass
+
+        stored = self._find_disabled_client(key)
+        if stored is not None:
+            return stored
 
         raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
 
@@ -762,6 +783,7 @@ class XrayDriver(CoreDriver):
         errors: list[dict[str, str]] = []
         applied: list[dict[str, Any]] = []
 
+        self._traffic_index_cache = None
         with self._inbound_lock(tag):
             inbound = self.get_inbound(inbound_id)
             inbound = self._ensure_shadowsocks_method(inbound)
@@ -801,19 +823,25 @@ class XrayDriver(CoreDriver):
                         continue
 
                     if not record_is_enabled(client):
-                        if existing is not None:
-                            try:
-                                self._api().remove_users(tag, [str(existing.get("email") or email)])
-                                succeeded += 1
-                                applied.append(client)
-                            except AgentError as exc:
-                                failed += 1
-                                errors.append({"email": email, "message": exc.message})
-                        else:
-                            succeeded += 1
-                            applied.append(client)
+                        # Cut the live user so traffic stops, but keep a disabled
+                        # record. Volume exhaustion used to vanish the client, so
+                        # renewal and panel sync only saw CLIENT_NOT_FOUND.
+                        prior = self._find_disabled_client(cid or email)
+                        if existing is not None or prior is not None:
+                            if existing is not None:
+                                try:
+                                    self._api().remove_users(tag, [str(existing.get("email") or email)])
+                                except AgentError as exc:
+                                    if not _is_missing_user_error(exc):
+                                        failed += 1
+                                        errors.append({"email": email, "message": exc.message})
+                                        continue
+                            self._remember_disabled_client(inbound_id, tag, client)
+                        succeeded += 1
+                        applied.append(client)
                         continue
 
+                    self._raise_zero_baseline_to_live(client)
                     native = xray_protocol_user(
                         protocol,
                         client,
@@ -879,16 +907,41 @@ class XrayDriver(CoreDriver):
                                         "message": str(err.get("message") or "failed"),
                                     }
                                 )
+                        failed_emails = {
+                            str(err.get("email") or "")
+                            for err in (result.get("errors") or [])
+                            if isinstance(err, dict)
+                        }
                         if batch_ok:
-                            # Best-effort: keep metas whose email is not in error list.
-                            failed_emails = {
-                                str(err.get("email") or "")
-                                for err in (result.get("errors") or [])
-                                if isinstance(err, dict)
-                            }
                             applied.extend(
                                 [row for row in meta if str(row.get("email") or "") not in failed_emails]
                             )
+                        if op in {"edit", "upsert"} and failed_emails:
+                            retry_rows = []
+                            retry_meta = []
+                            for row, client in zip(rows, meta):
+                                email = str(client.get("email") or "")
+                                if email and email in failed_emails:
+                                    retry_rows.append(row)
+                                    retry_meta.append(client)
+                            if retry_rows:
+                                try:
+                                    self._api().add_users(
+                                        tag,
+                                        retry_rows,
+                                        protocol=protocol,
+                                        inbound_settings=inbound.get("settings"),
+                                        atomic=False,
+                                    )
+                                    succeeded += len(retry_meta)
+                                    failed = max(0, failed - len(retry_meta))
+                                    applied.extend(retry_meta)
+                                    errors[:] = [
+                                        err for err in errors
+                                        if str(err.get("email") or "") not in {str(c.get("email") or "") for c in retry_meta}
+                                    ]
+                                except AgentError:
+                                    pass
                         return
                     succeeded += len(meta)
                     applied.extend(meta)
@@ -914,13 +967,24 @@ class XrayDriver(CoreDriver):
                                     atomic=False,
                                 )
                             elif op == "upsert":
-                                self._api().upsert_users(
-                                    tag,
-                                    [row],
-                                    protocol=protocol,
-                                    inbound_settings=inbound.get("settings"),
-                                    atomic=False,
-                                )
+                                try:
+                                    self._api().upsert_users(
+                                        tag,
+                                        [row],
+                                        protocol=protocol,
+                                        inbound_settings=inbound.get("settings"),
+                                        atomic=False,
+                                    )
+                                except AgentError as upsert_exc:
+                                    if not _is_missing_user_error(upsert_exc):
+                                        raise
+                                    self._api().add_users(
+                                        tag,
+                                        [row],
+                                        protocol=protocol,
+                                        inbound_settings=inbound.get("settings"),
+                                        atomic=False,
+                                    )
                             else:
                                 self._api().edit_users(
                                     tag,
@@ -932,8 +996,34 @@ class XrayDriver(CoreDriver):
                             succeeded += 1
                             applied.append(client)
                         except AgentError as row_exc:
-                            failed += 1
-                            errors.append({"email": email, "message": row_exc.message})
+                            recovered = False
+                            try:
+                                if op in {"edit", "upsert"} and _is_missing_user_error(row_exc):
+                                    self._api().add_users(
+                                        tag,
+                                        [row],
+                                        protocol=protocol,
+                                        inbound_settings=inbound.get("settings"),
+                                        atomic=False,
+                                    )
+                                    recovered = True
+                                elif op == "add" and _is_existing_user_error(row_exc):
+                                    self._api().edit_users(
+                                        tag,
+                                        [row],
+                                        protocol=protocol,
+                                        inbound_settings=inbound.get("settings"),
+                                        atomic=False,
+                                    )
+                                    recovered = True
+                            except AgentError as recover_exc:
+                                row_exc = recover_exc
+                            if recovered:
+                                succeeded += 1
+                                applied.append(client)
+                            else:
+                                failed += 1
+                                errors.append({"email": email, "message": row_exc.message})
                         except Exception as row_exc:  # noqa: BLE001
                             failed += 1
                             errors.append({"email": email, "message": f"{type(row_exc).__name__}: {row_exc}"})
@@ -948,11 +1038,16 @@ class XrayDriver(CoreDriver):
                         )
 
             if mode_key == "upsert":
-                _flush("upsert", to_add + to_edit, add_meta + edit_meta)
+                # Xray's users/upsert often edits in place and leaves a missing
+                # client absent, which the panel later reports as CLIENT_NOT_FOUND.
+                # Add the missing rows and edit the ones already on this inbound.
+                _flush("add", to_add, add_meta)
+                _flush("edit", to_edit, edit_meta)
             else:
                 _flush("edit", to_edit, edit_meta)
                 _flush("add", to_add, add_meta)
 
+            self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
             self._save_client_quotas(applied)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1026,6 +1121,7 @@ class XrayDriver(CoreDriver):
                     self._api().remove_users(tag, remove_emails)
                     succeeded = len(remove_emails)
                     self._forget_client_quotas(remove_emails + id_keys)
+                    self._forget_disabled_keys(remove_emails + id_keys)
                 except AgentError as exc:
                     forgotten: list[str] = []
                     for email in remove_emails:
@@ -1038,6 +1134,7 @@ class XrayDriver(CoreDriver):
                             errors.append({"email": email, "message": row_exc.message})
                     if forgotten:
                         self._forget_client_quotas(forgotten + id_keys)
+                        self._forget_disabled_keys(forgotten + id_keys)
                     if succeeded == 0 and not errors:
                         raise exc
 
@@ -1068,6 +1165,152 @@ class XrayDriver(CoreDriver):
             cid = str(meta.get("id") or "").strip()
             if cid and email and email != cid:
                 self.store.delete_doc(self.key, _QUOTA_KIND, email)
+
+    def _stamp_disabled_client(self, client: dict[str, Any]) -> dict[str, Any]:
+        row = normalize_xray_client(client)
+        row["is_enabled"] = False
+        if not str(row.get("disabled_reason") or "").strip():
+            mark_panel_disabled(row)
+        return row
+
+    def _remember_disabled_client(self, inbound_id: int | str, tag: str, client: dict[str, Any]) -> None:
+        row = self._stamp_disabled_client(client)
+        doc_id = str(row.get("id") or row.get("email") or "").strip()
+        if not doc_id:
+            return
+        row["inbound_id"] = str(inbound_id)
+        row["inbound_tag"] = str(tag or "")
+        self.store.put_doc(self.key, _DISABLED_KIND, doc_id, row)
+        email = str(row.get("email") or "").strip()
+        if email and email != doc_id:
+            self.store.delete_doc(self.key, _DISABLED_KIND, email)
+
+    def _disabled_docs(self) -> list[dict[str, Any]]:
+        try:
+            rows = self.store.list_docs(self.key, _DISABLED_KIND)
+        except Exception:
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _find_disabled_client(self, client_key: str) -> dict[str, Any] | None:
+        key = str(client_key or "").strip()
+        if not key:
+            return None
+        for row in self._disabled_docs():
+            cid = str(row.get("id") or "").strip()
+            email = str(row.get("email") or "").strip()
+            if key == cid or key == email:
+                found = normalize_xray_client(row)
+                found["is_enabled"] = False
+                if row.get("disabled_reason"):
+                    found["disabled_reason"] = row.get("disabled_reason")
+                if row.get("disabled_at"):
+                    found["disabled_at"] = row.get("disabled_at")
+                if isinstance(row.get("disabled_detail"), dict):
+                    found["disabled_detail"] = row.get("disabled_detail")
+                return found
+        return None
+
+    def _forget_disabled_clients(self, clients: list[dict[str, Any]]) -> None:
+        keys: list[str] = []
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            cid = str(client.get("id") or "").strip()
+            email = str(client.get("email") or "").strip()
+            if cid:
+                keys.append(cid)
+            if email:
+                keys.append(email)
+        self._forget_disabled_keys(keys)
+
+    def _forget_disabled_keys(self, keys: list[str]) -> None:
+        wanted = {str(key).strip() for key in keys if str(key).strip()}
+        if not wanted:
+            return
+        for row in self._disabled_docs():
+            cid = str(row.get("id") or "").strip()
+            email = str(row.get("email") or "").strip()
+            doc_id = cid or email
+            if doc_id and (cid in wanted or email in wanted or doc_id in wanted):
+                self.store.delete_doc(self.key, _DISABLED_KIND, doc_id)
+
+    def present_inbounds(self, inbounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Show quota-disabled clients that were removed from live Xray."""
+        docs = self._disabled_docs()
+        if not docs:
+            return inbounds
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            inbound_id = str(inbound.get("id") or "")
+            tag = str(inbound.get("tag") or "")
+            settings = inbound.setdefault("settings", {})
+            clients = list(settings.get("clients") or [])
+            seen: set[str] = set()
+            for client in clients:
+                if not isinstance(client, dict):
+                    continue
+                cid = str(client.get("id") or "").strip()
+                email = str(client.get("email") or "").strip()
+                if cid:
+                    seen.add(cid)
+                if email:
+                    seen.add(email)
+            for row in docs:
+                doc_inbound = str(row.get("inbound_id") or "")
+                doc_tag = str(row.get("inbound_tag") or "")
+                if not ((inbound_id and doc_inbound == inbound_id) or (tag and doc_tag == tag)):
+                    continue
+                cid = str(row.get("id") or "").strip()
+                email = str(row.get("email") or "").strip()
+                if (cid and cid in seen) or (email and email in seen):
+                    continue
+                clients.append(self._find_disabled_client(cid or email) or normalize_xray_client(row))
+                if cid:
+                    seen.add(cid)
+                if email:
+                    seen.add(email)
+            settings["clients"] = clients
+        return inbounds
+
+    def _user_traffic_index(self) -> dict[str, dict[str, int]]:
+        api = self._api()
+        query = getattr(api, "stats_query_grouped", None)
+        if not callable(query):
+            return {}
+        try:
+            groups = query("user>>>", "user")
+        except Exception:
+            return {}
+        if not isinstance(groups, dict):
+            return {}
+        users = groups.get("user") or {}
+        return dict(users) if isinstance(users, dict) else {}
+
+    def _raise_zero_baseline_to_live(self, client: dict[str, Any]) -> None:
+        """A renewed client is pushed with a zero baseline while Xray still has old counters.
+
+        Leaving that gap makes the quota enforcer treat history as new usage and cut the
+        client again immediately after volume renewal.
+        """
+        if int(client.get("_incoming") or 0) != 0 or int(client.get("_outgoing") or 0) != 0:
+            return
+        if not hasattr(self, "_traffic_index_cache"):
+            self._traffic_index_cache = None
+        if self._traffic_index_cache is None:
+            self._traffic_index_cache = self._user_traffic_index()
+        email = str(client.get("email") or "").strip()
+        cid = str(client.get("id") or "").strip()
+        traffic = dict(self._traffic_index_cache.get(email) or {})
+        if not traffic and cid:
+            traffic = dict(self._traffic_index_cache.get(cid) or {})
+        live_in = int(traffic.get("downlink") or 0)
+        live_out = int(traffic.get("uplink") or 0)
+        if live_in <= 0 and live_out <= 0:
+            return
+        client["_incoming"] = live_in
+        client["_outgoing"] = live_out
 
     def _forget_client_quotas(self, keys: list[str]) -> None:
         wanted = {str(key).strip() for key in keys if str(key).strip()}
@@ -1556,6 +1799,26 @@ class XrayDriver(CoreDriver):
                 httpapi = raw
         base = self.settings.xray
         return describe_httpapi_guard(httpapi, base.username, base.password)
+
+    def ensure_httpapi_auth(self) -> dict[str, Any]:
+        """Write Agent XRAY_USERNAME/PASSWORD into httpapi when the block is empty."""
+        from agent.xray_service import ensure_xray_httpapi_config
+
+        base = self.settings.xray
+        username = str(base.username or "").strip()
+        password = str(base.password or "").strip()
+        if username and password:
+            ensure_xray_httpapi_config(
+                Path(base.config),
+                api_base=base.api_base,
+                username=username,
+                password=password,
+            )
+            try:
+                self.restrict_config_permissions()
+            except OSError:
+                pass
+        return self.httpapi_guard()
 
     def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {"updated": 0}
