@@ -18,7 +18,7 @@ from typing import Any
 HOST = "127.0.0.1"
 PORT = 39217
 PATH = "/hit"
-DOMAIN = "app.nerobot.click"
+DOMAIN = "whoami.nerobot.click"
 MAX_BODY = 4096
 HEADER_LIMIT = 8192
 RATE_SECONDS = 30

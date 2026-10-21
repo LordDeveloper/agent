@@ -45,13 +45,14 @@ def test_bad_authorization_does_not_store():
 
 
 def test_only_the_check_host_is_stored_and_rate_limited():
-    assert destination_is_check_host("tcp:app.nerobot.click:443")
+    assert destination_is_check_host("tcp:whoami.nerobot.click:443")
     assert not destination_is_check_host("example.com")
-    assert not destination_is_check_host("evil.app.nerobot.click")
+    assert not destination_is_check_host("app.nerobot.click")
+    assert not destination_is_check_host("evil.whoami.nerobot.click")
 
-    body = b'{"email":"user1","destination":"app.nerobot.click:443","inboundTag":"inbound-1","source":"203.0.113.8:1"}'
+    body = b'{"email":"user1","destination":"whoami.nerobot.click:443","inboundTag":"inbound-1","source":"203.0.113.8:1"}'
     stored = decide("POST", "/hit", _headers(len(body)), body, True, SECRET, 1000, {})
-    empty = decide("POST", "/hit", _headers(20), b'{"email":"","destination":"app.nerobot.click"}', True, SECRET, 1000, {})
+    empty = decide("POST", "/hit", _headers(20), b'{"email":"","destination":"whoami.nerobot.click"}', True, SECRET, 1000, {})
     limited = decide("POST", "/hit", _headers(len(body)), body, True, SECRET, 1010, {"user1": 1000})
 
     assert stored["store"] is True
