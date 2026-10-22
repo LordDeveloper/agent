@@ -558,3 +558,28 @@ def test_replace_routing_rules(client: TestClient, fake_xray: FakeXrayHttpClient
     tags = [r["tag"] for r in fake_xray._rules]
     assert "node:1" not in tags
     assert "node:3" in tags
+
+
+def test_delete_client_does_not_list_every_inbound(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(40, 4040)).status_code == 200
+    node_id = "3aa073d3-1a78-44fd-98be-630c1114118d"
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/40/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": node_id, "email": "one@x", "is_enabled": True}]},
+    )
+    assert created.status_code == 200, created.text
+
+    calls = {"list": 0}
+    real_list = fake_xray.list_inbounds
+
+    def list_inbounds():
+        calls["list"] += 1
+        return real_list()
+
+    fake_xray.list_inbounds = list_inbounds
+    deleted = client.delete(f"/api/v1/cores/xray/inbounds/40/clients/{node_id}", headers=headers)
+    assert deleted.status_code == 200, deleted.text
+    assert calls["list"] == 0
+    assert fake_xray.list_users("inbound-40", "one@x") == []

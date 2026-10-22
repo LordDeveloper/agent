@@ -91,15 +91,25 @@ class XrayDriver(CoreDriver):
         self._client_override = client
         self._client: XrayHttpClient | None = None
         self._client_key: tuple[str, str, str] | None = None
+        self._settings_cache: tuple[int | None, XraySettings] | None = None
+        self._api_ready_until = 0.0
         self._inbound_locks: dict[str, Lock] = {}
         self._inbound_locks_guard = Lock()
 
     def _resolved_xray_settings(self) -> XraySettings:
         base = self.settings.xray
         config_path = Path(base.config)
+        try:
+            mtime = config_path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        cached = self._settings_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
         api_base = api_base_from_config(config_path, base.api_base)
         username, password = xray_auth_from_config(config_path, base.username, base.password)
-        return XraySettings(
+        resolved = XraySettings(
             api_base=api_base,
             username=username,
             password=password,
@@ -108,6 +118,8 @@ class XrayDriver(CoreDriver):
             timeout=base.timeout,
             connect_timeout=base.connect_timeout,
         )
+        self._settings_cache = (mtime, resolved)
+        return resolved
 
     @property
     def client(self) -> XrayHttpClient:
@@ -130,6 +142,7 @@ class XrayDriver(CoreDriver):
             self._client.close()
         self._client = None
         self._client_key = None
+        self._api_ready_until = 0.0
 
     def _ensure_api_ready(self) -> None:
         """Ensure HTTP API is reachable without restarting a live xray.service (keep connections)."""
@@ -202,7 +215,17 @@ class XrayDriver(CoreDriver):
         return Path(self.settings.xray.binary).is_file() or shutil.which("xray") is not None
 
     def _api(self) -> XrayHttpClient:
+        # A live client was checked moments ago. Skipping the stats ping and the
+        # config re-read keeps a single delete from repeating that work.
+        if (
+            self._client_override is None
+            and self._client is not None
+            and time.monotonic() < self._api_ready_until
+        ):
+            return self._client
         self._ensure_api_ready()
+        if self._client_override is None:
+            self._api_ready_until = time.monotonic() + 15.0
         return self.client
 
     def running(self) -> bool:
@@ -1715,16 +1738,22 @@ class XrayDriver(CoreDriver):
                     return email or key
         return ""
 
-    def _release_emails_from_other_inbounds(self, emails: list[str], keep_tag: str) -> None:
+    def _release_emails_from_other_inbounds(
+        self,
+        emails: list[str],
+        keep_tag: str,
+        config: dict[str, Any] | None = None,
+    ) -> None:
         """Remove these emails from every inbound except keep_tag.
 
         One local config read. remove_users runs only for tags that still have
         a matching row, so a normal upsert does not walk the live API.
         """
-        try:
-            config = self.read_config()
-        except AgentError:
-            return
+        if config is None:
+            try:
+                config = self.read_config()
+            except AgentError:
+                return
         plan = emails_on_other_inbounds(config, set(emails), keep_tag)
         for tag, found in plan.items():
             for offset in range(0, len(found), _CLIENT_BATCH_MAX):
@@ -1738,30 +1767,80 @@ class XrayDriver(CoreDriver):
                     raise
 
     def delete_client(self, inbound_id: int | str, client_key: str) -> bool:
-        inbound = self.get_inbound(inbound_id)
-        tag = str(inbound.get("tag") or self.inbound_tag(inbound_id))
-        current = self._find_client(inbound, client_key)
-        email = str((current or {}).get("email") or "").strip()
+        key = str(client_key or "").strip()
+        if not key:
+            raise AgentError("VALIDATION_ERROR", "client key is required", 422)
+
+        config: dict[str, Any] | None
+        try:
+            config = self.read_config()
+        except AgentError:
+            config = None
+
+        tag, email = self._client_email_in_config(config, inbound_id, key)
         if not email:
-            email = self._disk_email(inbound_id, tag, client_key)
-        if current is None and not email:
-            raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
+            tag = self.inbound_tag(inbound_id)
+            email = self._client_email_from_users(tag, key)
         if not email:
-            email = str(client_key)
-        result = self.batch_remove_clients(inbound_id, emails=[email])
-        if result.get("failed") and result.get("succeeded", 0) == 0:
-            try:
-                self._api().remove_users(tag, [email])
-            except AgentError as exc:
-                message = str(exc.message or "").lower()
-                missing = int(exc.status or 0) == 404 or "not found" in message
-                if missing and current is None:
-                    raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404) from exc
-                errors = result.get("errors") or []
-                detail = errors[0].get("message") if errors else exc.message
-                raise AgentError("VALIDATION_ERROR", str(detail), 422) from exc
-        self._release_emails_from_other_inbounds([email], tag)
+            raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
+
+        try:
+            self._api().remove_users(tag, [email])
+        except AgentError as exc:
+            message = str(exc.message or "").lower()
+            missing = int(exc.status or 0) == 404 or "not found" in message
+            if missing:
+                raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
+            raise
+
+        self._forget_client_keys([key, email])
+        self._release_emails_from_other_inbounds([email], tag, config)
+        self.audit.record("delete", f"xray/inbound/{inbound_id}/clients/{key}", email)
         return True
+
+    def _client_email_in_config(
+        self,
+        config: dict[str, Any] | None,
+        inbound_id: int | str,
+        client_key: str,
+    ) -> tuple[str, str]:
+        if not isinstance(config, dict):
+            return "", ""
+        wanted_tag = self.inbound_tag(inbound_id)
+        for inbound in config.get("inbounds") or []:
+            if not isinstance(inbound, dict):
+                continue
+            inbound_tag = str(inbound.get("tag") or "").strip()
+            if inbound_tag != wanted_tag and str(inbound.get("id") or "") != str(inbound_id):
+                continue
+            for row in xray_client_rows(inbound):
+                if not self._row_matches_key(row, client_key):
+                    continue
+                email = str(row.get("email") or "").strip()
+                return inbound_tag or wanted_tag, email or client_key
+        return "", ""
+
+    def _client_email_from_users(self, tag: str, client_key: str) -> str:
+        try:
+            users = self._api().list_users(tag)
+        except AgentError:
+            return ""
+        for row in users:
+            if not isinstance(row, dict) or not self._row_matches_key(row, client_key):
+                continue
+            email = str(row.get("email") or "").strip()
+            return email or client_key
+        return ""
+
+    def _forget_client_keys(self, keys: list[str]) -> None:
+        seen: set[str] = set()
+        for key in keys:
+            key = str(key or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            self.store.delete_doc(self.key, _QUOTA_KIND, key)
+            self.store.delete_doc(self.key, _DISABLED_KIND, key)
 
     def reset_client_traffic(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
         inbound = self.get_inbound(inbound_id)
