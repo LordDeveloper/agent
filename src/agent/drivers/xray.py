@@ -588,6 +588,40 @@ class XrayDriver(CoreDriver):
                 return inbound
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound_id}] not found", 404)
 
+    def _batch_inbound(self, inbound_id: int | str) -> dict[str, Any]:
+        """One inbound for a client batch, without downloading every inbound."""
+        tag = self.inbound_tag(inbound_id)
+        raw: dict[str, Any] | None = None
+        try:
+            config = self.read_config()
+        except AgentError:
+            config = None
+        if isinstance(config, dict):
+            for row in config.get("inbounds") or []:
+                if not isinstance(row, dict):
+                    continue
+                row_tag = str(row.get("tag") or "").strip()
+                if row_tag == tag or str(row.get("id") or "") == str(inbound_id):
+                    raw = row
+                    if row_tag:
+                        tag = row_tag
+                    break
+        if raw is None:
+            return self.get_inbound(inbound_id)
+
+        settings = dict(raw.get("settings") or {})
+        settings.pop("clients", None)
+        settings.pop("users", None)
+        inbound = self._normalize({**raw, "settings": settings})
+        try:
+            live = self._api().list_users(tag)
+        except AgentError:
+            live = []
+        inbound.setdefault("settings", {})["clients"] = [
+            normalize_xray_client(client) for client in live if isinstance(client, dict)
+        ]
+        return inbound
+
     def create_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {
             k: v
@@ -815,19 +849,9 @@ class XrayDriver(CoreDriver):
         return by_email, by_id
 
     def _visible_user_index(self, tag: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-        """Users the panel GET can see: inbound client list and the users API."""
+        """Users visible on this inbound. One users query, not every inbound."""
         by_email: dict[str, dict[str, Any]] = {}
         by_id: dict[str, dict[str, Any]] = {}
-        try:
-            for inbound in self._api().list_inbounds():
-                if str(inbound.get("tag") or "").strip() != tag:
-                    continue
-                extra_email, extra_id = self._index_user_rows(self._clients_of(inbound))
-                by_email.update(extra_email)
-                by_id.update(extra_id)
-                break
-        except AgentError:
-            pass
         try:
             extra_email, extra_id = self._index_user_rows(self._api().list_users(tag))
             by_email.update(extra_email)
@@ -1077,7 +1101,7 @@ class XrayDriver(CoreDriver):
                 413,
             )
 
-        inbound = self.get_inbound(inbound_id)
+        inbound = self._batch_inbound(inbound_id)
         inbound = self._ensure_shadowsocks_method(inbound)
         tag = str(inbound["tag"])
         protocol = self._protocol_of(inbound)
@@ -1095,7 +1119,7 @@ class XrayDriver(CoreDriver):
 
         self._traffic_index_cache = None
         with self._inbound_lock(tag):
-            inbound = self.get_inbound(inbound_id)
+            inbound = self._batch_inbound(inbound_id)
             inbound = self._ensure_shadowsocks_method(inbound)
             by_email, by_id = self._index_clients(inbound)
 
@@ -1103,6 +1127,8 @@ class XrayDriver(CoreDriver):
             to_edit: list[dict[str, Any]] = []
             add_meta: list[dict[str, Any]] = []
             edit_meta: list[dict[str, Any]] = []
+            to_remove: list[str] = []
+            remove_meta: list[dict[str, Any]] = []
 
             for raw in clients:
                 if not isinstance(raw, dict):
@@ -1133,33 +1159,30 @@ class XrayDriver(CoreDriver):
                         continue
 
                     if not record_is_enabled(client):
-                        # Keep a user that is already on the inbound, marked disabled.
-                        # Deleting it made diagnose report CLIENT_NOT_FOUND while
-                        # status still read the leftover disabled record.
+                        # Xray does not enforce enable=false on VLESS/VMess/Trojan
+                        # (and ignores it on Shadowsocks). Leaving the user on the
+                        # inbound keeps the credential working after the panel has
+                        # marked the quota finished. Remove them from the data plane
+                        # and keep a disabled record so list/diagnose still see them.
                         # A client that was never created stays absent.
                         client["is_enabled"] = False
+                        remove_email = ""
+                        if existing is not None:
+                            remove_email = str(existing.get("email") or email).strip()
+                        else:
+                            remove_email = self._live_user_email(tag, cid, email)
                         prior = self._find_disabled_client(cid or email)
-                        if existing is None and prior is None:
+                        if existing is None and prior is None and not remove_email:
                             succeeded += 1
                             applied.append(client)
                             continue
                         self._remember_disabled_client(inbound_id, tag, client)
-                        native = xray_protocol_user(
-                            protocol,
-                            client,
-                            inbound_settings=inbound.get("settings"),
-                        )
-                        native["enable"] = False
-                        native["is_enabled"] = False
-                        reason = str(client.get("disabled_reason") or "").strip()
-                        if reason:
-                            native["disabled_reason"] = reason
-                        if existing is not None:
-                            to_edit.append(native)
-                            edit_meta.append(client)
+                        if remove_email:
+                            to_remove.append(remove_email)
+                            remove_meta.append(client)
                         else:
-                            to_add.append(native)
-                            add_meta.append(client)
+                            succeeded += 1
+                            applied.append(client)
                         continue
 
                     self._raise_zero_baseline_to_live(client)
@@ -1212,12 +1235,8 @@ class XrayDriver(CoreDriver):
                 if not rows:
                     return
                 try:
-                    self._validate_config_mutation(
-                        lambda cfg, _rows=rows: self._merge_clients_in_config(cfg, tag, _rows),
-                    )
-                    # One Xray call for the chunk. Per-user calls each reload the
-                    # config under one lock, so a 100-row chunk outruns the panel
-                    # timeout. A success that writes nothing is repaired once below.
+                    # Do not spawn `xray -test` here. That loads the whole config
+                    # and runs into the same 60s ceiling as the panel request.
                     part_ok, part_fail, part_errors, part_applied = self._apply_clients_bulk(
                         op,
                         tag,
@@ -1230,89 +1249,16 @@ class XrayDriver(CoreDriver):
                     failed += part_fail
                     errors.extend(part_errors)
                     applied.extend(part_applied)
-                    return
                 except AgentError as exc:
-                    if exc.status == 413:
+                    if exc.status == 413 or len(rows) == 1:
                         failed += len(meta)
+                        message = exc.message
                         for client in meta:
-                            errors.append({"email": str(client.get("email") or ""), "message": exc.message})
+                            errors.append({"email": str(client.get("email") or ""), "message": message})
                         return
-                    # Fall back to per-user so one bad row does not fail the chunk.
-                    for row, client in zip(rows, meta):
-                        email = str(client.get("email") or "")
-                        try:
-                            self._validate_config_mutation(
-                                lambda cfg, _row=row: self._merge_client_in_config(cfg, tag, _row),
-                            )
-                            if op == "add":
-                                self._api().add_users(
-                                    tag,
-                                    [row],
-                                    protocol=protocol,
-                                    inbound_settings=inbound.get("settings"),
-                                    atomic=False,
-                                )
-                            elif op == "upsert":
-                                try:
-                                    self._api().upsert_users(
-                                        tag,
-                                        [row],
-                                        protocol=protocol,
-                                        inbound_settings=inbound.get("settings"),
-                                        atomic=False,
-                                    )
-                                except AgentError as upsert_exc:
-                                    if not _is_missing_user_error(upsert_exc):
-                                        raise
-                                    self._api().add_users(
-                                        tag,
-                                        [row],
-                                        protocol=protocol,
-                                        inbound_settings=inbound.get("settings"),
-                                        atomic=False,
-                                    )
-                            else:
-                                self._api().edit_users(
-                                    tag,
-                                    [row],
-                                    protocol=protocol,
-                                    inbound_settings=inbound.get("settings"),
-                                    atomic=False,
-                                )
-                            succeeded += 1
-                            applied.append(client)
-                        except AgentError as row_exc:
-                            recovered = False
-                            try:
-                                if op in {"edit", "upsert"} and _is_missing_user_error(row_exc):
-                                    self._api().add_users(
-                                        tag,
-                                        [row],
-                                        protocol=protocol,
-                                        inbound_settings=inbound.get("settings"),
-                                        atomic=False,
-                                    )
-                                    recovered = True
-                                elif op == "add" and _is_existing_user_error(row_exc):
-                                    self._api().edit_users(
-                                        tag,
-                                        [row],
-                                        protocol=protocol,
-                                        inbound_settings=inbound.get("settings"),
-                                        atomic=False,
-                                    )
-                                    recovered = True
-                            except AgentError as recover_exc:
-                                row_exc = recover_exc
-                            if recovered:
-                                succeeded += 1
-                                applied.append(client)
-                            else:
-                                failed += 1
-                                errors.append({"email": email, "message": row_exc.message})
-                        except Exception as row_exc:  # noqa: BLE001
-                            failed += 1
-                            errors.append({"email": email, "message": f"{type(row_exc).__name__}: {row_exc}"})
+                    mid = len(rows) // 2
+                    _flush(op, rows[:mid], meta[:mid])
+                    _flush(op, rows[mid:], meta[mid:])
                 except Exception as exc:  # noqa: BLE001
                     for client in meta:
                         failed += 1
@@ -1323,6 +1269,13 @@ class XrayDriver(CoreDriver):
                             }
                         )
 
+            removed_emails = self._remove_live_clients(tag, to_remove, errors)
+            for email, client in zip(to_remove, remove_meta):
+                if email in removed_emails:
+                    succeeded += 1
+                    applied.append(client)
+                else:
+                    failed += 1
             if mode_key == "upsert":
                 # Xray's users/upsert often edits in place and leaves a missing
                 # client absent, which the panel later reports as CLIENT_NOT_FOUND.
@@ -1438,6 +1391,70 @@ class XrayDriver(CoreDriver):
             "errors": errors,
             "ms": elapsed_ms,
         }
+
+    def _live_user_email(self, tag: str, client_id: str, email: str) -> str:
+        """Email of a user that is live even when inbounds/list omitted the row."""
+        try:
+            by_email, by_id = self._visible_user_index(tag)
+        except Exception:
+            return ""
+        row = by_id.get(client_id) if client_id else None
+        if row is None and email:
+            row = by_email.get(email)
+        if not isinstance(row, dict):
+            return ""
+        return str(row.get("email") or email or "").strip()
+
+    def _remove_live_clients(
+        self,
+        tag: str,
+        emails: list[str],
+        errors: list[dict[str, str]],
+    ) -> set[str]:
+        """Drop credentials from the running inbound. Missing users are already cut."""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for email in emails:
+            if email and email not in seen:
+                seen.add(email)
+                unique.append(email)
+        if not unique:
+            return set()
+
+        removed: set[str] = set()
+        try:
+            self._api().remove_users(tag, unique)
+            removed.update(unique)
+        except AgentError:
+            for email in unique:
+                try:
+                    self._api().remove_users(tag, [email])
+                    removed.add(email)
+                except AgentError as exc:
+                    if _is_missing_user_error(exc):
+                        removed.add(email)
+                        continue
+                    errors.append({"email": email, "message": exc.message})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            for email in unique:
+                errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+            return removed
+
+        # users/remove can report success and leave the credential in place.
+        # A disable that did not actually drop the user must fail so the panel retries.
+        try:
+            by_email, _by_id = self._visible_user_index(tag)
+        except Exception:
+            by_email = {}
+        still = {email for email in removed if email in by_email}
+        for email in still:
+            errors.append({
+                "email": email,
+                "message": "client is still on the live inbound after disable",
+            })
+        return removed - still
 
     def _save_client_quotas(self, clients: list[dict[str, Any]]) -> None:
         for client in clients:

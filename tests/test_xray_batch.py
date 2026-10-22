@@ -252,9 +252,13 @@ def test_disabling_existing_client_keeps_it_visible_until_reenabled(client: Test
         },
     )
     assert disabled.status_code == 200, disabled.text
-    live = fake_xray._inbounds[0]["settings"]["clients"]
-    assert [row.get("email") for row in live] == ["stay@x"]
-    assert live[0].get("enable") is False or live[0].get("is_enabled") is False
+    live = [
+        row
+        for inbound_row in fake_xray.list_inbounds()
+        if inbound_row.get("tag") == "inbound-26"
+        for row in (inbound_row.get("settings") or {}).get("clients") or []
+    ]
+    assert live == [], live
 
     listed = client.get("/api/v1/cores/xray/inbounds/26", headers=headers)
     clients = listed.json()["inbound"]["settings"]["clients"]

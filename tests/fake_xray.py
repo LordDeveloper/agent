@@ -117,6 +117,9 @@ class FakeXrayHttpClient:
 
     def remove_users(self, tag: str, emails: list[str], **kwargs: Any) -> dict[str, Any]:
         email_set = set(emails)
+        hidden = self._hidden_users.get(tag)
+        if hidden is not None:
+            self._hidden_users[tag] = [c for c in hidden if str(c.get("email")) not in email_set]
         for inbound in self._inbounds:
             if inbound.get("tag") != tag:
                 continue

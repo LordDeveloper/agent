@@ -1,5 +1,6 @@
 from agent.support.quota import (
     apply_quota_meta,
+    enforce_driver_quotas,
     has_volume_quota,
     quota_exceeded,
     quota_meta_from_client,
@@ -190,3 +191,98 @@ def test_quota_meta_clears_volume_for_unlimited():
 
     assert "volume" not in client
     assert has_volume_quota(client) is False
+
+
+class _UsageClient:
+    def __init__(self, email: str, incoming: int, outgoing: int, client_id: str = ""):
+        self.email = email
+        self.id = client_id
+        self.incoming = incoming
+        self.outgoing = outgoing
+
+
+class _UsageInbound:
+    def __init__(self, clients: list[_UsageClient]):
+        self.clients = clients
+
+
+class _UsageSnapshot:
+    def __init__(self, inbounds: list[_UsageInbound]):
+        self.inbounds = inbounds
+
+
+class _LiveXray:
+    key = "xray"
+
+    def __init__(self, clients: list[dict], disabled: list[dict] | None = None):
+        self.clients = clients
+        self.disabled = disabled or []
+        self.batches: list[list[dict]] = []
+
+    def running(self) -> bool:
+        return True
+
+    def usage_snapshot(self) -> _UsageSnapshot:
+        rows = [
+            _UsageClient(
+                str(client.get("email") or ""),
+                int(client.get("_incoming") or 0),
+                int(client.get("_outgoing") or 0),
+                str(client.get("id") or ""),
+            )
+            for client in self.clients
+        ]
+        return _UsageSnapshot([_UsageInbound(rows)])
+
+    def list_inbounds(self) -> list[dict]:
+        return [{"id": 1, "settings": {"clients": self.clients}}]
+
+    def _clients_of(self, inbound: dict) -> list[dict]:
+        return list(inbound["settings"]["clients"])
+
+    def _disabled_docs(self) -> list[dict]:
+        return self.disabled
+
+    def batch_clients(self, inbound_id, clients=None, *, mode="update"):
+        self.batches.append(list(clients or []))
+        return {"ok": True, "succeeded": len(clients or [])}
+
+
+def test_enforcer_cuts_client_left_live_after_panel_disable():
+    """Panel already stored quota_exceeded, but Xray ignored enable=false."""
+    driver = _LiveXray(
+        clients=[{
+            "id": "node-1",
+            "email": "spent@x",
+            "is_enabled": True,
+            "volume": 1,
+            "_incoming": 500,
+            "_outgoing": 500,
+        }],
+        disabled=[{
+            "id": "node-1",
+            "email": "spent@x",
+            "is_enabled": False,
+            "disabled_reason": "quota_exceeded",
+        }],
+    )
+
+    assert enforce_driver_quotas(driver) == 1
+    assert driver.batches[0][0]["is_enabled"] is False
+    assert driver.batches[0][0]["disabled_reason"] == "quota_exceeded"
+
+
+def test_enforcer_leaves_a_client_with_remaining_quota():
+    driver = _LiveXray(
+        clients=[{
+            "id": "node-2",
+            "email": "ok@x",
+            "is_enabled": True,
+            "volume": 10_000,
+            "_incoming": 100,
+            "_outgoing": 100,
+        }],
+    )
+
+    assert enforce_driver_quotas(driver) == 0
+    assert driver.batches == []

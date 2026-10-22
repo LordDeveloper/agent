@@ -123,6 +123,25 @@ def enforce_driver_quotas(driver: Any) -> int:
     return 0
 
 
+def _disabled_client_index(driver: Any) -> dict[str, dict[str, Any]]:
+    """Clients the panel or a previous enforce already marked disabled."""
+    docs = getattr(driver, "_disabled_docs", None)
+    if not callable(docs):
+        return {}
+    index: dict[str, dict[str, Any]] = {}
+    try:
+        rows = docs()
+    except Exception:
+        return {}
+    for row in rows or []:
+        if not isinstance(row, dict) or record_is_enabled(row):
+            continue
+        for key in (str(row.get("id") or "").strip(), str(row.get("email") or "").strip()):
+            if key:
+                index[key] = row
+    return index
+
+
 def _enforce_xray(driver: Any) -> int:
     if not driver.running():
         return 0
@@ -139,6 +158,7 @@ def _enforce_xray(driver: Any) -> int:
                 traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
 
     disabled = 0
+    disabled_index = _disabled_client_index(driver)
 
     for inbound in driver.list_inbounds():
         inbound_id = inbound.get("id")
@@ -146,11 +166,23 @@ def _enforce_xray(driver: Any) -> int:
         to_reseed: list[dict[str, Any]] = []
 
         for client in driver._clients_of(inbound):
+            email = str(client.get("email") or "")
+            cid = str(client.get("id") or "")
+            stored = disabled_index.get(cid) or disabled_index.get(email)
+            # A disable flag on the inbound does not stop Xray. If the client is
+            # still listed, pull them off so the credential cannot pass traffic.
+            if stored is not None or not record_is_enabled(client):
+                row = dict(client)
+                row["is_enabled"] = False
+                reason = str((stored or {}).get("disabled_reason") or row.get("disabled_reason") or "").strip()
+                if reason:
+                    row["disabled_reason"] = reason
+                to_disable.append(row)
+                continue
+
             if not has_volume_quota(client):
                 continue
 
-            email = str(client.get("email") or "")
-            cid = str(client.get("id") or "")
             live = traffic_by_email.get(email) or traffic_by_id.get(cid)
             if live is None:
                 live = (
