@@ -311,7 +311,7 @@ def test_batch_upsert_creates_missing_client_without_relying_on_xray_upsert(clie
     assert "missing@x" in emails
 
 
-def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: TestClient, fake_xray: FakeXrayHttpClient):
+def test_batch_upsert_writes_the_chunk_once_when_bulk_add_lies(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(28, 3044)).status_code == 200
 
@@ -320,11 +320,10 @@ def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: T
 
     def add_users(tag, clients, **kwargs):
         sizes.append(len(clients))
-        if len(clients) != 1:
-            return {"succeeded": len(clients), "failed": 0}
-        return real_add(tag, clients, **kwargs)
+        return {"succeeded": len(clients), "failed": 0}
 
     fake_xray.add_users = add_users
+    del real_add
 
     created = client.post(
         "/api/v1/cores/xray/inbounds/28/clients/batch",
@@ -339,7 +338,7 @@ def test_batch_upsert_applies_each_client_even_if_a_bulk_add_would_lie(client: T
     )
     assert created.status_code == 200, created.text
     assert created.json()["failed"] == 0
-    assert sizes and all(size == 1 for size in sizes)
+    assert sizes == [2]
     listed = client.get("/api/v1/cores/xray/inbounds/28", headers=headers)
     emails = [row["email"] for row in listed.json()["inbound"]["settings"]["clients"]]
     assert "one@x" in emails

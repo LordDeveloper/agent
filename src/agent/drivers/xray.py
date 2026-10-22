@@ -960,7 +960,7 @@ class XrayDriver(CoreDriver):
         payload["settings"] = settings
         self._api().edit_inbounds([payload], preserve_clients=False)
 
-    def _apply_clients_parallel(
+    def _apply_clients_bulk(
         self,
         op: str,
         tag: str,
@@ -970,89 +970,31 @@ class XrayDriver(CoreDriver):
         protocol: str,
         inbound_settings: Any,
     ) -> tuple[int, int, list[dict[str, str]], list[dict[str, Any]]]:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        def call(kind: str, row: dict[str, Any]) -> None:
-            kwargs = {
-                "protocol": protocol,
-                "inbound_settings": inbound_settings,
-                "atomic": False,
-            }
-            if kind == "add":
-                self._api().add_users(tag, [row], **kwargs)
-            else:
-                self._api().edit_users(tag, [row], **kwargs)
-
-        def one(row: dict[str, Any], client: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-            try:
-                call(op if op != "upsert" else "add", row)
-                return client, None
-            except AgentError as exc:
-                try:
-                    if op in {"edit", "upsert"} and _is_missing_user_error(exc):
-                        call("add", row)
-                        return client, None
-                    if op == "add" and _is_existing_user_error(exc):
-                        call("edit", row)
-                        return client, None
-                except AgentError as recover_exc:
-                    return client, recover_exc.message
-                return client, exc.message
-            except Exception as exc:  # noqa: BLE001
-                return client, f"{type(exc).__name__}: {exc}"
-
-        succeeded = 0
-        failed = 0
-        errors: list[dict[str, str]] = []
-        applied: list[dict[str, Any]] = []
-        workers = min(16, max(1, len(rows)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(one, row, client) for row, client in zip(rows, meta)]
-            for future in as_completed(futures):
-                client, message = future.result()
-                if message:
-                    failed += 1
-                    errors.append({"email": str(client.get("email") or ""), "message": message})
-                else:
-                    succeeded += 1
-                    applied.append(client)
+        kwargs = {
+            "protocol": protocol,
+            "inbound_settings": inbound_settings,
+            "atomic": False,
+        }
+        if op == "edit":
+            self._api().edit_users(tag, rows, **kwargs)
+        else:
+            self._api().add_users(tag, rows, **kwargs)
 
         # An add/edit HTTP 200 is not enough. Xray often reports succeeded while
         # the panel uuid is still absent, and an email-only hit is a different client.
-        applied_ids = {id(client) for client in applied}
-        pending = [(row, client) for row, client in zip(rows, meta) if id(client) in applied_ids]
+        # Repair every missing row with one inbound write, not another API call each.
+        pairs = list(zip(rows, meta))
+        succeeded = len(pairs)
+        failed = 0
+        errors: list[dict[str, str]] = []
         by_email, by_id = self._visible_user_index(tag)
         missing: list[tuple[dict[str, Any], dict[str, Any]]] = []
         kept: list[dict[str, Any]] = []
-        for row, client in pending:
+        for row, client in pairs:
             if self._client_uuid_visible(client, by_id, by_email):
                 kept.append(self._response_client(client, by_email, by_id))
-                continue
-            email = str(client.get("email") or "").strip()
-            cid = str(client.get("id") or "").strip()
-            stale = by_email.get(email) if email else None
-            stale_id = str((stale or {}).get("id") or (stale or {}).get("uuid") or "").strip()
-            if email and stale is not None and cid and stale_id and stale_id != cid:
-                try:
-                    self._api().remove_users(tag, [email])
-                except AgentError as exc:
-                    if not _is_missing_user_error(exc):
-                        pass
-            try:
-                call("add", row)
-            except AgentError:
-                pass
-            missing.append((row, client))
-
-        if missing:
-            by_email, by_id = self._visible_user_index(tag)
-            still: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            for row, client in missing:
-                if self._client_uuid_visible(client, by_id, by_email):
-                    kept.append(self._response_client(client, by_email, by_id))
-                else:
-                    still.append((row, client))
-            missing = still
+            else:
+                missing.append((row, client))
 
         commit_error: str | None = None
         if missing:
@@ -1250,10 +1192,10 @@ class XrayDriver(CoreDriver):
                     self._validate_config_mutation(
                         lambda cfg, _rows=rows: self._merge_clients_in_config(cfg, tag, _rows),
                     )
-                    # Panel sends one bulk body. Apply each user on its own Xray
-                    # call, in parallel. A single users/add or users/upsert can
-                    # report succeeded while leaving that uuid out of the config.
-                    part_ok, part_fail, part_errors, part_applied = self._apply_clients_parallel(
+                    # One Xray call for the chunk. Per-user calls each reload the
+                    # config under one lock, so a 100-row chunk outruns the panel
+                    # timeout. A success that writes nothing is repaired once below.
+                    part_ok, part_fail, part_errors, part_applied = self._apply_clients_bulk(
                         op,
                         tag,
                         rows,
