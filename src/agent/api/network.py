@@ -1,8 +1,8 @@
 from typing import Any
-import threading
 
 from fastapi import APIRouter, Request
 
+from agent.asyncutil import maybe_await
 from agent.db import Store
 from agent.errors import AgentError, raise_agent_error
 from agent.logutil import get_logger
@@ -13,92 +13,95 @@ log = get_logger("network")
 
 router = APIRouter(prefix="/network", tags=["network"])
 
-_probe_fallback_lock = threading.Lock()
 _probe_fallback_pending: set[str] = set()
 _probe_fallback_running = False
 
 
 @router.get("/interfaces")
-def network_interfaces():
-    return {"success": True, "interfaces": list_host_interfaces()}
+async def network_interfaces():
+    return {"success": True, "interfaces": await list_host_interfaces()}
 
 
 @router.get("/ads-block")
-def ads_block_status():
+async def ads_block_status():
     from agent.ads_block import ads_block_status as status_fn
 
-    return {"success": True, **status_fn()}
+    return {"success": True, **await status_fn()}
 
 
 @router.post("/ads-block/ensure")
-def ads_block_ensure():
+async def ads_block_ensure():
     from agent.ads_block import ads_block_ensure as ensure_fn
 
     try:
-        result = ensure_fn()
+        result = await ensure_fn()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **result}
 
 
 @router.post("/ads-block/disable")
-def ads_block_disable():
+async def ads_block_disable():
     from agent.ads_block import ads_block_disable as disable_fn
 
     try:
-        result = disable_fn()
+        result = await disable_fn()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **result}
 
 
-def _schedule_probe_fallbacks(ifaces: list[str], *, store: Store, settings: Any) -> None:
+async def _run_probe_fallbacks(*, store: Store, settings: Any) -> None:
     """Coalesce concurrent probe failures into one fallback worker (avoid thrash)."""
+    global _probe_fallback_running
+    from agent.asyncutil import gather_independent
+    from agent.support.mullvad import MullvadService
+
+    service = MullvadService(store, config_dir=settings.wireguard_config_dir)
+    try:
+        if not service.auto_fallback_enabled():
+            log.debug("mullvad probe fallback skipped — auto_fallback disabled")
+            _probe_fallback_pending.clear()
+            _probe_fallback_running = False
+            return
+    except Exception:
+        log.exception("mullvad auto_fallback flag read failed; continuing probe fallback")
+
+    while True:
+        batch = sorted(_probe_fallback_pending)
+        _probe_fallback_pending.clear()
+        if not batch:
+            _probe_fallback_running = False
+            return
+
+        async def _one(iface: str) -> None:
+            try:
+                result = await maybe_await(service.fallback_iface(iface))
+                if result and result.get("status") == "changed":
+                    log.info("mullvad probe fallback iface=%s %s", iface, result.get("message"))
+                elif result and result.get("status") == "failed":
+                    log.warning("mullvad probe fallback iface=%s %s", iface, result.get("message"))
+            except Exception:
+                log.exception("mullvad probe fallback failed iface=%s", iface)
+
+        await gather_independent(*(_one(iface) for iface in batch))
+
+
+def _schedule_probe_fallbacks(ifaces: list[str], *, store: Store, settings: Any) -> None:
     global _probe_fallback_running
 
     cleaned = [str(name or "").strip() for name in ifaces if str(name or "").strip()]
     if not cleaned:
         return
 
-    with _probe_fallback_lock:
-        _probe_fallback_pending.update(cleaned)
-        if _probe_fallback_running:
-            return
-        _probe_fallback_running = True
+    _probe_fallback_pending.update(cleaned)
+    if _probe_fallback_running:
+        return
+    _probe_fallback_running = True
 
-    def _run_fallback() -> None:
-        global _probe_fallback_running
-        from agent.support.mullvad import MullvadService
+    import asyncio
 
-        service = MullvadService(store, config_dir=settings.wireguard_config_dir)
-        try:
-            if not service.auto_fallback_enabled():
-                log.debug("mullvad probe fallback skipped — auto_fallback disabled")
-                with _probe_fallback_lock:
-                    _probe_fallback_pending.clear()
-                return
-        except Exception:
-            log.exception("mullvad auto_fallback flag read failed; continuing probe fallback")
-
-        while True:
-            with _probe_fallback_lock:
-                batch = sorted(_probe_fallback_pending)
-                _probe_fallback_pending.clear()
-                if not batch:
-                    _probe_fallback_running = False
-                    return
-
-            for iface in batch:
-                try:
-                    result = service.fallback_iface(iface)
-                    if result and result.get("status") == "changed":
-                        log.info("mullvad probe fallback iface=%s %s", iface, result.get("message"))
-                    elif result and result.get("status") == "failed":
-                        log.warning("mullvad probe fallback iface=%s %s", iface, result.get("message"))
-                except Exception:
-                    log.exception("mullvad probe fallback failed iface=%s", iface)
-
-    threading.Thread(target=_run_fallback, daemon=True, name="mullvad-probe-fallback").start()
+    asyncio.create_task(_run_probe_fallbacks(store=store, settings=settings))
 
 
 def _coerce_probe_fallback(value: Any, *, default: bool = True) -> bool:
@@ -115,7 +118,7 @@ def _coerce_probe_fallback(value: Any, *, default: bool = True) -> bool:
 
 
 @router.post("/nodes/probe")
-def probe_region_nodes(body: dict[str, Any], request: Request):
+async def probe_region_nodes(body: dict[str, Any], request: Request):
     from agent.drivers.xray import XrayDriver
     from agent.support.node_probe import probe_region_nodes as run_probe
 
@@ -132,14 +135,14 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
     try:
         driver = registry.get("xray")
         if isinstance(driver, XrayDriver):
-            listed = driver.list_outbounds()
+            listed = await driver.list_outbounds()
             if isinstance(listed, list):
                 outbounds = [row for row in listed if isinstance(row, dict)]
     except Exception:
         outbounds = []
 
     try:
-        result = run_probe(nodes, outbounds)
+        result = await run_probe(nodes, outbounds)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
 
@@ -169,7 +172,7 @@ def probe_region_nodes(body: dict[str, Any], request: Request):
 
 
 @router.post("/egress/repair")
-def egress_repair(request: Request):
+async def egress_repair(request: Request):
     """
     Agent-owned firewall/routing repair for WireGuard/Amnezia peer egress.
 
@@ -183,7 +186,7 @@ def egress_repair(request: Request):
 
 
 @router.get("/egress/status")
-def egress_status(request: Request):
+async def egress_status(request: Request):
     store: Store = request.app.state.store
     return {
         "success": True,

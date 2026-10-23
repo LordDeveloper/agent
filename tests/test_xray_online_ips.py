@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import httpx
@@ -7,8 +8,8 @@ from agent.drivers.xray_http import XrayHttpClient
 from agent.errors import AgentError
 
 
-class _OfflineIplistTransport(httpx.BaseTransport):
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+class _OfflineIplistTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/stats/online/iplist":
             return httpx.Response(
                 404,
@@ -17,8 +18,8 @@ class _OfflineIplistTransport(httpx.BaseTransport):
         return httpx.Response(404, json={"message": "404 page not found"})
 
 
-class _StaleIplistTransport(httpx.BaseTransport):
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+class _StaleIplistTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/stats/online/iplist":
             now = time.time()
             return httpx.Response(
@@ -45,8 +46,8 @@ def test_online_ips_drops_stale_last_seen():
     )
     client = XrayHttpClient(settings, transport=_StaleIplistTransport())
 
-    assert client.online_ips("uuid") == ["83.121.27.148"]
-    seen = client.online_ip_last_seen("uuid")
+    assert asyncio.run(client.online_ips("uuid")) == ["83.121.27.148"]
+    seen = asyncio.run(client.online_ip_last_seen("uuid"))
     assert list(seen) == ["83.121.27.148"]
     assert seen["83.121.27.148"] > 1_000_000_000
 
@@ -63,11 +64,11 @@ def test_online_ips_offline_user_returns_empty_list():
     )
     client = XrayHttpClient(settings, transport=_OfflineIplistTransport())
 
-    assert client.online_ips("uuid") == []
+    assert asyncio.run(client.online_ips("uuid")) == []
 
 
-class _OnlineAllTransport(httpx.BaseTransport):
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+class _OnlineAllTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/stats/sys":
             return httpx.Response(200, json={"uptime": 1})
         if request.url.path == "/api/stats/online/all":
@@ -94,7 +95,7 @@ def test_xray_http_online_all_returns_users():
     )
     client = XrayHttpClient(settings, transport=_OnlineAllTransport())
 
-    body = client.online_all()
+    body = asyncio.run(client.online_all())
     assert body["users"][0]["email"] == "CmLB85"
     assert "1.2.3.4" in body["users"][0]["ips"]
 
@@ -112,7 +113,7 @@ def test_online_ips_offline_raises_user_offline_not_config_not_found():
     client = XrayHttpClient(settings, transport=_OfflineIplistTransport())
 
     try:
-        client.get("/api/stats/online/iplist", params={"email": "uuid"})
+        asyncio.run(client.get("/api/stats/online/iplist", params={"email": "uuid"}))
         assert False, "expected AgentError"
     except AgentError as exc:
         assert exc.code == "USER_OFFLINE"

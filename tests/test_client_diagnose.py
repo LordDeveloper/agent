@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from agent.support.client_diagnose import diagnose_xray_client, diagnose_xray_clients_by_key
 
 
@@ -91,19 +93,19 @@ class _FakeXrayDriver:
 
 
 def test_diagnose_xray_client_by_inbound():
-    report = diagnose_xray_client(_FakeXrayDriver(), 7, "abc123")
+    report = asyncio.run(diagnose_xray_client(_FakeXrayDriver(), 7, "abc123"))
     assert report["found"] is True
     assert report["email"] == "abc123"
     assert report["matches"][0]["healthy"] is True
 
 
 def test_diagnose_xray_client_by_email_all_inbounds():
-    report = diagnose_xray_clients_by_key(_FakeXrayDriver(), "abc123")
+    report = asyncio.run(diagnose_xray_clients_by_key(_FakeXrayDriver(), "abc123"))
     assert report["found"] is True
     assert report["summary"]["match_count"] == 1
 
 
 def test_diagnose_xray_client_missing():
-    report = diagnose_xray_clients_by_key(_FakeXrayDriver(), "missing")
+    report = asyncio.run(diagnose_xray_clients_by_key(_FakeXrayDriver(), "missing"))
     assert report["found"] is False
     assert report["summary"]["issue_count"] == 1

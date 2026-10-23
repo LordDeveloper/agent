@@ -24,7 +24,7 @@ async def traffic_worker_loop(
 
     while not stop_event.is_set():
         try:
-            stats = traffic.sample_all(registry)
+            stats = await traffic.sample_all(registry)
             if stats.get("pending", 0) or stats.get("regressed", 0):
                 log.info(
                     "traffic sample clients=%s pending=%s initialized=%s regressed=%s",

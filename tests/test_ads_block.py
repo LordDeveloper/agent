@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,7 +49,7 @@ def test_ads_block_status_reports_gateway_dns(monkeypatch):
     )
     monkeypatch.setattr('agent.ads_block.ADS_ENABLED_MARKER', Path('/tmp/netinja-ads-block-enabled'))
 
-    payload = ads_block_status()
+    payload = asyncio.run(ads_block_status())
     assert payload['dns'] == '10.66.0.1'
     assert payload['listen_dns'] == '10.66.0.1'
     assert payload['ready'] is True
@@ -64,7 +65,7 @@ def test_ads_block_prerequisites_ready_when_adguard_firewall_and_vpn(monkeypatch
     monkeypatch.setattr('agent.ads_block.adguard_service_active', lambda runner=None: True)
     monkeypatch.setattr('agent.ads_block.sys.platform', 'linux')
 
-    payload = ads_block_prerequisites()
+    payload = asyncio.run(ads_block_prerequisites())
     assert payload['ready'] is True
     assert payload['firewall_backend'] == 'nft'
 
@@ -80,9 +81,7 @@ def test_ads_block_test_detects_blocked_answer(monkeypatch):
     def fake_run(args, **kwargs):
         return _Result(stdout='0.0.0.0\n')
 
-    monkeypatch.setattr('agent.ads_block.run', fake_run)
-
-    payload = ads_block_test('doubleclick.net')
+    payload = asyncio.run(ads_block_test('doubleclick.net', runner=fake_run))
     assert payload['blocked'] is True
     assert payload['answer'] == '0.0.0.0'
 
@@ -120,7 +119,7 @@ def test_ads_block_ensure_writes_marker_and_configures_resolver(tmp_path, monkey
     def fake_run(args, **kwargs):
         return _Result()
 
-    payload = ads_block_ensure(runner=fake_run)
+    payload = asyncio.run(ads_block_ensure(runner=fake_run))
 
     assert marker.is_file()
     assert resolver_calls
@@ -151,7 +150,7 @@ def test_ads_block_ensure_skips_when_already_active(tmp_path, monkeypatch):
         lambda **kwargs: resolver_calls.append(kwargs) or {},
     )
 
-    payload = ads_block_ensure()
+    payload = asyncio.run(ads_block_ensure())
 
     assert payload['skipped'] is True
     assert payload['ok'] is True

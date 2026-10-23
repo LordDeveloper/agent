@@ -4,20 +4,19 @@ import json
 import shutil
 from typing import Any, Callable
 
-from agent.support.process import run
+from agent.support.process import execute
 
 Runner = Callable[..., Any]
 
 
-def list_host_interfaces(*, runner: Runner | None = None) -> list[dict[str, Any]]:
+async def list_host_interfaces(*, runner: Runner | None = None) -> list[dict[str, Any]]:
     """Return host NICs (excluding loopback) for admin exit-interface selection."""
-    execute = runner or run
     if not shutil.which("ip"):
         return []
 
-    raw = _ip_json(["-j", "addr"], execute)
+    raw = await _ip_json(["-j", "addr"], runner)
     if raw is None:
-        raw = _ip_json(["-j", "link"], execute)
+        raw = await _ip_json(["-j", "link"], runner)
     if not isinstance(raw, list):
         return []
 
@@ -67,9 +66,9 @@ def list_host_interfaces(*, runner: Runner | None = None) -> list[dict[str, Any]
     return rows
 
 
-def _ip_json(args: list[str], runner: Runner) -> Any:
+async def _ip_json(args: list[str], runner: Runner | None) -> Any:
     try:
-        result = runner(["ip", *args], check=False, timeout=10)
+        result = await execute(runner, ["ip", *args], check=False, timeout=10)
     except Exception:
         return None
     if getattr(result, "returncode", 1) != 0:

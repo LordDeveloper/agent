@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from agent.errors import AgentError
-from agent.ops import run_cmd, which
-from agent.support.process import service_is_active, systemctl
+from agent.ops import which
+from agent.support.process import run, service_is_active, systemctl
 
 
 XRAY_UNIT = "xray"
@@ -290,7 +290,7 @@ def ensure_xray_traffic_stats_config(config_path: Path) -> bool:
     return True
 
 
-def wait_xray_http_api(
+async def wait_xray_http_api(
     *,
     api_base: str,
     username: str = "",
@@ -304,17 +304,18 @@ def wait_xray_http_api(
     url = f"{api_base.rstrip('/')}/api/stats/sys"
     last_error = "unknown"
 
-    for _ in range(max(1, attempts)):
-        try:
-            response = httpx.get(url, auth=auth, timeout=3.0)
-            # Only 2xx means the customized HTTP API is actually serving routes.
-            # Stock Xray / wrong port often answers bare "404 page not found".
-            if 200 <= response.status_code < 300:
-                return
-            last_error = f"HTTP {response.status_code}: {(response.text or '').strip()[:120] or 'empty'}"
-        except httpx.HTTPError as exc:
-            last_error = str(exc)
-        time.sleep(delay)
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for _ in range(max(1, attempts)):
+            try:
+                response = await client.get(url, auth=auth)
+                # Only 2xx means the customized HTTP API is actually serving routes.
+                # Stock Xray / wrong port often answers bare "404 page not found".
+                if 200 <= response.status_code < 300:
+                    return
+                last_error = f"HTTP {response.status_code}: {(response.text or '').strip()[:120] or 'empty'}"
+            except httpx.HTTPError as exc:
+                last_error = str(exc)
+            await asyncio.sleep(delay)
 
     raise AgentError(
         "CONFIG_NOT_FOUND",
@@ -439,17 +440,18 @@ def write_xray_unit(unit_path: Path, binary: str, config_path: str) -> None:
     unit_path.write_text(xray_unit_text(binary, config_path), encoding="utf-8")
 
 
-def _journal(unit: str, limit: int = 20) -> str:
+async def _journal(unit: str, limit: int = 20) -> str:
     if not which("journalctl"):
         return ""
-    proc = run_cmd(
+    proc = await run(
         ["journalctl", "-u", unit, "-n", str(limit), "--no-pager", "-o", "cat"],
         check=False,
+        timeout=15,
     )
     return (proc.stdout or proc.stderr or "").strip()
 
 
-def ensure_xray_runtime(
+async def ensure_xray_runtime(
     *,
     binary: str,
     config_path: str = DEFAULT_CONFIG_PATH,
@@ -494,7 +496,7 @@ def ensure_xray_runtime(
     if not start:
         return result
 
-    return _start_xray_if_needed(
+    return await _start_xray_if_needed(
         result,
         resolved_binary=resolved_binary,
         reachable_api=reachable_api,
@@ -503,7 +505,7 @@ def ensure_xray_runtime(
     )
 
 
-def _start_xray_if_needed(
+async def _start_xray_if_needed(
     result: dict[str, Any],
     *,
     resolved_binary: str,
@@ -524,9 +526,9 @@ def _start_xray_if_needed(
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found; cannot start xray.service")
 
-    if service_is_active(XRAY_UNIT):
+    if await service_is_active(XRAY_UNIT):
         try:
-            wait_xray_http_api(
+            await wait_xray_http_api(
                 api_base=reachable_api,
                 username=auth_user,
                 password=auth_pass,
@@ -536,21 +538,21 @@ def _start_xray_if_needed(
         except AgentError as exc:
             raise AgentError(
                 "VALIDATION_ERROR",
-                _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+                _unreachable_detail(exc.message, await _journal(XRAY_UNIT)),
             ) from exc
         result["started"] = False
         result["already_running"] = True
         return result
 
-    run_cmd(["systemctl", "reset-failed", XRAY_UNIT], check=False)
-    run_cmd(["systemctl", "daemon-reload"], check=False)
-    enabled = systemctl("enable", XRAY_UNIT)
-    started = systemctl("start", XRAY_UNIT)
+    await run(["systemctl", "reset-failed", XRAY_UNIT], check=False)
+    await run(["systemctl", "daemon-reload"], check=False)
+    enabled = await systemctl("enable", XRAY_UNIT)
+    started = await systemctl("start", XRAY_UNIT)
 
     for _ in range(20):
-        if service_is_active(XRAY_UNIT):
+        if await service_is_active(XRAY_UNIT):
             try:
-                wait_xray_http_api(
+                await wait_xray_http_api(
                     api_base=reachable_api,
                     username=auth_user,
                     password=auth_pass,
@@ -560,16 +562,16 @@ def _start_xray_if_needed(
             except AgentError as exc:
                 raise AgentError(
                     "VALIDATION_ERROR",
-                    _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+                    _unreachable_detail(exc.message, await _journal(XRAY_UNIT)),
                 ) from exc
             result["started"] = True
             result["already_running"] = False
             result["enable"] = enabled
             result["start"] = started
             return result
-        time.sleep(0.25)
+        await asyncio.sleep(0.25)
 
-    logs = _journal(XRAY_UNIT)
+    logs = await _journal(XRAY_UNIT)
     detail = started.get("stderr") or started.get("stdout") or logs or "xray.service did not become active"
     raise AgentError(
         "VALIDATION_ERROR",
@@ -577,7 +579,7 @@ def _start_xray_if_needed(
     )
 
 
-def ensure_xray_running(
+async def ensure_xray_running(
     *,
     binary: str,
     config_path: str = DEFAULT_CONFIG_PATH,
@@ -587,7 +589,7 @@ def ensure_xray_running(
     unit_path: str = DEFAULT_UNIT_PATH,
 ) -> dict[str, Any]:
     """Prepare config/unit and start only when inactive — never restarts a live service."""
-    return ensure_xray_runtime(
+    return await ensure_xray_runtime(
         binary=binary,
         config_path=config_path,
         api_base=api_base,
@@ -598,13 +600,13 @@ def ensure_xray_running(
     )
 
 
-def stop_xray_service() -> dict[str, Any]:
-    stopped = systemctl("stop", XRAY_UNIT)
-    disabled = systemctl("disable", XRAY_UNIT)
+async def stop_xray_service() -> dict[str, Any]:
+    stopped = await systemctl("stop", XRAY_UNIT)
+    disabled = await systemctl("disable", XRAY_UNIT)
     return {"stop": stopped, "disable": disabled, "ok": bool(stopped.get("ok"))}
 
 
-def restart_xray_service(
+async def restart_xray_service(
     *,
     binary: str,
     config_path: str,
@@ -612,7 +614,7 @@ def restart_xray_service(
     username: str = "",
     password: str = "",
 ) -> dict[str, Any]:
-    prepared = ensure_xray_runtime(
+    prepared = await ensure_xray_runtime(
         binary=binary,
         config_path=config_path,
         api_base=api_base,
@@ -627,11 +629,11 @@ def restart_xray_service(
             "UNSUPPORTED_CAPABILITY",
             f"Xray at [{prepared.get('binary') or binary}] has no HTTP API. {STOCK_XRAY_HINT}",
         )
-    run_cmd(["systemctl", "reset-failed", XRAY_UNIT], check=False)
-    run_cmd(["systemctl", "daemon-reload"], check=False)
-    restarted = systemctl("restart", XRAY_UNIT)
-    if not restarted.get("ok") and not service_is_active(XRAY_UNIT):
-        logs = _journal(XRAY_UNIT)
+    await run(["systemctl", "reset-failed", XRAY_UNIT], check=False)
+    await run(["systemctl", "daemon-reload"], check=False)
+    restarted = await systemctl("restart", XRAY_UNIT)
+    if not restarted.get("ok") and not await service_is_active(XRAY_UNIT):
+        logs = await _journal(XRAY_UNIT)
         raise AgentError(
             "VALIDATION_ERROR",
             _unreachable_detail(
@@ -642,7 +644,7 @@ def restart_xray_service(
     reachable_api = str(prepared.get("httpapi") or api_base_from_config(Path(config_path), api_base))
     auth_user, auth_pass = xray_auth_from_config(Path(config_path), username, password)
     try:
-        wait_xray_http_api(
+        await wait_xray_http_api(
             api_base=reachable_api,
             username=auth_user,
             password=auth_pass,
@@ -652,8 +654,8 @@ def restart_xray_service(
     except AgentError as exc:
         raise AgentError(
             "VALIDATION_ERROR",
-            _unreachable_detail(exc.message, _journal(XRAY_UNIT)),
+            _unreachable_detail(exc.message, await _journal(XRAY_UNIT)),
         ) from exc
     prepared["restart"] = restarted
-    prepared["started"] = service_is_active(XRAY_UNIT)
+    prepared["started"] = await service_is_active(XRAY_UNIT)
     return prepared

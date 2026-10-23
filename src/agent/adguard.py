@@ -9,14 +9,15 @@ import shutil
 import sys
 import tarfile
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
+from agent.asyncutil import gather_independent
 from agent.errors import AgentError
 from agent.logutil import get_logger
-from agent.support.process import run
+from agent.support.process import execute
 
 log = get_logger('adguard')
 
@@ -270,27 +271,24 @@ def _command_output(proc: Any) -> str:
     ).strip()
 
 
-def adguard_service_active(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def adguard_service_active(*, runner: Runner | None = None) -> bool:
     if not shutil.which('systemctl'):
         return False
-    proc = execute(['systemctl', 'is-active', AGENT_ADGUARD_UNIT], check=False, timeout=10)
+    proc = await execute(runner, ['systemctl', 'is-active', AGENT_ADGUARD_UNIT], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() == 'active'
 
 
-def adguard_unit_enabled(*, runner: Runner | None = None) -> str:
-    execute = runner or run
+async def adguard_unit_enabled(*, runner: Runner | None = None) -> str:
     if not shutil.which('systemctl'):
         return 'unknown'
-    proc = execute(['systemctl', 'is-enabled', AGENT_ADGUARD_UNIT], check=False, timeout=10)
+    proc = await execute(runner, ['systemctl', 'is-enabled', AGENT_ADGUARD_UNIT], check=False, timeout=10)
     return (getattr(proc, 'stdout', '') or '').strip() or 'unknown'
 
 
-def adguard_service_journal(*, runner: Runner | None = None, lines: int = 12) -> str:
-    execute = runner or run
+async def adguard_service_journal(*, runner: Runner | None = None, lines: int = 12) -> str:
     if not shutil.which('journalctl'):
         return ''
-    proc = execute(
+    proc = await execute(runner, 
         ['journalctl', '-u', AGENT_ADGUARD_UNIT, '-n', str(max(1, lines)), '--no-pager'],
         check=False,
         timeout=15,
@@ -298,19 +296,18 @@ def adguard_service_journal(*, runner: Runner | None = None, lines: int = 12) ->
     return (getattr(proc, 'stdout', '') or '').strip()
 
 
-def adguard_service_diagnostic(*, runner: Runner | None = None) -> str:
+async def adguard_service_diagnostic(*, runner: Runner | None = None) -> str:
     if not AGENT_ADGUARD_UNIT_PATH.is_file() and not ADGUARD_UNIT_MARKER.is_file():
         return 'AdGuard Home unit not found (run: agent ads-block install)'
-    journal = adguard_service_journal(runner=runner, lines=15)
+    journal = await adguard_service_journal(runner=runner, lines=15)
     if journal and journal != '-- No entries --':
         return journal
-    execute = runner or run
     if shutil.which('systemctl'):
-        proc = execute(['systemctl', 'status', AGENT_ADGUARD_UNIT, '-n', '15', '--no-pager'], check=False, timeout=15)
+        proc = await execute(runner, ['systemctl', 'status', AGENT_ADGUARD_UNIT, '-n', '15', '--no-pager'], check=False, timeout=15)
         status = _command_output(proc)
         if status:
             return status
-    enabled = adguard_unit_enabled(runner=runner)
+    enabled = await adguard_unit_enabled(runner=runner)
     if enabled == 'not-found':
         return 'AdGuard Home unit not found (run: agent ads-block install)'
     if enabled == 'masked':
@@ -333,11 +330,10 @@ def _resolved_stub_config_disabled() -> bool:
     return False
 
 
-def resolved_stub_listener_listening(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def resolved_stub_listener_listening(*, runner: Runner | None = None) -> bool:
     if not shutil.which('ss'):
         return False
-    proc = execute(['ss', '-H', '-lun'], check=False, timeout=10)
+    proc = await execute(runner, ['ss', '-H', '-lun'], check=False, timeout=10)
     text = _command_output(proc).lower()
     for line in text.splitlines():
         if ':53' not in line:
@@ -347,14 +343,13 @@ def resolved_stub_listener_listening(*, runner: Runner | None = None) -> bool:
     return False
 
 
-def resolved_stub_listener_disabled(*, runner: Runner | None = None) -> bool:
-    if resolved_stub_listener_listening(runner=runner):
+async def resolved_stub_listener_disabled(*, runner: Runner | None = None) -> bool:
+    if await resolved_stub_listener_listening(runner=runner):
         return False
     return _resolved_stub_config_disabled()
 
 
-def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
     content = '[Resolve]\nDNSStubListener=no\n'
     changed = False
     if not RESOLVED_STUB_DROPIN.is_file() or RESOLVED_STUB_DROPIN.read_text(encoding='utf-8') != content:
@@ -362,39 +357,50 @@ def disable_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
         RESOLVED_STUB_DROPIN.write_text(content, encoding='utf-8')
         changed = True
     if shutil.which('systemctl'):
-        execute(['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
-    return changed or resolved_stub_listener_disabled(runner=runner)
+        await execute(runner, ['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
+    return changed or await resolved_stub_listener_disabled(runner=runner)
 
 
-def restore_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def restore_resolved_stub_listener(*, runner: Runner | None = None) -> bool:
     if not RESOLVED_STUB_DROPIN.is_file():
         return False
     RESOLVED_STUB_DROPIN.unlink(missing_ok=True)
     if shutil.which('systemctl'):
-        execute(['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'restart', 'systemd-resolved'], check=False, timeout=30)
     return True
 
 
-def isolate_vpn_interfaces_from_host_dns(
+async def isolate_vpn_interfaces_from_host_dns(
     interfaces: list[dict[str, Any]],
     *,
     runner: Runner | None = None,
 ) -> list[str]:
     """Keep VPN server gateway IPs out of the host resolver (systemd-resolved)."""
-    execute = runner or run
     if not shutil.which('resolvectl'):
         return []
-    actions: list[str] = []
-    for row in interfaces:
-        name = str(row.get('name') or '').strip()
-        if not name or '+' in name or '*' in name:
-            continue
-        dns_proc = execute(['resolvectl', 'dns', name, 'off'], check=False, timeout=10)
-        execute(['resolvectl', 'domain', name, 'off'], check=False, timeout=10)
+
+    names = [
+        str(row.get('name') or '').strip()
+        for row in interfaces
+        if str(row.get('name') or '').strip()
+        and '+' not in str(row.get('name') or '')
+        and '*' not in str(row.get('name') or '')
+    ]
+    names = list(dict.fromkeys(names))
+    if not names:
+        return []
+
+    async def _clear(name: str) -> str | None:
+        dns_proc, _domain = await gather_independent(
+            execute(runner, ['resolvectl', 'dns', name, 'off'], check=False, timeout=10),
+            execute(runner, ['resolvectl', 'domain', name, 'off'], check=False, timeout=10),
+        )
         if getattr(dns_proc, 'returncode', 1) == 0:
-            actions.append(f'resolvectl_dns_off:{name}')
-    return actions
+            return f'resolvectl_dns_off:{name}'
+        return None
+
+    cleared = await gather_independent(*(_clear(name) for name in names))
+    return [item for item in cleared if isinstance(item, str)]
 
 
 def _render_agent_adguard_unit(binary: str, work_dir: str) -> str:
@@ -420,8 +426,7 @@ def _render_agent_adguard_unit(binary: str, work_dir: str) -> str:
     )
 
 
-def _download_adguard_binary(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def _download_adguard_binary(*, runner: Runner | None = None) -> bool:
     arch = _detect_arch()
     archive_name = f'AdGuardHome_linux_{arch}.tar.gz'
     url = f'{ADGUARD_RELEASE_BASE}/{ADGUARD_VERSION}/{archive_name}'
@@ -430,10 +435,15 @@ def _download_adguard_binary(*, runner: Runner | None = None) -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         archive_path = Path(tmp) / archive_name
         try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'netinja-agent/adguard'})
-            with urllib.request.urlopen(request, timeout=120) as response:
-                archive_path.write_bytes(response.read())
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            async with httpx.AsyncClient(
+                timeout=120.0,
+                follow_redirects=True,
+                headers={'User-Agent': 'netinja-agent/adguard'},
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                archive_path.write_bytes(response.content)
+        except (httpx.HTTPError, OSError) as exc:
             log.warning('adguard: failed to download %s: %s', url, exc)
             return False
 
@@ -460,17 +470,16 @@ def _download_adguard_binary(*, runner: Runner | None = None) -> bool:
     return ADGUARD_BINARY.is_file()
 
 
-def install_adguard_binary(*, runner: Runner | None = None) -> bool:
+async def install_adguard_binary(*, runner: Runner | None = None) -> bool:
     if ADGUARD_BINARY.is_file():
         return True
-    if _download_adguard_binary(runner=runner):
+    if await _download_adguard_binary(runner=runner):
         return True
     apt = shutil.which('apt-get')
     if apt is None:
         return False
-    execute = runner or run
-    execute([apt, 'update', '-qq'], check=False, timeout=120)
-    proc = execute([apt, 'install', '-y', '-qq', 'adguardhome'], check=False, timeout=300)
+    await execute(runner, [apt, 'update', '-qq'], check=False, timeout=120)
+    proc = await execute(runner, [apt, 'install', '-y', '-qq', 'adguardhome'], check=False, timeout=300)
     if proc.returncode == 0 and shutil.which('AdGuardHome'):
         system_binary = shutil.which('AdGuardHome')
         if system_binary:
@@ -483,9 +492,8 @@ def install_adguard_binary(*, runner: Runner | None = None) -> bool:
     return ADGUARD_BINARY.is_file()
 
 
-def ensure_adguard_systemd_unit(*, runner: Runner | None = None) -> dict[str, Any]:
-    execute = runner or run
-    installed = install_adguard_binary(runner=runner)
+async def ensure_adguard_systemd_unit(*, runner: Runner | None = None) -> dict[str, Any]:
+    installed = await install_adguard_binary(runner=runner)
     binary = str(ADGUARD_BINARY) if ADGUARD_BINARY.is_file() else shutil.which('AdGuardHome')
     if not binary:
         return {'ok': False, 'unit': None, 'message': 'AdGuard Home binary not found'}
@@ -502,7 +510,7 @@ def ensure_adguard_systemd_unit(*, runner: Runner | None = None) -> dict[str, An
     ADGUARD_UNIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
     ADGUARD_UNIT_MARKER.write_text(AGENT_ADGUARD_UNIT, encoding='utf-8')
     if shutil.which('systemctl'):
-        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'daemon-reload'], check=False, timeout=30)
     return {
         'ok': True,
         'unit': AGENT_ADGUARD_UNIT,
@@ -512,26 +520,24 @@ def ensure_adguard_systemd_unit(*, runner: Runner | None = None) -> dict[str, An
     }
 
 
-def remove_agent_adguard_systemd_unit(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def remove_agent_adguard_systemd_unit(*, runner: Runner | None = None) -> bool:
     if not ADGUARD_UNIT_MARKER.is_file():
         return False
     if shutil.which('systemctl'):
-        execute(['systemctl', 'stop', AGENT_ADGUARD_UNIT], check=False, timeout=30)
-        execute(['systemctl', 'disable', AGENT_ADGUARD_UNIT], check=False, timeout=30)
-        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'stop', AGENT_ADGUARD_UNIT], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'disable', AGENT_ADGUARD_UNIT], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'daemon-reload'], check=False, timeout=30)
     AGENT_ADGUARD_UNIT_PATH.unlink(missing_ok=True)
     ADGUARD_UNIT_MARKER.unlink(missing_ok=True)
     return True
 
 
-def cleanup_legacy_dnsmasq(*, runner: Runner | None = None) -> list[str]:
-    execute = runner or run
+async def cleanup_legacy_dnsmasq(*, runner: Runner | None = None) -> list[str]:
     removed: list[str] = []
 
     if shutil.which('systemctl'):
-        execute(['systemctl', 'stop', LEGACY_DNSMASQ_UNIT], check=False, timeout=30)
-        execute(['systemctl', 'disable', LEGACY_DNSMASQ_UNIT], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'stop', LEGACY_DNSMASQ_UNIT], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'disable', LEGACY_DNSMASQ_UNIT], check=False, timeout=30)
 
     for path in (
         LEGACY_DNSMASQ_UNIT_PATH,
@@ -553,7 +559,7 @@ def cleanup_legacy_dnsmasq(*, runner: Runner | None = None) -> list[str]:
         removed.append(str(legacy_resolved))
 
     if shutil.which('systemctl'):
-        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'daemon-reload'], check=False, timeout=30)
     return removed
 
 
@@ -575,30 +581,28 @@ def _yaml_bind_hosts(text: str) -> tuple[str, ...]:
     return tuple(hosts)
 
 
-def reload_adguard_config(*, runner: Runner | None = None) -> bool:
+async def reload_adguard_config(*, runner: Runner | None = None) -> bool:
     """Ask a running AdGuard to reread YAML without dropping port 53."""
-    execute = runner or run
-    if not adguard_service_active(runner=runner):
+    if not await adguard_service_active(runner=runner):
         return False
     if shutil.which('systemctl'):
-        proc = execute(['systemctl', 'reload', AGENT_ADGUARD_UNIT], check=False, timeout=30)
+        proc = await execute(runner, ['systemctl', 'reload', AGENT_ADGUARD_UNIT], check=False, timeout=30)
         if getattr(proc, 'returncode', 1) == 0:
             return True
-    proc = execute(['pkill', '-HUP', '-x', 'AdGuardHome'], check=False, timeout=10)
+    proc = await execute(runner, ['pkill', '-HUP', '-x', 'AdGuardHome'], check=False, timeout=10)
     return getattr(proc, 'returncode', 1) == 0
 
 
-def ensure_adguard_service(
+async def ensure_adguard_service(
     *,
     runner: Runner | None = None,
     fix_resolved: bool = True,
     restart: bool = False,
 ) -> dict[str, Any]:
-    execute = runner or run
     actions: list[str] = []
-    cleanup_legacy_dnsmasq(runner=runner)
+    await cleanup_legacy_dnsmasq(runner=runner)
 
-    unit_setup = ensure_adguard_systemd_unit(runner=runner)
+    unit_setup = await ensure_adguard_systemd_unit(runner=runner)
     unit = str(unit_setup.get('unit') or AGENT_ADGUARD_UNIT)
     if unit_setup.get('installed'):
         actions.append('installed_adguard_binary')
@@ -625,17 +629,17 @@ def ensure_adguard_service(
             'journal': None,
             'diagnostic': 'AdGuard Home binary not found',
             'unit': unit,
-            'unit_enabled': adguard_unit_enabled(runner=runner),
+            'unit_enabled': await adguard_unit_enabled(runner=runner),
             'actions': actions,
             'unit_setup': unit_setup,
         }
 
     config_ok = ADGUARD_CONFIG.is_file()
     config_message = 'ok' if config_ok else 'AdGuardHome.yaml missing (run ensure)'
-    unit_enabled = adguard_unit_enabled(runner=runner)
+    unit_enabled = await adguard_unit_enabled(runner=runner)
 
     if not config_ok:
-        diagnostic = adguard_service_diagnostic(runner=runner)
+        diagnostic = await adguard_service_diagnostic(runner=runner)
         return {
             'active': False,
             'config_ok': False,
@@ -650,28 +654,28 @@ def ensure_adguard_service(
 
     if shutil.which('systemctl'):
         if unit_enabled == 'masked':
-            execute(['systemctl', 'unmask', unit], check=False, timeout=30)
+            await execute(runner, ['systemctl', 'unmask', unit], check=False, timeout=30)
             actions.append('unmasked_adguard')
-            unit_enabled = adguard_unit_enabled(runner=runner)
-        execute(['systemctl', 'enable', unit], check=False, timeout=30)
-        already_active = adguard_service_active(runner=runner)
+            unit_enabled = await adguard_unit_enabled(runner=runner)
+        await execute(runner, ['systemctl', 'enable', unit], check=False, timeout=30)
+        already_active = await adguard_service_active(runner=runner)
         if restart or not already_active:
-            execute(
+            await execute(runner, 
                 ['systemctl', 'restart' if restart and already_active else 'start', unit],
                 check=False,
                 timeout=60,
             )
             actions.append('restarted_adguard' if restart and already_active else 'started_adguard')
-            if not adguard_service_active(runner=runner):
-                execute(['systemctl', 'start', unit], check=False, timeout=60)
+            if not await adguard_service_active(runner=runner):
+                await execute(runner, ['systemctl', 'start', unit], check=False, timeout=60)
         else:
             actions.append('adguard_already_active')
 
-    active = adguard_service_active(runner=runner)
+    active = await adguard_service_active(runner=runner)
     diagnostic = ''
 
     if not active and fix_resolved:
-        diagnostic = adguard_service_diagnostic(runner=runner)
+        diagnostic = await adguard_service_diagnostic(runner=runner)
         lowered = diagnostic.lower()
         port_conflict = any(
             token in lowered
@@ -684,14 +688,14 @@ def ensure_adguard_service(
             )
         )
         if port_conflict:
-            if disable_resolved_stub_listener(runner=runner):
+            if await disable_resolved_stub_listener(runner=runner):
                 actions.append('disabled_resolved_stub_listener')
-            execute(['systemctl', 'restart', unit], check=False, timeout=60)
-            if not adguard_service_active(runner=runner):
-                execute(['systemctl', 'start', unit], check=False, timeout=60)
-            active = adguard_service_active(runner=runner)
+            await execute(runner, ['systemctl', 'restart', unit], check=False, timeout=60)
+            if not await adguard_service_active(runner=runner):
+                await execute(runner, ['systemctl', 'start', unit], check=False, timeout=60)
+            active = await adguard_service_active(runner=runner)
             if not active:
-                diagnostic = adguard_service_diagnostic(runner=runner)
+                diagnostic = await adguard_service_diagnostic(runner=runner)
 
     return {
         'active': active,
@@ -701,14 +705,14 @@ def ensure_adguard_service(
         'diagnostic': diagnostic or None,
         'unit': unit,
         'unit_enabled': unit_enabled,
-        'resolved_stub_disabled': resolved_stub_listener_disabled(runner=runner),
-        'resolved_stub_listening': resolved_stub_listener_listening(runner=runner),
+        'resolved_stub_disabled': await resolved_stub_listener_disabled(runner=runner),
+        'resolved_stub_listening': await resolved_stub_listener_listening(runner=runner),
         'actions': actions,
         'unit_setup': unit_setup,
     }
 
 
-def write_adguard_config(
+async def write_adguard_config(
     bind_hosts: list[str],
     *,
     upstream: tuple[str, ...] = DEFAULT_UPSTREAM_DNS,
@@ -742,7 +746,7 @@ def write_adguard_config(
     }
 
 
-def ensure_adguard_resolver(
+async def ensure_adguard_resolver(
     interfaces: list[dict[str, Any]],
     *,
     upstream: tuple[str, ...] = DEFAULT_UPSTREAM_DNS,
@@ -754,7 +758,7 @@ def ensure_adguard_resolver(
     if not listen_addresses:
         raise AgentError('VALIDATION_ERROR', 'VPN interface list has no IPv4 gateway addresses')
 
-    config_meta = write_adguard_config(
+    config_meta = await write_adguard_config(
         listen_addresses,
         upstream=upstream,
         filtering_enabled=filtering_enabled,
@@ -763,9 +767,9 @@ def ensure_adguard_resolver(
     )
     written = bool(config_meta.get('written'))
     bind_changed = bool(config_meta.get('bind_hosts_changed'))
-    already_active = adguard_service_active(runner=runner)
+    already_active = await adguard_service_active(runner=runner)
 
-    if already_active and written and not bind_changed and reload_adguard_config(runner=runner):
+    if already_active and written and not bind_changed and await reload_adguard_config(runner=runner):
         service = {
             'active': True,
             'reloaded': True,
@@ -779,7 +783,7 @@ def ensure_adguard_resolver(
             'skipped': True,
         }
     else:
-        service = ensure_adguard_service(runner=runner, restart=bind_changed)
+        service = await ensure_adguard_service(runner=runner, restart=bind_changed)
     restarted = bool(service.get('restarted') or (service.get('active') and not already_active))
 
     return {
@@ -799,7 +803,7 @@ def adguard_configured() -> bool:
     return ADGUARD_CONFIG.is_file()
 
 
-def adguard_status_summary() -> dict[str, Any]:
+async def adguard_status_summary() -> dict[str, Any]:
     return {
         'installed': ADGUARD_BINARY.is_file() or bool(shutil.which('AdGuardHome')),
         'configured': adguard_configured(),

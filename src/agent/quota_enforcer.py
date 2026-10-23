@@ -13,17 +13,18 @@ if TYPE_CHECKING:
 log = get_logger("quota")
 
 
-def enforce_all(registry: CoreRegistry) -> int:
-    disabled = 0
+async def enforce_all(registry: CoreRegistry) -> int:
+    from agent.asyncutil import gather_independent
 
-    for core_key in registry.settings.cores():
+    async def one(core_key: str) -> int:
         try:
-            driver = registry.get(core_key)
-            disabled += enforce_driver_quotas(driver)
+            return int(await enforce_driver_quotas(registry.get(core_key)) or 0)
         except Exception:
             log.exception("quota enforce failed core=%s", core_key)
+            return 0
 
-    return disabled
+    counts = await gather_independent(*(one(core_key) for core_key in registry.settings.cores()))
+    return sum(int(count) for count in counts if isinstance(count, int))
 
 
 async def quota_enforcer_loop(
@@ -36,7 +37,7 @@ async def quota_enforcer_loop(
 
     while not stop_event.is_set():
         try:
-            count = enforce_all(registry)
+            count = await enforce_all(registry)
             if count:
                 log.warning("quota exceeded — disabled clients=%s", count)
         except Exception:

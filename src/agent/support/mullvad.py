@@ -7,12 +7,12 @@ matches a Mullvad relay. Fallback only rewrites Endpoint/PublicKey so the
 iface name — and panel exit_interface — stay unchanged.
 """
 
+import asyncio
 import ipaddress
 import re
 import shutil
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,7 +23,8 @@ from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.support.node_probe import _curl_probe, curl_speed_mbps
 from agent.support.peer_egress import normalize_exit_interface
-from agent.support.process import run
+from agent.asyncutil import bounded_gather, gather_independent, maybe_await
+from agent.support.process import execute
 
 log = get_logger("mullvad")
 
@@ -151,15 +152,16 @@ def _relays_cache() -> dict[str, Any]:
 _CACHE = _relays_cache()
 
 
-def fetch_relays(*, timeout: float = 20.0, force: bool = False) -> list[dict[str, Any]]:
+async def fetch_relays(*, timeout: float = 20.0, force: bool = False) -> list[dict[str, Any]]:
     now = time.time()
     if not force and _CACHE["rows"] and (now - float(_CACHE["at"])) < CACHE_TTL:
         return list(_CACHE["rows"])
 
     try:
-        response = httpx.get(RELAYS_URL, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(RELAYS_URL)
+            response.raise_for_status()
+            payload = response.json()
     except Exception as exc:
         if _CACHE["rows"]:
             log.warning("mullvad catalog refresh failed; using cache: %s", exc)
@@ -251,12 +253,12 @@ def parse_ping_ms(output: str) -> int | None:
         return None
 
 
-def icmp_ping(host: str, *, runner: Runner | None = None, timeout: float = 2.5) -> tuple[bool, int | None]:
+async def icmp_ping(host: str, *, runner: Runner | None = None, timeout: float = 2.5) -> tuple[bool, int | None]:
     ip = str(host or "").strip()
     if not ip:
         return False, None
-    execute = runner or run
-    result = execute(
+    result = await execute(
+        runner,
         ["ping", "-4", "-n", "-c", "1", "-W", "1", ip],
         check=False,
         timeout=timeout,
@@ -270,29 +272,31 @@ def icmp_ping(host: str, *, runner: Runner | None = None, timeout: float = 2.5) 
     return False, None
 
 
-def ping_relay_ip(
+async def ping_relay_ip(
     host: str,
     *,
     runner: Runner | None = None,
     tcp: TcpProbe | None = None,
 ) -> tuple[bool, int | None]:
-    ok, latency = icmp_ping(host, runner=runner)
+    ok, latency = await icmp_ping(host, runner=runner)
     if ok:
         return True, latency
     checker = tcp or tcp_probe
-    return checker(host, WG_PORT)
+    return await maybe_await(checker(host, WG_PORT))
 
 
-def tcp_probe(host: str, port: int = WG_PORT, *, timeout: float = TCP_TIMEOUT) -> tuple[bool, int | None]:
+async def tcp_probe(host: str, port: int = WG_PORT, *, timeout: float = TCP_TIMEOUT) -> tuple[bool, int | None]:
     host = str(host or "").strip()
     if not host or port <= 0:
         return False, None
     started = time.perf_counter()
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-            return True, latency_ms
-    except OSError:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
+        return True, latency_ms
+    except (OSError, asyncio.TimeoutError):
         return False, None
 
 
@@ -346,7 +350,7 @@ def relay_network_speed_mbps(row: dict[str, Any]) -> int:
     return 0
 
 
-def score_relays(
+async def score_relays(
     relays: list[dict[str, Any]],
     *,
     exclude_hostname: str = "",
@@ -364,18 +368,19 @@ def score_relays(
     """
     # Catalog port Mbps is not used for ranking; throughput is measured per-iface with curl.
     _ = normalize_relay_metric(metric)
-    checker = probe or (lambda host, port: tcp_probe(host, port))
-    scored: list[tuple[int, dict[str, Any], bool]] = []
+    checker = probe or tcp_probe
     skip = {str(exclude_hostname or "").strip().lower()}
     skip.update(str(name or "").strip().lower() for name in (exclude_hostnames or []))
     skip.discard("")
 
-    def _one(row: dict[str, Any]) -> tuple[int, dict[str, Any], bool] | None:
+    async def _one(row: dict[str, Any]) -> tuple[int, dict[str, Any], bool] | None:
         hostname = str(row.get("hostname") or "").strip().lower()
         if hostname and hostname in skip:
             return None
         ipv4 = str(row.get("ipv4_addr_in") or "").strip()
-        ok, latency = checker(ipv4, WG_PORT) if ipv4 else (False, None)
+        ok, latency = (False, None)
+        if ipv4:
+            ok, latency = await maybe_await(checker(ipv4, WG_PORT))
         measured = bool(ok and latency is not None)
         if require_reachable and not measured:
             return None
@@ -386,13 +391,9 @@ def score_relays(
 
     if not relays:
         return []
-    pool_size = min(max(1, workers), max(1, len(relays)))
-    with ThreadPoolExecutor(max_workers=pool_size) as pool:
-        futures = [pool.submit(_one, row) for row in relays]
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                scored.append(result)
+    limit = min(max(1, workers), max(1, len(relays)))
+    raw = await bounded_gather([lambda row=row: _one(row) for row in relays], limit=limit)
+    scored = [item for item in raw if isinstance(item, tuple)]
 
     measured = [item for item in scored if item[2]]
     pool = measured if (prefer_measured and measured) else scored
@@ -408,7 +409,7 @@ def score_relays(
     return ranked
 
 
-def pick_best_relay(
+async def pick_best_relay(
     relays: list[dict[str, Any]],
     *,
     exclude_hostname: str = "",
@@ -418,7 +419,7 @@ def pick_best_relay(
     prefer_measured: bool = True,
     metric: str = RELAY_METRIC_PING,
 ) -> dict[str, Any] | None:
-    scored = score_relays(
+    scored = await score_relays(
         relays,
         exclude_hostname=exclude_hostname,
         exclude_hostnames=exclude_hostnames,
@@ -565,13 +566,16 @@ class MullvadService:
     ) -> None:
         self.store = store
         self.config_dir = Path(config_dir)
-        self.runner = runner or run
+        self.runner = runner
         self.fetch = fetch or fetch_relays
         self.probe = probe or (lambda host, _port: ping_relay_ip(host, runner=self.runner))
         self.egress_probe = egress_probe or _curl_probe
         self.handshake_wait = 2.0
         self.persist_script = Path(persist_script) if persist_script else PERSIST_HOLD_SCRIPT
         self.persist_unit_path = Path(persist_unit_path) if persist_unit_path else PERSIST_UNIT_PATH
+
+    async def _exec(self, args: list[str], **kwargs):
+        return await execute(self.runner, args, **kwargs)
 
     def settings(self) -> dict[str, Any]:
         row = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
@@ -586,12 +590,12 @@ class MullvadService:
             "has_private_key": bool(private_key),
             "key_preview": mask_key(private_key),
             "relay_metric": metric,
-            "relay_metric_label": "سرعت واقعی (curl)" if metric == RELAY_METRIC_SPEED else "پینگ",
+            "relay_metric_label": "real speed (curl)" if metric == RELAY_METRIC_SPEED else "ping",
             "relay_mode": mode,
             "selection_mode": mode,
-            "relay_mode_label": "رله ثابت" if mode == RELAY_MODE_FIXED else "خودکار",
+            "relay_mode_label": "fixed relay" if mode == RELAY_MODE_FIXED else "automatic",
             "auto_fallback": auto_fallback,
-            "auto_fallback_label": "روشن" if auto_fallback else "خاموش",
+            "auto_fallback_label": "on" if auto_fallback else "off",
         }
 
     def relay_metric(self) -> str:
@@ -616,7 +620,7 @@ class MullvadService:
             return False
         return bool(default)
 
-    def save_settings(
+    async def save_settings(
         self,
         *,
         private_key: str | None = None,
@@ -674,7 +678,7 @@ class MullvadService:
         addr = str(address if address is not None else current.get("address") or "").strip()
         if address is not None or (private_key is not None and not addr):
             if not addr:
-                addr = self._discover_address()
+                addr = await self._discover_address()
         if addr:
             addr = normalize_tunnel_address(addr)
 
@@ -691,13 +695,13 @@ class MullvadService:
         # Changing account key/IP must rewrite every bound exit conf + live iface.
         # Previously only the store doc changed, so poland/pl/sw kept the old PrivateKey.
         if private_key is not None or address is not None:
-            result["propagated"] = self.propagate_account(
+            result["propagated"] = await self.propagate_account(
                 private_key=key if private_key is not None else None,
                 address=addr if address is not None else None,
             )
         return result
 
-    def propagate_account(
+    async def propagate_account(
         self,
         *,
         private_key: str | None = None,
@@ -757,9 +761,9 @@ class MullvadService:
                 peers = [dict(peer) for peer in (parsed.get("peers") or []) if isinstance(peer, dict)]
                 path.write_text(dump_wg_conf({"interface": interface, "peers": peers}), encoding="utf-8")
                 # Reload only when conf actually changed.
-                self._sync_iface(iface, path)
+                await maybe_await(self._sync_iface(iface, path))
                 try:
-                    self._ensure_persist_unit(iface)
+                    await self._ensure_persist_unit(iface)
                 except Exception as exc:
                     log.warning("mullvad persist after key propagate failed iface=%s: %s", iface, exc)
                 updated.append(iface)
@@ -788,9 +792,9 @@ class MullvadService:
         row = self.store.get_doc(CORE, KIND_LOCATION, code)
         return row if isinstance(row, dict) else None
 
-    def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
-        relays = fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch()
-        self.refresh_bindings(relays)
+    async def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
+        relays = await maybe_await(fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch())
+        await self.refresh_bindings(relays)
         bound = {str(row.get("country_code") or "").lower(): row for row in self.bindings()}
         locations = []
         for item in group_locations(relays):
@@ -813,13 +817,13 @@ class MullvadService:
                 }
             )
         if ping:
-            locations = self._attach_pings(locations, relays)
+            locations = await self._attach_pings(locations, relays)
         return {
             "settings": {k: v for k, v in self.settings().items() if k != "private_key"},
             "locations": locations,
         }
 
-    def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
         jobs: list[tuple[str, str]] = []
         for item in locations:
             iface = str(item.get("iface") or "")
@@ -835,27 +839,44 @@ class MullvadService:
 
         best: dict[str, tuple[int, str]] = {}
         if jobs:
-            with ThreadPoolExecutor(max_workers=min(32, max(1, len(jobs)))) as pool:
-                futures = {
-                    pool.submit(ping_relay_ip, ip, runner=self.runner, tcp=self.probe): (code, ip)
-                    for code, ip in jobs
-                }
-                for future in as_completed(futures):
-                    code, ip = futures[future]
-                    ok, latency = future.result()
-                    if not ok or latency is None:
-                        continue
-                    previous = best.get(code)
-                    if previous is None or latency < previous[0]:
-                        best[code] = (latency, ip)
+            pinged = await bounded_gather(
+                [lambda code=code, ip=ip: ping_relay_ip(ip, runner=self.runner, tcp=self.probe) for code, ip in jobs],
+                limit=min(32, max(1, len(jobs))),
+            )
+            for (code, ip), result in zip(jobs, pinged):
+                if not isinstance(result, tuple):
+                    continue
+                ok, latency = result
+                if not ok or latency is None:
+                    continue
+                previous = best.get(code)
+                if previous is None or latency < previous[0]:
+                    best[code] = (latency, ip)
+
+        tunnel_ifaces = [
+            str(item.get("iface") or "")
+            for item in locations
+            if item.get("bound") and str(item.get("iface") or "") and self._iface_up(str(item.get("iface") or ""))
+        ]
+        tunnel_pings: dict[str, int] = {}
+        if tunnel_ifaces:
+            probed = await gather_independent(
+                *(maybe_await(self.egress_probe(interface=iface, runner=self.runner)) for iface in tunnel_ifaces)
+            )
+            for iface, result in zip(tunnel_ifaces, probed):
+                if not isinstance(result, tuple):
+                    continue
+                tunnel_ok, _message, tunnel_ms = result
+                if tunnel_ok and tunnel_ms:
+                    tunnel_pings[iface] = int(tunnel_ms)
 
         for item in locations:
             code = str(item.get("country_code") or "")
             iface = str(item.get("iface") or "")
             has_tunnel = bool(item.get("bound") and iface and self._iface_up(iface))
             if has_tunnel:
-                tunnel_ok, _message, tunnel_ms = self.egress_probe(interface=iface, runner=self.runner)
-                if tunnel_ok and tunnel_ms:
+                tunnel_ms = tunnel_pings.get(iface)
+                if tunnel_ms:
                     item["ping_ms"] = tunnel_ms
                     item["ping_ip"] = None
                     item["reachable"] = True
@@ -874,8 +895,8 @@ class MullvadService:
                 item["ping_via"] = None
         return locations
 
-    def refresh_bindings(self, relays: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        catalog = relays if relays is not None else self.fetch()
+    async def refresh_bindings(self, relays: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        catalog = relays if relays is not None else await maybe_await(self.fetch())
         claimed_ifaces = {
             str(row.get("iface") or "").strip()
             for row in self.bindings()
@@ -887,7 +908,7 @@ class MullvadService:
             if str(row.get("country_code") or "").strip()
         }
 
-        for iface, parsed, live in self._scan_interfaces():
+        for iface, parsed, live in await self._scan_interfaces():
             if iface in claimed_ifaces:
                 self._seed_settings_from_conf(parsed)
                 continue
@@ -919,19 +940,19 @@ class MullvadService:
 
         return self.bindings()
 
-    def ensure(self, country_code: str) -> dict[str, Any]:
+    async def ensure(self, country_code: str) -> dict[str, Any]:
         code = str(country_code or "").strip().lower()
         if not re.fullmatch(r"[a-z]{2}", code or ""):
             raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
 
-        relays = self.fetch()
-        self.refresh_bindings(relays)
+        relays = await maybe_await(self.fetch())
+        await self.refresh_bindings(relays)
         candidates = active_relays(relays, code)
         if not candidates:
             raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
 
         bind = self.binding_for(code)
-        iface = str((bind or {}).get("iface") or "").strip() or self._allocate_iface(code)
+        iface = str((bind or {}).get("iface") or "").strip() or await self._allocate_iface(code)
         normalized = normalize_exit_interface(iface)
         if not normalized:
             raise AgentError("VALIDATION_ERROR", f"Invalid interface name [{iface}]", 422)
@@ -940,14 +961,14 @@ class MullvadService:
         current_host = str((bind or {}).get("hostname") or "")
         healthy = False
         if bind and self._iface_up(iface):
-            healthy = self._iface_healthy(iface)
+            healthy = await maybe_await(self._iface_healthy(iface))
 
         relay = None
         if healthy and bind:
             relay = next((row for row in candidates if str(row.get("hostname") or "") == current_host), None)
         if relay is None:
             exclude = current_host if not healthy else ""
-            relay = pick_best_relay(
+            relay = await pick_best_relay(
                 candidates,
                 exclude_hostname=exclude,
                 probe=self.probe,
@@ -956,25 +977,25 @@ class MullvadService:
         if relay is None:
             relay = candidates[0]
 
-        self._apply_relay(iface, relay)
+        await self._apply_relay(iface, relay)
         self._put_binding(country_code=code, iface=iface, relay=relay, adopted=bool((bind or {}).get("adopted")))
         return self._present_binding(self.binding_for(code) or {})
 
-    def fallback_iface(self, iface: str) -> dict[str, Any] | None:
+    async def fallback_iface(self, iface: str) -> dict[str, Any] | None:
         name = str(iface or "").strip()
         if not name:
             return None
-        relays = self.fetch()
-        self.refresh_bindings(relays)
+        relays = await maybe_await(self.fetch())
+        await self.refresh_bindings(relays)
         for bind in self.bindings():
             if str(bind.get("iface") or "").strip() == name:
-                return self._fallback_one(bind, relays)
+                return await self._fallback_one(bind, relays)
         code = country_for_iface_name(name)
         if not code:
             log.warning("mullvad fallback skipped iface=%s: no country binding", name)
             return None
         bind = self.binding_for(code) or {}
-        live = self._live_peer(name) or {}
+        live = await self._live_peer(name) or {}
         hostname = str(bind.get("hostname") or "")
         if not hostname:
             match = match_relay(
@@ -992,11 +1013,11 @@ class MullvadService:
             "adopted": bool(bind.get("adopted", True)),
         }
         log.info("mullvad fallback iface=%s country=%s hostname=%s", name, code, hostname or "-")
-        return self._fallback_one(synthesized, relays)
+        return await self._fallback_one(synthesized, relays)
 
-    def fallback(self, country_code: str | None = None, *, optimize: bool = False) -> dict[str, Any]:
-        relays = self.fetch()
-        self.refresh_bindings(relays)
+    async def fallback(self, country_code: str | None = None, *, optimize: bool = False) -> dict[str, Any]:
+        relays = await maybe_await(self.fetch())
+        await self.refresh_bindings(relays)
         targets = self.bindings()
         if country_code:
             code = str(country_code).strip().lower()
@@ -1007,8 +1028,12 @@ class MullvadService:
         changed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        for bind in targets:
-            result = self._fallback_one(bind, relays, optimize=optimize)
+        results = await gather_independent(
+            *(self._fallback_one(bind, relays, optimize=optimize) for bind in targets)
+        )
+        for result in results:
+            if not isinstance(result, dict):
+                continue
             status = result.get("status")
             if status == "changed":
                 changed.append(result)
@@ -1018,13 +1043,13 @@ class MullvadService:
                 skipped.append(result)
         return {"changed": changed, "skipped": skipped, "failed": failed, "optimize": bool(optimize)}
 
-    def country_relays(self, country_code: str, *, ping: bool = True) -> dict[str, Any]:
+    async def country_relays(self, country_code: str, *, ping: bool = True) -> dict[str, Any]:
         code = str(country_code or "").strip().lower()
         if not re.fullmatch(r"[a-z]{2}", code or ""):
             raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
 
-        relays = self.fetch()
-        self.refresh_bindings(relays)
+        relays = await maybe_await(self.fetch())
+        await self.refresh_bindings(relays)
         candidates = active_relays(relays, code)
         if not candidates:
             raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
@@ -1038,7 +1063,7 @@ class MullvadService:
 
         ping_by_host: dict[str, int | None] = {}
         if ping:
-            for score, row in score_relays(
+            for score, row in await score_relays(
                 candidates,
                 probe=self.probe,
                 prefer_measured=False,
@@ -1047,7 +1072,7 @@ class MullvadService:
                 host = str(row.get("hostname") or "").strip().lower()
                 ping_by_host[host] = score if score < 40_000 else None
 
-        scored = score_relays(
+        scored = await score_relays(
             candidates,
             probe=self.probe,
             prefer_measured=False,
@@ -1079,7 +1104,7 @@ class MullvadService:
             "relays": rows,
         }
 
-    def switch_relay(
+    async def switch_relay(
         self,
         country_code: str,
         hostname: str,
@@ -1096,8 +1121,8 @@ class MullvadService:
 
         pin_fixed = bool(fixed if pin is None else pin)
 
-        relays = self.fetch()
-        self.refresh_bindings(relays)
+        relays = await maybe_await(self.fetch())
+        await self.refresh_bindings(relays)
         candidates = active_relays(relays, code)
         relay = next(
             (row for row in candidates if str(row.get("hostname") or "").strip().lower() == host.lower()),
@@ -1115,7 +1140,7 @@ class MullvadService:
             raise AgentError("VALIDATION_ERROR", f"Missing interface for {code}", 422)
 
         previous = str(bind.get("hostname") or "").strip()
-        self._apply_relay(iface, relay)
+        await self._apply_relay(iface, relay)
         self._put_binding(
             country_code=code,
             iface=iface,
@@ -1182,54 +1207,64 @@ class MullvadService:
             "message": f"relay fixed on {hostname}" if pin_fixed else f"relay unfixed for {code}",
         }
 
-    def status(self, *, probe: bool = False) -> dict[str, Any]:
+    async def status(self, *, probe: bool = False) -> dict[str, Any]:
         """Service snapshot for the panel.
 
         Default is lightweight (link + handshake + unit) — full curl egress on every
         tunnel made panel calls hit 504 during auto-update / busy Agent.
         Pass probe=True only when an explicit health check is requested.
         """
-        self.refresh_bindings()
-        rows = []
-        for bind in self.bindings():
+        await self.refresh_bindings()
+
+        async def _row(bind: dict[str, Any]) -> dict[str, Any]:
             iface = str(bind.get("iface") or "")
             up = bool(iface and self._iface_up(iface))
-            handshake = self._latest_handshake(iface) if up else None
+            handshake = await maybe_await(self._latest_handshake(iface)) if up else None
             has_handshake = bool(handshake and int(handshake) > 0)
             ok = False
             message = "interface down"
             latency = None
-            if up and probe:
-                ok, message, latency = self.egress_probe(interface=iface, runner=self.runner)
-            elif up:
-                ok = has_handshake
-                message = "handshake ok" if has_handshake else "waiting for handshake"
-            unit = self._unit_status(iface) if iface else {
+            unit = {
                 "unit": None,
                 "active": False,
                 "enabled": False,
                 "state": "missing",
             }
-            rows.append(
-                {
-                    **self._present_binding(bind),
-                    "up": up,
-                    "healthy": ok,
-                    "handshake": has_handshake,
-                    "handshake_at": handshake,
-                    "message": message if up else (unit.get("state") or message),
-                    "latency_ms": latency,
-                    "unit": unit.get("unit"),
-                    "unit_active": bool(unit.get("active")),
-                    "unit_enabled": bool(unit.get("enabled")),
-                    "service_state": unit.get("state") or ("running" if up else "stopped"),
-                }
-            )
+            if up and probe:
+                (ok, message, latency), unit = await gather_independent(
+                    maybe_await(self.egress_probe(interface=iface, runner=self.runner)),
+                    self._unit_status(iface),
+                )
+            elif up:
+                ok = has_handshake
+                message = "handshake ok" if has_handshake else "waiting for handshake"
+                unit = await self._unit_status(iface) if iface else unit
+            elif iface:
+                unit = await self._unit_status(iface)
+            return {
+                **self._present_binding(bind),
+                "up": up,
+                "healthy": ok,
+                "handshake": has_handshake,
+                "handshake_at": handshake,
+                "message": message if up else (unit.get("state") or message),
+                "latency_ms": latency,
+                "unit": unit.get("unit"),
+                "unit_active": bool(unit.get("active")),
+                "unit_enabled": bool(unit.get("enabled")),
+                "service_state": unit.get("state") or ("running" if up else "stopped"),
+            }
+
+        rows = [
+            row
+            for row in await gather_independent(*(_row(bind) for bind in self.bindings()))
+            if isinstance(row, dict)
+        ]
         settings = self.settings()
         settings.pop("private_key", None)
         return {"settings": settings, "tunnels": rows, "probed": bool(probe)}
 
-    def control_tunnel(self, iface: str, action: str) -> dict[str, Any]:
+    async def control_tunnel(self, iface: str, action: str) -> dict[str, Any]:
         """Start / stop / restart one Mullvad exit (systemd unit + live WireGuard iface)."""
         name = normalize_exit_interface(str(iface or ""))
         if not name:
@@ -1250,9 +1285,9 @@ class MullvadService:
         instance = f"agent-mullvad-wg@{name}.service"
 
         if verb == "stop":
-            self.runner(["systemctl", "stop", instance], check=False, timeout=30)
-            self.runner(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
-            unit = self._unit_status(name)
+            await self._exec(["systemctl", "stop", instance], check=False, timeout=30)
+            await self._exec(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
+            unit = await self._unit_status(name)
             return {
                 "ok": True,
                 "iface": name,
@@ -1266,18 +1301,18 @@ class MullvadService:
             }
 
         if verb == "restart":
-            self.runner(["systemctl", "stop", instance], check=False, timeout=30)
-            self.runner(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
+            await self._exec(["systemctl", "stop", instance], check=False, timeout=30)
+            await self._exec(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
 
         if not path.is_file():
             raise AgentError("NOT_FOUND", f"Mullvad conf missing for {name}", 404)
 
         # Never rewrite PrivateKey here — conf on disk is source of truth for start/restart.
         # Explicit key rotation goes through save_settings → propagate_account only.
-        self._ensure_persist_unit(name)
-        self._sync_iface(name, path)
-        start = self.runner(["systemctl", "start", instance], check=False, timeout=30)
-        unit = self._unit_status(name)
+        await self._ensure_persist_unit(name)
+        await maybe_await(self._sync_iface(name, path))
+        start = await self._exec(["systemctl", "start", instance], check=False, timeout=30)
+        unit = await self._unit_status(name)
         started = bool(unit.get("active")) or self._iface_up(name)
         if not started and getattr(start, "returncode", 1) != 0:
             raise AgentError(
@@ -1297,7 +1332,7 @@ class MullvadService:
             "binding": self._present_binding(bind) if bind else {"iface": name},
         }
 
-    def control_tunnels(self, action: str, *, ifaces: list[str] | None = None) -> dict[str, Any]:
+    async def control_tunnels(self, action: str, *, ifaces: list[str] | None = None) -> dict[str, Any]:
         verb = str(action or "").strip().lower()
         if verb not in {"start", "stop", "restart"}:
             raise AgentError("VALIDATION_ERROR", "action must be start, stop, or restart", 422)
@@ -1319,13 +1354,17 @@ class MullvadService:
 
         results: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        for iface in targets:
-            try:
-                results.append(self.control_tunnel(iface, verb))
-            except AgentError as exc:
-                errors.append({"iface": iface, "error": exc.message})
-            except Exception as exc:
-                errors.append({"iface": iface, "error": str(exc)})
+        brought = await gather_independent(
+            *(self.control_tunnel(iface, verb) for iface in targets),
+            return_exceptions=True,
+        )
+        for iface, item in zip(targets, brought):
+            if isinstance(item, AgentError):
+                errors.append({"iface": iface, "error": item.message})
+            elif isinstance(item, Exception):
+                errors.append({"iface": iface, "error": str(item)})
+            elif isinstance(item, dict):
+                results.append(item)
         return {
             "ok": errors == [],
             "action": verb,
@@ -1335,7 +1374,7 @@ class MullvadService:
             "failed_count": len(errors),
         }
 
-    def _unit_status(self, iface: str) -> dict[str, Any]:
+    async def _unit_status(self, iface: str) -> dict[str, Any]:
         name = normalize_exit_interface(str(iface or ""))
         instance = f"agent-mullvad-wg@{name}.service" if name else None
         if not name or shutil.which("systemctl") is None:
@@ -1345,8 +1384,10 @@ class MullvadService:
                 "enabled": False,
                 "state": "unavailable",
             }
-        active = self.runner(["systemctl", "is-active", instance], check=False, timeout=10)
-        enabled = self.runner(["systemctl", "is-enabled", instance], check=False, timeout=10)
+        active, enabled = await gather_independent(
+            self._exec(["systemctl", "is-active", instance], check=False, timeout=10),
+            self._exec(["systemctl", "is-enabled", instance], check=False, timeout=10),
+        )
         active_out = (getattr(active, "stdout", "") or "").strip().lower()
         enabled_out = (getattr(enabled, "stdout", "") or "").strip().lower()
         is_active = getattr(active, "returncode", 1) == 0 or active_out == "active"
@@ -1365,7 +1406,7 @@ class MullvadService:
             "state": state,
         }
 
-    def _fallback_one(
+    async def _fallback_one(
         self,
         bind: dict[str, Any],
         relays: list[dict[str, Any]],
@@ -1389,14 +1430,14 @@ class MullvadService:
 
         # Recent handshake = tunnel is exchanging data. Curl egress often flakes under
         # ads/dns/load; switching relays then kills traffic about one worker cycle later.
-        if self._iface_up(iface) and not optimize and self._has_recent_handshake(iface, max_age=180):
+        if self._iface_up(iface) and not optimize and await self._has_recent_handshake(iface, max_age=180):
             return {
                 **presented,
                 "status": "ok",
                 "message": "handshake recent — skip fallback",
             }
 
-        healthy = self._iface_up(iface) and self._iface_healthy(iface)
+        healthy = self._iface_up(iface) and await maybe_await(self._iface_healthy(iface))
         if healthy and not optimize:
             return {**presented, "status": "ok", "message": "healthy"}
 
@@ -1410,7 +1451,7 @@ class MullvadService:
 
         metric = self.relay_metric()
         if metric == RELAY_METRIC_SPEED:
-            return self._fallback_one_by_speed(
+            return await self._fallback_one_by_speed(
                 bind,
                 candidates,
                 optimize=optimize,
@@ -1419,7 +1460,7 @@ class MullvadService:
             )
 
         if optimize and healthy:
-            scored = score_relays(candidates, probe=self.probe, prefer_measured=True, metric=RELAY_METRIC_PING)
+            scored = await score_relays(candidates, probe=self.probe, prefer_measured=True, metric=RELAY_METRIC_PING)
             if not scored:
                 return {**presented, "status": "ok", "message": "healthy"}
             best_score, best = scored[0]
@@ -1458,7 +1499,7 @@ class MullvadService:
             metric,
         )
         for _ in range(attempts):
-            relay = pick_best_relay(
+            relay = await pick_best_relay(
                 candidates,
                 exclude_hostnames=tried,
                 probe=self.probe,
@@ -1476,7 +1517,7 @@ class MullvadService:
                 break
             relay_host = str(relay.get("hostname") or "").strip()
             try:
-                self._apply_relay(iface, relay)
+                await self._apply_relay(iface, relay)
                 self._put_binding(
                     country_code=code,
                     iface=iface,
@@ -1498,8 +1539,8 @@ class MullvadService:
                 }
                 wait = float(getattr(self, "handshake_wait", 0) or 0)
                 if wait > 0:
-                    time.sleep(wait)
-                if self._iface_healthy(iface):
+                    await asyncio.sleep(wait)
+                if await maybe_await(self._iface_healthy(iface)):
                     return last_changed
                 log.warning(
                     "mullvad fallback still unhealthy country=%s iface=%s hostname=%s",
@@ -1525,13 +1566,13 @@ class MullvadService:
             return last_changed
         return {**presented, "status": "failed", "message": last_error}
 
-    def _measure_iface_speed(self, iface: str) -> float | None:
-        ok, _message, mbps = curl_speed_mbps(interface=iface, runner=self.runner)
+    async def _measure_iface_speed(self, iface: str) -> float | None:
+        ok, _message, mbps = await curl_speed_mbps(interface=iface, runner=self.runner)
         if not ok or mbps is None:
             return None
         return float(mbps)
 
-    def _fallback_one_by_speed(
+    async def _fallback_one_by_speed(
         self,
         bind: dict[str, Any],
         candidates: list[dict[str, Any]],
@@ -1552,7 +1593,7 @@ class MullvadService:
             return {**presented, "status": "ok", "message": "healthy"}
 
         shortlist_n = 5 if optimize else 4
-        ranked = score_relays(
+        ranked = await score_relays(
             candidates,
             exclude_hostnames=tried,
             probe=self.probe,
@@ -1579,7 +1620,7 @@ class MullvadService:
 
         # Measure current first without switching when already healthy.
         if healthy and hostname:
-            current_mbps = self._measure_iface_speed(iface)
+            current_mbps = await self._measure_iface_speed(iface)
             if current_mbps is not None:
                 best_mbps = current_mbps
                 best_relay = next(
@@ -1606,7 +1647,7 @@ class MullvadService:
             if healthy and relay_host.lower() == hostname.lower():
                 continue
             try:
-                self._apply_relay(iface, relay)
+                await self._apply_relay(iface, relay)
                 applied_host = relay_host
                 self._put_binding(
                     country_code=code,
@@ -1623,12 +1664,12 @@ class MullvadService:
                 )
                 wait = float(getattr(self, "handshake_wait", 0) or 0)
                 if wait > 0:
-                    time.sleep(wait)
-                if not self._iface_healthy(iface):
+                    await asyncio.sleep(wait)
+                if not await maybe_await(self._iface_healthy(iface)):
                     last_error = f"egress still down after {relay_host}"
                     tried.add(relay_host.lower())
                     continue
-                mbps = self._measure_iface_speed(iface)
+                mbps = await self._measure_iface_speed(iface)
                 if mbps is None:
                     last_error = f"curl speed failed on {relay_host}"
                     tried.add(relay_host.lower())
@@ -1687,7 +1728,7 @@ class MullvadService:
             )
             if current_relay is not None and applied_host.lower() != hostname.lower():
                 try:
-                    self._apply_relay(iface, current_relay)
+                    await self._apply_relay(iface, current_relay)
                     self._put_binding(
                         country_code=code,
                         iface=iface,
@@ -1712,7 +1753,7 @@ class MullvadService:
 
         if applied_host.lower() != best_host.lower():
             try:
-                self._apply_relay(iface, best_relay)
+                await self._apply_relay(iface, best_relay)
                 self._put_binding(
                     country_code=code,
                     iface=iface,
@@ -1741,12 +1782,12 @@ class MullvadService:
             "message": f"switched to {best_host} ({best_mbps} Mbps via curl --interface {iface})",
         }
 
-    def _allocate_iface(self, country_code: str) -> str:
+    async def _allocate_iface(self, country_code: str) -> str:
         preferred = preferred_iface(country_code)
         used = {str(row.get("iface") or "").strip() for row in self.bindings()}
         if preferred not in used:
             parsed = read_conf(conf_path(self.config_dir, preferred))
-            if parsed is None or self._conf_looks_mullvad(parsed):
+            if parsed is None or await self._conf_looks_mullvad(parsed):
                 return preferred
             raise AgentError(
                 "CONFLICT",
@@ -1755,9 +1796,9 @@ class MullvadService:
             )
         raise AgentError("CONFLICT", f"Country {country_code} already has an interface", 409)
 
-    def _conf_looks_mullvad(self, parsed: dict[str, Any]) -> bool:
+    async def _conf_looks_mullvad(self, parsed: dict[str, Any]) -> bool:
         try:
-            catalog = self.fetch()
+            catalog = await maybe_await(self.fetch())
         except AgentError:
             return False
         peers = parsed.get("peers") or []
@@ -1765,7 +1806,7 @@ class MullvadService:
             return False
         return match_relay(catalog, pubkey=str(peers[0].get("PublicKey") or ""), endpoint_host=str(peers[0].get("Endpoint") or "")) is not None
 
-    def _apply_relay(self, iface: str, relay: dict[str, Any]) -> None:
+    async def _apply_relay(self, iface: str, relay: dict[str, Any]) -> None:
         settings = self.settings()
         path = conf_path(self.config_dir, iface)
         parsed = read_conf(path) or {"interface": {}, "peers": []}
@@ -1803,9 +1844,9 @@ class MullvadService:
         parsed = {"interface": interface, "peers": [peer]}
         self.config_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(dump_wg_conf(parsed), encoding="utf-8")
-        self._sync_iface(iface, path)
+        await maybe_await(self._sync_iface(iface, path))
         try:
-            self._ensure_persist_unit(iface)
+            await self._ensure_persist_unit(iface)
         except Exception as exc:
             log.warning("mullvad persist unit failed iface=%s: %s", iface, exc)
         # Seed account settings from conf only when missing — never wipe relay_metric.
@@ -1822,7 +1863,7 @@ class MullvadService:
                 seeded["selection_mode"] = mode
             self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, seeded)
 
-    def restore_interfaces(self) -> dict[str, Any]:
+    async def restore_interfaces(self) -> dict[str, Any]:
         restored: list[str] = []
         persisted: list[str] = []
         failed: list[str] = []
@@ -1833,16 +1874,16 @@ class MullvadService:
             path = conf_path(self.config_dir, iface)
             try:
                 if path.is_file() and not self._iface_up(iface):
-                    self._sync_iface(iface, path)
+                    await maybe_await(self._sync_iface(iface, path))
                     restored.append(iface)
-                if self._ensure_persist_unit(iface).get("ok"):
+                if await self._ensure_persist_unit(iface).get("ok"):
                     persisted.append(iface)
             except Exception as exc:
                 log.warning("mullvad restore failed iface=%s: %s", iface, exc)
                 failed.append(iface)
         return {"restored": restored, "persisted": persisted, "failed": failed}
 
-    def _ensure_persist_unit(self, iface: str) -> dict[str, Any]:
+    async def _ensure_persist_unit(self, iface: str) -> dict[str, Any]:
         name = normalize_exit_interface(iface)
         if not name:
             return {"ok": False, "skipped": True, "reason": "invalid iface"}
@@ -1866,36 +1907,36 @@ class MullvadService:
             if previous_unit != unit_text:
                 self.persist_unit_path.write_text(unit_text, encoding="utf-8")
             if changed:
-                self.runner(["systemctl", "daemon-reload"], check=False, timeout=30)
+                await self._exec(["systemctl", "daemon-reload"], check=False, timeout=30)
         except OSError as exc:
             log.warning("mullvad persist unit write failed: %s", exc)
             return {"ok": False, "skipped": False, "reason": str(exc)}
 
         instance = f"agent-mullvad-wg@{name}.service"
-        self.runner(["systemctl", "disable", f"wg-quick@{name}.service"], check=False, timeout=30)
-        enabled = self.runner(["systemctl", "is-enabled", instance], check=False, timeout=10)
+        await self._exec(["systemctl", "disable", f"wg-quick@{name}.service"], check=False, timeout=30)
+        enabled = await self._exec(["systemctl", "is-enabled", instance], check=False, timeout=10)
         if getattr(enabled, "returncode", 1) != 0:
-            self.runner(["systemctl", "enable", instance], check=False, timeout=30)
-        active = self.runner(["systemctl", "is-active", instance], check=False, timeout=10)
+            await self._exec(["systemctl", "enable", instance], check=False, timeout=30)
+        active = await self._exec(["systemctl", "is-active", instance], check=False, timeout=10)
         started = getattr(active, "returncode", 1) == 0
         if not started:
-            start = self.runner(["systemctl", "start", instance], check=False, timeout=30)
+            start = await self._exec(["systemctl", "start", instance], check=False, timeout=30)
             started = getattr(start, "returncode", 1) == 0
         return {"ok": True, "unit": instance, "started": started}
 
-    def _sync_iface(self, iface: str, path: Path) -> None:
-        stripped = self._stripped_conf(iface, path)
+    async def _sync_iface(self, iface: str, path: Path) -> None:
+        stripped = await self._stripped_conf(iface, path)
         existed = self._iface_up(iface)
         if not existed:
-            self._create_wg_link(iface)
-        self._wg_apply_conf(iface, stripped)
-        self._link_up(iface)
-        self._assign_tunnel_address(iface, path)
+            await self._create_wg_link(iface)
+        await self._wg_apply_conf(iface, stripped)
+        await self._link_up(iface)
+        await self._assign_tunnel_address(iface, path)
 
-    def _stripped_conf(self, iface: str, path: Path) -> str:
-        strip = self.runner(["wg-quick", "strip", str(path)], check=False, timeout=15)
+    async def _stripped_conf(self, iface: str, path: Path) -> str:
+        strip = await self._exec(["wg-quick", "strip", str(path)], check=False, timeout=15)
         if getattr(strip, "returncode", 1) != 0:
-            strip = self.runner(["wg-quick", "strip", iface], check=False, timeout=15)
+            strip = await self._exec(["wg-quick", "strip", iface], check=False, timeout=15)
         stripped = (getattr(strip, "stdout", "") or "").strip()
         if getattr(strip, "returncode", 1) != 0 or not stripped:
             raise AgentError("EXEC_ERROR", f"wg-quick strip failed for {iface}", 500)
@@ -1912,8 +1953,8 @@ class MullvadService:
             or "already assigned" in text
         )
 
-    def _create_wg_link(self, iface: str) -> None:
-        add = self.runner(["ip", "link", "add", "name", iface, "type", "wireguard"], check=False, timeout=10)
+    async def _create_wg_link(self, iface: str) -> None:
+        add = await self._exec(["ip", "link", "add", "name", iface, "type", "wireguard"], check=False, timeout=10)
         if getattr(add, "returncode", 1) == 0 or self._iface_up(iface):
             return
         err = self._proc_err(add, f"ip link add {iface} failed")
@@ -1921,13 +1962,13 @@ class MullvadService:
             return
         raise AgentError("EXEC_ERROR", err, 500)
 
-    def _wg_apply_conf(self, iface: str, stripped: str) -> None:
+    async def _wg_apply_conf(self, iface: str, stripped: str) -> None:
         tmp = Path(str(self.config_dir / iface) + ".sync")
         tmp.write_text(stripped + "\n", encoding="utf-8")
         try:
-            applied = self.runner(["wg", "setconf", iface, str(tmp)], check=False, timeout=15)
+            applied = await self._exec(["wg", "setconf", iface, str(tmp)], check=False, timeout=15)
             if getattr(applied, "returncode", 1) != 0:
-                applied = self.runner(["wg", "syncconf", iface, str(tmp)], check=False, timeout=15)
+                applied = await self._exec(["wg", "syncconf", iface, str(tmp)], check=False, timeout=15)
             if getattr(applied, "returncode", 1) != 0:
                 raise AgentError("EXEC_ERROR", self._proc_err(applied, f"wg setconf {iface} failed"), 500)
         finally:
@@ -1936,13 +1977,13 @@ class MullvadService:
             except OSError:
                 pass
 
-    def _link_up(self, iface: str) -> None:
-        result = self.runner(["ip", "link", "set", "dev", iface, "up"], check=False, timeout=10)
+    async def _link_up(self, iface: str) -> None:
+        result = await self._exec(["ip", "link", "set", "dev", iface, "up"], check=False, timeout=10)
         if getattr(result, "returncode", 1) == 0:
             return
         raise AgentError("EXEC_ERROR", self._proc_err(result, f"ip link set {iface} up failed"), 500)
 
-    def _assign_tunnel_address(self, iface: str, path: Path) -> None:
+    async def _assign_tunnel_address(self, iface: str, path: Path) -> None:
         parsed = read_conf(path) or {}
         address = str((parsed.get("interface") or {}).get("Address") or "").strip()
         if not address:
@@ -1954,7 +1995,7 @@ class MullvadService:
             if "/" not in cidr:
                 cidr = f"{cidr}/32"
             family = "-6" if ":" in cidr.split("/", 1)[0] else "-4"
-            result = self.runner(
+            result = await self._exec(
                 ["ip", family, "addr", "add", cidr, "dev", iface],
                 check=False,
                 timeout=10,
@@ -1969,22 +2010,22 @@ class MullvadService:
     def _iface_up(self, iface: str) -> bool:
         return Path(f"/sys/class/net/{iface}").is_dir()
 
-    def _iface_healthy(self, iface: str) -> bool:
-        ok, message, _latency = self.egress_probe(interface=iface, runner=self.runner)
+    async def _iface_healthy(self, iface: str) -> bool:
+        ok, message, _latency = await maybe_await(self.egress_probe(interface=iface, runner=self.runner))
         if ok:
             return True
         log.info("mullvad egress down iface=%s: %s", iface, message)
         return False
 
-    def _has_recent_handshake(self, iface: str, *, max_age: int = 180) -> bool:
-        handshake = self._latest_handshake(iface)
+    async def _has_recent_handshake(self, iface: str, *, max_age: int = 180) -> bool:
+        handshake = await maybe_await(self._latest_handshake(iface))
         if not handshake or int(handshake) <= 0:
             return False
         age = max(0, int(time.time()) - int(handshake))
         return age <= max(1, int(max_age))
 
-    def _latest_handshake(self, iface: str) -> int | None:
-        result = self.runner(["wg", "show", iface, "latest-handshakes"], check=False, timeout=5)
+    async def _latest_handshake(self, iface: str) -> int | None:
+        result = await self._exec(["wg", "show", iface, "latest-handshakes"], check=False, timeout=5)
         if getattr(result, "returncode", 1) != 0:
             return None
         newest = 0
@@ -1999,26 +2040,26 @@ class MullvadService:
             newest = max(newest, ts)
         return newest or None
 
-    def _scan_interfaces(self) -> list[tuple[str, dict[str, Any], dict[str, str] | None]]:
+    async def _scan_interfaces(self) -> list[tuple[str, dict[str, Any], dict[str, str] | None]]:
         names: set[str] = set()
         if self.config_dir.is_dir():
             for path in self.config_dir.glob("*.conf"):
                 names.add(path.stem)
-        listed = self.runner(["wg", "show", "interfaces"], check=False, timeout=5)
+        listed = await self._exec(["wg", "show", "interfaces"], check=False, timeout=5)
         if getattr(listed, "returncode", 0) == 0:
             for name in (getattr(listed, "stdout", "") or "").split():
                 if name.strip():
                     names.add(name.strip())
+        wanted = [name for name in sorted(names) if normalize_exit_interface(name)]
+        peers = await gather_independent(*(maybe_await(self._live_peer(name)) for name in wanted))
         rows: list[tuple[str, dict[str, Any], dict[str, str] | None]] = []
-        for name in sorted(names):
-            if not normalize_exit_interface(name):
-                continue
+        for name, live in zip(wanted, peers):
             parsed = read_conf(conf_path(self.config_dir, name)) or {"interface": {}, "peers": []}
-            rows.append((name, parsed, self._live_peer(name)))
+            rows.append((name, parsed, live if isinstance(live, dict) else None))
         return rows
 
-    def _live_peer(self, iface: str) -> dict[str, str] | None:
-        dump = self.runner(["wg", "show", iface, "dump"], check=False, timeout=5)
+    async def _live_peer(self, iface: str) -> dict[str, str] | None:
+        dump = await self._exec(["wg", "show", iface, "dump"], check=False, timeout=5)
         if getattr(dump, "returncode", 1) != 0:
             return None
         lines = [line for line in (getattr(dump, "stdout", "") or "").splitlines() if line.strip()]
@@ -2096,8 +2137,8 @@ class MullvadService:
             "last_error": str(bind.get("last_error") or "") or None,
         }
 
-    def _discover_address(self) -> str:
-        for _iface, parsed, _live in self._scan_interfaces():
+    async def _discover_address(self) -> str:
+        for _iface, parsed, _live in await self._scan_interfaces():
             address = str((parsed.get("interface") or {}).get("Address") or "").strip()
             if address:
                 return address

@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import shutil
 import socket
 import subprocess
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import urlparse
 
+from agent.asyncutil import bounded_gather, gather_independent, maybe_await
 from agent.errors import AgentError
 from agent.support.host_interfaces import list_host_interfaces
-from agent.support.process import run
+from agent.support.process import execute
 
 Runner = Callable[..., Any]
 
@@ -67,18 +67,16 @@ SPEED_MAX_TIME = 12
 # Mullvad exits use Table=off: peer traffic works via policy routing, but host
 # curl --interface needs a temporary /32 via that device. Lock per destination so
 # parallel probes can proceed on distinct IPs without thrashing the same route.
-_probe_route_locks_guard = threading.Lock()
-_probe_route_locks: dict[str, threading.Lock] = {}
+_probe_route_locks: dict[str, asyncio.Lock] = {}
 
 
-def _route_lock_for(dest: str) -> threading.Lock:
+def _route_lock_for(dest: str) -> asyncio.Lock:
     key = str(dest or '').strip() or '*'
-    with _probe_route_locks_guard:
-        lock = _probe_route_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _probe_route_locks[key] = lock
-        return lock
+    lock = _probe_route_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _probe_route_locks[key] = lock
+    return lock
 
 
 def _rotated_probe_urls(start_index: int = 0, *, limit: int | None = None) -> list[str]:
@@ -102,13 +100,12 @@ def _http_code_means_egress(http_code: int) -> bool:
     return 100 <= int(http_code or 0) < 600
 
 
-def _wg_latest_handshake(iface: str, *, runner: Runner | None = None) -> int | None:
+async def _wg_latest_handshake(iface: str, *, runner: Runner | None = None) -> int | None:
     name = str(iface or '').strip()
     if not name or _looks_like_ip(name) or not shutil.which('wg'):
         return None
-    execute = _runner(runner)
     try:
-        result = execute(['wg', 'show', name, 'latest-handshakes'], check=False, timeout=5)
+        result = await execute(runner, ['wg', 'show', name, 'latest-handshakes'], check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
     raw_code = getattr(result, 'returncode', 1)
@@ -127,13 +124,13 @@ def _wg_latest_handshake(iface: str, *, runner: Runner | None = None) -> int | N
     return newest or None
 
 
-def _wg_has_recent_handshake(
+async def _wg_has_recent_handshake(
     iface: str,
     *,
     runner: Runner | None = None,
     max_age: int = HANDSHAKE_ONLINE_MAX_AGE,
 ) -> bool:
-    handshake = _wg_latest_handshake(iface, runner=runner)
+    handshake = await _wg_latest_handshake(iface, runner=runner)
     if not handshake or int(handshake) <= 0:
         return False
     age = max(0, int(time.time()) - int(handshake))
@@ -170,14 +167,13 @@ def _parse_wg_endpoint(raw: str) -> tuple[str, int] | None:
     return host, port
 
 
-def _wg_relay_ipv4(iface: str | None, *, runner: Runner | None = None) -> str | None:
+async def _wg_relay_ipv4(iface: str | None, *, runner: Runner | None = None) -> str | None:
     """Peer/relay IPv4 from ``wg show <iface> endpoints``."""
     name = str(iface or '').strip()
     if not name or _looks_like_ip(name) or not shutil.which('wg'):
         return None
-    execute = _runner(runner)
     try:
-        result = execute(['wg', 'show', name, 'endpoints'], check=False, timeout=5)
+        result = await execute(runner, ['wg', 'show', name, 'endpoints'], check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
     raw_code = getattr(result, 'returncode', 1)
@@ -210,7 +206,7 @@ def _parse_ping_ms(body: str) -> int | None:
         return None
 
 
-def _run_ping_ms(
+async def _run_ping_ms(
     dest: str,
     *,
     interface: str | None = None,
@@ -219,7 +215,6 @@ def _run_ping_ms(
 ) -> int | None:
     if not dest or not shutil.which('ping'):
         return None
-    execute = _runner(runner)
     cmd = ['ping', '-4', '-n', '-c', '1', '-W', str(PING_WAIT_SECONDS)]
     bind = str(interface or '').strip()
     if bind:
@@ -228,10 +223,10 @@ def _run_ping_ms(
 
     try:
         if via_iface_route and bind and not _looks_like_ip(bind):
-            with _host_routes_for_iface(bind, [dest], runner=execute):
-                result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
+            async with _host_routes_for_iface(bind, [dest], runner=runner):
+                result = await execute(runner, cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
         else:
-            result = execute(cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
+            result = await execute(runner, cmd, check=False, timeout=PING_WAIT_SECONDS + 2)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -239,7 +234,7 @@ def _run_ping_ms(
     return _parse_ping_ms(body)
 
 
-def _iface_ping_ms(
+async def _iface_ping_ms(
     interface: str | None,
     *,
     runner: Runner | None = None,
@@ -251,25 +246,25 @@ def _iface_ping_ms(
     (that would try to reach the peer through the tunnel). Fallback ``8.8.8.8``
     still uses a temp host route so ICMP egresses through the exit iface.
     """
-    bind = _resolve_curl_bind(interface, runner=runner)
+    bind = await _resolve_curl_bind(interface, runner=runner)
     if not bind:
         return None
 
     explicit = str(target or '').strip()
-    relay = explicit or _wg_relay_ipv4(bind if not _looks_like_ip(bind) else str(interface or ''), runner=runner)
+    relay = explicit or await _wg_relay_ipv4(bind if not _looks_like_ip(bind) else str(interface or ''), runner=runner)
 
     if relay:
         # Best path: ping the node's own Mullvad/WG relay.
-        latency = _run_ping_ms(relay, interface=bind, runner=runner, via_iface_route=False)
+        latency = await _run_ping_ms(relay, interface=bind, runner=runner, via_iface_route=False)
         if latency is not None:
             return latency
         # Some hosts reject -I on WG for endpoint probes — plain ping to relay.
-        latency = _run_ping_ms(relay, interface=None, runner=runner, via_iface_route=False)
+        latency = await _run_ping_ms(relay, interface=None, runner=runner, via_iface_route=False)
         if latency is not None:
             return latency
 
     # Non-WG / missing endpoint: egress ping through the iface to a public IP.
-    return _run_ping_ms(
+    return await _run_ping_ms(
         PING_FALLBACK_TARGET,
         interface=bind,
         runner=runner,
@@ -277,7 +272,7 @@ def _iface_ping_ms(
     )
 
 
-def _handshake_online_result(
+async def _handshake_online_result(
     iface: str,
     *,
     runner: Runner | None = None,
@@ -285,19 +280,15 @@ def _handshake_online_result(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         'ok': True,
-        'message': 'تونل آنلاین (handshake)',
+        'message': 'tunnel online (handshake)',
         'interface': iface,
         'via': 'handshake',
     }
-    ping_ms = latency_ms if latency_ms is not None else _iface_ping_ms(iface, runner=runner)
+    ping_ms = latency_ms if latency_ms is not None else await _iface_ping_ms(iface, runner=runner)
     if ping_ms is not None:
         result['latency_ms'] = ping_ms
-        result['message'] = 'تونل آنلاین (handshake)'
+        result['message'] = 'tunnel online (handshake)'
     return result
-
-
-def _runner(runner: Runner | None) -> Runner:
-    return runner or run
 
 
 def _url_host(url: str) -> str | None:
@@ -309,9 +300,10 @@ def _url_host(url: str) -> str | None:
     return text or None
 
 
-def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
+async def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
     resolved: list[str] = []
     seen: set[str] = set()
+    loop = asyncio.get_running_loop()
     for host in hosts:
         text = str(host or '').strip()
         if not text:
@@ -327,7 +319,7 @@ def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
         except ValueError:
             pass
         try:
-            infos = socket.getaddrinfo(text, None, socket.AF_INET, socket.SOCK_STREAM)
+            infos = await loop.getaddrinfo(text, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
         except OSError:
             continue
         for info in infos:
@@ -339,24 +331,25 @@ def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
     return resolved
 
 
-def _ip_route_replace_dev(
+async def _ip_route_replace_dev(
     dest: str,
     iface: str,
     *,
-    runner: Runner,
+    runner: Runner | None = None,
     src: str | None = None,
 ) -> bool:
     cmd = ['ip', 'route', 'replace', f'{dest}/32', 'dev', iface]
     source = str(src or '').strip()
     if source and _looks_like_ip(source):
         cmd.extend(['src', source])
-    result = runner(cmd, check=False, timeout=5)
+    result = await execute(runner, cmd, check=False, timeout=5)
     code = getattr(result, 'returncode', 1)
     return int(0 if code is None else code) == 0
 
 
-def _ip_route_del_dev(dest: str, iface: str, *, runner: Runner) -> None:
-    runner(
+async def _ip_route_del_dev(dest: str, iface: str, *, runner: Runner | None = None) -> None:
+    await execute(
+        runner,
         ['ip', 'route', 'del', f'{dest}/32', 'dev', iface],
         check=False,
         timeout=5,
@@ -369,36 +362,34 @@ def _curl_interface_arg(bind: str | None) -> str | None:
     return text or None
 
 
-@contextmanager
-def _host_routes_for_iface(
+@asynccontextmanager
+async def _host_routes_for_iface(
     iface: str | None,
     destinations: list[str],
     *,
     runner: Runner | None = None,
-) -> Iterator[None]:
+) -> AsyncIterator[None]:
     """Install temporary /32 routes so curl --interface works with Table=off WG."""
     bind = str(iface or '').strip()
-    execute = _runner(runner)
     if not bind or _looks_like_ip(bind) or not shutil.which('ip'):
         yield
         return
 
-    hosts = _resolve_ipv4_hosts(destinations)
+    hosts = await maybe_await(_resolve_ipv4_hosts(destinations))
     if not hosts:
         yield
         return
 
-    # Acquire destination locks in sorted order to avoid deadlocks across threads.
     ordered = sorted(set(hosts))
     locks = [_route_lock_for(dest) for dest in ordered]
     for lock in locks:
-        lock.acquire()
+        await lock.acquire()
     installed: list[str] = []
-    src = next(iter(sorted(_interface_addresses(bind, runner=execute))), None)
+    src = next(iter(sorted(await _interface_addresses(bind, runner=runner))), None)
     try:
         for dest in ordered:
             try:
-                if _ip_route_replace_dev(dest, bind, runner=execute, src=src):
+                if await _ip_route_replace_dev(dest, bind, runner=runner, src=src):
                     installed.append(dest)
             except Exception:
                 continue
@@ -406,25 +397,25 @@ def _host_routes_for_iface(
     finally:
         for dest in installed:
             try:
-                _ip_route_del_dev(dest, bind, runner=execute)
+                await _ip_route_del_dev(dest, bind, runner=runner)
             except Exception:
                 pass
         for lock in reversed(locks):
             lock.release()
 
 
-def _interface_row(name: str, *, runner: Runner | None = None) -> dict[str, Any] | None:
+async def _interface_row(name: str, *, runner: Runner | None = None) -> dict[str, Any] | None:
     target = str(name or '').strip()
     if not target:
         return None
-    for row in list_host_interfaces(runner=runner):
+    for row in await maybe_await(list_host_interfaces(runner=runner)):
         if str(row.get('name') or '').strip() == target:
             return row
     return None
 
 
-def _interface_addresses(name: str, *, runner: Runner | None = None) -> set[str]:
-    row = _interface_row(name, runner=runner)
+async def _interface_addresses(name: str, *, runner: Runner | None = None) -> set[str]:
+    row = await _interface_row(name, runner=runner)
     if row is None:
         return set()
 
@@ -444,7 +435,7 @@ def _interface_addresses(name: str, *, runner: Runner | None = None) -> set[str]
     return addresses
 
 
-def _resolve_curl_bind(target: str | None, *, runner: Runner | None = None) -> str | None:
+async def _resolve_curl_bind(target: str | None, *, runner: Runner | None = None) -> str | None:
     bind = str(target or '').strip()
     if not bind:
         return None
@@ -455,7 +446,7 @@ def _resolve_curl_bind(target: str | None, *, runner: Runner | None = None) -> s
     except ValueError:
         pass
 
-    row = _interface_row(bind, runner=runner)
+    row = await _interface_row(bind, runner=runner)
     if row is None:
         return bind
 
@@ -465,7 +456,7 @@ def _resolve_curl_bind(target: str | None, *, runner: Runner | None = None) -> s
     return bind
 
 
-def _bind_targets_equivalent(left: str | None, right: str | None, *, runner: Runner | None = None) -> bool:
+async def _bind_targets_equivalent(left: str | None, right: str | None, *, runner: Runner | None = None) -> bool:
     a = str(left or '').strip()
     b = str(right or '').strip()
     if not a or not b:
@@ -486,10 +477,10 @@ def _bind_targets_equivalent(left: str | None, right: str | None, *, runner: Run
     if a_ip and b_ip:
         return a_ip == b_ip
 
-    if a_ip and _interface_addresses(b, runner=runner) == {a_ip}:
+    if a_ip and await _interface_addresses(b, runner=runner) == {a_ip}:
         return True
 
-    if b_ip and _interface_addresses(a, runner=runner) == {b_ip}:
+    if b_ip and await _interface_addresses(a, runner=runner) == {b_ip}:
         return True
 
     return False
@@ -515,17 +506,16 @@ def _parse_curl_write_out(body: str) -> tuple[int, int | None]:
     return http_code, latency_ms
 
 
-def _curl_probe(
+async def _curl_probe(
     *,
     interface: str | None = None,
     runner: Runner | None = None,
     start_index: int = 0,
 ) -> tuple[bool, str, int | None]:
-    execute = _runner(runner)
     if not shutil.which('curl'):
-        return False, 'curl در Agent موجود نیست', None
+        return False, 'curl is not installed on the agent', None
 
-    bind = _resolve_curl_bind(interface, runner=runner)
+    bind = await _resolve_curl_bind(interface, runner=runner)
     errors: list[str] = []
     per_try_timeout = PROBE_TIMEOUT + CONNECT_TIMEOUT + 2
     urls = _rotated_probe_urls(start_index, limit=MAX_PROBE_ATTEMPTS)
@@ -533,7 +523,7 @@ def _curl_probe(
     # Install one /32 at a time so parallel probes on different IPs can overlap.
     for url in urls:
         host = _url_host(url)
-        with _host_routes_for_iface(bind, [host] if host else [], runner=execute):
+        async with _host_routes_for_iface(bind, [host] if host else [], runner=runner):
             cmd = [
                 'curl',
                 '-4',
@@ -553,7 +543,7 @@ def _curl_probe(
                 cmd[1:1] = ['--interface', curl_bind]
 
             try:
-                result = execute(cmd, check=False, timeout=per_try_timeout)
+                result = await execute(runner, cmd, check=False, timeout=per_try_timeout)
             except subprocess.TimeoutExpired:
                 errors.append(f'Connection timed out after {per_try_timeout}s ({url})')
                 continue
@@ -569,7 +559,7 @@ def _curl_probe(
             if code == 0:
                 http_code, latency_ms = _parse_curl_write_out(body)
                 if _http_code_means_egress(http_code):
-                    return True, 'اتصال برقرار شد', latency_ms
+                    return True, 'connection established', latency_ms
                 errors.append(f'HTTP {http_code or "?"}')
                 continue
 
@@ -581,7 +571,7 @@ def _curl_probe(
             if code in BIND_ERROR_CODES or 'bind' in stderr.lower() or 'interface' in stderr.lower():
                 break
 
-    detail = errors[-1] if errors else 'اتصال برقرار نشد'
+    detail = errors[-1] if errors else 'connection failed'
     return False, detail, None
 
 
@@ -602,7 +592,7 @@ def _parse_curl_speed(body: str) -> tuple[int, float | None]:
     return http_code, speed_bps
 
 
-def curl_speed_mbps(
+async def curl_speed_mbps(
     *,
     interface: str | None = None,
     runner: Runner | None = None,
@@ -613,14 +603,13 @@ def curl_speed_mbps(
     Mullvad exits share one tunnel Address (same private key). Binding by IP is
     ambiguous; always pass the WireGuard interface name (e.g. ``us``, ``de``).
     """
-    execute = _runner(runner)
     if not shutil.which('curl'):
-        return False, 'curl در Agent موجود نیست', None
+        return False, 'curl is not installed on the agent', None
 
     # Keep the iface name as-is — do not resolve to the shared tunnel IP.
     bind = str(interface or '').strip()
     if not bind:
-        return False, 'نام اینترفیس مشخص نیست', None
+        return False, 'interface name is missing', None
 
     host = _url_host(url)
     destinations = [host] if host else []
@@ -640,9 +629,9 @@ def curl_speed_mbps(
         '%{http_code} %{speed_download}',
         url,
     ]
-    with _host_routes_for_iface(bind, destinations, runner=execute):
+    async with _host_routes_for_iface(bind, destinations, runner=runner):
         try:
-            result = execute(cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
+            result = await execute(runner, cmd, check=False, timeout=SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2)
         except subprocess.TimeoutExpired:
             return False, f'timeout after {SPEED_MAX_TIME + SPEED_CONNECT_TIMEOUT + 2}s', None
         except OSError as exc:
@@ -664,17 +653,19 @@ def curl_speed_mbps(
     return True, f'{mbps} Mbps', mbps
 
 
-def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str, int | None]:
+async def _tcp_probe(host: str, port: int, *, timeout: float = 5.0) -> tuple[bool, str, int | None]:
     host = str(host or '').strip()
     if not host or port <= 0:
-        return False, 'آدرس/پورت نامعتبر', None
+        return False, 'invalid address/port', None
     started = time.perf_counter()
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-            return True, 'TCP متصل شد', latency_ms
-    except OSError as exc:
-        return False, str(exc) or 'TCP ناموفق', None
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
+        return True, 'TCP connected', latency_ms
+    except (OSError, asyncio.TimeoutError) as exc:
+        return False, str(exc) or 'TCP failed', None
 
 
 def _find_outbound(tag: str, outbounds: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -732,7 +723,7 @@ def _looks_like_ip(value: str) -> bool:
         return False
 
 
-def _interfaces_sharing_address(address: str, *, runner: Runner | None = None) -> list[str]:
+async def _interfaces_sharing_address(address: str, *, runner: Runner | None = None) -> list[str]:
     needle = str(address or '').strip()
     if not needle:
         return []
@@ -742,7 +733,7 @@ def _interfaces_sharing_address(address: str, *, runner: Runner | None = None) -
         return []
 
     names: list[str] = []
-    for row in list_host_interfaces(runner=runner):
+    for row in await maybe_await(list_host_interfaces(runner=runner)):
         name = str(row.get('name') or '').strip()
         if not name:
             continue
@@ -760,7 +751,7 @@ def _interfaces_sharing_address(address: str, *, runner: Runner | None = None) -
     return names
 
 
-def _prefer_named_bind(
+async def _prefer_named_bind(
     bind: str | None,
     preferred_iface: str | None,
     *,
@@ -773,14 +764,14 @@ def _prefer_named_bind(
         return preferred
     if not current or not _looks_like_ip(current):
         return current
-    owners = _interfaces_sharing_address(current, runner=runner)
+    owners = await _interfaces_sharing_address(current, runner=runner)
     if len(owners) == 1:
         return owners[0]
     # Shared Address across Mullvad exits — IP bind is ambiguous.
     return current
 
 
-def _should_skip_exit_interface_check(
+async def _should_skip_exit_interface_check(
     outbound_tag: str | None,
     exit_interface: str | None,
     outbounds: list[dict[str, Any]],
@@ -810,11 +801,11 @@ def _should_skip_exit_interface_check(
     if not bind and not iface:
         return False
 
-    preferred = _prefer_named_bind(bind, iface, runner=runner)
+    preferred = await _prefer_named_bind(bind, iface, runner=runner)
     return preferred == iface
 
 
-def probe_exit_interface(
+async def probe_exit_interface(
     name: str,
     *,
     runner: Runner | None = None,
@@ -822,20 +813,22 @@ def probe_exit_interface(
 ) -> dict[str, Any]:
     iface = str(name or '').strip()
     if not iface:
-        return {'ok': False, 'message': 'exit_interface تنظیم نشده'}
+        return {'ok': False, 'message': 'exit_interface is not set'}
 
-    row = _interface_row(iface, runner=runner)
+    row = await _interface_row(iface, runner=runner)
     if row is None:
-        return {'ok': False, 'message': f'اینترفیس {iface} یافت نشد'}
+        return {'ok': False, 'message': f'interface {iface} was not found'}
     if row.get('is_up') is False:
-        return {'ok': False, 'message': f'اینترفیس {iface} down است'}
+        return {'ok': False, 'message': f'interface {iface} is down'}
 
-    # Traffic path = curl; panel ping = ping -I (never curl time_total).
-    ok, message, _curl_latency = _curl_probe(interface=iface, runner=runner, start_index=start_index)
-    ping_ms = _iface_ping_ms(iface, runner=runner)
+    # Traffic path = curl; panel ping = ping -I. Independent, so they overlap.
+    (ok, message, _curl_latency), ping_ms = await gather_independent(
+        _curl_probe(interface=iface, runner=runner, start_index=start_index),
+        maybe_await(_iface_ping_ms(iface, runner=runner)),
+    )
 
     if ok:
-        row: dict[str, Any] = {
+        row = {
             'ok': True,
             'message': message,
             'interface': iface,
@@ -846,8 +839,8 @@ def probe_exit_interface(
         return row
 
     # Curl egress flake on Table=off Mullvad — recent handshake = interface online.
-    if _wg_has_recent_handshake(iface, runner=runner):
-        return _handshake_online_result(iface, runner=runner, latency_ms=ping_ms)
+    if await _wg_has_recent_handshake(iface, runner=runner):
+        return await _handshake_online_result(iface, runner=runner, latency_ms=ping_ms)
 
     failed: dict[str, Any] = {'ok': False, 'message': message, 'interface': iface}
     if ping_ms is not None:
@@ -855,7 +848,7 @@ def probe_exit_interface(
     return failed
 
 
-def probe_outbound_tag(
+async def probe_outbound_tag(
     tag: str,
     outbounds: list[dict[str, Any]],
     *,
@@ -865,43 +858,41 @@ def probe_outbound_tag(
 ) -> dict[str, Any]:
     needle = str(tag or '').strip()
     if not needle:
-        return {'ok': False, 'message': 'outbound_tag تنظیم نشده'}
+        return {'ok': False, 'message': 'outbound_tag is not set'}
 
     outbound = _find_outbound(needle, outbounds)
     if outbound is None:
-        return {'ok': False, 'message': f'اوتباند {needle} در Agent یافت نشد'}
+        return {'ok': False, 'message': f'outbound {needle} was not found on the agent'}
 
     protocol = str(outbound.get('protocol') or '').strip().lower()
     bind_iface = _resolve_bind_interface(outbound) or str(fallback_interface or '').strip()
 
     if protocol == 'blackhole':
-        return {'ok': False, 'message': 'اوتباند blackhole است'}
+        return {'ok': False, 'message': 'outbound is blackhole'}
 
     if protocol == 'freedom':
         if not bind_iface and not str(fallback_interface or '').strip():
-            return {'ok': False, 'message': 'اوتباند freedom بدون sendThrough/interface قابل تست نیست'}
+            return {'ok': False, 'message': 'freedom outbound cannot be tested without sendThrough/interface'}
         # Mullvad exits share one tunnel Address — always probe by iface name when known.
-        bind_iface = _prefer_named_bind(bind_iface, fallback_interface, runner=runner)
+        bind_iface = await _prefer_named_bind(bind_iface, fallback_interface, runner=runner)
         if not bind_iface:
-            return {'ok': False, 'message': 'اوتباند freedom بدون sendThrough/interface قابل تست نیست'}
+            return {'ok': False, 'message': 'freedom outbound cannot be tested without sendThrough/interface'}
         if _looks_like_ip(bind_iface):
-            owners = _interfaces_sharing_address(bind_iface, runner=runner)
+            owners = await _interfaces_sharing_address(bind_iface, runner=runner)
             if len(owners) > 1:
                 return {
                     'ok': False,
                     'message': (
-                        f'sendThrough={bind_iface} روی چند اینترفیس مشترک است '
-                        f'({", ".join(owners[:6])}); exit_interface لازم است'
+                        f'sendThrough={bind_iface} is shared by multiple interfaces '
+                        f'({", ".join(owners[:6])}); exit_interface is required'
                     ),
                     'protocol': protocol,
                     'interface': bind_iface,
                 }
-        ok, message, _curl_latency = _curl_probe(
-            interface=bind_iface,
-            runner=runner,
-            start_index=start_index,
+        (ok, message, _curl_latency), ping_ms = await gather_independent(
+            _curl_probe(interface=bind_iface, runner=runner, start_index=start_index),
+            maybe_await(_iface_ping_ms(bind_iface, runner=runner)),
         )
-        ping_ms = _iface_ping_ms(bind_iface, runner=runner)
 
         if ok:
             row = {
@@ -915,8 +906,8 @@ def probe_outbound_tag(
                 row['latency_ms'] = ping_ms
             return row
 
-        if not _looks_like_ip(bind_iface) and _wg_has_recent_handshake(bind_iface, runner=runner):
-            row = _handshake_online_result(bind_iface, runner=runner, latency_ms=ping_ms)
+        if not _looks_like_ip(bind_iface) and await _wg_has_recent_handshake(bind_iface, runner=runner):
+            row = await _handshake_online_result(bind_iface, runner=runner, latency_ms=ping_ms)
             row['protocol'] = protocol
             return row
 
@@ -931,12 +922,12 @@ def probe_outbound_tag(
         return failed
 
     if protocol in {'dns', 'loopback'}:
-        return {'ok': True, 'message': f'اوتباند {protocol} — بدون تست egress', 'protocol': protocol}
+        return {'ok': True, 'message': f'{protocol} outbound — no egress test', 'protocol': protocol}
 
     endpoint = _outbound_server(outbound)
     if endpoint is not None:
         host, port = endpoint
-        ok, message, latency_ms = _tcp_probe(host, port)
+        ok, message, latency_ms = await _tcp_probe(host, port)
         result = {
             'ok': ok,
             'message': message,
@@ -947,10 +938,10 @@ def probe_outbound_tag(
             result['latency_ms'] = latency_ms
         return result
 
-    return {'ok': False, 'message': f'اوتباند {protocol} قابل تست نیست', 'protocol': protocol}
+    return {'ok': False, 'message': f'{protocol} outbound cannot be tested', 'protocol': protocol}
 
 
-def probe_region_node(
+async def probe_region_node(
     *,
     node_id: int | str,
     outbound_tag: str | None = None,
@@ -960,47 +951,66 @@ def probe_region_node(
     start_index: int = 0,
 ) -> dict[str, Any]:
     checks: dict[str, Any] = {}
-    outcomes: list[bool] = []
-    messages: list[str] = []
     outbounds = outbounds or []
 
     outbound_tag = str(outbound_tag or '').strip() or None
     exit_interface = str(exit_interface or '').strip() or None
 
-    if outbound_tag:
-        checks['outbound'] = probe_outbound_tag(
+    skip_exit = bool(
+        exit_interface
+        and await _should_skip_exit_interface_check(
             outbound_tag,
-            outbounds,
-            fallback_interface=exit_interface,
-            runner=runner,
-            start_index=start_index,
-        )
-        outcomes.append(bool(checks['outbound'].get('ok')))
-        message = str(checks['outbound'].get('message') or '').strip()
-        if message:
-            messages.append(message)
-
-    if exit_interface and not _should_skip_exit_interface_check(
-        outbound_tag,
-        exit_interface,
-        outbounds,
-        runner=runner,
-    ):
-        checks['exit_interface'] = probe_exit_interface(
             exit_interface,
+            outbounds,
             runner=runner,
-            start_index=start_index,
         )
-        outcomes.append(bool(checks['exit_interface'].get('ok')))
-        message = str(checks['exit_interface'].get('message') or '').strip()
-        if message:
-            messages.append(message)
+    )
 
+    jobs: list[tuple[str, Any]] = []
+    if outbound_tag:
+        jobs.append(
+            (
+                'outbound',
+                probe_outbound_tag(
+                    outbound_tag,
+                    outbounds,
+                    fallback_interface=exit_interface,
+                    runner=runner,
+                    start_index=start_index,
+                ),
+            )
+        )
+    if exit_interface and not skip_exit:
+        jobs.append(
+            (
+                'exit_interface',
+                probe_exit_interface(
+                    exit_interface,
+                    runner=runner,
+                    start_index=start_index,
+                ),
+            )
+        )
+
+    if not jobs:
+        return {
+            'id': node_id,
+            'ok': False,
+            'message': 'no egress path is configured for this node',
+            'checks': checks,
+        }
+
+    results = await gather_independent(*(job for _key, job in jobs))
+    for (key, _job), check in zip(jobs, results):
+        if isinstance(check, dict):
+            checks[key] = check
+
+    outcomes = [bool(check.get('ok')) for check in checks.values() if isinstance(check, dict)]
     if not outcomes:
         return {
             'id': node_id,
             'ok': False,
-            'message': 'هیچ مسیر خروجی برای این نود تنظیم نشده',
+            'message': 'no egress path is configured for this node',
             'checks': checks,
         }
 
@@ -1019,7 +1029,7 @@ def probe_region_node(
     result: dict[str, Any] = {
         'id': node_id,
         'ok': ok,
-        'message': 'ترافیک از این نود عبور می‌کند' if ok else (failure_messages[0] if failure_messages else 'ناموفق'),
+        'message': 'traffic is flowing through this node' if ok else (failure_messages[0] if failure_messages else 'failed'),
         'checks': checks,
     }
     if latency_values:
@@ -1028,7 +1038,7 @@ def probe_region_node(
     return result
 
 
-def probe_region_nodes(
+async def probe_region_nodes(
     nodes: list[dict[str, Any]],
     outbounds: list[dict[str, Any]] | None = None,
     *,
@@ -1045,28 +1055,23 @@ def probe_region_nodes(
             'summary': {'total': 0, 'passed': 0, 'failed': 0},
         }
 
-    def _probe_item(item: dict[str, Any], index: int) -> dict[str, Any]:
-        return probe_region_node(
-            node_id=item.get('id'),
-            outbound_tag=item.get('outbound_tag'),
-            exit_interface=item.get('exit_interface'),
-            outbounds=outbounds,
-            runner=runner,
-            start_index=index,
-        )
-
     # Parallel across nodes; each node starts on a different probe IP so /32 route
     # locks rarely contend (Table=off Mullvad exits need host routes per dest).
-    max_workers = min(MAX_PROBE_WORKERS, len(PROBE_URLS), len(valid_nodes))
-    rows: list[dict[str, Any] | None] = [None] * len(valid_nodes)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(_probe_item, item, index): index
+    limit = min(MAX_PROBE_WORKERS, len(PROBE_URLS), len(valid_nodes))
+    rows = await bounded_gather(
+        [
+            lambda item=item, index=index: probe_region_node(
+                node_id=item.get('id'),
+                outbound_tag=item.get('outbound_tag'),
+                exit_interface=item.get('exit_interface'),
+                outbounds=outbounds,
+                runner=runner,
+                start_index=index,
+            )
             for index, item in enumerate(valid_nodes)
-        }
-        for future, index in future_map.items():
-            rows[index] = future.result()
+        ],
+        limit=limit,
+    )
 
     resolved = [row for row in rows if isinstance(row, dict)]
     passed = sum(1 for row in resolved if row.get('ok'))

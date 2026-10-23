@@ -29,26 +29,26 @@ attach_lifecycle(router, core='openvpn', get_driver=get_openvpn)
 
 
 @router.get('/status')
-def status(openvpn: OpenVpnDriver = Depends(get_openvpn)):
-    return health_payload(openvpn)
+async def status(openvpn: OpenVpnDriver = Depends(get_openvpn)):
+    return await health_payload(openvpn)
 
 
 @router.get('/servers')
-def list_servers(openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def list_servers(openvpn: OpenVpnDriver = Depends(get_openvpn)):
     return {'success': True, 'servers': openvpn.list_servers()}
 
 
 @router.post('/servers')
-def create_server(payload: OpenVpnServerPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def create_server(payload: OpenVpnServerPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        server = openvpn.create_server(payload.model_dump(exclude_none=True))
+        server = await openvpn.create_server(payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
 
 
 @router.get('/servers/{server_id}')
-def get_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def get_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
         server = openvpn.get_server(server_id)
     except AgentError as exc:
@@ -57,27 +57,27 @@ def get_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
 
 
 @router.put('/servers/{server_id}')
-def update_server(server_id: str, payload: OpenVpnServerPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def update_server(server_id: str, payload: OpenVpnServerPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        server = openvpn.update_server(server_id, payload.model_dump(exclude_none=True))
+        server = await openvpn.update_server(server_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
 
 
 @router.delete('/servers/{server_id}')
-def delete_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def delete_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        openvpn.delete_server(server_id)
+        await openvpn.delete_server(server_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True}
 
 
 @router.post('/servers/{server_id}/users')
-def add_user(server_id: str, payload: OpenVpnUserPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def add_user(server_id: str, payload: OpenVpnUserPayload, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        user = openvpn.add_user(server_id, payload.model_dump(exclude_none=True))
+        user = await openvpn.add_user(server_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'user': user}
@@ -85,14 +85,14 @@ def add_user(server_id: str, payload: OpenVpnUserPayload, openvpn: OpenVpnDriver
 
 @router.post('/servers/{server_id}/users/batch')
 @router.post('/servers/{server_id}/users:batch')
-def batch_users(server_id: str, body: dict[str, Any], openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def batch_users(server_id: str, body: dict[str, Any], openvpn: OpenVpnDriver = Depends(get_openvpn)):
     users = body.get('users') or []
     if not isinstance(users, list):
         raise_agent_error('VALIDATION_ERROR', 'users must be a list', 422)
     mode = str(body.get('mode') or 'upsert')
     atomic = bool(body.get('atomic', False))
     try:
-        result = openvpn.batch_users(
+        result = await openvpn.batch_users(
             server_id,
             [row for row in users if isinstance(row, dict)],
             mode=mode,
@@ -104,30 +104,30 @@ def batch_users(server_id: str, body: dict[str, Any], openvpn: OpenVpnDriver = D
 
 
 @router.put('/servers/{server_id}/users/{user_id}')
-def update_user(
+async def update_user(
     server_id: str,
     user_id: str,
     payload: OpenVpnUserPayload,
     openvpn: OpenVpnDriver = Depends(get_openvpn),
 ):
     try:
-        user = openvpn.update_user(server_id, user_id, payload.model_dump(exclude_none=True))
+        user = await openvpn.update_user(server_id, user_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'user': user}
 
 
 @router.delete('/servers/{server_id}/users/{user_id}')
-def delete_user(server_id: str, user_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def delete_user(server_id: str, user_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        openvpn.delete_user(server_id, user_id)
+        await openvpn.delete_user(server_id, user_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True}
 
 
 @router.get('/servers/{server_id}/users/{user_id}/config')
-def user_config(
+async def user_config(
     server_id: str,
     user_id: str,
     endpoint: str | None = None,
@@ -141,23 +141,24 @@ def user_config(
 
 
 @router.get('/diagnose')
-def diagnose_user(address: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def diagnose_user(address: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        report = openvpn.diagnose_address(address)
+        report = await openvpn.diagnose_address(address)
     except ValueError as exc:
         raise_agent_error('VALIDATION_ERROR', str(exc), 422)
     return report
 
 
 @router.post('/backup')
-def backup(openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def backup(openvpn: OpenVpnDriver = Depends(get_openvpn)):
     return {'success': True, 'backup': openvpn.backup()}
 
+
 @router.post('/restore')
-def restore(body: dict[str, Any], openvpn: OpenVpnDriver = Depends(get_openvpn)):
+async def restore(body: dict[str, Any], openvpn: OpenVpnDriver = Depends(get_openvpn)):
     payload = body.get('backup') if isinstance(body.get('backup'), dict) else body
     try:
-        openvpn.restore(payload)
+        await openvpn.restore(payload)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True}

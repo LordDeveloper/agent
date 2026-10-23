@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from agent.asyncutil import maybe_await, run_sync
+
 if TYPE_CHECKING:
     from agent.config import AgentSettings
     from agent.registry import CoreRegistry
 
 
-def bootstrap_enabled_cores(
+async def bootstrap_enabled_cores(
     settings: AgentSettings,
     registry: CoreRegistry,
     log: logging.Logger | None = None,
@@ -30,37 +32,45 @@ def bootstrap_enabled_cores(
                 logger.info("supervisor skip core=%s: not installed", key)
                 continue
             if key == "xray":
-                if driver.running():
+                if await maybe_await(driver.running()):
                     logger.info("supervisor core=%s already running", key)
                     try:
-                        driver.sync_proxy_protocol_forwarders()
+                        await maybe_await(driver.sync_proxy_protocol_forwarders())
                     except Exception as exc:
                         logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
-                driver.enable()
+                await maybe_await(driver.enable())
                 try:
-                    driver.sync_proxy_protocol_forwarders()
+                    await maybe_await(driver.sync_proxy_protocol_forwarders())
                 except Exception as exc:
                     logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
             elif key == "l2tp":
-                if driver.running():
+                if await maybe_await(driver.running()):
                     logger.info("supervisor core=%s already running; reconcile companions", key)
                     try:
-                        driver.reconcile_runtime()
+                        await maybe_await(driver.reconcile_runtime())
                     except Exception as exc:
                         logger.warning("supervisor l2tp companion reconcile failed: %s", exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
-                driver.enable()
+                await maybe_await(driver.enable())
             elif key == "openvpn":
-                if driver.running():
+                if await maybe_await(driver.running()):
                     logger.info("supervisor core=%s already running", key)
                     continue
                 logger.info("supervisor starting core=%s", key)
-                driver.enable()
+                await maybe_await(driver.enable())
             else:
                 logger.info("supervisor enabling interfaces core=%s", key)
-                driver.enable()
+                await maybe_await(driver.enable())
         except Exception as exc:
             logger.warning("supervisor core=%s bootstrap failed: %s", key, exc)
+
+
+def bootstrap_enabled_cores_sync(
+    settings: AgentSettings,
+    registry: CoreRegistry,
+    log: logging.Logger | None = None,
+) -> None:
+    run_sync(bootstrap_enabled_cores(settings, registry, log))

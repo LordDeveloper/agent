@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import asyncio
 import os
 
 import pytest
@@ -41,9 +42,40 @@ def wg_client(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._bring_up", lambda self, iface: {"ok": True})
-    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._bring_down", lambda self, iface: {"ok": True})
-    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._apply_live", lambda self, iface: None)
+    async def _ok(self, iface, **_kwargs):
+        return {"ok": True}
+
+    async def _noop(self, iface, **_kwargs):
+        return None
+
+    async def _fake_keys(cli: str = "wg"):
+        return ("E" * 42 + "E=", "A" * 42 + "A=")
+
+    async def _fake_pub(cli, key):
+        return "A" * 42 + "A="
+
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._bring_up", _ok)
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._bring_down", _ok)
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._apply_live", _noop)
+    monkeypatch.setattr("agent.drivers.wireguard._wg_keypair", _fake_keys)
+    monkeypatch.setattr("agent.drivers.wireguard._wg_pubkey", _fake_pub)
+
+    async def _fake_run(args, **kwargs):
+        class Result:
+            returncode = 0
+            stdout = "[Interface]\nPrivateKey = x\nListenPort = 51820\n"
+            stderr = ""
+
+        return Result()
+
+    async def _fake_strip(conf_text, **_kwargs):
+        return conf_text
+
+    monkeypatch.setattr("agent.support.process.run", _fake_run)
+    monkeypatch.setattr("agent.drivers.wireguard.run", _fake_run)
+    monkeypatch.setattr("agent.support.config_validate.run", _fake_run)
+    monkeypatch.setattr("agent.drivers.wireguard.validate_wg_conf_stripped", _fake_strip)
+    monkeypatch.setattr("agent.support.config_validate.validate_wg_conf_stripped", _fake_strip)
     with TestClient(create_app(str(env))) as client:
         yield client
     _clear_env()
@@ -189,7 +221,7 @@ def test_validate_wg_conf_strip_uses_absolute_config_path(tmp_path, monkeypatch)
 
     seen: dict[str, list[str]] = {}
 
-    def fake_run(args, **kwargs):
+    async def fake_run(args, **kwargs):
         seen["args"] = list(args)
 
         class Result:
@@ -199,14 +231,14 @@ def test_validate_wg_conf_strip_uses_absolute_config_path(tmp_path, monkeypatch)
 
         return Result()
 
-    monkeypatch.setattr("agent.support.config_validate.subprocess.run", fake_run)
+    monkeypatch.setattr("agent.support.config_validate.run", fake_run)
     conf_dir = tmp_path / "amneziawg"
     conf_dir.mkdir()
-    out = validate_wg_conf_stripped(
+    out = asyncio.run(validate_wg_conf_stripped(
         "[Interface]\nPrivateKey = x\nListenPort = 51820\n",
         quick_bin="awg-quick",
         config_dir=conf_dir,
-    )
+    ))
     assert seen["args"][0] == "awg-quick"
     assert seen["args"][1] == "strip"
     conf_path = Path(seen["args"][2])

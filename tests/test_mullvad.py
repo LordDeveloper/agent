@@ -1,4 +1,6 @@
 from pathlib import Path
+
+from agent.asyncutil import run_sync
 from types import SimpleNamespace
 
 from agent.db import Store
@@ -94,10 +96,10 @@ def test_pick_best_relay_skips_excluded_and_uses_lowest_ping():
         return True, latency
 
     de = [row for row in RELAYS if row["country_code"] == "de"]
-    best = pick_best_relay(de, exclude_hostname="de-ber-wg-001", probe=probe)
+    best = run_sync(pick_best_relay(de, exclude_hostname="de-ber-wg-001", probe=probe))
     assert best["hostname"] == "de-fra-wg-001"
 
-    best_all = pick_best_relay(de, probe=probe)
+    best_all = run_sync(pick_best_relay(de, probe=probe))
     assert best_all["hostname"] == "de-ber-wg-001"
 
 
@@ -110,7 +112,7 @@ def test_pick_best_relay_prefers_measured_ping_over_owned_guess():
             return True, 18
         return False, None
 
-    best = pick_best_relay([owned_fra, slow_ber], probe=probe)
+    best = run_sync(pick_best_relay([owned_fra, slow_ber], probe=probe))
     assert best["hostname"] == "de-ber-wg-001"
 
 
@@ -124,43 +126,43 @@ def test_pick_best_relay_by_catalog_speed():
             return False, None
         return True, latency
 
-    best_ping = pick_best_relay(de, probe=probe, metric="ping")
+    best_ping = run_sync(pick_best_relay(de, probe=probe, metric="ping"))
     assert best_ping["hostname"] == "de-fra-wg-001"
-    best_speed = pick_best_relay(de, probe=probe, metric="speed")
+    best_speed = run_sync(pick_best_relay(de, probe=probe, metric="speed"))
     assert best_speed["hostname"] == "de-fra-wg-001"
 
 
 def test_save_settings_relay_metric(tmp_path: Path):
     svc = _service(tmp_path)
-    svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="speed")
+    run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="speed"))
     assert svc.relay_metric() == "speed"
-    svc.save_settings(relay_metric="ping")
+    run_sync(svc.save_settings(relay_metric="ping"))
     assert svc.relay_metric() == "ping"
 
 
 def test_save_settings_auto_fallback(tmp_path: Path):
     svc = _service(tmp_path)
-    svc.save_settings(private_key=PRIV, address="10.64.0.2/32")
+    run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32"))
     assert svc.auto_fallback_enabled() is True
-    saved = svc.save_settings(auto_fallback=False)
+    saved = run_sync(svc.save_settings(auto_fallback=False))
     assert saved["auto_fallback"] is False
     assert svc.auto_fallback_enabled() is False
     # Lightweight flag flip must keep account fields.
     assert saved["address"] == "10.64.0.2/32"
-    saved = svc.save_settings(auto_fallback=True)
+    saved = run_sync(svc.save_settings(auto_fallback=True))
     assert saved["auto_fallback"] is True
     assert svc.auto_fallback_enabled() is True
 
 
 def test_save_settings_relay_mode_fixed(tmp_path: Path):
     svc = _service(tmp_path)
-    svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="ping")
+    run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="ping"))
     assert svc.relay_mode() == "auto"
-    saved = svc.save_settings(relay_mode="fixed")
+    saved = run_sync(svc.save_settings(relay_mode="fixed"))
     assert saved["relay_mode"] == "fixed"
     assert saved["selection_mode"] == "fixed"
     assert svc.relay_mode() == "fixed"
-    saved = svc.save_settings(relay_metric="speed", relay_mode="auto")
+    saved = run_sync(svc.save_settings(relay_metric="speed", relay_mode="auto"))
     assert saved["relay_metric"] == "speed"
     assert saved["relay_mode"] == "auto"
 
@@ -168,9 +170,9 @@ def test_save_settings_relay_mode_fixed(tmp_path: Path):
 def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
     svc = _service(tmp_path)
     dual = "10.64.0.2/32,fc00:bbbb:bbbb:bb01::2/128"
-    svc.save_settings(private_key=PRIV, address=dual, relay_metric="ping")
+    run_sync(svc.save_settings(private_key=PRIV, address=dual, relay_metric="ping"))
     assert svc.settings()["address"] == dual
-    saved = svc.save_settings(relay_metric="speed")
+    saved = run_sync(svc.save_settings(relay_metric="speed"))
     assert saved["relay_metric"] == "speed"
     assert saved["relay_mode"] == "auto"
     assert saved["address"] == dual
@@ -189,12 +191,12 @@ def test_save_settings_propagates_private_key_to_bound_ifaces(tmp_path: Path, mo
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     synced: list[str] = []
     monkeypatch.setattr(svc, "_sync_iface", lambda iface, _path: synced.append(iface))
     monkeypatch.setattr(svc, "_ensure_persist_unit", lambda _iface: {"ok": True})
 
-    saved = svc.save_settings(private_key=new_key, address="10.64.0.2/32")
+    saved = run_sync(svc.save_settings(private_key=new_key, address="10.64.0.2/32"))
     assert saved["has_private_key"] is True
     assert saved["propagated"]["updated"] == ["de"]
     assert synced == ["de"]
@@ -206,7 +208,7 @@ def test_save_settings_propagates_private_key_to_bound_ifaces(tmp_path: Path, mo
 def test_apply_relay_keeps_conf_private_key(tmp_path: Path, monkeypatch):
     settings_key = "J" * 42 + "A="
     svc = _service(tmp_path)
-    svc.save_settings(private_key=settings_key, address="10.64.0.2/32")
+    run_sync(svc.save_settings(private_key=settings_key, address="10.64.0.2/32"))
     path = tmp_path / "wg" / "de.conf"
     path.write_text(
         dump_wg_conf(
@@ -219,7 +221,7 @@ def test_apply_relay_keeps_conf_private_key(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
     monkeypatch.setattr(svc, "_ensure_persist_unit", lambda _iface: {"ok": True})
-    svc._apply_relay("de", RELAYS[1])  # berlin
+    run_sync(svc._apply_relay("de", RELAYS[1]))  # berlin
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
     # Fallback/relay switch must not stomp the working conf key with settings.
     assert parsed["interface"]["PrivateKey"] == PRIV
@@ -264,12 +266,12 @@ def test_fallback_by_speed_uses_curl_interface(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
-    svc.save_settings(relay_metric="speed")
+    run_sync(svc.refresh_bindings())
+    run_sync(svc.save_settings(relay_metric="speed"))
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_iface_healthy", lambda _iface: True)
 
-    result = svc.fallback(country_code="de", optimize=True)
+    result = run_sync(svc.fallback(country_code="de", optimize=True))
     assert measured
     assert all(name == "de" for name in measured)
     assert result["changed"] or result["skipped"]
@@ -277,15 +279,15 @@ def test_fallback_by_speed_uses_curl_interface(tmp_path: Path, monkeypatch):
 
 def test_pick_best_relay_uses_catalog_when_tcp_closed():
     de = [row for row in RELAYS if row["country_code"] == "de"]
-    best = pick_best_relay(de, exclude_hostname="de-fra-wg-001", probe=lambda _host, _port: (False, None))
+    best = run_sync(pick_best_relay(de, exclude_hostname="de-fra-wg-001", probe=lambda _host, _port: (False, None)))
     assert best is not None
     assert best["hostname"] == "de-ber-wg-001"
-    none = pick_best_relay(
+    none = run_sync(pick_best_relay(
         de,
         exclude_hostname="de-fra-wg-001",
         probe=lambda _host, _port: (False, None),
         require_reachable=True,
-    )
+    ))
     assert none is None
 
 
@@ -323,12 +325,12 @@ def test_adopts_existing_de_conf(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    bindings = svc.refresh_bindings()
+    bindings = run_sync(svc.refresh_bindings())
     assert any(row["country_code"] == "de" and row["iface"] == "de" and row["adopted"] for row in bindings)
     assert svc.settings()["private_key"] == PRIV
     assert svc.settings()["address"] == "10.64.9.9/32"
 
-    payload = svc.locations()
+    payload = run_sync(svc.locations())
     de = next(row for row in payload["locations"] if row["country_code"] == "de")
     assert de["bound"] is True
     assert de["iface"] == "de"
@@ -353,11 +355,11 @@ def test_fallback_rewrites_peer_keeps_iface_name(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
 
-    result = svc.fallback("de")
+    result = run_sync(svc.fallback("de"))
     assert result["changed"]
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
@@ -381,7 +383,7 @@ def test_fallback_switches_when_relay_tcp_probe_fails(tmp_path: Path, monkeypatc
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
     healthy_calls = {"n": 0}
@@ -391,7 +393,7 @@ def test_fallback_switches_when_relay_tcp_probe_fails(tmp_path: Path, monkeypatc
         return healthy_calls["n"] > 1
 
     monkeypatch.setattr(svc, "_iface_healthy", healthy)
-    result = svc.fallback("de")
+    result = run_sync(svc.fallback("de"))
     assert result["changed"]
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
@@ -413,11 +415,11 @@ def test_fallback_skips_when_handshake_is_recent(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_latest_handshake", lambda _iface: int(__import__("time").time()))
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
-    result = svc.fallback("de")
+    result = run_sync(svc.fallback("de"))
     assert result["changed"] == []
     assert result["failed"] == []
     assert result["skipped"]
@@ -445,7 +447,7 @@ def test_fallback_iface_uses_country_from_iface_name(tmp_path: Path, monkeypatch
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
     monkeypatch.setattr(svc, "_live_peer", lambda _iface: {"public_key": PUB_FRA, "endpoint": "1.1.1.1:51820"})
-    result = svc.fallback_iface("de")
+    result = run_sync(svc.fallback_iface("de"))
     assert result is not None
     assert result["status"] == "changed"
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
@@ -454,11 +456,11 @@ def test_fallback_iface_uses_country_from_iface_name(tmp_path: Path, monkeypatch
 
 def test_ensure_new_location_uses_preferred_iface(tmp_path: Path, monkeypatch):
     svc = _service(tmp_path)
-    svc.save_settings(private_key=PRIV, address="10.64.9.9/32")
+    run_sync(svc.save_settings(private_key=PRIV, address="10.64.9.9/32"))
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
-    row = svc.ensure("jp")
+    row = run_sync(svc.ensure("jp"))
     assert row["iface"] == "jp"
-    usa = svc.ensure("us")
+    usa = run_sync(svc.ensure("us"))
     assert usa["iface"] == "usa"
     assert (tmp_path / "wg" / "jp.conf").is_file()
     parsed = parse_wg_conf((tmp_path / "wg" / "jp.conf").read_text(encoding="utf-8"))
@@ -476,7 +478,7 @@ def test_does_not_adopt_non_mullvad_conf(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    bindings = svc.refresh_bindings()
+    bindings = run_sync(svc.refresh_bindings())
     assert bindings == []
 
 
@@ -485,7 +487,7 @@ def test_locations_ping_uses_best_relay(tmp_path: Path):
         tmp_path,
         probe=lambda host, _port: (True, {"1.1.1.1": 40, "2.2.2.2": 12, "6.6.6.6": 70}.get(host, 200)),
     )
-    payload = svc.locations(ping=True)
+    payload = run_sync(svc.locations(ping=True))
     de = next(row for row in payload["locations"] if row["country_code"] == "de")
     jp = next(row for row in payload["locations"] if row["country_code"] == "jp")
     assert de["reachable"] is True
@@ -525,7 +527,7 @@ def test_sync_iface_creates_link_without_wg_quick_up(tmp_path: Path):
         encoding="utf-8",
     )
     svc._iface_up = lambda _name: False  # type: ignore[method-assign]
-    svc._sync_iface("no", path)
+    run_sync(svc._sync_iface("no", path))
 
     assert ["wg-quick", "up", "no"] not in commands
     assert ["ip", "link", "add", "name", "no", "type", "wireguard"] in commands
@@ -553,7 +555,7 @@ def test_assign_tunnel_address_ignores_already_assigned(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    svc._assign_tunnel_address("us", path)
+    run_sync(svc._assign_tunnel_address("us", path))
     assert ["ip", "-4", "addr", "add", "10.64.9.9/32", "dev", "us"] in commands
 
 
@@ -572,15 +574,15 @@ def test_switch_relay_rewrites_peer(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
 
-    listed = svc.country_relays("de", ping=True)
+    listed = run_sync(svc.country_relays("de", ping=True))
     assert listed["current_hostname"] == "de-fra-wg-001"
     assert listed["relays"][0]["hostname"] == "de-ber-wg-001"
 
-    result = svc.switch_relay("de", "de-ber-wg-001")
+    result = run_sync(svc.switch_relay("de", "de-ber-wg-001"))
     assert result["status"] == "changed"
     assert result["hostname"] == "de-ber-wg-001"
     assert result.get("fixed") is False
@@ -603,24 +605,24 @@ def test_switch_relay_fixed_is_per_node_and_skips_fallback(tmp_path: Path, monke
         ),
         encoding="utf-8",
     )
-    svc.refresh_bindings()
+    run_sync(svc.refresh_bindings())
     monkeypatch.setattr(svc, "_iface_up", lambda _iface: True)
     monkeypatch.setattr(svc, "_iface_healthy", lambda _iface: False)
     monkeypatch.setattr(svc, "_sync_iface", lambda *_a, **_k: None)
 
-    result = svc.switch_relay("de", "de-ber-wg-001", fixed=True)
+    result = run_sync(svc.switch_relay("de", "de-ber-wg-001", fixed=True))
     assert result["status"] == "changed"
     assert result["fixed"] is True
     # Global metric mode stays auto — fixed is per binding.
     assert svc.relay_mode() == "auto"
-    listed = svc.country_relays("de", ping=False)
+    listed = run_sync(svc.country_relays("de", ping=False))
     assert listed["current_fixed"] is True
     assert listed["current_hostname"] == "de-ber-wg-001"
-    assert svc.locations()["locations"]
-    de_row = next(row for row in svc.locations()["locations"] if row["country_code"] == "de")
+    assert run_sync(svc.locations())["locations"]
+    de_row = next(row for row in run_sync(svc.locations())["locations"] if row["country_code"] == "de")
     assert de_row["fixed"] is True
 
-    fallback = svc.fallback("de", optimize=True)
+    fallback = run_sync(svc.fallback("de", optimize=True))
     assert fallback["changed"] == []
     assert fallback["skipped"]
     assert "fixed" in str(fallback["skipped"][0].get("message") or "").lower()
@@ -648,7 +650,7 @@ def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):
     svc = _service(tmp_path, runner=runner)
     svc.persist_script = tmp_path / "mullvad-wg-hold.sh"
     svc.persist_unit_path = tmp_path / "systemd" / "agent-mullvad-wg@.service"
-    result = svc._ensure_persist_unit("no")
+    result = run_sync(svc._ensure_persist_unit("no"))
     assert result["ok"] is True
     assert result["unit"] == "agent-mullvad-wg@no.service"
     script = svc.persist_script.read_text(encoding="utf-8")

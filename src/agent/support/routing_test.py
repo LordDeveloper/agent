@@ -61,7 +61,7 @@ def _match_domain_entry(entry: str, domain: str, *, geosite_path: Path | None, w
     if lower.startswith("geosite:"):
         category = entry.split(":", 1)[1].strip()
         if geosite_path is None:
-            warnings.append(f"geosite:{category} resolve نشد (فایل geosite.dat یافت نشد)")
+            warnings.append(f"geosite:{category} did not resolve (geosite.dat not found)")
             return None
         matched, err = domain_in_geosite(geosite_path, category, domain)
         if err:
@@ -81,7 +81,7 @@ def _match_domain_entry(entry: str, domain: str, *, geosite_path: Path | None, w
         try:
             return re.search(pattern, domain) is not None
         except re.error:
-            warnings.append(f"regexp نامعتبر: {pattern}")
+            warnings.append(f"invalid regexp: {pattern}")
             return False
 
     # bare domain → suffix match (Xray default)
@@ -99,7 +99,7 @@ def _match_ip_entry(entry: str, ip: str, *, geoip_path: Path | None, warnings: l
     if lower.startswith("geoip:"):
         code = entry.split(":", 1)[1].strip()
         if geoip_path is None:
-            warnings.append(f"geoip:{code} resolve نشد (فایل geoip.dat یافت نشد)")
+            warnings.append(f"geoip:{code} did not resolve (geoip.dat not found)")
             return None
         matched, err = geoip_contains(geoip_path, code, ip)
         if err:
@@ -181,7 +181,7 @@ def match_field_rule(
     rule_inbounds = _as_list(rule.get("inboundTag"))
     if rule_inbounds:
         if not inbound:
-            chain.append("inboundTag: ورودی تست خالی است → عدم تطبیق")
+            chain.append("inboundTag: test inbound is empty → no match")
             return False, chain, warnings
         if inbound not in rule_inbounds:
             chain.append(f"inboundTag: {inbound} ∉ {rule_inbounds}")
@@ -192,7 +192,7 @@ def match_field_rule(
     rule_users = [u.lower() for u in _as_list(rule.get("user"))]
     if rule_users:
         if not user:
-            chain.append("user: ایمیل تست خالی است → عدم تطبیق")
+            chain.append("user: test email is empty → no match")
             return False, chain, warnings
         if user not in rule_users:
             chain.append(f"user: {user} ∉ rule.user")
@@ -203,7 +203,7 @@ def match_field_rule(
     rule_protocols = [p.lower() for p in _as_list(rule.get("protocol"))]
     if rule_protocols:
         if not protocol:
-            chain.append("protocol: خالی → عدم تطبیق")
+            chain.append("protocol: empty → no match")
             return False, chain, warnings
         if protocol not in rule_protocols:
             chain.append(f"protocol: {protocol} ∉ {rule_protocols}")
@@ -214,7 +214,7 @@ def match_field_rule(
     rule_network = str(rule.get("network") or "").strip().lower()
     if rule_network:
         if not network:
-            chain.append("network: خالی → عدم تطبیق")
+            chain.append("network: empty → no match")
             return False, chain, warnings
         allowed = {part.strip() for part in rule_network.replace(",", " ").split() if part.strip()}
         if network not in allowed:
@@ -225,7 +225,7 @@ def match_field_rule(
     # port
     if rule.get("port") not in (None, "", []):
         if not _match_port(rule.get("port"), port):
-            chain.append(f"port: {port} تطبیق نشد")
+            chain.append(f"port: {port} did not match")
             return False, chain, warnings
         chain.append(f"port: {port}")
 
@@ -233,7 +233,7 @@ def match_field_rule(
     rule_domains = _as_list(rule.get("domain"))
     if rule_domains:
         if not domain:
-            chain.append("domain: دامنه تست خالی است → عدم تطبیق")
+            chain.append("domain: test domain is empty → no match")
             return False, chain, warnings
         if not _list_condition_matches(
             rule_domains,
@@ -244,7 +244,7 @@ def match_field_rule(
             geoip_path=geoip_path,
             warnings=warnings,
         ):
-            chain.append(f"domain: {domain} تطبیق نشد")
+            chain.append(f"domain: {domain} did not match")
             return False, chain, warnings
         chain.append(f"domain: {domain}")
 
@@ -252,7 +252,7 @@ def match_field_rule(
     rule_ips = _as_list(rule.get("ip"))
     if rule_ips:
         if not ip:
-            chain.append("ip: آدرس تست خالی است → عدم تطبیق")
+            chain.append("ip: test address is empty → no match")
             return False, chain, warnings
         if not _list_condition_matches(
             rule_ips,
@@ -263,7 +263,7 @@ def match_field_rule(
             geoip_path=geoip_path,
             warnings=warnings,
         ):
-            chain.append(f"ip: {ip} تطبیق نشد")
+            chain.append(f"ip: {ip} did not match")
             return False, chain, warnings
         chain.append(f"ip: {ip}")
 
@@ -271,7 +271,7 @@ def match_field_rule(
     rule_sources = _as_list(rule.get("source"))
     if rule_sources:
         if not source:
-            chain.append("source: خالی → عدم تطبیق")
+            chain.append("source: empty → no match")
             return False, chain, warnings
         if not _list_condition_matches(
             rule_sources,
@@ -282,7 +282,7 @@ def match_field_rule(
             geoip_path=geoip_path,
             warnings=warnings,
         ):
-            chain.append(f"source: {source} تطبیق نشد")
+            chain.append(f"source: {source} did not match")
             return False, chain, warnings
         chain.append(f"source: {source}")
 
@@ -353,7 +353,7 @@ def test_routing_rules(
         "rule": None,
         "outboundTag": None,
         "default": True,
-        "chain": ["هیچ رولی تطبیق نشد → مسیر پیش‌فرض / fallback"],
+        "chain": ["no rule matched → default / fallback route"],
         "evaluated": evaluated,
         "warnings": warnings,
         "geosite_path": str(geosite_path) if geosite_path else None,

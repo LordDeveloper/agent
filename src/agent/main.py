@@ -113,7 +113,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
             ",".join(settings.cores()) or "-",
             resolve_log_path(settings),
         )
-        bootstrap_enabled_cores(settings, registry, app_log)
+        await bootstrap_enabled_cores(settings, registry, app_log)
 
         stop_quota = asyncio.Event()
         quota_task = None
@@ -125,7 +125,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
         stop_traffic = asyncio.Event()
         traffic_task = None
         if float(settings.traffic_sample_interval) > 0:
-            traffic.sample_all(registry)
+            await traffic.sample_all(registry)
             traffic_task = asyncio.create_task(
                 traffic_worker_loop(registry, traffic, settings, stop_traffic),
             )
@@ -183,19 +183,19 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(mullvad_router, prefix="/api/v1", dependencies=auth)
 
     @app.get("/health")
-    def root_health(request: Request):
+    async def root_health(request: Request):
         reg: CoreRegistry = request.app.state.registry
         return {
             "success": True,
             "service": "agent",
             "version": __version__,
             "db": str(settings.resolve_db_path()),
-            "cores": [c.model_dump() for c in reg.list_cores()],
+            "cores": [c.model_dump() for c in await reg.list_cores()],
         }
 
     def _register_public_core_health(core_key: str, slug: str) -> None:
         @app.get(f"/cores/{slug}/health", name=f"{slug}-public-health")
-        def public_core_health(request: Request):
+        async def public_core_health(request: Request):
             try:
                 driver = request.app.state.registry.get(core_key)
             except AgentError:
@@ -206,7 +206,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
                         "error": {"code": "CONFIG_NOT_FOUND", "message": f"Core [{core_key}] is not enabled"},
                     },
                 )
-            return health_payload(driver)
+            return await health_payload(driver)
 
     for core_key, slug in ROUTE_SLUGS.items():
         _register_public_core_health(core_key, slug)

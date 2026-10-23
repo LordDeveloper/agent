@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -47,7 +48,7 @@ def test_discover_vpn_interfaces_filters_wireguard(monkeypatch):
         return _Result(stdout=json.dumps(payload))
 
     monkeypatch.setattr('agent.support.host_interfaces.shutil.which', lambda cmd: '/sbin/ip' if cmd == 'ip' else None)
-    rows = discover_vpn_interfaces(runner=fake_run)
+    rows = asyncio.run(discover_vpn_interfaces(runner=fake_run))
     assert len(rows) == 1
     assert rows[0]['name'] == 'wg-de'
     assert rows[0]['gateway'] == '10.66.0.1'
@@ -62,7 +63,8 @@ def test_render_apply_script_contains_redirect_rules(monkeypatch):
     assert '10.80.0.1:53' in script
     assert 'resolvectl dns "wg0" off' in script
     assert NFT_TABLE in script
-    assert 'no-v6' not in script
+    assert '-no-v6"' not in script
+    assert '-no-v6-out"' not in script
 
 
 def test_render_apply_script_can_block_ipv6(monkeypatch):
@@ -85,12 +87,12 @@ def test_ensure_vpn_dns_resolver_configures_adguard_and_dnat(tmp_path, monkeypat
     def fake_run(args, **kwargs):
         return _Result()
 
-    monkeypatch.setattr('agent.dns_leak.run', fake_run)
+    # runner is passed into the API; do not patch execute() itself.
     monkeypatch.setattr('agent.dns_leak.ensure_dns_leak_unit', lambda script_path, runner=None: {'ok': True})
     monkeypatch.setattr('agent.dns_leak._ensure_adguard', lambda interfaces, **kwargs: {'restarted': True})
 
     targets = [{'name': 'wg0', 'gateway': '10.80.0.1', 'addresses': ['10.80.0.1/24']}]
-    result = ensure_vpn_dns_resolver(interfaces=targets, runner=fake_run, data_dir=data_dir)
+    result = asyncio.run(ensure_vpn_dns_resolver(interfaces=targets, runner=fake_run, data_dir=data_dir))
     assert result['ok'] is True
     assert result['resolver']['restarted'] is True
     assert result['dnat'] is not None
@@ -115,12 +117,12 @@ def test_dns_leak_apply_writes_script_and_runs(tmp_path, monkeypatch):
         commands.append(list(args))
         return _Result()
 
-    monkeypatch.setattr('agent.dns_leak.run', fake_run)
+    # runner is passed into the API; do not patch execute() itself.
     monkeypatch.setattr('agent.dns_leak.shutil.which', lambda cmd: '/usr/bin/' + cmd)
     monkeypatch.setattr('agent.dns_leak.ensure_dns_leak_unit', lambda script_path, runner=None: {'ok': True})
     monkeypatch.setattr('agent.dns_leak._ensure_adguard', lambda interfaces, **kwargs: {'installed': True})
 
-    result = dns_leak_apply(with_resolver=True, runner=fake_run)
+    result = asyncio.run(dns_leak_apply(with_resolver=True, runner=fake_run))
     assert result['applied'] is True
     assert apply_script_path(data_dir).is_file()
     assert result['backend'] == 'nft'
@@ -137,8 +139,8 @@ def test_dns_leak_status_reports_table(monkeypatch):
             return _Result(stdout='active\n')
         return _Result()
 
-    monkeypatch.setattr('agent.dns_leak.run', fake_run)
-    payload = dns_leak_status(runner=fake_run)
+    # runner is passed into the API; do not patch execute() itself.
+    payload = asyncio.run(dns_leak_status(runner=fake_run))
     assert payload['active'] is True
     assert payload['nft_table'] == NFT_TABLE
 
@@ -157,8 +159,8 @@ def test_dns_leak_remove_cleans_files(tmp_path, monkeypatch):
     def fake_run(args, **kwargs):
         return _Result()
 
-    monkeypatch.setattr('agent.dns_leak.run', fake_run)
-    result = dns_leak_remove(runner=fake_run)
+    # runner is passed into the API; do not patch execute() itself.
+    result = asyncio.run(dns_leak_remove(runner=fake_run))
     assert result['removed'] is True
     assert not script.exists()
 

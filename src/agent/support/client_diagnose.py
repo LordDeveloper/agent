@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.asyncutil import gather_independent, maybe_await
 from agent.support import normalize_xray_client, record_is_enabled, xray_client_rows
 from agent.support.disable_reason import explain_disabled
 from agent.support.quota import has_volume_quota, quota_exceeded
@@ -87,7 +88,7 @@ def _find_config_clients_by_key(config: dict[str, Any], client_key: str) -> list
     return rows
 
 
-def _live_user_snapshot(
+async def _live_user_snapshot(
     driver: Any,
     inbound_tag: str,
     client: dict[str, Any],
@@ -96,7 +97,7 @@ def _live_user_snapshot(
 ) -> dict[str, Any] | None:
     runtime = None
     try:
-        for inbound in driver.list_inbounds():
+        for inbound in await maybe_await(driver.list_inbounds()):
             tag = str(inbound.get('tag') or '').strip()
             if tag != inbound_tag:
                 continue
@@ -117,7 +118,7 @@ def _live_user_snapshot(
     }
 
     try:
-        ips = driver.client_ips(email) if email else []
+        ips = await maybe_await(driver.client_ips(email)) if email else []
         if ips:
             live['ips'] = ips
     except Exception:
@@ -126,7 +127,7 @@ def _live_user_snapshot(
     return live
 
 
-def diagnose_client_match(
+async def diagnose_client_match(
     *,
     driver: Any,
     inbound_id: str,
@@ -154,12 +155,13 @@ def diagnose_client_match(
             )
         )
 
-    xray_running = bool(getattr(driver, 'running', lambda: False)())
+    running = getattr(driver, 'running', None)
+    xray_running = bool(await maybe_await(running())) if callable(running) else False
     checks.append({'name': 'xray_running', 'ok': xray_running})
     if not xray_running:
         issues.append(_issue('error', 'XRAY_NOT_RUNNING', 'Xray process or HTTP API is not reachable'))
 
-    live = _live_user_snapshot(driver, inbound_tag, config_client, online_emails=online_emails)
+    live = await _live_user_snapshot(driver, inbound_tag, config_client, online_emails=online_emails)
     checks.append({'name': 'client_in_live_xray', 'ok': (live is not None) if enabled else True})
     if enabled and live is None:
         issues.append(
@@ -224,10 +226,10 @@ def diagnose_client_match(
     }
 
 
-def _traffic_for_client(driver: Any, inbound_tag: str, inbound_id: str, config_client: dict[str, Any]) -> tuple[int, int]:
+async def _traffic_for_client(driver: Any, inbound_tag: str, inbound_id: str, config_client: dict[str, Any]) -> tuple[int, int]:
     live_in = live_out = 0
     try:
-        snapshot = driver.usage_snapshot()
+        snapshot = await maybe_await(driver.usage_snapshot())
         email = str(config_client.get('email') or '').strip()
         cid = str(config_client.get('id') or '').strip()
         for inbound in snapshot.inbounds:
@@ -242,9 +244,10 @@ def _traffic_for_client(driver: Any, inbound_tag: str, inbound_id: str, config_c
     return live_in, live_out
 
 
-def _online_email_set(driver: Any) -> set[str]:
+async def _online_email_set(driver: Any) -> set[str]:
     try:
-        return {str(email).strip() for email in driver.online_users() if str(email).strip()}
+        users = await maybe_await(driver.online_users())
+        return {str(email).strip() for email in users if str(email).strip()}
     except Exception:
         return set()
 
@@ -298,7 +301,7 @@ def _finalize_report(*, inbound_id: str | None, key: str, email: str, matches: l
     }
 
 
-def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str, Any]:
+async def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str, Any]:
     key = str(client_key or '').strip()
     if not key:
         raise ValueError('client key is required')
@@ -308,28 +311,31 @@ def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str, Any]
     if not located:
         return _not_found_report(inbound_id=None, key=key)
 
-    online_emails = _online_email_set(driver)
-    matches: list[dict[str, Any]] = []
+    online_emails = await _online_email_set(driver)
     resolved_email = ''
-
+    jobs = []
     for config_client, inbound_summary in located:
         inbound_tag = str(inbound_summary.get('tag') or '').strip()
         inbound_id = str(inbound_summary.get('id') or driver.id_from_tag(inbound_tag) or inbound_tag)
         if not resolved_email:
             resolved_email = str(config_client.get('email') or key)
-        live_traffic = _traffic_for_client(driver, inbound_tag, inbound_id, config_client)
-        matches.append(
-            diagnose_client_match(
-                driver=driver,
-                inbound_id=inbound_id,
-                inbound_tag=inbound_tag,
-                inbound_summary=inbound_summary,
-                config_client=config_client,
-                client_key=key,
-                online_emails=online_emails,
-                live_traffic=live_traffic,
-            )
+        jobs.append((config_client, inbound_summary, inbound_tag, inbound_id))
+
+    async def one(config_client, inbound_summary, inbound_tag, inbound_id):
+        live_traffic = await _traffic_for_client(driver, inbound_tag, inbound_id, config_client)
+        return await diagnose_client_match(
+            driver=driver,
+            inbound_id=inbound_id,
+            inbound_tag=inbound_tag,
+            inbound_summary=inbound_summary,
+            config_client=config_client,
+            client_key=key,
+            online_emails=online_emails,
+            live_traffic=live_traffic,
         )
+
+    matches = await gather_independent(*(one(*job) for job in jobs))
+    matches = [row for row in matches if isinstance(row, dict)]
 
     return _finalize_report(
         inbound_id=None,
@@ -339,7 +345,7 @@ def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str, Any]
     )
 
 
-def diagnose_xray_client(driver: Any, inbound_id: str | int, client_key: str) -> dict[str, Any]:
+async def diagnose_xray_client(driver: Any, inbound_id: str | int, client_key: str) -> dict[str, Any]:
     key = str(client_key or '').strip()
     if not key:
         raise ValueError('client key is required')
@@ -351,10 +357,13 @@ def diagnose_xray_client(driver: Any, inbound_id: str | int, client_key: str) ->
     if config_client is None:
         return _not_found_report(inbound_id=str(inbound_id), key=key)
 
-    online_emails = _online_email_set(driver)
-    live_in, live_out = _traffic_for_client(driver, tag, str(inbound_id), config_client)
+    online_emails, live_traffic = await gather_independent(
+        _online_email_set(driver),
+        _traffic_for_client(driver, tag, str(inbound_id), config_client),
+    )
+    live_in, live_out = live_traffic
 
-    match = diagnose_client_match(
+    match = await diagnose_client_match(
         driver=driver,
         inbound_id=str(inbound_id),
         inbound_tag=tag,

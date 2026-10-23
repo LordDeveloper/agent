@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import tarfile
 
@@ -65,7 +66,7 @@ def test_bootstrap_starts_xray_when_down():
     registry = _FakeRegistry({"xray": xray})
     settings = _FakeSettings(["xray"])
 
-    bootstrap_enabled_cores(settings, registry)
+    asyncio.run(bootstrap_enabled_cores(settings, registry))
 
     assert xray.enabled is True
 
@@ -75,7 +76,7 @@ def test_bootstrap_skips_running_xray():
     registry = _FakeRegistry({"xray": xray})
     settings = _FakeSettings(["xray"])
 
-    bootstrap_enabled_cores(settings, registry)
+    asyncio.run(bootstrap_enabled_cores(settings, registry))
 
     assert xray.enabled is False
 

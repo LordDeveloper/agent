@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from agent import __version__
+from agent.asyncutil import run_sync
 from agent.errors import AgentError
 from agent.ops import (
     KNOWN_CORES,
@@ -73,7 +74,7 @@ def cmd_version(_: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     runtime = open_runtime(args.env_file)
     try:
-        cores = [c.model_dump() for c in runtime.registry.list_cores()]
+        cores = [c.model_dump() for c in run_sync(runtime.registry.list_cores())]
         _print_json(
             {
                 "success": True,
@@ -94,11 +95,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     try:
         payload = {
             "success": True,
-            "online": runtime.registry.online_users(args.core),
-            "snapshot": runtime.registry.usage_snapshot(args.core).model_dump(by_alias=True),
+            "online": run_sync(runtime.registry.online_users(args.core)),
+            "snapshot": run_sync(runtime.registry.usage_snapshot(args.core)).model_dump(by_alias=True),
         }
         if getattr(args, "online_traffic", False):
-            payload = {"success": True, "users": runtime.registry.online_traffic(args.core)}
+            payload = {"success": True, "users": run_sync(runtime.registry.online_traffic(args.core))}
         elif args.online_only:
             payload = {"success": True, "users": payload["online"]}
         _print_json(payload)
@@ -120,7 +121,7 @@ def cmd_core_list(args: argparse.Namespace) -> int:
                         "key": key,
                         "enabled": True,
                         "installed": info.installed(),
-                        "running": info.running(),
+                        "running": run_sync(info.running()),
                         "version": info.version(),
                         "capabilities": info.capabilities(),
                     }
@@ -349,67 +350,67 @@ def cmd_bbr_disable(args: argparse.Namespace) -> int:
 
 def cmd_dns_leak_status(_: argparse.Namespace) -> int:
     from agent.dns_leak import dns_leak_status
-    _print_json({'success': True, **dns_leak_status()})
+    _print_json({'success': True, **run_sync(dns_leak_status())})
     return 0
 
 
 def cmd_dns_leak_apply(args: argparse.Namespace) -> int:
     from agent.dns_leak import dns_leak_apply
-    result = dns_leak_apply(
+    result = run_sync(dns_leak_apply(
         interfaces=list(args.interface or []),
         block_ipv6=bool(getattr(args, 'block_ipv6', False)),
         with_resolver=not bool(getattr(args, 'no_resolver', False)),
         upstream_dns=list(args.upstream or []) or None,
-    )
+    ))
     _print_json({'success': bool(result.get('applied', True)), **result})
     return 0 if result.get('applied', True) else 1
 
 
 def cmd_dns_leak_remove(_: argparse.Namespace) -> int:
     from agent.dns_leak import dns_leak_remove
-    _print_json({'success': True, **dns_leak_remove()})
+    _print_json({'success': True, **run_sync(dns_leak_remove())})
     return 0
 
 
 def cmd_ads_block_status(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_status
-    _print_json({'success': True, **ads_block_status()})
+    _print_json({'success': True, **run_sync(ads_block_status())})
     return 0
 
 
 def cmd_ads_block_prerequisites(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_prerequisites
-    _print_json({'success': True, **ads_block_prerequisites()})
+    _print_json({'success': True, **run_sync(ads_block_prerequisites())})
     return 0
 
 
 def cmd_ads_block_install(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_install_prerequisites
-    _print_json({'success': True, **ads_block_install_prerequisites()})
+    _print_json({'success': True, **run_sync(ads_block_install_prerequisites())})
     return 0
 
 
 def cmd_ads_block_ensure(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_ensure
-    _print_json({'success': True, **ads_block_ensure()})
+    _print_json({'success': True, **run_sync(ads_block_ensure())})
     return 0
 
 
 def cmd_ads_block_disable(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_disable
-    _print_json({'success': True, **ads_block_disable()})
+    _print_json({'success': True, **run_sync(ads_block_disable())})
     return 0
 
 
 def cmd_ads_block_repair(_: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_repair_service
-    _print_json({'success': True, **ads_block_repair_service()})
+    _print_json({'success': True, **run_sync(ads_block_repair_service())})
     return 0
 
 
 def cmd_ads_block_test(args: argparse.Namespace) -> int:
     from agent.ads_block import ads_block_test
-    result = ads_block_test(str(getattr(args, 'domain', '') or 'doubleclick.net'))
+    result = run_sync(ads_block_test(str(getattr(args, 'domain', '') or 'doubleclick.net')))
     _print_json({'success': bool(result.get('blocked')), **result})
     return 0 if result.get('blocked') else 1
 
@@ -441,7 +442,7 @@ def cmd_client_diagnose(args: argparse.Namespace) -> int:
         if not client_key:
             raise AgentError("VALIDATION_ERROR", "email, key, or client_id is required")
         inbound_id = str(getattr(args, "inbound_id", "") or "").strip() or None
-        report = driver.diagnose_client(client_key, inbound_id=inbound_id)
+        report = run_sync(driver.diagnose_client(client_key, inbound_id=inbound_id))
         _emit_diagnose_report(report, args)
         healthy = bool((report.get("summary") or {}).get("healthy"))
         if report.get("found") is False:

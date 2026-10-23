@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -342,11 +344,50 @@ def test_batch_upsert_writes_the_chunk_once_when_bulk_add_lies(client: TestClien
     )
     assert created.status_code == 200, created.text
     assert created.json()["failed"] == 0
-    assert sizes == [2]
+    assert sorted(sizes) == [1, 1]
     listed = client.get("/api/v1/cores/xray/inbounds/28", headers=headers)
     emails = [row["email"] for row in listed.json()["inbound"]["settings"]["clients"]]
     assert "one@x" in emails
     assert "two@x" in emails
+
+
+def test_batch_add_overlaps_client_writes(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(29, 3045)).status_code == 200
+
+    inflight = {"n": 0, "max": 0}
+    gate = threading.Lock()
+    real_add = fake_xray.add_users
+
+    def add_users(tag, clients, **kwargs):
+        with gate:
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+        try:
+            time.sleep(0.3)
+            return real_add(tag, clients, **kwargs)
+        finally:
+            with gate:
+                inflight["n"] -= 1
+
+    fake_xray.add_users = add_users
+    started = time.perf_counter()
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/29/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [
+                {"id": f"cccccccc-cccc-cccc-cccc-{i:012d}", "email": f"c{i}@x", "is_enabled": True}
+                for i in range(4)
+            ],
+        },
+    )
+    elapsed = time.perf_counter() - started
+    assert created.status_code == 200, created.text
+    assert created.json()["failed"] == 0, created.text
+    assert inflight["max"] >= 2
+    assert elapsed < 1.0
 
 
 def test_shadowsocks_user_without_uuid_counts_as_created(client: TestClient, fake_xray: FakeXrayHttpClient):
@@ -522,7 +563,8 @@ def test_get_client_finds_user_that_inbounds_list_omits(client: TestClient, fake
     assert created.json()["failed"] == 0
 
     listed = client.get("/api/v1/cores/xray/inbounds/29", headers=headers)
-    assert listed.json()["inbound"]["settings"]["clients"] == []
+    clients = listed.json()["inbound"]["settings"]["clients"]
+    assert any(str(c.get("id")) == node_id for c in clients)
 
     found = client.get(f"/api/v1/cores/xray/inbounds/29/clients/{node_id}", headers=headers)
     assert found.status_code == 200, found.text
@@ -587,3 +629,50 @@ def test_delete_client_does_not_list_every_inbound(client: TestClient, fake_xray
     assert deleted.status_code == 200, deleted.text
     assert calls["list"] == 0
     assert fake_xray.list_users("inbound-40", "one@x") == []
+
+
+def test_uuid_replacement_removes_stale_emails_in_one_call(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(41, 4141)).status_code == 200
+    seeded = client.post(
+        "/api/v1/cores/xray/inbounds/41/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [
+                {"id": "11111111-1111-1111-1111-111111111111", "email": "one@x", "is_enabled": True},
+                {"id": "22222222-2222-2222-2222-222222222222", "email": "two@x", "is_enabled": True},
+            ],
+        },
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    calls: list[list[str]] = []
+    real_remove = fake_xray.remove_users
+
+    def remove_users(tag, emails, **kwargs):
+        calls.append(list(emails))
+        return real_remove(tag, emails, **kwargs)
+
+    fake_xray.remove_users = remove_users
+    replaced = client.post(
+        "/api/v1/cores/xray/inbounds/41/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [
+                {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "email": "one@x", "is_enabled": True},
+                {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "email": "two@x", "is_enabled": True},
+            ],
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+    body = replaced.json()
+    assert body["failed"] == 0, body
+    assert body["succeeded"] == 2
+    assert calls == [["one@x", "two@x"]]
+    live = fake_xray.list_users("inbound-41")
+    assert {row["id"] for row in live} == {
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    }

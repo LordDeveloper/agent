@@ -1,5 +1,8 @@
-﻿import json
+﻿import asyncio
+import json
 from pathlib import Path
+
+import httpx
 
 from agent.xray_service import (
     default_xray_config,
@@ -10,6 +13,14 @@ from agent.xray_service import (
     xray_unit_text,
 )
 from agent.errors import AgentError
+
+
+class _AsyncMockTransport(httpx.AsyncBaseTransport):
+    def __init__(self, handler):
+        self._handler = handler
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return self._handler(request)
 
 
 def test_httpapi_listen_parses_api_base():
@@ -68,13 +79,13 @@ def test_ensure_writes_unit_and_config(tmp_path, monkeypatch):
     config = tmp_path / "etc" / "config.json"
     unit = tmp_path / "systemd" / "xray.service"
 
-    result = ensure_xray_runtime(
+    result = asyncio.run(ensure_xray_runtime(
         binary=str(binary),
         config_path=str(config),
         api_base="http://127.0.0.1:8080",
         unit_path=str(unit),
         start=False,
-    )
+    ))
     assert result["wrote_config"] is True
     assert config.is_file()
     assert unit.is_file()
@@ -86,12 +97,12 @@ def test_ensure_start_without_systemctl_raises(tmp_path, monkeypatch):
     binary.write_bytes(b"xray httpapi /api/stats/sys")
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
     try:
-        ensure_xray_runtime(
+        asyncio.run(ensure_xray_runtime(
             binary=str(binary),
             config_path=str(tmp_path / "config.json"),
             unit_path=str(tmp_path / "xray.service"),
             start=True,
-        )
+        ))
         assert False, "expected AgentError"
     except AgentError as exc:
         assert "systemctl" in exc.message
@@ -102,12 +113,12 @@ def test_ensure_start_rejects_stock_binary(tmp_path, monkeypatch):
     binary.write_bytes(b"Xray, Penetrates Everything.")
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None)
     try:
-        ensure_xray_runtime(
+        asyncio.run(ensure_xray_runtime(
             binary=str(binary),
             config_path=str(tmp_path / "config.json"),
             unit_path=str(tmp_path / "xray.service"),
             start=True,
-        )
+        ))
         assert False, "expected AgentError"
     except AgentError as exc:
         assert "HTTP API" in exc.message
@@ -127,25 +138,32 @@ def test_ensure_start_skips_restart_when_already_active(tmp_path, monkeypatch):
         "agent.xray_service.which",
         lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None,
     )
-    monkeypatch.setattr("agent.xray_service.service_is_active", lambda unit_name: True)
-    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", lambda **kwargs: None)
+    async def fake_active(unit_name):
+        return True
 
-    def fake_systemctl(action, unit_name):
+    async def fake_wait(**kwargs):
+        return None
+
+    monkeypatch.setattr("agent.xray_service.service_is_active", fake_active)
+    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", fake_wait)
+
+    async def fake_systemctl(action, unit_name):
         actions.append(action)
         return {"ok": True, "action": action, "unit": unit_name, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr("agent.xray_service.systemctl", fake_systemctl)
-    monkeypatch.setattr(
-        "agent.xray_service.run_cmd",
-        lambda *args, **kwargs: type("P", (), {"stdout": "", "stderr": "", "returncode": 0})(),
-    )
 
-    result = ensure_xray_running(
+    async def fake_run(*args, **kwargs):
+        return type("P", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("agent.xray_service.run", fake_run)
+
+    result = asyncio.run(ensure_xray_running(
         binary=str(binary),
         config_path=str(config),
         api_base="http://127.0.0.1:8080",
         unit_path=str(unit),
-    )
+    ))
     assert result["already_running"] is True
     assert result["started"] is False
     assert "restart" not in actions
@@ -164,28 +182,35 @@ def test_ensure_start_starts_only_when_inactive(tmp_path, monkeypatch):
         "agent.xray_service.which",
         lambda cmd: "/usr/bin/systemctl" if cmd == "systemctl" else None,
     )
-    monkeypatch.setattr("agent.xray_service.service_is_active", lambda unit_name: active["value"])
-    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", lambda **kwargs: None)
+    async def fake_active(unit_name):
+        return active["value"]
 
-    def fake_systemctl(action, unit_name):
+    async def fake_wait(**kwargs):
+        return None
+
+    monkeypatch.setattr("agent.xray_service.service_is_active", fake_active)
+    monkeypatch.setattr("agent.xray_service.wait_xray_http_api", fake_wait)
+
+    async def fake_systemctl(action, unit_name):
         actions.append(action)
         if action == "start":
             active["value"] = True
         return {"ok": True, "action": action, "unit": unit_name, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr("agent.xray_service.systemctl", fake_systemctl)
-    monkeypatch.setattr(
-        "agent.xray_service.run_cmd",
-        lambda *args, **kwargs: type("P", (), {"stdout": "", "stderr": "", "returncode": 0})(),
-    )
 
-    result = ensure_xray_runtime(
+    async def fake_run(*args, **kwargs):
+        return type("P", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("agent.xray_service.run", fake_run)
+
+    result = asyncio.run(ensure_xray_runtime(
         binary=str(binary),
         config_path=str(config),
         api_base="http://127.0.0.1:8080",
         unit_path=str(unit),
         start=True,
-    )
+    ))
     assert result["started"] is True
     assert result.get("already_running") is False
     assert "start" in actions
@@ -342,10 +367,20 @@ def test_wait_xray_http_api_rejects_bare_404(monkeypatch):
         status_code = 404
         text = "404 page not found"
 
-    monkeypatch.setattr("httpx.get", lambda *args, **kwargs: _Resp())
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: _Client())
 
     try:
-        wait_xray_http_api(api_base="http://127.0.0.1:9", attempts=1, delay=0)
+        asyncio.run(wait_xray_http_api(api_base="http://127.0.0.1:9", attempts=1, delay=0))
         assert False, "expected AgentError"
     except AgentError as exc:
         assert exc.code == "CONFIG_NOT_FOUND"
@@ -357,10 +392,10 @@ def test_xray_http_maps_404_to_config_not_found():
     from agent.drivers.xray_http import XrayHttpClient
     import httpx
 
-    transport = httpx.MockTransport(lambda request: httpx.Response(404, text="404 page not found"))
+    transport = _AsyncMockTransport(lambda request: httpx.Response(404, text="404 page not found"))
     client = XrayHttpClient(XraySettings(api_base="http://test"), transport=transport)
     try:
-        client.list_inbounds()
+        asyncio.run(client.list_inbounds())
         assert False, "expected AgentError"
     except AgentError as exc:
         assert exc.code == "CONFIG_NOT_FOUND"
@@ -407,14 +442,14 @@ def test_xray_http_users_upsert_falls_back_to_inbound_edit():
             return httpx.Response(200, json={"status": "ok"})
         return httpx.Response(500, text=f"unexpected {request.method} {path}")
 
-    client = XrayHttpClient(XraySettings(api_base="http://test"), transport=httpx.MockTransport(handler))
+    client = XrayHttpClient(XraySettings(api_base="http://test"), transport=_AsyncMockTransport(handler))
     try:
-        result = client.upsert_users(
+        result = asyncio.run(client.upsert_users(
             "inbound-1642",
             [{"id": "00000000-0000-4000-8000-000000000001", "email": "probe-test"}],
             protocol="vless",
             inbound_settings={"decryption": "none"},
-        )
+        ))
         assert result.get("succeeded") == 1
         assert result.get("fallback") == "inbounds/edit"
         assert state["inbounds"][0]["settings"]["clients"][0]["email"] == "probe-test"

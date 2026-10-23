@@ -211,6 +211,24 @@ class FakeXrayHttpClient:
                 users[email] = {}
         return {"users": users}
 
+    def stats_query(
+        self,
+        pattern: str,
+        *,
+        reset: bool = False,
+        online_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        prefix = "user>>>"
+        suffix = ">>>traffic>>>"
+        if pattern.startswith(prefix) and suffix in pattern:
+            rest = pattern[len(prefix) :]
+            email = rest.split(suffix, 1)[0]
+            traffic = self._user_traffic.get(email) or {}
+            rows.append({"name": f"user>>>{email}>>>traffic>>>uplink", "value": int(traffic.get("uplink") or 0)})
+            rows.append({"name": f"user>>>{email}>>>traffic>>>downlink", "value": int(traffic.get("downlink") or 0)})
+        return rows
+
     def stats_query_grouped(
         self,
         pattern: str,

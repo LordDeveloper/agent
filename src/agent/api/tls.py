@@ -25,7 +25,7 @@ router = APIRouter(prefix='/tls', tags=['tls'])
 
 
 @router.get('/status')
-def tls_status():
+async def tls_status():
     return {
         'success': True,
         'acme_installed': acme_installed(),
@@ -34,26 +34,26 @@ def tls_status():
 
 
 @router.post('/install-acme')
-def install_acme(body: dict[str, Any] | None = Body(default=None)):
+async def install_acme(body: dict[str, Any] | None = Body(default=None)):
     payload = body or {}
     try:
-        result = ensure_acme(email=str(payload.get('email', '')))
+        result = await ensure_acme(email=str(payload.get('email', '')))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, **result}
 
 
 @router.post('/install-certbot')
-def install_certbot_endpoint(body: dict[str, Any] | None = Body(default=None)):
+async def install_certbot_endpoint(body: dict[str, Any] | None = Body(default=None)):
     try:
-        result = ensure_certbot()
+        result = await ensure_certbot()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, **result}
 
 
 @router.post('/issue')
-def tls_issue(body: dict[str, Any] = Body()):
+async def tls_issue(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
     raw_domains = body.get('domains')
     domains: list[str] | None = None
@@ -70,7 +70,7 @@ def tls_issue(body: dict[str, Any] = Body()):
     tool = str(body.get('tool', 'acme')).strip().lower()
 
     try:
-        result = issue_cert(
+        result = await issue_cert(
             domain=domain,
             method=method,
             cf_token=cf_token,
@@ -86,25 +86,25 @@ def tls_issue(body: dict[str, Any] = Body()):
 
 
 @router.post('/renew')
-def tls_renew(body: dict[str, Any] = Body()):
+async def tls_renew(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
     force = bool(body.get('force', False))
     tool = str(body.get('tool', 'acme')).strip().lower()
 
     try:
-        result = renew_cert(domain=domain, force=force, tool=tool)
+        result = await renew_cert(domain=domain, force=force, tool=tool)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return result
 
 
 @router.get('/certs')
-def tls_list():
+async def tls_list():
     return {'success': True, 'certs': list_certs()}
 
 
 @router.get('/certs/{domain}')
-def tls_cert_info(domain: str):
+async def tls_cert_info(domain: str):
     paths = cert_paths(domain)
     from pathlib import Path
 
@@ -118,7 +118,7 @@ def tls_cert_info(domain: str):
 
 
 @router.post('/export-files')
-def tls_export_files(body: dict[str, Any] = Body()):
+async def tls_export_files(body: dict[str, Any] = Body()):
     raw = body.get('paths')
     if not isinstance(raw, list):
         raise_agent_error('VALIDATION_ERROR', 'paths must be a list', 422)
@@ -130,7 +130,7 @@ def tls_export_files(body: dict[str, Any] = Body()):
 
 
 @router.post('/import-files')
-def tls_import_files(body: dict[str, Any] = Body()):
+async def tls_import_files(body: dict[str, Any] = Body()):
     raw = body.get('files')
     if not isinstance(raw, list):
         raise_agent_error('VALIDATION_ERROR', 'files must be a list', 422)
@@ -142,7 +142,7 @@ def tls_import_files(body: dict[str, Any] = Body()):
 
 
 @router.get('/acme-store')
-def tls_export_acme_store():
+async def tls_export_acme_store():
     try:
         result = export_acme_store()
     except AgentError as exc:
@@ -151,7 +151,7 @@ def tls_export_acme_store():
 
 
 @router.post('/acme-store')
-def tls_import_acme_store(body: dict[str, Any] = Body()):
+async def tls_import_acme_store(body: dict[str, Any] = Body()):
     raw = body.get('files')
     if not isinstance(raw, list):
         raise_agent_error('VALIDATION_ERROR', 'files must be a list', 422)
@@ -163,10 +163,10 @@ def tls_import_acme_store(body: dict[str, Any] = Body()):
 
 
 @router.post('/revoke')
-def tls_revoke(body: dict[str, Any] = Body()):
+async def tls_revoke(body: dict[str, Any] = Body()):
     domain = str(body.get('domain', '')).strip()
     try:
-        result = revoke_cert(domain=domain)
+        result = await revoke_cert(domain=domain)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return result

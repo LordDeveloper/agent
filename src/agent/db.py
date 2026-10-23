@@ -117,6 +117,36 @@ class Store:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def write_docs(
+        self,
+        core: str,
+        kind: str,
+        puts: list[tuple[str, dict[str, Any]]],
+        deletes: list[str] | None = None,
+    ) -> None:
+        """Insert and delete documents in one transaction."""
+        with self._lock:
+            for doc_id, data in puts:
+                payload = json.dumps(data, ensure_ascii=False)
+                self._conn.execute(
+                    """
+                    INSERT INTO documents (core, kind, doc_id, data, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(core, kind, doc_id) DO UPDATE SET
+                        data = excluded.data,
+                        updated_at = datetime('now')
+                    """,
+                    (core, kind, str(doc_id), payload),
+                )
+            for doc_id in deletes or []:
+                if not str(doc_id).strip():
+                    continue
+                self._conn.execute(
+                    "DELETE FROM documents WHERE core = ? AND kind = ? AND doc_id = ?",
+                    (core, kind, str(doc_id)),
+                )
+            self._conn.commit()
+
     def replace_docs(self, core: str, kind: str, docs: list[dict[str, Any]], id_key: str = "id") -> None:
         with self._lock:
             self._conn.execute(

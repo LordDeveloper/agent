@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.errors import AgentError
 from agent.logutil import get_logger
+from agent.support.process import run
 
 log = get_logger('tls')
 
@@ -27,9 +27,9 @@ CERTBOT_LIVE = Path('/etc/letsencrypt/live')
 TOOLS = ('acme', 'certbot')
 
 
-def _run(args: list[str], *, timeout: int = 300, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+async def _run(args: list[str], *, timeout: int = 300, env: dict[str, str] | None = None):
     merged = {**os.environ, **(env or {})}
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=merged)
+    return await run(args, timeout=timeout, env=merged)
 
 
 def _resolve_acme_email(email: str = '') -> str:
@@ -74,12 +74,12 @@ def _extract_acme_error(combined: str) -> str:
     return '\n'.join(tail)[-800:]
 
 
-def _configure_acme(email: str = '') -> None:
+async def _configure_acme(email: str = '') -> None:
     """Force Let's Encrypt (or ACME_SERVER) and register account email when needed."""
     if not acme_installed():
         return
 
-    proc = _run([
+    proc = await _run([
         str(ACME_BIN), '--set-default-ca',
         '--home', str(ACME_HOME),
         *_acme_server_args(),
@@ -94,7 +94,7 @@ def _configure_acme(email: str = '') -> None:
     if not resolved_email:
         return
 
-    proc = _run([
+    proc = await _run([
         str(ACME_BIN), '--register-account',
         '--home', str(ACME_HOME),
         *_acme_server_args(),
@@ -109,7 +109,7 @@ def _configure_acme(email: str = '') -> None:
             )
 
 
-def _install_cert_to_agent(domain: str, paths: dict[str, str]) -> None:
+async def _install_cert_to_agent(domain: str, paths: dict[str, str]) -> None:
     base_args = [
         str(ACME_BIN), '--install-cert',
         '--home', str(ACME_HOME),
@@ -119,7 +119,7 @@ def _install_cert_to_agent(domain: str, paths: dict[str, str]) -> None:
     ]
     last_error = ''
     for extra in (['--ecc'], []):
-        proc = _run(base_args + extra, timeout=60)
+        proc = await _run(base_args + extra, timeout=60)
         if proc.returncode == 0 and Path(paths['cert_file']).is_file() and Path(paths['key_file']).is_file():
             return
         last_error = _extract_acme_error(f'{proc.stdout or ""}\n{proc.stderr or ""}')
@@ -127,13 +127,13 @@ def _install_cert_to_agent(domain: str, paths: dict[str, str]) -> None:
     raise AgentError('VALIDATION_ERROR', f'Certificate install failed: {last_error or "unknown error"}')
 
 
-def _try_install_from_acme_store(domain: str, paths: dict[str, str]) -> bool:
+async def _try_install_from_acme_store(domain: str, paths: dict[str, str]) -> bool:
     """Restore agent cert files from an existing acme.sh store entry."""
     if not acme_installed():
         return False
 
     try:
-        _install_cert_to_agent(domain, paths)
+        await _install_cert_to_agent(domain, paths)
     except AgentError:
         return False
 
@@ -148,7 +148,7 @@ def acme_installed() -> bool:
     return ACME_BIN.is_file()
 
 
-def ensure_acme(email: str = '') -> dict:
+async def ensure_acme(email: str = '') -> dict:
     downloaded = False
 
     if not acme_installed():
@@ -160,12 +160,12 @@ def ensure_acme(email: str = '') -> dict:
         ACME_HOME.mkdir(parents=True, exist_ok=True)
 
         if curl:
-            proc = _run([
+            proc = await _run([
                 curl, '-fsSL', ACME_INSTALL_URL,
                 '-o', str(ACME_HOME / 'acme.sh'),
             ])
         else:
-            proc = _run([
+            proc = await _run([
                 wget, '-qO', str(ACME_HOME / 'acme.sh'), ACME_INSTALL_URL,
             ])
 
@@ -182,12 +182,12 @@ def ensure_acme(email: str = '') -> dict:
         resolved_email = _resolve_acme_email(email)
         if resolved_email:
             install_args += ['--accountemail', resolved_email]
-        proc = _run(install_args)
+        proc = await _run(install_args)
         if proc.returncode != 0:
             log.warning('acme.sh --install warning: %s', proc.stderr.strip()[:300])
         downloaded = True
 
-    _configure_acme(email)
+    await _configure_acme(email)
 
     return {'installed': True, 'downloaded': downloaded, 'path': str(ACME_BIN)}
 
@@ -200,20 +200,20 @@ def certbot_installed() -> bool:
     return shutil.which('certbot') is not None
 
 
-def ensure_certbot() -> dict:
+async def ensure_certbot() -> dict:
     if certbot_installed():
         return {'installed': True, 'downloaded': False, 'path': str(shutil.which('certbot'))}
 
     apt = shutil.which('apt-get')
     if apt:
-        proc = _run([apt, 'update', '-qq'], timeout=120)
-        proc = _run([apt, 'install', '-y', '-qq', 'certbot'], timeout=300)
+        proc = await _run([apt, 'update', '-qq'], timeout=120)
+        proc = await _run([apt, 'install', '-y', '-qq', 'certbot'], timeout=300)
         if proc.returncode == 0 and certbot_installed():
             return {'installed': True, 'downloaded': True, 'path': str(shutil.which('certbot'))}
 
     snap = shutil.which('snap')
     if snap:
-        proc = _run([snap, 'install', '--classic', 'certbot'], timeout=300)
+        proc = await _run([snap, 'install', '--classic', 'certbot'], timeout=300)
         if proc.returncode == 0 and certbot_installed():
             return {'installed': True, 'downloaded': True, 'path': str(shutil.which('certbot'))}
 
@@ -270,7 +270,7 @@ def _domain_args(domains: list[str]) -> list[str]:
 # issue / renew dispatchers
 # ---------------------------------------------------------------------------
 
-def issue_cert(
+async def issue_cert(
     domain: str,
     method: str = 'standalone',
     cf_token: str | None = None,
@@ -285,7 +285,7 @@ def issue_cert(
         raise AgentError('VALIDATION_ERROR', f'Unknown tool [{tool}]. Use acme or certbot.')
 
     if tool == 'certbot':
-        return _issue_cert_certbot(
+        return await _issue_cert_certbot(
             domain,
             method=method,
             cf_token=cf_token,
@@ -293,7 +293,7 @@ def issue_cert(
             force=force,
             domains=domains,
         )
-    return _issue_cert_acme(
+    return await _issue_cert_acme(
         domain,
         method=method,
         cf_token=cf_token,
@@ -304,21 +304,21 @@ def issue_cert(
     )
 
 
-def renew_cert(domain: str, force: bool = False, tool: str = 'acme') -> dict:
+async def renew_cert(domain: str, force: bool = False, tool: str = 'acme') -> dict:
     tool = (tool or 'acme').strip().lower()
     if tool not in TOOLS:
         raise AgentError('VALIDATION_ERROR', f'Unknown tool [{tool}]. Use acme or certbot.')
 
     if tool == 'certbot':
-        return _renew_cert_certbot(domain, force=force)
-    return _renew_cert_acme(domain, force=force)
+        return await _renew_cert_certbot(domain, force=force)
+    return await _renew_cert_acme(domain, force=force)
 
 
 # ---------------------------------------------------------------------------
 # acme.sh issue / renew
 # ---------------------------------------------------------------------------
 
-def _issue_cert_acme(
+async def _issue_cert_acme(
     domain: str,
     method: str = 'standalone',
     cf_token: str | None = None,
@@ -329,7 +329,7 @@ def _issue_cert_acme(
 ) -> dict:
     san_domains = normalize_domains(domain, domains)
     primary = san_domains[0]
-    ensure_acme(email=email)
+    await ensure_acme(email=email)
 
     out_dir = _cert_dir(primary)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -346,7 +346,7 @@ def _issue_cert_acme(
             **paths,
         }
 
-    if not force and _try_install_from_acme_store(primary, paths):
+    if not force and await _try_install_from_acme_store(primary, paths):
         log.info('certificate restored from acme store domain=%s cert=%s', primary, paths['cert_file'])
         return {
             'success': True,
@@ -393,7 +393,7 @@ def _issue_cert_acme(
         ','.join(san_domains),
         method,
     )
-    proc = _run(args, timeout=300, env=env)
+    proc = await _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
         combined = f'{proc.stdout or ""}\n{proc.stderr or ""}'.strip()
@@ -401,7 +401,7 @@ def _issue_cert_acme(
         log.error('acme.sh --issue failed: %s', detail)
         raise AgentError('VALIDATION_ERROR', f'Certificate issue failed: {detail}')
 
-    _install_cert_to_agent(primary, paths)
+    await _install_cert_to_agent(primary, paths)
 
     log.info('certificate issued domain=%s cert=%s tool=acme', primary, paths['cert_file'])
     return {
@@ -415,7 +415,7 @@ def _issue_cert_acme(
     }
 
 
-def _renew_cert_acme(domain: str, force: bool = False) -> dict:
+async def _renew_cert_acme(domain: str, force: bool = False) -> dict:
     if not domain or not domain.strip():
         raise AgentError('VALIDATION_ERROR', 'domain is required')
 
@@ -423,7 +423,7 @@ def _renew_cert_acme(domain: str, force: bool = False) -> dict:
     if not acme_installed():
         raise AgentError('VALIDATION_ERROR', 'acme.sh is not installed. Call install-acme first.')
 
-    _configure_acme()
+    await _configure_acme()
 
     args = [
         str(ACME_BIN), '--renew',
@@ -434,13 +434,13 @@ def _renew_cert_acme(domain: str, force: bool = False) -> dict:
     if force:
         args += ['--force']
 
-    proc = _run(args, timeout=180)
+    proc = await _run(args, timeout=180)
     if proc.returncode != 0:
         combined = f'{proc.stdout or ""}\n{proc.stderr or ""}'.strip()
         raise AgentError('VALIDATION_ERROR', f'Certificate renew failed: {_extract_acme_error(combined)}')
 
     paths = cert_paths(domain)
-    _install_cert_to_agent(domain, paths)
+    await _install_cert_to_agent(domain, paths)
 
     return {'success': True, 'renewed': True, 'tool': 'acme', 'domain': domain, **paths}
 
@@ -449,7 +449,7 @@ def _renew_cert_acme(domain: str, force: bool = False) -> dict:
 # certbot issue / renew
 # ---------------------------------------------------------------------------
 
-def _issue_cert_certbot(
+async def _issue_cert_certbot(
     domain: str,
     method: str = 'standalone',
     cf_token: str | None = None,
@@ -459,7 +459,7 @@ def _issue_cert_certbot(
 ) -> dict:
     san_domains = normalize_domains(domain, domains)
     primary = san_domains[0]
-    ensure_certbot()
+    await ensure_certbot()
 
     out_dir = _cert_dir(primary)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -513,7 +513,7 @@ def _issue_cert_certbot(
         ','.join(san_domains),
         method,
     )
-    proc = _run(args, timeout=300, env=env)
+    proc = await _run(args, timeout=300, env=env)
 
     if proc.returncode != 0:
         output = (proc.stdout or '').strip()
@@ -547,7 +547,7 @@ def _issue_cert_certbot(
     }
 
 
-def _renew_cert_certbot(domain: str, force: bool = False) -> dict:
+async def _renew_cert_certbot(domain: str, force: bool = False) -> dict:
     if not domain or not domain.strip():
         raise AgentError('VALIDATION_ERROR', 'domain is required')
 
@@ -560,7 +560,7 @@ def _renew_cert_certbot(domain: str, force: bool = False) -> dict:
     if force:
         args += ['--force-renewal']
 
-    proc = _run(args, timeout=300)
+    proc = await _run(args, timeout=300)
     if proc.returncode != 0:
         stderr = proc.stderr.strip()[:500] or proc.stdout.strip()[:500]
         raise AgentError('VALIDATION_ERROR', f'Certificate renew failed: {stderr}')
@@ -613,7 +613,7 @@ def list_certs() -> list[dict]:
     return certs
 
 
-def revoke_cert(domain: str) -> dict:
+async def revoke_cert(domain: str) -> dict:
     if not domain or not domain.strip():
         raise AgentError('VALIDATION_ERROR', 'domain is required')
 
@@ -627,7 +627,7 @@ def revoke_cert(domain: str) -> dict:
         *_acme_server_args(),
         '-d', domain,
     ]
-    proc = _run(args, timeout=120)
+    proc = await _run(args, timeout=120)
     revoked = proc.returncode == 0
 
     cert_dir = _cert_dir(domain)

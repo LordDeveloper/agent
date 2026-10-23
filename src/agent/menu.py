@@ -10,6 +10,7 @@ from typing import Callable
 import httpx
 
 from agent import __version__
+from agent.asyncutil import run_sync
 from agent.errors import AgentError
 from agent.ops import (
     KNOWN_CORES,
@@ -194,7 +195,7 @@ def _show_agent_status() -> None:
         _print(kv("Listen", runtime.settings.listen, CYAN))
         _print(kv("Enabled cores", enabled, GREEN))
         _print()
-        for info in runtime.registry.list_cores():
+        for info in run_sync(runtime.registry.list_cores()):
             bits = [
                 "installed" if info.installed else "missing",
                 "running" if info.running else "stopped",
@@ -287,7 +288,7 @@ def _show_core_runtime_status(name: str) -> None:
             return
 
         installed = bool(driver.installed())
-        running = bool(driver.running())
+        running = bool(run_sync(driver.running()))
         version = driver.version() or "-"
         _print(kv("Installed", "yes" if installed else "no", GREEN if installed else RED))
         _print(kv("Running", "yes" if running else "no", GREEN if running else RED))
@@ -460,7 +461,7 @@ def _show_stats(*, online_only: bool) -> None:
     runtime = open_runtime()
     try:
         if online_only:
-            users = runtime.registry.online_traffic()
+            users = run_sync(runtime.registry.online_traffic())
             _print(kv("Online", str(len(users)), GREEN))
             _print()
             if not users:
@@ -476,7 +477,7 @@ def _show_stats(*, online_only: bool) -> None:
                 _print(paint(line, WHITE))
             return
 
-        snapshot = runtime.registry.usage_snapshot()
+        snapshot = run_sync(runtime.registry.usage_snapshot())
         if not snapshot.inbounds:
             _print(paint("  No usage data.", DIM))
             return
@@ -912,7 +913,7 @@ def _dns_leak_menu() -> None:
 def _show_dns_leak_status() -> None:
     from agent.dns_leak import dns_leak_status
 
-    payload = dns_leak_status()
+    payload = run_sync(dns_leak_status())
     active = bool(payload.get("active"))
     _print(kv("Active", "yes" if active else "no", GREEN if active else YELLOW))
     _print(kv("Backend", str(payload.get("backend") or "-"), CYAN))
@@ -925,7 +926,7 @@ def _show_dns_leak_status() -> None:
 def _show_dns_leak_apply() -> None:
     from agent.dns_leak import dns_leak_apply
 
-    result = dns_leak_apply()
+    result = run_sync(dns_leak_apply())
     _print(kv("Applied", "yes" if result.get("applied") else "no", GREEN if result.get("applied") else RED))
     _print(kv("Backend", str(result.get("backend") or "-"), CYAN))
     for row in result.get("interfaces") or []:
@@ -935,14 +936,14 @@ def _show_dns_leak_apply() -> None:
 def _show_dns_leak_remove() -> None:
     from agent.dns_leak import dns_leak_remove
 
-    result = dns_leak_remove()
+    result = run_sync(dns_leak_remove())
     _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
 
 
 def _show_ads_block_prerequisites() -> None:
     from agent.ads_block import ads_block_prerequisites
 
-    payload = ads_block_prerequisites()
+    payload = run_sync(ads_block_prerequisites())
     _print(kv("Linux", "yes" if payload.get("linux") else "no", GREEN if payload.get("linux") else RED))
     _print(kv("Root", "yes" if payload.get("root") else "no", GREEN if payload.get("root") else YELLOW))
     _print(kv("AdGuard installed", "yes" if payload.get("adguard_installed") else "no", GREEN if payload.get("adguard_installed") else RED))
@@ -960,7 +961,7 @@ def _show_ads_block_prerequisites() -> None:
 def _show_ads_block_repair() -> None:
     from agent.ads_block import ads_block_repair_service
 
-    result = ads_block_repair_service()
+    result = run_sync(ads_block_repair_service())
     service = result.get("service") or {}
     _print(kv("AdGuard active", "yes" if result.get("adguard_active") else "no", GREEN if result.get("adguard_active") else RED))
     actions = service.get("actions") or []
@@ -972,7 +973,7 @@ def _show_ads_block_repair() -> None:
 def _show_ads_block_install() -> None:
     from agent.ads_block import ads_block_install_prerequisites
 
-    result = ads_block_install_prerequisites()
+    result = run_sync(ads_block_install_prerequisites())
     installed = result.get("installed") or []
     _print(kv("Installed", ", ".join(installed) if installed else "already present", GREEN))
     _print(kv("AdGuard active", "yes" if result.get("adguard_active") else "no", GREEN if result.get("adguard_active") else YELLOW))
@@ -982,7 +983,7 @@ def _show_ads_block_install() -> None:
 def _show_ads_block_status() -> None:
     from agent.ads_block import ads_block_status
 
-    payload = ads_block_status()
+    payload = run_sync(ads_block_status())
     enabled = bool(payload.get("enabled"))
     _print(kv("Enabled", "yes" if enabled else "no", GREEN if enabled else YELLOW))
     _print(kv("Custom rules", str(payload.get("custom_rules") or 0), WHITE))
@@ -998,7 +999,7 @@ def _show_ads_block_status() -> None:
 def _show_ads_block_enable() -> None:
     from agent.ads_block import ads_block_ensure
 
-    result = ads_block_ensure()
+    result = run_sync(ads_block_ensure())
     _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
     _print(kv("Custom rules", str(result.get("custom_rules") or 0), WHITE))
     _print(kv("Client DNS", str(result.get("dns") or "-"), CYAN))
@@ -1012,14 +1013,14 @@ def _show_ads_block_enable() -> None:
 def _show_ads_block_disable() -> None:
     from agent.ads_block import ads_block_disable
 
-    result = ads_block_disable()
+    result = run_sync(ads_block_disable())
     _print(kv("Removed", "yes" if result.get("removed") else "no", GREEN))
 
 
 def _show_ads_block_test(domain: str) -> None:
     from agent.ads_block import ads_block_test
 
-    result = ads_block_test(domain)
+    result = run_sync(ads_block_test(domain))
     blocked = bool(result.get("blocked"))
     _print(kv("Domain", str(result.get("domain") or domain), WHITE))
     _print(kv("DNS", str(result.get("dns") or "-"), CYAN))

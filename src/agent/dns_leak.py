@@ -23,10 +23,11 @@ from agent.adguard import (
     remove_agent_adguard_systemd_unit,
     restore_resolved_stub_listener,
 )
+from agent.asyncutil import maybe_await
 from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.support.host_interfaces import list_host_interfaces
-from agent.support.process import run
+from agent.support.process import execute
 
 log = get_logger('dns_leak')
 
@@ -356,9 +357,9 @@ def _configured_openvpn_targets() -> list[dict[str, str]]:
     return rows
 
 
-def _host_ipv4_set(*, runner: Runner | None = None) -> set[str]:
+async def _host_ipv4_set(*, runner: Runner | None = None) -> set[str]:
     addrs: set[str] = set()
-    for item in list_host_interfaces(runner=runner):
+    for item in await maybe_await(list_host_interfaces(runner=runner)):
         for raw in item.get('addresses') or []:
             host = str(raw).split('/', 1)[0].strip()
             try:
@@ -370,19 +371,18 @@ def _host_ipv4_set(*, runner: Runner | None = None) -> set[str]:
     return addrs
 
 
-def ensure_dns_bind_addresses(
+async def ensure_dns_bind_addresses(
     gateways: list[str],
     *,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
     """Ensure AdGuard can bind VPN gateway IPs even before PPP/OpenVPN clients exist."""
-    execute = runner or run
     wanted = [str(item).strip() for item in gateways if str(item).strip()]
     wanted = list(dict.fromkeys(wanted))
     if not wanted:
         return {'ok': True, 'added': [], 'iface': DNS_DUMMY_IFACE, 'skipped': True}
 
-    existing = _host_ipv4_set(runner=runner)
+    existing = await _host_ipv4_set(runner=runner)
     missing = [gw for gw in wanted if gw not in existing]
     if not missing:
         return {'ok': True, 'added': [], 'iface': DNS_DUMMY_IFACE, 'skipped': True}
@@ -390,11 +390,11 @@ def ensure_dns_bind_addresses(
     if not shutil.which('ip'):
         return {'ok': False, 'added': [], 'iface': DNS_DUMMY_IFACE, 'error': 'ip not found'}
 
-    execute(['ip', 'link', 'add', 'name', DNS_DUMMY_IFACE, 'type', 'dummy'], check=False, timeout=10)
-    execute(['ip', 'link', 'set', 'dev', DNS_DUMMY_IFACE, 'up'], check=False, timeout=10)
+    await execute(runner, ['ip', 'link', 'add', 'name', DNS_DUMMY_IFACE, 'type', 'dummy'], check=False, timeout=10)
+    await execute(runner, ['ip', 'link', 'set', 'dev', DNS_DUMMY_IFACE, 'up'], check=False, timeout=10)
     added: list[str] = []
     for gateway in missing:
-        proc = execute(
+        proc = await execute(runner, 
             ['ip', 'addr', 'add', f'{gateway}/32', 'dev', DNS_DUMMY_IFACE],
             check=False,
             timeout=10,
@@ -403,12 +403,12 @@ def ensure_dns_bind_addresses(
             added.append(gateway)
         else:
             # Already present (race) still counts as success.
-            if gateway in _host_ipv4_set(runner=runner):
+            if gateway in await _host_ipv4_set(runner=runner):
                 added.append(gateway)
     return {'ok': True, 'added': added, 'iface': DNS_DUMMY_IFACE, 'missing': missing}
 
 
-def discover_vpn_interfaces(*, runner: Runner | None = None) -> list[dict[str, Any]]:
+async def discover_vpn_interfaces(*, runner: Runner | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     seen_gateways: set[str] = set()
@@ -416,7 +416,7 @@ def discover_vpn_interfaces(*, runner: Runner | None = None) -> list[dict[str, A
     bound = _mullvad_bound_ifaces()
     mullvad_gateways = _mullvad_exit_gateway_ips(bound=bound)
 
-    for item in list_host_interfaces(runner=runner):
+    for item in await maybe_await(list_host_interfaces(runner=runner)):
         if not _is_vpn_interface(item, bound=bound, mullvad_gateways=mullvad_gateways):
             continue
         gateway = _interface_ipv4(list(item.get('addresses') or []))
@@ -625,12 +625,12 @@ def _normalize_interface_names(names: list[str] | None) -> list[str]:
     return out
 
 
-def _resolve_targets(
+async def _resolve_targets(
     interfaces: list[str] | None,
     *,
     runner: Runner | None = None,
 ) -> list[dict[str, Any]]:
-    discovered = discover_vpn_interfaces(runner=runner)
+    discovered = await maybe_await(discover_vpn_interfaces(runner=runner))
     by_name = {str(row['name']): row for row in discovered}
     requested = _normalize_interface_names(interfaces)
 
@@ -651,18 +651,18 @@ def _resolve_targets(
     return discovered
 
 
-def _dns_leak_active(*, runner: Runner | None = None) -> bool:
+async def _dns_leak_active(*, runner: Runner | None = None) -> bool:
     if UNIT_PATH.is_file() or apply_script_path().is_file():
         return True
-    return _nft_table_exists(runner=runner)
+    return await _nft_table_exists(runner=runner)
 
 
-def preferred_client_dns(*, runner: Runner | None = None) -> list[str]:
+async def preferred_client_dns(*, runner: Runner | None = None) -> list[str]:
     """DNS servers pushed to L2TP/OpenVPN clients (AdGuard gateways when active)."""
-    if not (ADS_ENABLED_MARKER.is_file() or _dns_leak_active(runner=runner)):
+    if not (ADS_ENABLED_MARKER.is_file() or await _dns_leak_active(runner=runner)):
         return list(DEFAULT_UPSTREAM_DNS)
     try:
-        interfaces = discover_vpn_interfaces(runner=runner)
+        interfaces = await maybe_await(discover_vpn_interfaces(runner=runner))
     except AgentError:
         interfaces = []
     dns: list[str] = []
@@ -749,14 +749,13 @@ def ensure_ppp_dns_hook(*, runner: Runner | None = None) -> dict[str, Any]:
         return {'ok': False, 'error': str(exc)}
 
 
-def sync_client_dns_push(
+async def sync_client_dns_push(
     dns_servers: list[str] | None = None,
     *,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
     """Point L2TP ms-dns and OpenVPN dhcp-option DNS at AdGuard (or defaults)."""
-    execute = runner or run
-    dns = [str(item).strip() for item in (dns_servers or preferred_client_dns(runner=runner)) if str(item).strip()]
+    dns = [str(item).strip() for item in (dns_servers or await preferred_client_dns(runner=runner)) if str(item).strip()]
     if not dns:
         dns = list(DEFAULT_UPSTREAM_DNS)
 
@@ -792,9 +791,9 @@ def sync_client_dns_push(
             instance = conf.stem
             unit = f'openvpn-server@{instance}.service'
             if shutil.which('systemctl'):
-                proc = execute(['systemctl', 'reload', unit], check=False, timeout=30)
+                proc = await execute(runner, ['systemctl', 'reload', unit], check=False, timeout=30)
                 if getattr(proc, 'returncode', 1) != 0:
-                    execute(['systemctl', 'restart', unit], check=False, timeout=60)
+                    await execute(runner, ['systemctl', 'restart', unit], check=False, timeout=60)
                 reloaded.append(unit)
 
     return {'ok': True, 'dns': dns, 'updated': updated, 'reloaded': reloaded}
@@ -816,7 +815,7 @@ def _write_apply_script(
     return path
 
 
-def _ensure_adguard(
+async def _ensure_adguard(
     interfaces: list[dict[str, Any]],
     *,
     upstream: tuple[str, ...] = DEFAULT_UPSTREAM_DNS,
@@ -824,8 +823,8 @@ def _ensure_adguard(
     user_rules: list[str] | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
-    cleanup_legacy_dnsmasq(runner=runner)
-    resolver = ensure_adguard_resolver(
+    await cleanup_legacy_dnsmasq(runner=runner)
+    resolver = await ensure_adguard_resolver(
         interfaces,
         upstream=upstream,
         filtering_enabled=filtering_enabled,
@@ -835,8 +834,7 @@ def _ensure_adguard(
     return resolver
 
 
-def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> dict[str, Any]:
-    execute = runner or run
+async def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> dict[str, Any]:
     if not shutil.which('systemctl'):
         return {'ok': False, 'skipped': True, 'reason': 'systemctl not found'}
 
@@ -861,10 +859,10 @@ def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = None) -> 
     if previous != unit:
         UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
         UNIT_PATH.write_text(unit, encoding='utf-8')
-        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'daemon-reload'], check=False, timeout=30)
 
-    enable = execute(['systemctl', 'enable', UNIT_NAME], check=False, timeout=30)
-    start = execute(['systemctl', 'start', UNIT_NAME], check=False, timeout=60)
+    enable = await execute(runner, ['systemctl', 'enable', UNIT_NAME], check=False, timeout=30)
+    start = await execute(runner, ['systemctl', 'start', UNIT_NAME], check=False, timeout=60)
     return {
         'ok': getattr(enable, 'returncode', 1) == 0 and getattr(start, 'returncode', 1) == 0,
         'unit': str(UNIT_PATH),
@@ -890,9 +888,8 @@ def _filter_client_vpn_targets(targets: list[dict[str, Any]]) -> list[dict[str, 
     return out
 
 
-def cleanup_mullvad_exit_dns_artifacts(*, runner: Runner | None = None) -> list[str]:
+async def cleanup_mullvad_exit_dns_artifacts(*, runner: Runner | None = None) -> list[str]:
     """Undo leftover resolvectl dns/domain off on Mullvad exits (breaks handshake/egress)."""
-    execute = runner or run
     if not shutil.which('resolvectl'):
         return []
     actions: list[str] = []
@@ -912,13 +909,13 @@ def cleanup_mullvad_exit_dns_artifacts(*, runner: Runner | None = None) -> list[
         if not name or '+' in name or '*' in name:
             continue
         # revert clears dns/domain overrides that ads-block may have left behind
-        proc = execute(['resolvectl', 'revert', name], check=False, timeout=10)
+        proc = await execute(runner, ['resolvectl', 'revert', name], check=False, timeout=10)
         if getattr(proc, 'returncode', 1) == 0:
             actions.append(f'resolvectl_revert:{name}')
     return actions
 
 
-def ensure_vpn_dns_resolver(
+async def ensure_vpn_dns_resolver(
     *,
     interfaces: list[dict[str, Any]] | None = None,
     block_ipv6: bool = False,
@@ -934,7 +931,7 @@ def ensure_vpn_dns_resolver(
     _require_root()
 
     if interfaces is None:
-        targets = _resolve_targets(None, runner=runner)
+        targets = await maybe_await(_resolve_targets(None, runner=runner))
     else:
         targets = [row for row in interfaces if str(row.get('gateway') or '').strip()]
         if not targets:
@@ -950,23 +947,23 @@ def ensure_vpn_dns_resolver(
             'No client VPN interfaces left after excluding Mullvad exits',
         )
 
-    exit_cleanup = cleanup_mullvad_exit_dns_artifacts(runner=runner)
+    exit_cleanup = await cleanup_mullvad_exit_dns_artifacts(runner=runner)
 
     upstream = tuple(upstream_dns or DEFAULT_UPSTREAM_DNS)
     ads_filtering = ADS_ENABLED_MARKER.is_file() if filtering_enabled is None else bool(filtering_enabled)
     gateways = [str(row.get('gateway') or '').strip() for row in targets if str(row.get('gateway') or '').strip()]
-    bind = ensure_dns_bind_addresses(gateways, runner=runner)
-    resolver = _ensure_adguard(
+    bind = await ensure_dns_bind_addresses(gateways, runner=runner)
+    resolver = await maybe_await(_ensure_adguard(
         targets,
         upstream=upstream,
         filtering_enabled=ads_filtering,
         user_rules=user_rules,
         runner=runner,
-    )
+    ))
     resolver['bind_addresses'] = bind
     if exit_cleanup:
         resolver['exit_dns_cleanup'] = exit_cleanup
-    host_dns = isolate_vpn_interfaces_from_host_dns(targets, runner=runner)
+    host_dns = await isolate_vpn_interfaces_from_host_dns(targets, runner=runner)
     if host_dns:
         resolver['host_dns_isolated'] = host_dns
 
@@ -976,9 +973,8 @@ def ensure_vpn_dns_resolver(
             log.warning('ensure_vpn_dns_resolver: nft/iptables missing; skipping DNS DNAT')
         else:
             script = _write_apply_script(targets, data_dir=data_dir, block_ipv6=block_ipv6)
-            execute = runner or run
-            proc = execute(['/bin/sh', str(script)], check=False, timeout=120)
-            unit = ensure_dns_leak_unit(script, runner=runner)
+            proc = await execute(runner, ['/bin/sh', str(script)], check=False, timeout=120)
+            unit = await maybe_await(ensure_dns_leak_unit(script, runner=runner))
             dnat = {
                 'applied': proc.returncode == 0,
                 'script': str(script),
@@ -986,7 +982,7 @@ def ensure_vpn_dns_resolver(
                 'backend': _firewall_backend(),
             }
 
-    push = sync_client_dns_push(gateways or list(upstream), runner=runner)
+    push = await sync_client_dns_push(gateways or list(upstream), runner=runner)
     hook = ensure_ppp_dns_hook(runner=runner)
 
     return {
@@ -1001,7 +997,7 @@ def ensure_vpn_dns_resolver(
     }
 
 
-def dns_leak_apply(
+async def dns_leak_apply(
     *,
     interfaces: list[str] | None = None,
     block_ipv6: bool = False,
@@ -1015,20 +1011,19 @@ def dns_leak_apply(
     if _firewall_backend() is None:
         raise AgentError('VALIDATION_ERROR', 'nft or iptables is required for DNS leak protection')
 
-    targets = _resolve_targets(interfaces, runner=runner)
+    targets = await maybe_await(_resolve_targets(interfaces, runner=runner))
     gateways = [str(row.get('gateway') or '').strip() for row in targets if str(row.get('gateway') or '').strip()]
-    ensure_dns_bind_addresses(gateways, runner=runner)
+    await ensure_dns_bind_addresses(gateways, runner=runner)
     script = _write_apply_script(targets, data_dir=data_dir, block_ipv6=block_ipv6)
-    execute = runner or run
-    proc = execute(['/bin/sh', str(script)], check=False, timeout=120)
-    unit = ensure_dns_leak_unit(script, runner=runner)
-    push = sync_client_dns_push(gateways or list(upstream_dns or DEFAULT_UPSTREAM_DNS), runner=runner)
+    proc = await execute(runner, ['/bin/sh', str(script)], check=False, timeout=120)
+    unit = await maybe_await(ensure_dns_leak_unit(script, runner=runner))
+    push = await sync_client_dns_push(gateways or list(upstream_dns or DEFAULT_UPSTREAM_DNS), runner=runner)
     hook = ensure_ppp_dns_hook(runner=runner)
 
     resolver: dict[str, Any] | None = None
     if with_resolver:
         upstream = tuple(upstream_dns or DEFAULT_UPSTREAM_DNS)
-        resolver = _ensure_adguard(targets, upstream=upstream, filtering_enabled=False, runner=runner)
+        resolver = await maybe_await(_ensure_adguard(targets, upstream=upstream, filtering_enabled=False, runner=runner))
 
     return {
         'applied': proc.returncode == 0,
@@ -1044,22 +1039,20 @@ def dns_leak_apply(
     }
 
 
-def _nft_table_exists(*, runner: Runner | None = None) -> bool:
-    execute = runner or run
+async def _nft_table_exists(*, runner: Runner | None = None) -> bool:
     if not shutil.which('nft'):
         return False
-    proc = execute(['nft', 'list', 'table', 'inet', NFT_TABLE], check=False, timeout=15)
+    proc = await execute(runner, ['nft', 'list', 'table', 'inet', NFT_TABLE], check=False, timeout=15)
     return proc.returncode == 0
 
 
-def dns_leak_status(*, runner: Runner | None = None) -> dict[str, Any]:
+async def dns_leak_status(*, runner: Runner | None = None) -> dict[str, Any]:
     _require_linux()
-    execute = runner or run
-    interfaces = discover_vpn_interfaces(runner=runner)
-    active = _nft_table_exists(runner=runner)
+    interfaces = await maybe_await(discover_vpn_interfaces(runner=runner))
+    active = await maybe_await(_nft_table_exists(runner=runner))
     unit_active = False
     if shutil.which('systemctl'):
-        proc = execute(['systemctl', 'is-active', UNIT_NAME], check=False, timeout=10)
+        proc = await execute(runner, ['systemctl', 'is-active', UNIT_NAME], check=False, timeout=10)
         unit_active = (getattr(proc, 'stdout', '') or '').strip() == 'active'
 
     return {
@@ -1072,23 +1065,23 @@ def dns_leak_status(*, runner: Runner | None = None) -> dict[str, Any]:
         'script_exists': apply_script_path().is_file(),
         'adguard_config': str(ADGUARD_CONFIG),
         'adguard_configured': adguard_configured(),
-        'adguard_active': adguard_service_active(runner=runner),
+        'adguard_active': await maybe_await(adguard_service_active(runner=runner)),
         'interfaces': interfaces,
     }
 
 
-def _vpn_dns_still_needed(*, runner: Runner | None = None) -> bool:
+async def _vpn_dns_still_needed(*, runner: Runner | None = None) -> bool:
     if ADS_ENABLED_MARKER.is_file():
         return True
-    return _nft_table_exists(runner=runner) or UNIT_PATH.is_file()
+    return await maybe_await(_nft_table_exists(runner=runner)) or UNIT_PATH.is_file()
 
 
-def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any]:
+async def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any]:
     """Remove AdGuard VPN resolver and restore host DNS when leak/ads are both off."""
     removed_files: list[str] = []
     resolved_restored = False
 
-    if _vpn_dns_still_needed(runner=runner):
+    if await _vpn_dns_still_needed(runner=runner):
         return {
             'removed_files': removed_files,
             'resolved_restored': resolved_restored,
@@ -1099,9 +1092,9 @@ def teardown_vpn_dns_if_unused(*, runner: Runner | None = None) -> dict[str, Any
         ADGUARD_CONFIG.unlink()
         removed_files.append(str(ADGUARD_CONFIG))
 
-    cleanup_legacy_dnsmasq(runner=runner)
-    resolved_restored = restore_resolved_stub_listener(runner=runner)
-    agent_unit_removed = remove_agent_adguard_systemd_unit(runner=runner)
+    await cleanup_legacy_dnsmasq(runner=runner)
+    resolved_restored = await restore_resolved_stub_listener(runner=runner)
+    agent_unit_removed = await remove_agent_adguard_systemd_unit(runner=runner)
 
     return {
         'removed_files': removed_files,
@@ -1134,13 +1127,12 @@ def render_remove_script() -> str:
     return '\n'.join(lines) + '\n'
 
 
-def dns_leak_remove(*, runner: Runner | None = None) -> dict[str, Any]:
+async def dns_leak_remove(*, runner: Runner | None = None) -> dict[str, Any]:
     _require_linux()
     _require_root()
-    execute = runner or run
 
     if shutil.which('nft'):
-        execute(['nft', 'delete', 'table', 'inet', NFT_TABLE], check=False, timeout=15)
+        await execute(runner, ['nft', 'delete', 'table', 'inet', NFT_TABLE], check=False, timeout=15)
 
     remove_script = apply_script_path().with_name('dns-leak-remove.sh')
     remove_script.write_text(render_remove_script(), encoding='utf-8')
@@ -1148,14 +1140,14 @@ def dns_leak_remove(*, runner: Runner | None = None) -> dict[str, Any]:
         remove_script.chmod(0o755)
     except OSError:
         pass
-    execute(['/bin/sh', str(remove_script)], check=False, timeout=60)
+    await execute(runner, ['/bin/sh', str(remove_script)], check=False, timeout=60)
 
     stopped = False
     if shutil.which('systemctl') and UNIT_PATH.is_file():
-        execute(['systemctl', 'stop', UNIT_NAME], check=False, timeout=30)
-        execute(['systemctl', 'disable', UNIT_NAME], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'stop', UNIT_NAME], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'disable', UNIT_NAME], check=False, timeout=30)
         UNIT_PATH.unlink(missing_ok=True)
-        execute(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await execute(runner, ['systemctl', 'daemon-reload'], check=False, timeout=30)
         stopped = True
 
     removed_files: list[str] = []
@@ -1164,11 +1156,11 @@ def dns_leak_remove(*, runner: Runner | None = None) -> dict[str, Any]:
             path.unlink()
             removed_files.append(str(path))
 
-    cleanup = teardown_vpn_dns_if_unused(runner=runner)
+    cleanup = await teardown_vpn_dns_if_unused(runner=runner)
     removed_files.extend(cleanup.get('removed_files') or [])
     push: dict[str, Any] | None = None
     if not cleanup.get('skipped'):
-        push = sync_client_dns_push(list(DEFAULT_UPSTREAM_DNS), runner=runner)
+        push = await sync_client_dns_push(list(DEFAULT_UPSTREAM_DNS), runner=runner)
 
     return {
         'removed': True,

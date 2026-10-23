@@ -34,26 +34,26 @@ attach_lifecycle(router, core='l2tp', get_driver=get_l2tp)
 
 
 @router.get('/status')
-def status(l2tp: L2tpDriver = Depends(get_l2tp)):
-    return health_payload(l2tp)
+async def status(l2tp: L2tpDriver = Depends(get_l2tp)):
+    return await health_payload(l2tp)
 
 
 @router.get('/servers')
-def list_servers(l2tp: L2tpDriver = Depends(get_l2tp)):
+async def list_servers(l2tp: L2tpDriver = Depends(get_l2tp)):
     return {'success': True, 'servers': l2tp.list_servers()}
 
 
 @router.post('/servers')
-def create_server(payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def create_server(payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        server = l2tp.create_server(payload.model_dump(exclude_none=True))
+        server = await l2tp.create_server(payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
 
 
 @router.get('/servers/{server_id}')
-def get_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def get_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
         server = l2tp.get_server(server_id)
     except AgentError as exc:
@@ -62,27 +62,27 @@ def get_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
 
 
 @router.put('/servers/{server_id}')
-def update_server(server_id: str, payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def update_server(server_id: str, payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        server = l2tp.update_server(server_id, payload.model_dump(exclude_none=True))
+        server = await l2tp.update_server(server_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
 
 
 @router.delete('/servers/{server_id}')
-def delete_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def delete_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        l2tp.delete_server(server_id)
+        await l2tp.delete_server(server_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True}
 
 
 @router.post('/servers/{server_id}/users')
-def add_user(server_id: str, payload: L2tpUserPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def add_user(server_id: str, payload: L2tpUserPayload, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        user = l2tp.add_user(server_id, payload.model_dump(exclude_none=True))
+        user = await l2tp.add_user(server_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'user': user}
@@ -90,44 +90,44 @@ def add_user(server_id: str, payload: L2tpUserPayload, l2tp: L2tpDriver = Depend
 
 @router.post('/servers/{server_id}/users/batch')
 @router.post('/servers/{server_id}/users:batch')
-def batch_users(server_id: str, body: dict[str, Any], l2tp: L2tpDriver = Depends(get_l2tp)):
+async def batch_users(server_id: str, body: dict[str, Any], l2tp: L2tpDriver = Depends(get_l2tp)):
     users = body.get('users') or []
     if not isinstance(users, list):
         raise_agent_error('VALIDATION_ERROR', 'users must be a list', 422)
     mode = str(body.get('mode') or 'upsert')
     atomic = bool(body.get('atomic', False))
     try:
-        result = l2tp.batch_users(server_id, [row for row in users if isinstance(row, dict)], mode=mode, atomic=atomic)
+        result = await l2tp.batch_users(server_id, [row for row in users if isinstance(row, dict)], mode=mode, atomic=atomic)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, **result}
 
 
 @router.put('/servers/{server_id}/users/{user_id}')
-def update_user(
+async def update_user(
     server_id: str,
     user_id: str,
     payload: L2tpUserPayload,
     l2tp: L2tpDriver = Depends(get_l2tp),
 ):
     try:
-        user = l2tp.update_user(server_id, user_id, payload.model_dump(exclude_none=True))
+        user = await l2tp.update_user(server_id, user_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'user': user}
 
 
 @router.delete('/servers/{server_id}/users/{user_id}')
-def delete_user(server_id: str, user_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def delete_user(server_id: str, user_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        l2tp.delete_user(server_id, user_id)
+        await l2tp.delete_user(server_id, user_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True}
 
 
 @router.get('/servers/{server_id}/users/{user_id}/config')
-def user_config(
+async def user_config(
     server_id: str,
     user_id: str,
     endpoint: str | None = None,
@@ -141,21 +141,21 @@ def user_config(
 
 
 @router.get('/diagnose')
-def diagnose_user(address: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def diagnose_user(address: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        report = l2tp.diagnose_address(address)
+        report = await l2tp.diagnose_address(address)
     except ValueError as exc:
         raise_agent_error('VALIDATION_ERROR', str(exc), 422)
     return report
 
 
 @router.post('/backup')
-def backup(l2tp: L2tpDriver = Depends(get_l2tp)):
+async def backup(l2tp: L2tpDriver = Depends(get_l2tp)):
     return {'success': True, 'backup': l2tp.backup()}
 
 
 @router.post('/restore')
-def restore(body: dict[str, Any], l2tp: L2tpDriver = Depends(get_l2tp)):
+async def restore(body: dict[str, Any], l2tp: L2tpDriver = Depends(get_l2tp)):
     payload = body.get('backup') if isinstance(body.get('backup'), dict) else body
-    l2tp.restore(payload)
+    await l2tp.restore(payload)
     return {'success': True}

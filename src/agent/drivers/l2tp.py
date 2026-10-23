@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 import shutil
 import subprocess
@@ -89,53 +90,47 @@ class L2tpDriver(CoreDriver):
             and stroke_plugin_present()
         )
 
-    def running(self) -> bool:
-        return self._service_active('xl2tpd')
+    async def running(self) -> bool:
+        return await self._service_active('xl2tpd')
 
-    def version(self) -> str | None:
+    async def version(self) -> str | None:
         try:
-            result = subprocess.run(
-                ['xl2tpd', '-v'],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
+            result = await run(['xl2tpd', '-v'], timeout=5, check=False)
             text = (result.stdout or result.stderr).strip()
             return text.splitlines()[0] if text else None
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def install(self) -> dict[str, Any]:
+    async def install(self) -> dict[str, Any]:
         from agent.ops import install_l2tp
 
         result = install_l2tp()
         # Apply conf + clean-restart strongSwan so stroke/charon.ctl take effect now.
         try:
-            self._apply_all_configs()
-            self._ensure_services(start=True, restart=True)
+            await self._apply_all_configs()
+            await self._ensure_services(start=True, restart=True)
         except Exception as exc:
             log.error('l2tp post-install apply/restart failed: %s', exc)
             result = {**result, 'apply_error': str(exc)}
         return result
 
-    def enable(self) -> dict[str, Any]:
-        self._apply_all_configs()
-        self._ensure_services(start=True)
-        self._sync_peer_egress()
+    async def enable(self) -> dict[str, Any]:
+        await self._apply_all_configs()
+        await self._ensure_services(start=True)
+        await self._sync_peer_egress()
         return {'enabled': True, 'servers': len(self.list_servers())}
 
-    def reconcile_runtime(self, *, drop_keys: list[str] | None = None) -> None:
+    async def reconcile_runtime(self, *, drop_keys: list[str] | None = None) -> None:
         """Re-derive companion egress from WG peers without bouncing xl2tpd."""
-        self._sync_peer_egress(drop_keys=drop_keys)
+        await self._sync_peer_egress(drop_keys=drop_keys)
 
-    def disable(self) -> dict[str, Any]:
-        run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
+    async def disable(self) -> dict[str, Any]:
+        await run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
         return {'enabled': False}
 
-    def restart(self) -> dict[str, Any]:
-        self._apply_all_configs()
-        self._ensure_services(start=True, restart=True)
+    async def restart(self) -> dict[str, Any]:
+        await self._apply_all_configs()
+        await self._ensure_services(start=True, restart=True)
         return {'restarted': True}
 
     def list_servers(self) -> list[dict[str, Any]]:
@@ -150,7 +145,7 @@ class L2tpDriver(CoreDriver):
                 return row
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
 
-    def create_server(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create_server(self, payload: dict[str, Any]) -> dict[str, Any]:
         server_id = payload.get('id')
         if server_id is None:
             existing = []
@@ -178,8 +173,8 @@ class L2tpDriver(CoreDriver):
         }
         self.store.put_doc(self.key, self._kind, str(server_id), server)
         self.audit.record('create', f'{self.key}/server/{server_id}')
-        self._apply_all_configs()
-        self._ensure_services(start=True)
+        await self._apply_all_configs()
+        await self._ensure_services(start=True)
         return server
 
     def _default_subnet(self, server_id: int | str) -> str:
@@ -336,7 +331,7 @@ class L2tpDriver(CoreDriver):
             )
         return changed
 
-    def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
         if 'subnet' in updates and updates['subnet'] is not None:
@@ -371,19 +366,19 @@ class L2tpDriver(CoreDriver):
             updates['templates'] = normalize_templates(updates.get('templates'))
         server.update(updates)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        self._apply_all_configs()
-        self._ensure_services(start=True, restart=True)
+        await self._apply_all_configs()
+        await self._ensure_services(start=True, restart=True)
         return server
 
-    def delete_server(self, server_id: int | str) -> bool:
+    async def delete_server(self, server_id: int | str) -> bool:
         server = self.get_server(server_id)
         if not self.store.delete_doc(self.key, self._kind, str(server.get('id'))):
             raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
         self.audit.record('delete', f'{self.key}/server/{server_id}')
-        self._apply_all_configs()
+        await self._apply_all_configs()
         return True
 
-    def add_user(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def add_user(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         user = normalize_peer(payload)
         user.setdefault('id', str(uuid.uuid4()))
@@ -403,15 +398,15 @@ class L2tpDriver(CoreDriver):
                     used_by_others.discard(existing_addr)
                     if existing_addr and existing_addr in used_by_others:
                         raise AgentError('VALIDATION_ERROR', f'Duplicate L2TP address [{existing_addr}]')
-                    return self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+                    return await self.update_user(server_id, str(existing.get('id') or user['id']), payload)
                 except AgentError:
                     # Subnet changed or duplicate IP — recreate with a free address.
-                    self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                    await self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
                     server = self.get_server(server_id)
                     break
             if same_email:
                 # Peer identity rotate: drop the stale user so username/password/address can change.
-                self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                await self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
                 server = self.get_server(server_id)
                 break
 
@@ -435,12 +430,12 @@ class L2tpDriver(CoreDriver):
         server.setdefault('users', []).append(user)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self.audit.record('create', f'{self.key}/user/{user.get("id")}')
-        self._apply_all_configs()
-        self._sync_peer_egress()
-        self._ensure_services(start=True)
+        await self._apply_all_configs()
+        await self._sync_peer_egress()
+        await self._ensure_services(start=True)
         return user
 
-    def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         server = self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
@@ -461,16 +456,16 @@ class L2tpDriver(CoreDriver):
                 server['users'][idx] = merged
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
                 if any(k in payload for k in ('username', 'password', 'address', 'is_enabled', 'exit_interface')):
-                    self._apply_all_configs()
+                    await self._apply_all_configs()
                     # Soft ensure — never restart xl2tpd/ipsec (keeps existing PPP sessions).
-                    self._ensure_services(start=True)
+                    await self._ensure_services(start=True)
                 else:
-                    self._apply_all_configs()
-                self._sync_peer_egress()
+                    await self._apply_all_configs()
+                await self._sync_peer_egress()
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
-    def delete_user(self, server_id: int | str, user_id: str) -> bool:
+    async def delete_user(self, server_id: int | str, user_id: str) -> bool:
         server = self.get_server(server_id)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
@@ -478,14 +473,14 @@ class L2tpDriver(CoreDriver):
             raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
         server['users'] = filtered
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        self._apply_all_configs()
-        self._sync_peer_egress()
+        await self._apply_all_configs()
+        await self._sync_peer_egress()
         # chap-secrets update only — do not bounce live tunnels.
-        self._ensure_services(start=True)
+        await self._ensure_services(start=True)
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
-    def batch_users(
+    async def batch_users(
         self,
         server_id: int | str,
         users: list[dict[str, Any]],
@@ -511,9 +506,9 @@ class L2tpDriver(CoreDriver):
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    self.add_user(server_id, row)
+                    await self.add_user(server_id, row)
                 else:
-                    self.update_user(server_id, uid, row)
+                    await self.update_user(server_id, uid, row)
                 applied += 1
             except AgentError as exc:
                 failed += 1
@@ -567,18 +562,18 @@ class L2tpDriver(CoreDriver):
         ]
         return '\n'.join(lines) + '\n'
 
-    def diagnose_address(self, address: str) -> dict[str, Any]:
+    async def diagnose_address(self, address: str) -> dict[str, Any]:
         from agent.support.l2tp_diagnose import diagnose_user_address
 
         # Heal before reporting — xl2tpd often stays stopped after reboot/config write.
-        if self.installed() and not self._service_active('xl2tpd'):
-            self._ensure_services(start=True, restart=True)
+        if self.installed() and not await self._service_active('xl2tpd'):
+            await self._ensure_services(start=True, restart=True)
 
-        self.sync_user_stats()
+        await self.sync_user_stats()
         return diagnose_user_address(self.store, self.key, address)
 
-    def usage_snapshot(self) -> UsageSnapshotModel:
-        self.sync_user_stats()
+    async def usage_snapshot(self) -> UsageSnapshotModel:
+        await self.sync_user_stats()
         rows: list[InboundUsageModel] = []
         for server in self.list_servers():
             clients = []
@@ -609,8 +604,8 @@ class L2tpDriver(CoreDriver):
             )
         return UsageSnapshotModel(inbounds=rows)
 
-    def online_users(self) -> list[str]:
-        self.sync_user_stats()
+    async def online_users(self) -> list[str]:
+        await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
         for server in self.list_servers():
@@ -629,13 +624,13 @@ class L2tpDriver(CoreDriver):
                         online.append(label)
         return online
 
-    def online_traffic(self) -> dict[str, dict[str, int]]:
+    async def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot
 
         return online_traffic_from_snapshot(self)
 
-    def sync_user_stats(self) -> None:
-        sessions = self._collect_ppp_sessions()
+    async def sync_user_stats(self) -> None:
+        sessions = await self._collect_ppp_sessions()
         now = int(time.time())
         for server in self.list_servers():
             changed = False
@@ -732,7 +727,7 @@ class L2tpDriver(CoreDriver):
     def backup(self) -> dict[str, Any]:
         return {'servers': self.list_servers()}
 
-    def restore(self, payload: dict[str, Any]) -> None:
+    async def restore(self, payload: dict[str, Any]) -> None:
         servers = payload.get('servers')
         if not isinstance(servers, list):
             raise AgentError('VALIDATION_ERROR', 'backup.servers must be a list', 422)
@@ -741,8 +736,8 @@ class L2tpDriver(CoreDriver):
         for server in servers:
             if isinstance(server, dict) and server.get('id') is not None:
                 self.store.put_doc(self.key, self._kind, str(server['id']), server)
-        self._apply_all_configs()
-        self._ensure_services(start=True, restart=True)
+        await self._apply_all_configs()
+        await self._ensure_services(start=True, restart=True)
         self.audit.record('restore', self.key)
 
     def _config_dir(self) -> Path:
@@ -753,7 +748,7 @@ class L2tpDriver(CoreDriver):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _apply_all_configs(self) -> None:
+    async def _apply_all_configs(self) -> None:
         # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
         self._repair_duplicate_addresses()
         self._align_server_subnets_to_users()
@@ -775,8 +770,8 @@ class L2tpDriver(CoreDriver):
                 except OSError:
                     pass
 
-        self._install_to_system(staging)
-        self._sync_peer_egress()
+        await self._install_to_system(staging)
+        await self._sync_peer_egress()
 
     def _egress_interfaces(self) -> list[dict[str, Any]]:
         from agent.support.peer_egress import l2tp_servers_as_interfaces
@@ -801,7 +796,7 @@ class L2tpDriver(CoreDriver):
         if current:
             user['exit_interface'] = current
 
-    def _sync_peer_egress(self, drop_keys: list[str] | None = None) -> None:
+    async def _sync_peer_egress(self, drop_keys: list[str] | None = None) -> None:
         try:
             from agent.support.l2tp_companion import sync_companions
             from agent.support.peer_egress import reconcile_core_egress
@@ -813,8 +808,8 @@ class L2tpDriver(CoreDriver):
                     result.get('updated'),
                     result.get('removed'),
                 )
-                self._apply_all_configs()
-                self._ensure_services(start=True)
+                await self._apply_all_configs()
+                await self._ensure_services(start=True)
 
             reconcile_core_egress(
                 self.store,
@@ -822,11 +817,11 @@ class L2tpDriver(CoreDriver):
                 self._egress_interfaces(),
                 data_dir=self.settings.data_dir,
             )
-            self._install_ppp_egress_hook()
+            await self._install_ppp_egress_hook()
         except Exception:
             log.exception('l2tp peer egress reconcile failed')
 
-    def _install_ppp_egress_hook(self) -> None:
+    async def _install_ppp_egress_hook(self) -> None:
         """Re-apply peer egress when a PPP session comes up (pppN appears after L2TP auth)."""
         from agent.support.peer_egress import apply_script_path
 
@@ -850,7 +845,7 @@ class L2tpDriver(CoreDriver):
         except OSError as exc:
             log.warning('l2tp ppp ip-up hook install failed: %s', exc)
 
-    def _install_to_system(self, staging: Path) -> None:
+    async def _install_to_system(self, staging: Path) -> None:
         targets = {
             staging / 'xl2tpd.conf': Path('/etc/xl2tpd/xl2tpd.conf'),
             staging / 'options.xl2tpd': Path('/etc/ppp/options.xl2tpd'),
@@ -867,8 +862,8 @@ class L2tpDriver(CoreDriver):
                 except OSError:
                     pass
 
-    def _service_active(self, unit: str) -> bool:
-        result = run(['systemctl', 'is-active', unit], check=False, timeout=10)
+    async def _service_active(self, unit: str) -> bool:
+        result = await run(['systemctl', 'is-active', unit], check=False, timeout=10)
         return (result.stdout or '').strip() == 'active'
 
     def _ensure_runtime_dirs(self) -> None:
@@ -884,7 +879,7 @@ class L2tpDriver(CoreDriver):
             except OSError as exc:
                 log.warning('l2tp runtime dir %s: %s', path, exc)
 
-    def _ensure_services(self, *, start: bool, restart: bool = False, reload: bool = False) -> None:
+    async def _ensure_services(self, *, start: bool, restart: bool = False, reload: bool = False) -> None:
         """Start L2TP stack; only bounce processes when restart=True.
 
         ``reload`` is kept for callers but is treated as a soft ensure (same as
@@ -915,34 +910,34 @@ class L2tpDriver(CoreDriver):
                 Path(f'/lib/systemd/system/{unit}.service').is_file()
                 or Path(f'/usr/lib/systemd/system/{unit}.service').is_file()
                 or Path(f'/etc/systemd/system/{unit}.service').is_file()
-                or self._service_active(unit)
+                or await self._service_active(unit)
                 or shutil.which('ipsec') is not None
             )
             if not unit_exists:
                 continue
-            run(['systemctl', 'unmask', unit], check=False, timeout=15)
-            run(['systemctl', 'enable', unit], check=False, timeout=15)
-            if need_clean_restart or not self._service_active(unit):
-                self._restart_ipsec_clean(unit)
+            await run(['systemctl', 'unmask', unit], check=False, timeout=15)
+            await run(['systemctl', 'enable', unit], check=False, timeout=15)
+            if need_clean_restart or not await self._service_active(unit):
+                await self._restart_ipsec_clean(unit)
             else:
                 # Already healthy — leave CHILD_SAs alone (ipsec reload would drop them).
-                run(['systemctl', 'start', unit], check=False, timeout=60)
+                await run(['systemctl', 'start', unit], check=False, timeout=60)
                 if not charon_ctl_ready():
-                    self._restart_ipsec_clean(unit)
+                    await self._restart_ipsec_clean(unit)
             break
 
-        self._ensure_xl2tpd(force_restart=force)
+        await self._ensure_xl2tpd(force_restart=force)
 
-    def _restart_ipsec_clean(self, unit: str) -> None:
+    async def _restart_ipsec_clean(self, unit: str) -> None:
         """Stop stale charon/starter PIDs, clear sockets, start unit, wait for charon.ctl."""
         from agent.ops import charon_ctl_ready
 
-        run(['systemctl', 'reset-failed', unit], check=False, timeout=15)
-        run(['systemctl', 'stop', unit], check=False, timeout=60)
-        run(['ipsec', 'stop'], check=False, timeout=30)
+        await run(['systemctl', 'reset-failed', unit], check=False, timeout=15)
+        await run(['systemctl', 'stop', unit], check=False, timeout=60)
+        await run(['ipsec', 'stop'], check=False, timeout=30)
         # Orphaned pid/socket files leave starter unable to push ipsec.conf.
-        run(['pkill', '-9', '-f', '/usr/lib/ipsec/charon'], check=False, timeout=15)
-        run(['pkill', '-9', '-f', '/usr/lib/ipsec/starter'], check=False, timeout=15)
+        await run(['pkill', '-9', '-f', '/usr/lib/ipsec/charon'], check=False, timeout=15)
+        await run(['pkill', '-9', '-f', '/usr/lib/ipsec/starter'], check=False, timeout=15)
         for base in (Path('/var/run'), Path('/run')):
             for name in ('charon.pid', 'starter.charon.pid', 'charon.ctl', 'starter.pid'):
                 path = base / name
@@ -952,14 +947,14 @@ class L2tpDriver(CoreDriver):
                 except OSError as exc:
                     log.warning('l2tp remove stale ipsec path %s: %s', path, exc)
 
-        run(['systemctl', 'start', unit], check=False, timeout=60)
+        await run(['systemctl', 'start', unit], check=False, timeout=60)
 
         ready = False
         for _ in range(20):
-            if charon_ctl_ready() and self._service_active(unit):
+            if charon_ctl_ready() and await self._service_active(unit):
                 ready = True
                 break
-            time.sleep(0.25)
+            await asyncio.sleep(0.25)
 
         if not ready:
             log.error(
@@ -968,69 +963,69 @@ class L2tpDriver(CoreDriver):
             )
             return
 
-        run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
-        run(['ipsec', 'reload'], check=False, timeout=30)
-        status = run(['ipsec', 'statusall'], check=False, timeout=30)
+        await run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
+        await run(['ipsec', 'reload'], check=False, timeout=30)
+        status = await run(['ipsec', 'statusall'], check=False, timeout=30)
         text = (status.stdout or '') + (status.stderr or '')
         if 'L2TP-PSK' not in text:
             log.warning('l2tp ipsec reload finished but L2TP-PSK conn not visible in statusall')
         else:
             log.info('l2tp ipsec L2TP-PSK conn loaded')
 
-    def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
+    async def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
         # Always rewrite configs before touching the unit — stale huge ip-range
         # or invalid flags are the usual reason SysV start exits 1 with no detail.
         try:
-            self._apply_all_configs()
+            await self._apply_all_configs()
         except Exception as exc:
             log.error('l2tp config apply failed before xl2tpd start: %s', exc)
 
         self._ensure_runtime_dirs()
-        self._load_l2tp_kernel_modules()
+        await self._load_l2tp_kernel_modules()
 
-        running = self._service_active('xl2tpd') or self._xl2tpd_process_running()
+        running = await self._service_active('xl2tpd') or await self._xl2tpd_process_running()
         if running and not force_restart:
             # chap-secrets / options are re-read by pppd on each new auth.
             # Killing xl2tpd here used to drop every live L2TP client on peer create.
             log.info('xl2tpd already running — skip restart to keep existing PPP sessions')
             return True
 
-        self._clear_xl2tpd_stale_state()
+        await self._clear_xl2tpd_stale_state()
 
-        probe_ok, probe_msg = self._probe_xl2tpd_config()
+        probe_ok, probe_msg = await self._probe_xl2tpd_config()
         if not probe_ok:
             log.error('xl2tpd config probe failed: %s', probe_msg)
 
-        run(['systemctl', 'unmask', 'xl2tpd'], check=False, timeout=15)
-        run(['systemctl', 'enable', 'xl2tpd'], check=False, timeout=15)
-        run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
+        await run(['systemctl', 'unmask', 'xl2tpd'], check=False, timeout=15)
+        await run(['systemctl', 'enable', 'xl2tpd'], check=False, timeout=15)
+        await run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
 
-        if force_restart or not self._service_active('xl2tpd'):
-            run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
-            self._clear_xl2tpd_stale_state()
-            run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
+        if force_restart or not await self._service_active('xl2tpd'):
+            await run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
+            await self._clear_xl2tpd_stale_state()
+            await run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
         else:
-            run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
+            await run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
 
-        if self._service_active('xl2tpd'):
+        if await self._service_active('xl2tpd'):
             return True
 
         # SysV generator often hides the real daemon error — start binary ourselves.
-        direct_ok, direct_msg = self._start_xl2tpd_direct()
-        if direct_ok and self._xl2tpd_process_running():
+        direct_ok, direct_msg = await self._start_xl2tpd_direct()
+        if direct_ok and await self._xl2tpd_process_running():
             log.warning('xl2tpd started via direct binary after systemctl failure')
             return True
 
-        run(['systemctl', 'daemon-reload'], check=False, timeout=30)
-        run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
-        self._clear_xl2tpd_stale_state()
-        run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
+        await run(['systemctl', 'daemon-reload'], check=False, timeout=30)
+        await run(['systemctl', 'reset-failed', 'xl2tpd'], check=False, timeout=15)
+        await self._clear_xl2tpd_stale_state()
+        await run(['systemctl', 'start', 'xl2tpd'], check=False, timeout=60)
 
-        if self._service_active('xl2tpd') or self._xl2tpd_process_running():
+        if await self._service_active('xl2tpd') or await self._xl2tpd_process_running():
             return True
 
-        status = run(['systemctl', 'status', 'xl2tpd', '--no-pager', '-l', '-n', '30'], check=False, timeout=15)
-        journal = run(
+        status = await run(['systemctl', 'status', 'xl2tpd', '--no-pager', '-l', '-n', '30'], check=False, timeout=15)
+        journal = await run(
             ['journalctl', '-u', 'xl2tpd', '-n', '40', '--no-pager', '-o', 'cat'],
             check=False,
             timeout=15,
@@ -1049,12 +1044,12 @@ class L2tpDriver(CoreDriver):
         )
         return False
 
-    def _load_l2tp_kernel_modules(self) -> None:
+    async def _load_l2tp_kernel_modules(self) -> None:
         for mod in ('l2tp_ppp', 'l2tp_netlink', 'pppoe', 'pppox', 'ppp_generic'):
-            run(['modprobe', '-q', mod], check=False, timeout=15)
+            await run(['modprobe', '-q', mod], check=False, timeout=15)
 
-    def _clear_xl2tpd_stale_state(self) -> None:
-        run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
+    async def _clear_xl2tpd_stale_state(self) -> None:
+        await run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
         for path in (
             Path('/var/run/xl2tpd.pid'),
             Path('/run/xl2tpd.pid'),
@@ -1069,11 +1064,11 @@ class L2tpDriver(CoreDriver):
     def _xl2tpd_binary(self) -> str:
         return shutil.which('xl2tpd') or '/usr/sbin/xl2tpd'
 
-    def _xl2tpd_process_running(self) -> bool:
-        result = run(['pgrep', '-x', 'xl2tpd'], check=False, timeout=5)
+    async def _xl2tpd_process_running(self) -> bool:
+        result = await run(['pgrep', '-x', 'xl2tpd'], check=False, timeout=5)
         return result.returncode == 0
 
-    def _probe_xl2tpd_config(self) -> tuple[bool, str]:
+    async def _probe_xl2tpd_config(self) -> tuple[bool, str]:
         """Run xl2tpd briefly in foreground to surface parse/die errors SysV hides."""
         binary = self._xl2tpd_binary()
         conf = '/etc/xl2tpd/xl2tpd.conf'
@@ -1083,16 +1078,10 @@ class L2tpDriver(CoreDriver):
             return False, f'config missing: {conf}'
 
         try:
-            result = subprocess.run(
-                [binary, '-D', '-c', conf],
-                capture_output=True,
-                text=True,
-                timeout=1.5,
-                check=False,
-            )
+            result = await run([binary, '-D', '-c', conf], timeout=1.5, check=False)
         except subprocess.TimeoutExpired as exc:
             # Still running after 1.5s ⇒ config accepted; stop probe instance.
-            run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
+            await run(['pkill', '-x', 'xl2tpd'], check=False, timeout=10)
             out = ''
             if exc.stdout:
                 out += exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode('utf-8', 'replace')
@@ -1101,21 +1090,21 @@ class L2tpDriver(CoreDriver):
             return True, (out.strip() or 'probe timed out while running (config ok)')
 
         out = ((result.stdout or '') + (result.stderr or '')).strip()
-        if result.returncode == 0 and self._xl2tpd_process_running():
+        if result.returncode == 0 and await self._xl2tpd_process_running():
             return True, out or 'probe exited 0'
         return False, out or f'probe exit={result.returncode}'
 
-    def _start_xl2tpd_direct(self) -> tuple[bool, str]:
+    async def _start_xl2tpd_direct(self) -> tuple[bool, str]:
         binary = self._xl2tpd_binary()
         conf = '/etc/xl2tpd/xl2tpd.conf'
-        self._clear_xl2tpd_stale_state()
-        result = run([binary, '-c', conf], check=False, timeout=15)
+        await self._clear_xl2tpd_stale_state()
+        result = await run([binary, '-c', conf], check=False, timeout=15)
         out = ((result.stdout or '') + (result.stderr or '')).strip()
-        if self._xl2tpd_process_running():
+        if await self._xl2tpd_process_running():
             return True, out or 'direct start ok'
         return False, out or f'direct exit={result.returncode}'
 
-    def _collect_ppp_sessions(self) -> dict[str, dict[str, Any]]:
+    async def _collect_ppp_sessions(self) -> dict[str, dict[str, Any]]:
         from agent.support.l2tp_diagnose import _collect_ppp_sessions
 
-        return _collect_ppp_sessions(run)
+        return await _collect_ppp_sessions(run)

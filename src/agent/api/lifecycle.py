@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, Query, Request
 
+from agent.asyncutil import maybe_await
 from agent.errorlog import CoreErrorLog
 from agent.errors import AgentError, raise_agent_error
 from agent.ops import install_core as run_install
@@ -10,7 +11,9 @@ from agent.routing import slug_for
 from typing import Any, Callable
 
 
-def health_payload(driver: Any) -> dict[str, Any]:
+async def health_payload(driver: Any) -> dict[str, Any]:
+    running = await maybe_await(driver.running())
+    version = await maybe_await(driver.version())
     return {
         "success": True,
         "service": "agent",
@@ -19,8 +22,8 @@ def health_payload(driver: Any) -> dict[str, Any]:
         "slug": slug_for(driver.key),
         "label": driver.label,
         "installed": driver.installed(),
-        "running": driver.running(),
-        "version": driver.version(),
+        "running": bool(running),
+        "version": version,
         "capabilities": list(driver.capabilities()),
     }
 
@@ -31,50 +34,52 @@ def get_errors(request: Request) -> CoreErrorLog:
 
 def attach_lifecycle(router: APIRouter, *, core: str, get_driver: Callable) -> None:
     @router.get("/health")
-    def core_health(driver=Depends(get_driver)):
-        return health_payload(driver)
+    async def core_health(driver=Depends(get_driver)):
+        return await health_payload(driver)
 
     @router.post("/install")
-    def core_install(body: dict[str, Any] | None = Body(default=None)):
+    async def core_install(body: dict[str, Any] | None = Body(default=None)):
         payload = body or {}
         token = payload.get("github_token")
         force = bool(payload.get("force"))
         tag_raw = payload.get("tag") or payload.get("version") or payload.get("release_tag")
         tag = tag_raw.strip() if isinstance(tag_raw, str) and tag_raw.strip() else None
         try:
-            result = run_install(
-                core,
-                github_token=token if isinstance(token, str) else None,
-                force=force,
-                tag=tag,
+            result = await maybe_await(
+                run_install(
+                    core,
+                    github_token=token if isinstance(token, str) else None,
+                    force=force,
+                    tag=tag,
+                )
             )
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)
         return {"success": True, "result": result}
 
     @router.post("/enable")
-    def core_enable(driver=Depends(get_driver)):
+    async def core_enable(driver=Depends(get_driver)):
         try:
-            return {"success": True, "result": driver.enable()}
+            return {"success": True, "result": await maybe_await(driver.enable())}
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.post("/disable")
-    def core_disable(driver=Depends(get_driver)):
+    async def core_disable(driver=Depends(get_driver)):
         try:
-            return {"success": True, "result": driver.disable()}
+            return {"success": True, "result": await maybe_await(driver.disable())}
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.post("/restart")
-    def core_restart(driver=Depends(get_driver)):
+    async def core_restart(driver=Depends(get_driver)):
         try:
-            return {"success": True, "result": driver.restart()}
+            return {"success": True, "result": await maybe_await(driver.restart())}
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)
 
     @router.get("/errors")
-    def core_errors(
+    async def core_errors(
         limit: int = Query(40, ge=1, le=200),
         level: str | None = Query(None),
         errors: CoreErrorLog = Depends(get_errors),

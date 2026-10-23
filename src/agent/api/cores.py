@@ -10,14 +10,14 @@ def get_registry(request: Request) -> CoreRegistry:
 
 
 @router.get("/health")
-def health(registry: CoreRegistry = Depends(get_registry)):
+async def health(registry: CoreRegistry = Depends(get_registry)):
     return {
         "success": True,
         "service": "agent",
-        "cores": [c.model_dump() for c in registry.list_cores()],
+        "cores": [c.model_dump() for c in await registry.list_cores()],
     }
 
 
 @router.get("/cores")
-def list_cores(registry: CoreRegistry = Depends(get_registry)):
-    return {"success": True, "cores": [c.model_dump() for c in registry.list_cores()]}
+async def list_cores(registry: CoreRegistry = Depends(get_registry)):
+    return {"success": True, "cores": [c.model_dump() for c in await registry.list_cores()]}

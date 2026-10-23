@@ -13,34 +13,34 @@ def _service(request: Request) -> MullvadService:
 
 
 @router.get("/locations")
-def mullvad_locations(request: Request, force: bool = False, ping: bool = False):
+async def mullvad_locations(request: Request, force: bool = False, ping: bool = False):
     try:
-        payload = _service(request).locations(force=force, ping=ping)
+        payload = await _service(request).locations(force=force, ping=ping)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.get("/locations/{country_code}/relays")
-def mullvad_country_relays(country_code: str, request: Request, ping: bool = True):
+async def mullvad_country_relays(country_code: str, request: Request, ping: bool = True):
     try:
-        payload = _service(request).country_relays(country_code, ping=ping)
+        payload = await _service(request).country_relays(country_code, ping=ping)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.get("/status")
-def mullvad_status(request: Request, probe: bool = False):
+async def mullvad_status(request: Request, probe: bool = False):
     try:
-        payload = _service(request).status(probe=bool(probe))
+        payload = await _service(request).status(probe=bool(probe))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/settings")
-def mullvad_settings(body: dict[str, Any], request: Request):
+async def mullvad_settings(body: dict[str, Any], request: Request):
     try:
         kwargs: dict[str, Any] = {}
         if "private_key" in body and body.get("private_key") is not None:
@@ -71,7 +71,7 @@ def mullvad_settings(body: dict[str, Any], request: Request):
                     raise AgentError("VALIDATION_ERROR", "auto_fallback must be true/false", 422)
         if not kwargs:
             raise AgentError("VALIDATION_ERROR", "No settings provided", 422)
-        payload = _service(request).save_settings(**kwargs)
+        payload = await _service(request).save_settings(**kwargs)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     propagated = payload.pop("propagated", None) if isinstance(payload, dict) else None
@@ -83,20 +83,20 @@ def mullvad_settings(body: dict[str, Any], request: Request):
 
 
 @router.post("/tunnels/{iface}/service")
-def mullvad_tunnel_service(iface: str, body: dict[str, Any], request: Request):
+async def mullvad_tunnel_service(iface: str, body: dict[str, Any], request: Request):
     try:
-        payload = _service(request).control_tunnel(iface, str(body.get("action") or ""))
+        payload = await _service(request).control_tunnel(iface, str(body.get("action") or ""))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/service")
-def mullvad_service_bulk(body: dict[str, Any], request: Request):
+async def mullvad_service_bulk(body: dict[str, Any], request: Request):
     try:
         raw_ifaces = body.get("ifaces") or body.get("interfaces") or []
         ifaces = [str(item) for item in raw_ifaces] if isinstance(raw_ifaces, list) else None
-        payload = _service(request).control_tunnels(
+        payload = await _service(request).control_tunnels(
             str(body.get("action") or ""),
             ifaces=ifaces,
         )
@@ -106,19 +106,19 @@ def mullvad_service_bulk(body: dict[str, Any], request: Request):
 
 
 @router.post("/locations/{country_code}/ensure")
-def mullvad_ensure(country_code: str, request: Request):
+async def mullvad_ensure(country_code: str, request: Request):
     try:
-        payload = _service(request).ensure(country_code)
+        payload = await _service(request).ensure(country_code)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/locations/{country_code}/relay")
-def mullvad_switch_relay(country_code: str, body: dict[str, Any], request: Request):
+async def mullvad_switch_relay(country_code: str, body: dict[str, Any], request: Request):
     try:
         fixed = bool(body.get("fixed") or body.get("pin") or body.get("pinned"))
-        payload = _service(request).switch_relay(
+        payload = await _service(request).switch_relay(
             country_code,
             str(body.get("hostname") or ""),
             fixed=fixed,
@@ -129,7 +129,7 @@ def mullvad_switch_relay(country_code: str, body: dict[str, Any], request: Reque
 
 
 @router.post("/locations/{country_code}/fixed")
-def mullvad_set_relay_fixed(country_code: str, body: dict[str, Any], request: Request):
+async def mullvad_set_relay_fixed(country_code: str, body: dict[str, Any], request: Request):
     try:
         fixed = bool(body.get("fixed") if "fixed" in body else (body.get("pin") or body.get("pinned")))
         payload = _service(request).set_relay_fixed(country_code, fixed)
@@ -139,27 +139,27 @@ def mullvad_set_relay_fixed(country_code: str, body: dict[str, Any], request: Re
 
 
 @router.post("/locations/{country_code}/fallback")
-def mullvad_fallback_one(country_code: str, request: Request, optimize: bool = False):
+async def mullvad_fallback_one(country_code: str, request: Request, optimize: bool = False):
     try:
-        payload = _service(request).fallback(country_code, optimize=optimize)
+        payload = await _service(request).fallback(country_code, optimize=optimize)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/fallback")
-def mullvad_fallback_all(request: Request, optimize: bool = False):
+async def mullvad_fallback_all(request: Request, optimize: bool = False):
     try:
-        payload = _service(request).fallback(optimize=optimize)
+        payload = await _service(request).fallback(optimize=optimize)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}
 
 
 @router.post("/bindings/refresh")
-def mullvad_refresh_bindings(request: Request):
+async def mullvad_refresh_bindings(request: Request):
     try:
-        rows = _service(request).refresh_bindings()
+        rows = await _service(request).refresh_bindings()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "bindings": rows}

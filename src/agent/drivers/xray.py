@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -9,7 +10,6 @@ import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
-from threading import Lock
 from typing import Any, Callable
 
 from agent.audit import AuditLog
@@ -42,16 +42,19 @@ from agent.support.xray_console import (
     tail_file,
 )
 from agent.logutil import get_logger
-from agent.support.process import service_is_active
+from agent.support.process import run, service_is_active
 from agent.support.proxy_protocol_forwarder import (
     stop_forwarders,
     sync_forwarders_from_inbounds,
 )
+from agent.asyncutil import bounded_gather, gather_independent, maybe_await
 from agent.xray_service import api_base_from_config, describe_httpapi_guard, xray_auth_from_config
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
 _CLIENT_BATCH_MAX = 200
+# Overlap per-client Xray writes. Wall time stays near one call, not N calls.
+_CLIENT_PARALLELISM = 32
 _QUOTA_KIND = "client_quota"
 _DISABLED_KIND = "xray_disabled_client"
 _log = get_logger("xray")
@@ -93,8 +96,7 @@ class XrayDriver(CoreDriver):
         self._client_key: tuple[str, str, str] | None = None
         self._settings_cache: tuple[int | None, XraySettings] | None = None
         self._api_ready_until = 0.0
-        self._inbound_locks: dict[str, Lock] = {}
-        self._inbound_locks_guard = Lock()
+        self._inbound_locks: dict[str, asyncio.Lock] = {}
 
     def _resolved_xray_settings(self) -> XraySettings:
         base = self.settings.xray
@@ -144,10 +146,10 @@ class XrayDriver(CoreDriver):
         self._client_key = None
         self._api_ready_until = 0.0
 
-    def _ensure_api_ready(self) -> None:
+    async def _ensure_api_ready(self) -> None:
         """Ensure HTTP API is reachable without restarting a live xray.service (keep connections)."""
         try:
-            self.client.system()
+            await maybe_await(self.client.system())
             return
         except AgentError:
             pass
@@ -170,8 +172,8 @@ class XrayDriver(CoreDriver):
         self._reset_client()
         resolved = self._resolved_xray_settings()
 
-        if service_is_active(_XRAY_UNIT):
-            wait_xray_http_api(
+        if await service_is_active(_XRAY_UNIT):
+            await wait_xray_http_api(
                 api_base=resolved.api_base,
                 username=resolved.username,
                 password=resolved.password,
@@ -179,7 +181,7 @@ class XrayDriver(CoreDriver):
                 delay=0.3,
             )
         else:
-            ensure_xray_running(
+            await ensure_xray_running(
                 binary=base.binary,
                 config_path=base.config,
                 api_base=base.api_base,
@@ -188,7 +190,7 @@ class XrayDriver(CoreDriver):
             )
 
         self._reset_client()
-        self.client.system()
+        await maybe_await(self.client.system())
 
     def capabilities(self) -> list[str]:
         return [
@@ -214,7 +216,7 @@ class XrayDriver(CoreDriver):
     def installed(self) -> bool:
         return Path(self.settings.xray.binary).is_file() or shutil.which("xray") is not None
 
-    def _api(self) -> XrayHttpClient:
+    async def _api(self) -> XrayHttpClient:
         # A live client was checked moments ago. Skipping the stats ping and the
         # config re-read keeps a single delete from repeating that work.
         if (
@@ -223,26 +225,30 @@ class XrayDriver(CoreDriver):
             and time.monotonic() < self._api_ready_until
         ):
             return self._client
-        self._ensure_api_ready()
+        await self._ensure_api_ready()
         if self._client_override is None:
             self._api_ready_until = time.monotonic() + 15.0
         return self.client
 
-    def running(self) -> bool:
+    async def _api_call(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        api = await self._api()
+        return await maybe_await(getattr(api, name)(*args, **kwargs))
+
+    async def running(self) -> bool:
         if not self.installed():
             return False
         try:
-            self.client.system()
+            await maybe_await(self.client.system())
             return True
         except AgentError:
             return False
 
-    def version(self) -> str | None:
+    async def version(self) -> str | None:
         binary = self._binary()
         if not binary:
             return None
         try:
-            result = subprocess.run([binary, "version"], capture_output=True, text=True, timeout=5, check=False)
+            result = await run([binary, "version"], timeout=5, check=False)
             return (result.stdout or result.stderr).strip().split("\n")[0] or None
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -252,7 +258,7 @@ class XrayDriver(CoreDriver):
 
         return install_xray()
 
-    def enable(self) -> dict[str, Any]:
+    async def enable(self) -> dict[str, Any]:
         from agent.ops import install_xray
         from agent.xray_service import binary_has_httpapi, ensure_xray_running
 
@@ -262,7 +268,7 @@ class XrayDriver(CoreDriver):
             install_xray(force=True)
 
         # Keep-alive: start only when down; never bounce an already-running unit.
-        return ensure_xray_running(
+        return await ensure_xray_running(
             binary=xray.binary,
             config_path=xray.config,
             api_base=xray.api_base,
@@ -270,17 +276,17 @@ class XrayDriver(CoreDriver):
             password=xray.password,
         )
 
-    def disable(self) -> dict[str, Any]:
+    async def disable(self) -> dict[str, Any]:
         from agent.xray_service import stop_xray_service
 
         stop_forwarders(self.settings)
-        return stop_xray_service()
+        return await stop_xray_service()
 
-    def restart(self) -> dict[str, Any]:
+    async def restart(self) -> dict[str, Any]:
         from agent.xray_service import restart_xray_service
 
         xray = self.settings.xray
-        return restart_xray_service(
+        return await restart_xray_service(
             binary=xray.binary,
             config_path=xray.config,
             api_base=xray.api_base,
@@ -301,11 +307,12 @@ class XrayDriver(CoreDriver):
         return int(value) if value.isdigit() else value
 
     def _binary(self) -> str | None:
-        if Path(self.settings.xray.binary).is_file():
-            return self.settings.xray.binary
-        return shutil.which("xray")
+        for candidate in (self.settings.xray.binary, shutil.which("xray")):
+            if candidate and Path(candidate).is_file():
+                return str(candidate)
+        return None
 
-    def _validate_config_mutation(
+    async def _validate_config_mutation(
         self,
         mutate: Callable[[dict[str, Any]], None],
         *,
@@ -322,7 +329,7 @@ class XrayDriver(CoreDriver):
         if not config_path.is_file():
             return
 
-        validate_xray_config_mutation(binary, config_path, mutate)
+        await validate_xray_config_mutation(binary, config_path, mutate)
 
     def _replace_inbound_in_config(self, config: dict[str, Any], inbound: dict[str, Any]) -> None:
         tag = str(inbound.get("tag") or "")
@@ -383,13 +390,145 @@ class XrayDriver(CoreDriver):
     def _protocol_of(self, inbound: dict[str, Any]) -> str:
         return str(inbound.get("protocol") or "vless").strip().lower()
 
-    def _inbound_lock(self, tag: str) -> Lock:
-        with self._inbound_locks_guard:
-            lock = self._inbound_locks.get(tag)
-            if lock is None:
-                lock = Lock()
-                self._inbound_locks[tag] = lock
-            return lock
+    def _inbound_lock(self, tag: str) -> asyncio.Lock:
+        lock = self._inbound_locks.get(tag)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inbound_locks[tag] = lock
+        return lock
+
+    def _disk_config(self) -> dict[str, Any] | None:
+        try:
+            config = self.read_config()
+        except AgentError:
+            return None
+        return config if isinstance(config, dict) else None
+
+    @staticmethod
+    def _is_api_inbound(row: dict[str, Any]) -> bool:
+        tag = str(row.get("tag") or "").strip().lower()
+        protocol = str(row.get("protocol") or "").strip().lower()
+        return tag == "api" or protocol in {"dokodemo-door", "tunnel"}
+
+    def _row_matches_inbound_id(self, row: dict[str, Any], inbound_id: int | str, tag: str) -> bool:
+        row_tag = str(row.get("tag") or "").strip()
+        return row_tag == tag or str(row.get("id") or "") == str(inbound_id)
+
+    def _disk_inbounds(self) -> list[dict[str, Any]]:
+        config = self._disk_config()
+        if config is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw in config.get("inbounds") or []:
+            if not isinstance(raw, dict) or self._is_api_inbound(raw):
+                continue
+            rows.append(self._normalize(raw))
+        return rows
+
+    def list_quota_inbounds(self) -> list[dict[str, Any]]:
+        """Quota checks use the on-disk user list, not /api/inbounds/list."""
+        inbounds = self._disk_inbounds()
+        self._overlay_quota(inbounds, include_flags=False)
+        return inbounds
+
+    async def _inbound_shell(self, inbound_id: int | str) -> dict[str, Any]:
+        """Inbound settings from disk (or one live row). Does not list every user."""
+        tag = self.inbound_tag(inbound_id)
+        config = self._disk_config()
+        if config is not None:
+            for row in config.get("inbounds") or []:
+                if not isinstance(row, dict):
+                    continue
+                if self._row_matches_inbound_id(row, inbound_id, tag):
+                    return self._normalize(row)
+        for row in await self._api_call("list_inbounds", ):
+            if not isinstance(row, dict):
+                continue
+            if self._row_matches_inbound_id(row, inbound_id, tag):
+                return self._normalize(row)
+        raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound_id}] not found", 404)
+
+    async def _attach_live_users(self, inbound: dict[str, Any]) -> dict[str, Any]:
+        tag = str(inbound.get("tag") or "").strip()
+        try:
+            live = await self._api_call("list_users", tag) if tag else []
+        except AgentError:
+            live = []
+        inbound.setdefault("settings", {})["clients"] = [
+            normalize_xray_client(client) for client in live if isinstance(client, dict)
+        ]
+        return inbound
+
+    async def _lookup_clients_for_batch(
+        self,
+        tag: str,
+        clients: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        emails: list[str] = []
+        seen: set[str] = set()
+        for raw in clients:
+            if not isinstance(raw, dict):
+                continue
+            email = str(raw.get("email") or "").strip()
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            emails.append(email)
+
+        async def lookup(email: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+            try:
+                rows = await self._api_call("list_users", tag, email)
+            except AgentError:
+                return {}, {}
+            return self._index_user_rows(
+                [normalize_xray_client(row) for row in rows if isinstance(row, dict)]
+            )
+
+        parts = await bounded_gather(
+            [lambda email=email: lookup(email) for email in emails],
+            limit=_CLIENT_PARALLELISM,
+        )
+        by_email: dict[str, dict[str, Any]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
+        for part in parts:
+            if not isinstance(part, tuple):
+                continue
+            extra_email, extra_id = part
+            by_email.update(extra_email)
+            by_id.update(extra_id)
+        return by_email, by_id
+
+    async def _live_counters_for(self, email: str, cid: str) -> tuple[int, int]:
+        api = await self._api()
+        query = getattr(api, "stats_query", None)
+        if not callable(query):
+            return 0, 0
+        for key in (email, cid):
+            if not key:
+                continue
+            try:
+                rows = await maybe_await(query(f"user>>>{key}>>>traffic>>>"))
+            except Exception:
+                continue
+            incoming = outgoing = 0
+            found = False
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or "")
+                try:
+                    value = int(row.get("value") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if name.endswith(">>>downlink"):
+                    incoming = value
+                    found = True
+                elif name.endswith(">>>uplink"):
+                    outgoing = value
+                    found = True
+            if found:
+                return incoming, outgoing
+        return 0, 0
 
     @staticmethod
     def _clients_of(inbound: dict[str, Any]) -> list[dict[str, Any]]:
@@ -462,11 +601,11 @@ class XrayDriver(CoreDriver):
         inbound["settings"] = settings
         return inbound
 
-    def _edit_inbound_preserving(self, inbound: dict[str, Any], *, preserve_clients: bool) -> None:
+    async def _edit_inbound_preserving(self, inbound: dict[str, Any], *, preserve_clients: bool) -> None:
         self._pause_proxy_forwarders()
         try:
             api_payload = self._wire_inbound(inbound)
-            self._validate_config_mutation(
+            await self._validate_config_mutation(
                 lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
                 inbound=api_payload,
             )
@@ -478,11 +617,11 @@ class XrayDriver(CoreDriver):
                 settings.pop("clients", None)
                 settings.pop("users", None)
                 slim["settings"] = settings
-                self._api().edit_inbounds([slim], preserve_clients=True)
+                await self._api_call("edit_inbounds", [slim], preserve_clients=True)
                 return
-            self._api().edit_inbounds([api_payload], preserve_clients=False)
+            await self._api_call("edit_inbounds", [api_payload], preserve_clients=False)
         finally:
-            self._resume_proxy_forwarders()
+            await self._resume_proxy_forwarders()
 
     def _wire_clients(self, inbound: dict[str, Any], clients: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         protocol = self._protocol_of(inbound)
@@ -559,14 +698,14 @@ class XrayDriver(CoreDriver):
         ]
         return inbound
 
-    def list_inbounds(self) -> list[dict[str, Any]]:
-        inbounds = [self._normalize(row) for row in self._api().list_inbounds()]
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        inbounds = [self._normalize(row) for row in await self._api_call("list_inbounds", )]
         self._overlay_quota(inbounds, include_flags=False)
         return inbounds
 
-    def sync_proxy_protocol_forwarders(self) -> dict[str, Any]:
+    async def sync_proxy_protocol_forwarders(self) -> dict[str, Any]:
         try:
-            return sync_forwarders_from_inbounds(self.list_inbounds(), settings=self.settings)
+            return sync_forwarders_from_inbounds(await self.list_inbounds(), settings=self.settings)
         except AgentError as exc:
             _log.warning("pp-forward sync skipped: %s", exc.message)
             return {"enabled": True, "rules": 0, "running": False, "error": exc.code}
@@ -575,54 +714,29 @@ class XrayDriver(CoreDriver):
         """Release public listen ports before Xray rebinding (port-1 conflicts)."""
         stop_forwarders(self.settings)
 
-    def _resume_proxy_forwarders(self) -> None:
+    async def _resume_proxy_forwarders(self) -> None:
         try:
-            self.sync_proxy_protocol_forwarders()
+            await self.sync_proxy_protocol_forwarders()
         except Exception as exc:  # noqa: BLE001 — best-effort restore after failed edit
             _log.warning("pp-forward resync failed: %s", exc)
 
-    def get_inbound(self, inbound_id: int | str) -> dict[str, Any]:
-        tag = self.inbound_tag(inbound_id)
-        for inbound in self.list_inbounds():
-            if inbound.get("tag") == tag or str(inbound.get("id")) == str(inbound_id):
-                return inbound
-        raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound_id}] not found", 404)
-
-    def _batch_inbound(self, inbound_id: int | str) -> dict[str, Any]:
-        """One inbound for a client batch, without downloading every inbound."""
-        tag = self.inbound_tag(inbound_id)
-        raw: dict[str, Any] | None = None
-        try:
-            config = self.read_config()
-        except AgentError:
-            config = None
-        if isinstance(config, dict):
-            for row in config.get("inbounds") or []:
-                if not isinstance(row, dict):
-                    continue
-                row_tag = str(row.get("tag") or "").strip()
-                if row_tag == tag or str(row.get("id") or "") == str(inbound_id):
-                    raw = row
-                    if row_tag:
-                        tag = row_tag
-                    break
-        if raw is None:
-            return self.get_inbound(inbound_id)
-
-        settings = dict(raw.get("settings") or {})
-        settings.pop("clients", None)
-        settings.pop("users", None)
-        inbound = self._normalize({**raw, "settings": settings})
-        try:
-            live = self._api().list_users(tag)
-        except AgentError:
-            live = []
-        inbound.setdefault("settings", {})["clients"] = [
-            normalize_xray_client(client) for client in live if isinstance(client, dict)
-        ]
+    async def get_inbound(self, inbound_id: int | str, *, include_clients: bool = True) -> dict[str, Any]:
+        inbound = await self._inbound_shell(inbound_id)
+        if not include_clients:
+            settings = inbound.setdefault("settings", {})
+            inbound["clients_count"] = self._clients_count(inbound)
+            settings["clients"] = []
+            settings["users"] = []
+            return inbound
+        inbound = await self._attach_live_users(inbound)
+        self._overlay_quota([inbound], include_flags=False)
         return inbound
 
-    def create_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _batch_inbound(self, inbound_id: int | str) -> dict[str, Any]:
+        """One inbound plus its live users. Prefer targeted lookups for upserts."""
+        return await self._attach_live_users(await self._inbound_shell(inbound_id))
+
+    async def create_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {
             k: v
             for k, v in payload.items()
@@ -636,7 +750,7 @@ class XrayDriver(CoreDriver):
         inbound_id = payload.get("id")
         if inbound_id is None:
             existing_ids: list[int] = []
-            for row in self.list_inbounds():
+            for row in await self.list_inbounds():
                 try:
                     existing_ids.append(int(row.get("id", 0)))
                 except (TypeError, ValueError):
@@ -654,49 +768,49 @@ class XrayDriver(CoreDriver):
         inbound.setdefault("sniffing", {})
 
         api_payload = self._wire_inbound(inbound)
-        self._validate_config_mutation(
+        await self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
         )
         self._pause_proxy_forwarders()
         try:
-            self._api().add_inbounds([api_payload])
+            await self._api_call("add_inbounds", [api_payload])
         finally:
-            self._resume_proxy_forwarders()
+            await self._resume_proxy_forwarders()
         self.audit.record("create", f"xray/inbound/{inbound_id}")
-        return self.get_inbound(inbound_id)
+        return await self.get_inbound(inbound_id)
 
-    def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        existing = self.get_inbound(inbound_id)
+    async def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+        existing = await self.get_inbound(inbound_id)
         tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         preserve_clients = bool(payload.get("preserve_clients", True))
         reset_clients = bool(payload.get("reset_clients", False))
         if reset_clients:
             preserve_clients = False
 
-        with self._inbound_lock(tag):
-            existing = self.get_inbound(inbound_id)
+        async with self._inbound_lock(tag):
+            existing = await self.get_inbound(inbound_id)
             inbound = self._apply_inbound_patch(
                 existing,
                 payload,
                 preserve_clients=preserve_clients,
                 reset_clients=reset_clients,
             )
-            self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
+            await self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}")
-            return self.get_inbound(inbound_id)
+            return await self.get_inbound(inbound_id)
 
-    def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Rebuild protocol/stream for an inbound without delete+create when possible."""
-        existing = self.get_inbound(inbound_id)
+        existing = await self.get_inbound(inbound_id)
         tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         reset_clients = bool(payload.pop("reset_clients", False))
         preserve_clients = not reset_clients
         payload = {k: v for k, v in payload.items() if k != "format"}
         payload.setdefault("port", existing.get("port"))
 
-        with self._inbound_lock(tag):
-            existing = self.get_inbound(inbound_id)
+        async with self._inbound_lock(tag):
+            existing = await self.get_inbound(inbound_id)
             inbound = self._apply_inbound_patch(
                 existing,
                 payload,
@@ -704,29 +818,29 @@ class XrayDriver(CoreDriver):
                 reset_clients=reset_clients,
             )
             # Prefer in-place edit so clients stay attached and we avoid remove+add churn.
-            self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
+            await self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             self.audit.record("update", f"xray/inbound/{inbound_id}/refresh")
-            return self.get_inbound(inbound_id)
+            return await self.get_inbound(inbound_id)
 
-    def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Update port/stream/sniffing/settings without rewriting client lists."""
         payload = dict(payload or {})
         payload["preserve_clients"] = True
         payload.pop("reset_clients", None)
         started = time.perf_counter()
-        inbound = self.update_inbound(inbound_id, payload)
+        inbound = await self.update_inbound(inbound_id, payload)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         summary = self._inbound_summary(inbound)
         self.audit.record("update", f"xray/inbound/{inbound_id}/settings", detail=f"ms={elapsed_ms};clients={summary.get('clients_count')}")
         return summary
 
-    def delete_inbound(self, inbound_id: int | str) -> bool:
-        inbound = self.get_inbound(inbound_id)
+    async def delete_inbound(self, inbound_id: int | str) -> bool:
+        inbound = await self.get_inbound(inbound_id)
         self._pause_proxy_forwarders()
         try:
-            self._api().remove_inbounds([str(inbound.get("tag"))])
+            await self._api_call("remove_inbounds", [str(inbound.get("tag"))])
         finally:
-            self._resume_proxy_forwarders()
+            await self._resume_proxy_forwarders()
         self.audit.record("delete", f"xray/inbound/{inbound_id}")
         return True
 
@@ -747,7 +861,7 @@ class XrayDriver(CoreDriver):
             str(client.get("password") or "").strip(),
         }
 
-    def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
+    async def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
         """Return client metadata from config.json (includes disabled / quota rows)."""
         key = str(client_key or "").strip()
         if not key:
@@ -769,18 +883,18 @@ class XrayDriver(CoreDriver):
                 return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
 
         try:
-            inbound = self.get_inbound(inbound_id)
+            inbound = await self.get_inbound(inbound_id)
             client = self._find_client(inbound, key)
             if client is not None:
-                return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
+                return self._live_client_record(normalize_xray_client(client), key)
         except AgentError:
             pass
 
         # users/add updates the users API. inbounds/list and config.json can
         # omit that row, so a client that is live still looked missing here.
-        live = self._find_live_user(tag, key)
+        live = await self._find_live_user(tag, key)
         if live is not None:
-            return self._with_stored_quota(normalize_xray_client(live), include_flags=True)
+            return self._live_client_record(normalize_xray_client(live), key)
 
         stored = self._find_disabled_client(key)
         if stored is not None:
@@ -788,9 +902,28 @@ class XrayDriver(CoreDriver):
 
         raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
 
-    def _find_live_user(self, tag: str, key: str) -> dict[str, Any] | None:
+    def _live_client_record(self, client: dict[str, Any], key: str) -> dict[str, Any]:
+        row = self._with_stored_quota(client, include_flags=True)
+        row["is_enabled"] = True
+        self._forget_disabled_keys([
+            key,
+            str(row.get("id") or ""),
+            str(row.get("email") or ""),
+            str(row.get("password") or ""),
+        ])
+        return row
+
+    async def _find_live_user(self, tag: str, key: str) -> dict[str, Any] | None:
+        users: list[dict[str, Any]] = []
         try:
-            users = self._api().list_users(tag)
+            users = await self._api_call("list_users", tag, key)
+        except AgentError:
+            users = []
+        for user in users:
+            if isinstance(user, dict) and self._row_matches_key(user, key):
+                return user
+        try:
+            users = await self._api_call("list_users", tag)
         except AgentError:
             return None
         for user in users:
@@ -805,7 +938,7 @@ class XrayDriver(CoreDriver):
                 return user
         return None
 
-    def diagnose_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
+    async def diagnose_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
         from agent.support.client_diagnose import diagnose_xray_client, diagnose_xray_clients_by_key
 
         key = str(client_key or "").strip()
@@ -813,9 +946,9 @@ class XrayDriver(CoreDriver):
             raise ValueError("client key is required")
 
         if inbound_id is not None and str(inbound_id).strip() != "":
-            return diagnose_xray_client(self, inbound_id, key)
+            return await diagnose_xray_client(self, inbound_id, key)
 
-        return diagnose_xray_clients_by_key(self, key)
+        return await diagnose_xray_clients_by_key(self, key)
 
     def _index_clients(self, inbound: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         by_email: dict[str, dict[str, Any]] = {}
@@ -848,17 +981,29 @@ class XrayDriver(CoreDriver):
                 by_id[password] = user
         return by_email, by_id
 
-    def _visible_user_index(self, tag: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-        """Users visible on this inbound. One users query, not every inbound."""
-        by_email: dict[str, dict[str, Any]] = {}
-        by_id: dict[str, dict[str, Any]] = {}
+    async def _visible_user_index(
+        self,
+        tag: str,
+        emails: list[str] | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Users visible on this inbound. Prefer per-email lookups."""
+        wanted = [str(email).strip() for email in (emails or []) if str(email).strip()]
         try:
-            extra_email, extra_id = self._index_user_rows(self._api().list_users(tag))
-            by_email.update(extra_email)
-            by_id.update(extra_id)
+            if wanted:
+                parts = await bounded_gather(
+                    [lambda email=email: self._api_call("list_users", tag, email) for email in wanted],
+                    limit=_CLIENT_PARALLELISM,
+                )
+                rows: list[dict[str, Any]] = []
+                for part in parts:
+                    if isinstance(part, Exception):
+                        raise part
+                    rows.extend(part or [])
+            else:
+                rows = await self._api_call("list_users", tag)
         except AgentError:
-            pass
-        return by_email, by_id
+            return {}, {}
+        return self._index_user_rows(rows)
 
     def _response_client(
         self,
@@ -912,7 +1057,7 @@ class XrayDriver(CoreDriver):
             return True
         return bool(cid) and live_id == cid
 
-    def _commit_clients_to_inbound(
+    async def _commit_clients_to_inbound(
         self,
         tag: str,
         clients: list[dict[str, Any]],
@@ -922,7 +1067,7 @@ class XrayDriver(CoreDriver):
     ) -> None:
         """Write uuids into the inbound document when users/add leaves them out."""
         current: dict[str, Any] | None = None
-        for row in self._api().list_inbounds():
+        for row in await self._api_call("list_inbounds", ):
             if str(row.get("tag") or "").strip() == tag:
                 current = row
                 break
@@ -931,7 +1076,7 @@ class XrayDriver(CoreDriver):
 
         by_email, by_id = self._index_user_rows(self._clients_of(current))
         try:
-            extra_email, extra_id = self._index_user_rows(self._api().list_users(tag))
+            extra_email, extra_id = self._index_user_rows(await self._api_call("list_users", tag))
         except AgentError:
             extra_email, extra_id = {}, {}
         for email, row in extra_email.items():
@@ -1005,9 +1150,56 @@ class XrayDriver(CoreDriver):
         payload["tag"] = tag
         payload["protocol"] = str(current.get("protocol") or protocol)
         payload["settings"] = settings
-        self._api().edit_inbounds([payload], preserve_clients=False)
+        await self._api_call("edit_inbounds", [payload], preserve_clients=False)
 
-    def _apply_clients_bulk(
+    async def _write_client_rows(
+        self,
+        op: str,
+        tag: str,
+        rows: list[dict[str, Any]],
+        *,
+        protocol: str,
+        inbound_settings: Any,
+    ) -> dict[int, str]:
+        """Write each client on its own request and overlap those requests."""
+        if not rows:
+            return {}
+        method = "edit_users" if op == "edit" else "add_users"
+        kwargs = {
+            "protocol": protocol,
+            "inbound_settings": inbound_settings,
+            "atomic": False,
+            "parallel": True,
+        }
+
+        async def one(index: int, row: dict[str, Any]) -> tuple[int, str | None, bool]:
+            try:
+                await self._api_call(method, tag, [row], **kwargs)
+            except AgentError as exc:
+                missing = XrayHttpClient._is_http_route_missing(exc)
+                return index, exc.message, missing
+            except Exception as exc:  # noqa: BLE001
+                return index, f"{type(exc).__name__}: {exc}", False
+            return index, None, False
+
+        outcomes = await bounded_gather(
+            [lambda index=index, row=row: one(index, row) for index, row in enumerate(rows)],
+            limit=_CLIENT_PARALLELISM,
+        )
+        typed: list[tuple[int, str | None, bool]] = [
+            item if isinstance(item, tuple) else (0, str(item), False)
+            for item in outcomes
+        ]
+        if any(route_missing for _index, _message, route_missing in typed):
+            await self._api_call(method, tag, rows, protocol=protocol, inbound_settings=inbound_settings, atomic=False, parallel=False)
+            return {}
+        return {
+            index: message
+            for index, message, _route_missing in typed
+            if message
+        }
+
+    async def _apply_clients_bulk(
         self,
         op: str,
         tag: str,
@@ -1017,15 +1209,13 @@ class XrayDriver(CoreDriver):
         protocol: str,
         inbound_settings: Any,
     ) -> tuple[int, int, list[dict[str, str]], list[dict[str, Any]]]:
-        kwargs = {
-            "protocol": protocol,
-            "inbound_settings": inbound_settings,
-            "atomic": False,
-        }
-        if op == "edit":
-            self._api().edit_users(tag, rows, **kwargs)
-        else:
-            self._api().add_users(tag, rows, **kwargs)
+        write_errors = await self._write_client_rows(
+            op,
+            tag,
+            rows,
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
 
         # An add/edit HTTP 200 is not enough. Xray often reports succeeded while
         # the panel uuid is still absent, and an email-only hit is a different client.
@@ -1034,10 +1224,27 @@ class XrayDriver(CoreDriver):
         succeeded = len(pairs)
         failed = 0
         errors: list[dict[str, str]] = []
-        by_email, by_id = self._visible_user_index(tag)
+        pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for index, (row, client) in enumerate(pairs):
+            message = write_errors.get(index)
+            if message is None:
+                pending.append((row, client))
+                continue
+            succeeded -= 1
+            failed += 1
+            errors.append({
+                "email": str(client.get("email") or ""),
+                "id": str(client.get("id") or ""),
+                "message": message,
+            })
+        if not pending:
+            return max(0, succeeded), failed, errors, []
+
+        verify_emails = [str(client.get("email") or "").strip() for _row, client in pending]
+        by_email, by_id = await self._visible_user_index(tag, verify_emails)
         missing: list[tuple[dict[str, Any], dict[str, Any]]] = []
         kept: list[dict[str, Any]] = []
-        for row, client in pairs:
+        for row, client in pending:
             if self._client_uuid_visible(client, by_id, by_email):
                 kept.append(self._response_client(client, by_email, by_id))
             else:
@@ -1046,7 +1253,7 @@ class XrayDriver(CoreDriver):
         commit_error: str | None = None
         if missing:
             try:
-                self._commit_clients_to_inbound(
+                await self._commit_clients_to_inbound(
                     tag,
                     [row for row, _client in missing],
                     protocol=protocol,
@@ -1054,7 +1261,10 @@ class XrayDriver(CoreDriver):
                 )
             except AgentError as exc:
                 commit_error = exc.message
-            by_email, by_id = self._visible_user_index(tag)
+            by_email, by_id = await self._visible_user_index(
+                tag,
+                [str(client.get("email") or "").strip() for _row, client in missing],
+            )
             for _row, client in missing:
                 email = str(client.get("email") or "")
                 if self._client_uuid_visible(client, by_id, by_email):
@@ -1072,8 +1282,8 @@ class XrayDriver(CoreDriver):
 
         return max(0, succeeded), failed, errors, kept
 
-    def add_client(self, inbound_id: int | str, client: dict[str, Any]) -> dict[str, Any]:
-        result = self.batch_clients(inbound_id, [client], mode="upsert")
+    async def add_client(self, inbound_id: int | str, client: dict[str, Any]) -> dict[str, Any]:
+        result = await self.batch_clients(inbound_id, [client], mode="upsert")
         if result.get("failed"):
             errors = result.get("errors") or []
             message = errors[0].get("message") if errors else "client upsert failed"
@@ -1081,7 +1291,7 @@ class XrayDriver(CoreDriver):
         rows = result.get("clients") or []
         return rows[0] if rows else normalize_xray_client(client)
 
-    def batch_clients(
+    async def batch_clients(
         self,
         inbound_id: int | str,
         clients: list[dict[str, Any]],
@@ -1101,13 +1311,13 @@ class XrayDriver(CoreDriver):
                 413,
             )
 
-        inbound = self._batch_inbound(inbound_id)
-        inbound = self._ensure_shadowsocks_method(inbound)
+        inbound = await self._inbound_shell(inbound_id)
+        inbound = await self._ensure_shadowsocks_method(inbound)
         tag = str(inbound["tag"])
         protocol = self._protocol_of(inbound)
         # Protocol change keeps the email and adds a new uuid on another inbound.
         # Drop that email everywhere else first, or the old protocol stays usable.
-        self._release_emails_from_other_inbounds(
+        await self._release_emails_from_other_inbounds(
             [str(raw.get("email") or "") for raw in clients if isinstance(raw, dict)],
             tag,
         )
@@ -1118,10 +1328,13 @@ class XrayDriver(CoreDriver):
         applied: list[dict[str, Any]] = []
 
         self._traffic_index_cache = None
-        with self._inbound_lock(tag):
-            inbound = self._batch_inbound(inbound_id)
-            inbound = self._ensure_shadowsocks_method(inbound)
+        async with self._inbound_lock(tag):
+            inbound = await self._inbound_shell(inbound_id)
+            inbound = await self._ensure_shadowsocks_method(inbound)
             by_email, by_id = self._index_clients(inbound)
+            live_email, live_id = await self._lookup_clients_for_batch(tag, clients)
+            by_email.update(live_email)
+            by_id.update(live_id)
 
             to_add: list[dict[str, Any]] = []
             to_edit: list[dict[str, Any]] = []
@@ -1129,6 +1342,9 @@ class XrayDriver(CoreDriver):
             edit_meta: list[dict[str, Any]] = []
             to_remove: list[str] = []
             remove_meta: list[dict[str, Any]] = []
+            # Email hit with a different panel uuid. Removed in one users/remove
+            # after the loop; a per-client call would add a full Xray wait each.
+            stale_replacements: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
             for raw in clients:
                 if not isinstance(raw, dict):
@@ -1170,7 +1386,7 @@ class XrayDriver(CoreDriver):
                         if existing is not None:
                             remove_email = str(existing.get("email") or email).strip()
                         else:
-                            remove_email = self._live_user_email(tag, cid, email)
+                            remove_email = await self._live_user_email(tag, cid, email)
                         prior = self._find_disabled_client(cid or email)
                         if existing is None and prior is None and not remove_email:
                             succeeded += 1
@@ -1185,7 +1401,7 @@ class XrayDriver(CoreDriver):
                             applied.append(client)
                         continue
 
-                    self._raise_zero_baseline_to_live(client)
+                    await self._raise_zero_baseline_to_live(client)
                     client["is_enabled"] = True
                     native = xray_protocol_user(
                         protocol,
@@ -1194,11 +1410,6 @@ class XrayDriver(CoreDriver):
                     )
                     native["enable"] = True
                     native["is_enabled"] = True
-                    self._forget_disabled_keys([
-                        cid,
-                        email,
-                        str(client.get("password") or ""),
-                    ])
                     if existing is not None:
                         existing_id = str(existing.get("id") or "").strip()
                         # Edit keeps the old uuid. The panel looks the client up
@@ -1206,15 +1417,10 @@ class XrayDriver(CoreDriver):
                         if cid and existing_id and existing_id != cid:
                             stale_email = str(existing.get("email") or email).strip()
                             if stale_email:
-                                try:
-                                    self._api().remove_users(tag, [stale_email])
-                                except AgentError as exc:
-                                    if not _is_missing_user_error(exc):
-                                        failed += 1
-                                        errors.append({"email": email, "id": cid, "message": exc.message})
-                                        continue
-                            to_add.append(native)
-                            add_meta.append(client)
+                                stale_replacements.append((stale_email, native, client))
+                            else:
+                                to_add.append(native)
+                                add_meta.append(client)
                         else:
                             to_edit.append(native)
                             edit_meta.append(client)
@@ -1230,14 +1436,17 @@ class XrayDriver(CoreDriver):
                         }
                     )
 
-            def _flush(op: str, rows: list[dict[str, Any]], meta: list[dict[str, Any]]) -> None:
-                nonlocal succeeded, failed
+            async def _flush(
+                op: str,
+                rows: list[dict[str, Any]],
+                meta: list[dict[str, Any]],
+            ) -> tuple[int, int, list[dict[str, str]], list[dict[str, Any]]]:
                 if not rows:
-                    return
+                    return 0, 0, [], []
                 try:
                     # Do not spawn `xray -test` here. That loads the whole config
                     # and runs into the same 60s ceiling as the panel request.
-                    part_ok, part_fail, part_errors, part_applied = self._apply_clients_bulk(
+                    return await self._apply_clients_bulk(
                         op,
                         tag,
                         rows,
@@ -1245,46 +1454,64 @@ class XrayDriver(CoreDriver):
                         protocol=protocol,
                         inbound_settings=inbound.get("settings"),
                     )
-                    succeeded += part_ok
-                    failed += part_fail
-                    errors.extend(part_errors)
-                    applied.extend(part_applied)
                 except AgentError as exc:
                     if exc.status == 413 or len(rows) == 1:
-                        failed += len(meta)
                         message = exc.message
-                        for client in meta:
-                            errors.append({"email": str(client.get("email") or ""), "message": message})
-                        return
+                        return (
+                            0,
+                            len(meta),
+                            [{"email": str(client.get("email") or ""), "message": message} for client in meta],
+                            [],
+                        )
                     mid = len(rows) // 2
-                    _flush(op, rows[:mid], meta[:mid])
-                    _flush(op, rows[mid:], meta[mid:])
+                    left, right = await asyncio.gather(
+                        _flush(op, rows[:mid], meta[:mid]),
+                        _flush(op, rows[mid:], meta[mid:]),
+                    )
+                    return (
+                        left[0] + right[0],
+                        left[1] + right[1],
+                        left[2] + right[2],
+                        left[3] + right[3],
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    for client in meta:
-                        failed += 1
-                        errors.append(
+                    return (
+                        0,
+                        len(meta),
+                        [
                             {
                                 "email": str(client.get("email") or ""),
                                 "message": f"{type(exc).__name__}: {exc}",
                             }
-                        )
+                            for client in meta
+                        ],
+                        [],
+                    )
 
-            removed_emails = self._remove_live_clients(tag, to_remove, errors)
+            stale_emails = [email for email, _native, _client in stale_replacements]
+            removed_emails = await self._remove_live_clients(tag, [*to_remove, *stale_emails], errors)
             for email, client in zip(to_remove, remove_meta):
                 if email in removed_emails:
                     succeeded += 1
                     applied.append(client)
                 else:
                     failed += 1
-            if mode_key == "upsert":
-                # Xray's users/upsert often edits in place and leaves a missing
-                # client absent, which the panel later reports as CLIENT_NOT_FOUND.
-                # Add the missing rows and edit the ones already on this inbound.
-                _flush("add", to_add, add_meta)
-                _flush("edit", to_edit, edit_meta)
-            else:
-                _flush("edit", to_edit, edit_meta)
-                _flush("add", to_add, add_meta)
+            for email, native, client in stale_replacements:
+                if email in removed_emails:
+                    to_add.append(native)
+                    add_meta.append(client)
+                else:
+                    failed += 1
+            # Adds and edits target disjoint emails, so they can overlap.
+            add_part, edit_part = await asyncio.gather(
+                _flush("add", to_add, add_meta),
+                _flush("edit", to_edit, edit_meta),
+            )
+            for part_ok, part_fail, part_errors, part_applied in (add_part, edit_part):
+                succeeded += part_ok
+                failed += part_fail
+                errors.extend(part_errors)
+                applied.extend(part_applied)
 
             self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
             self._save_client_quotas(applied)
@@ -1304,7 +1531,7 @@ class XrayDriver(CoreDriver):
             "ms": elapsed_ms,
         }
 
-    def batch_remove_clients(
+    async def batch_remove_clients(
         self,
         inbound_id: int | str,
         *,
@@ -1322,7 +1549,7 @@ class XrayDriver(CoreDriver):
                 413,
             )
 
-        inbound = self.get_inbound(inbound_id)
+        inbound = await self.get_inbound(inbound_id)
         tag = str(inbound["tag"])
         started = time.perf_counter()
         remove_emails: list[str] = []
@@ -1330,8 +1557,8 @@ class XrayDriver(CoreDriver):
         succeeded = 0
         failed = 0
 
-        with self._inbound_lock(tag):
-            inbound = self.get_inbound(inbound_id)
+        async with self._inbound_lock(tag):
+            inbound = await self.get_inbound(inbound_id)
             by_email, by_id = self._index_clients(inbound)
             seen: set[str] = set()
             for email in email_keys:
@@ -1358,20 +1585,33 @@ class XrayDriver(CoreDriver):
 
             if remove_emails:
                 try:
-                    self._api().remove_users(tag, remove_emails)
+                    await self._api_call("remove_users", tag, remove_emails)
                     succeeded = len(remove_emails)
                     self._forget_client_quotas(remove_emails + id_keys)
                     self._forget_disabled_keys(remove_emails + id_keys)
                 except AgentError as exc:
-                    forgotten: list[str] = []
-                    for email in remove_emails:
+                    async def drop_one(email: str) -> tuple[str, str | None]:
                         try:
-                            self._api().remove_users(tag, [email])
+                            await self._api_call("remove_users", tag, [email])
+                            return email, None
+                        except AgentError as row_exc:
+                            return email, row_exc.message
+
+                    outcomes = await bounded_gather(
+                        [lambda email=email: drop_one(email) for email in remove_emails],
+                        limit=_CLIENT_PARALLELISM,
+                    )
+                    forgotten: list[str] = []
+                    for outcome in outcomes:
+                        if not isinstance(outcome, tuple):
+                            continue
+                        email, message = outcome
+                        if message is None:
                             succeeded += 1
                             forgotten.append(email)
-                        except AgentError as row_exc:
+                        else:
                             failed += 1
-                            errors.append({"email": email, "message": row_exc.message})
+                            errors.append({"email": email, "message": message})
                     if forgotten:
                         self._forget_client_quotas(forgotten + id_keys)
                         self._forget_disabled_keys(forgotten + id_keys)
@@ -1392,10 +1632,10 @@ class XrayDriver(CoreDriver):
             "ms": elapsed_ms,
         }
 
-    def _live_user_email(self, tag: str, client_id: str, email: str) -> str:
+    async def _live_user_email(self, tag: str, client_id: str, email: str) -> str:
         """Email of a user that is live even when inbounds/list omitted the row."""
         try:
-            by_email, by_id = self._visible_user_index(tag)
+            by_email, by_id = await self._visible_user_index(tag, [email] if email else None)
         except Exception:
             return ""
         row = by_id.get(client_id) if client_id else None
@@ -1405,7 +1645,7 @@ class XrayDriver(CoreDriver):
             return ""
         return str(row.get("email") or email or "").strip()
 
-    def _remove_live_clients(
+    async def _remove_live_clients(
         self,
         tag: str,
         emails: list[str],
@@ -1423,20 +1663,32 @@ class XrayDriver(CoreDriver):
 
         removed: set[str] = set()
         try:
-            self._api().remove_users(tag, unique)
+            await self._api_call("remove_users", tag, unique)
             removed.update(unique)
         except AgentError:
-            for email in unique:
+            async def drop_one(email: str) -> tuple[str, str | None]:
                 try:
-                    self._api().remove_users(tag, [email])
-                    removed.add(email)
+                    await self._api_call("remove_users", tag, [email])
+                    return email, None
                 except AgentError as exc:
                     if _is_missing_user_error(exc):
-                        removed.add(email)
-                        continue
-                    errors.append({"email": email, "message": exc.message})
+                        return email, None
+                    return email, exc.message
                 except Exception as exc:  # noqa: BLE001
-                    errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
+                    return email, f"{type(exc).__name__}: {exc}"
+
+            outcomes = await bounded_gather(
+                [lambda email=email: drop_one(email) for email in unique],
+                limit=_CLIENT_PARALLELISM,
+            )
+            for outcome in outcomes:
+                if not isinstance(outcome, tuple):
+                    continue
+                email, message = outcome
+                if message is None:
+                    removed.add(email)
+                else:
+                    errors.append({"email": email, "message": message})
         except Exception as exc:  # noqa: BLE001
             for email in unique:
                 errors.append({"email": email, "message": f"{type(exc).__name__}: {exc}"})
@@ -1445,7 +1697,7 @@ class XrayDriver(CoreDriver):
         # users/remove can report success and leave the credential in place.
         # A disable that did not actually drop the user must fail so the panel retries.
         try:
-            by_email, _by_id = self._visible_user_index(tag)
+            by_email, _by_id = await self._visible_user_index(tag, unique)
         except Exception:
             by_email = {}
         still = {email for email in removed if email in by_email}
@@ -1457,6 +1709,8 @@ class XrayDriver(CoreDriver):
         return removed - still
 
     def _save_client_quotas(self, clients: list[dict[str, Any]]) -> None:
+        puts: list[tuple[str, dict[str, Any]]] = []
+        deletes: list[str] = []
         for client in clients:
             if not isinstance(client, dict):
                 continue
@@ -1464,11 +1718,14 @@ class XrayDriver(CoreDriver):
             doc_id = str(meta.get("id") or meta.get("email") or "").strip()
             if not doc_id:
                 continue
-            self.store.put_doc(self.key, _QUOTA_KIND, doc_id, meta)
+            puts.append((doc_id, meta))
             email = str(meta.get("email") or "").strip()
             cid = str(meta.get("id") or "").strip()
             if cid and email and email != cid:
-                self.store.delete_doc(self.key, _QUOTA_KIND, email)
+                deletes.append(email)
+        if not puts and not deletes:
+            return
+        self.store.write_docs(self.key, _QUOTA_KIND, puts, deletes)
 
     def _stamp_disabled_client(self, client: dict[str, Any]) -> dict[str, Any]:
         row = normalize_xray_client(client)
@@ -1582,13 +1839,13 @@ class XrayDriver(CoreDriver):
             settings["clients"] = clients
         return inbounds
 
-    def _user_traffic_index(self) -> dict[str, dict[str, int]]:
-        api = self._api()
+    async def _user_traffic_index(self) -> dict[str, dict[str, int]]:
+        api = await self._api()
         query = getattr(api, "stats_query_grouped", None)
         if not callable(query):
             return {}
         try:
-            groups = query("user>>>", "user")
+            groups = await maybe_await(query("user>>>", "user"))
         except Exception:
             return {}
         if not isinstance(groups, dict):
@@ -1596,7 +1853,7 @@ class XrayDriver(CoreDriver):
         users = groups.get("user") or {}
         return dict(users) if isinstance(users, dict) else {}
 
-    def _raise_zero_baseline_to_live(self, client: dict[str, Any]) -> None:
+    async def _raise_zero_baseline_to_live(self, client: dict[str, Any]) -> None:
         """A renewed client is pushed with a zero baseline while Xray still has old counters.
 
         Leaving that gap makes the quota enforcer treat history as new usage and cut the
@@ -1604,17 +1861,9 @@ class XrayDriver(CoreDriver):
         """
         if int(client.get("_incoming") or 0) != 0 or int(client.get("_outgoing") or 0) != 0:
             return
-        if not hasattr(self, "_traffic_index_cache"):
-            self._traffic_index_cache = None
-        if self._traffic_index_cache is None:
-            self._traffic_index_cache = self._user_traffic_index()
         email = str(client.get("email") or "").strip()
         cid = str(client.get("id") or "").strip()
-        traffic = dict(self._traffic_index_cache.get(email) or {})
-        if not traffic and cid:
-            traffic = dict(self._traffic_index_cache.get(cid) or {})
-        live_in = int(traffic.get("downlink") or 0)
-        live_out = int(traffic.get("uplink") or 0)
+        live_in, live_out = await self._live_counters_for(email, cid)
         if live_in <= 0 and live_out <= 0:
             return
         client["_incoming"] = live_in
@@ -1675,7 +1924,7 @@ class XrayDriver(CoreDriver):
                 if meta:
                     apply_quota_meta(client, meta, include_flags=include_flags)
 
-    def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
+    async def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
         """Repair blank Shadowsocks cipher keys left by legacy broken inbounds."""
         from agent.support import repair_shadowsocks_settings
 
@@ -1688,20 +1937,20 @@ class XrayDriver(CoreDriver):
 
         settings.setdefault("network", "tcp,udp")
         api_payload = self._wire_inbound(inbound)
-        self._validate_config_mutation(
+        await self._validate_config_mutation(
             lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
             inbound=api_payload,
         )
-        self._api().edit_inbounds([api_payload], preserve_clients=True)
+        await self._api_call("edit_inbounds", [api_payload], preserve_clients=True)
         inbound_id = inbound.get("id") or self.id_from_tag(str(inbound.get("tag") or ""))
         if inbound_id is None:
             return inbound
-        return self.get_inbound(inbound_id)
+        return await self.get_inbound(inbound_id)
 
-    def update_client(self, inbound_id: int | str, client_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_client(self, inbound_id: int | str, client_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         # Canonical key is panel ``node_id`` (Xray ``id``); always try it first,
         # then fall back to the configured email alias from the payload.
-        inbound = self.get_inbound(inbound_id)
+        inbound = await self.get_inbound(inbound_id)
         current = self._find_client(inbound, client_key)
         payload_email = ""
         try:
@@ -1725,7 +1974,7 @@ class XrayDriver(CoreDriver):
             if not str(merged.get("email") or "").strip():
                 merged["email"] = payload_email or str(current.get("email") or client_key)
             mode = "update"
-        result = self.batch_clients(inbound_id, [merged], mode=mode)
+        result = await self.batch_clients(inbound_id, [merged], mode=mode)
         if result.get("failed"):
             errors = result.get("errors") or []
             message = errors[0].get("message") if errors else "client update failed"
@@ -1755,7 +2004,7 @@ class XrayDriver(CoreDriver):
                     return email or key
         return ""
 
-    def _release_emails_from_other_inbounds(
+    async def _release_emails_from_other_inbounds(
         self,
         emails: list[str],
         keep_tag: str,
@@ -1772,18 +2021,21 @@ class XrayDriver(CoreDriver):
             except AgentError:
                 return
         plan = emails_on_other_inbounds(config, set(emails), keep_tag)
-        for tag, found in plan.items():
+
+        async def drop(tag: str, found: list[str]) -> None:
             for offset in range(0, len(found), _CLIENT_BATCH_MAX):
                 chunk = found[offset : offset + _CLIENT_BATCH_MAX]
                 try:
-                    self._api().remove_users(tag, chunk)
+                    await self._api_call("remove_users", tag, chunk)
                 except AgentError as exc:
                     message = str(exc.message or "").lower()
                     if int(exc.status or 0) == 404 or "not found" in message:
                         continue
                     raise
 
-    def delete_client(self, inbound_id: int | str, client_key: str) -> bool:
+        await gather_independent(*(drop(tag, found) for tag, found in plan.items()))
+
+    async def delete_client(self, inbound_id: int | str, client_key: str) -> bool:
         key = str(client_key or "").strip()
         if not key:
             raise AgentError("VALIDATION_ERROR", "client key is required", 422)
@@ -1797,12 +2049,12 @@ class XrayDriver(CoreDriver):
         tag, email = self._client_email_in_config(config, inbound_id, key)
         if not email:
             tag = self.inbound_tag(inbound_id)
-            email = self._client_email_from_users(tag, key)
+            email = await self._client_email_from_users(tag, key)
         if not email:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
 
         try:
-            self._api().remove_users(tag, [email])
+            await self._api_call("remove_users", tag, [email])
         except AgentError as exc:
             message = str(exc.message or "").lower()
             missing = int(exc.status or 0) == 404 or "not found" in message
@@ -1811,7 +2063,7 @@ class XrayDriver(CoreDriver):
             raise
 
         self._forget_client_keys([key, email])
-        self._release_emails_from_other_inbounds([email], tag, config)
+        await self._release_emails_from_other_inbounds([email], tag, config)
         self.audit.record("delete", f"xray/inbound/{inbound_id}/clients/{key}", email)
         return True
 
@@ -1837,9 +2089,9 @@ class XrayDriver(CoreDriver):
                 return inbound_tag or wanted_tag, email or client_key
         return "", ""
 
-    def _client_email_from_users(self, tag: str, client_key: str) -> str:
+    async def _client_email_from_users(self, tag: str, client_key: str) -> str:
         try:
-            users = self._api().list_users(tag)
+            users = await self._api_call("list_users", tag)
         except AgentError:
             return ""
         for row in users:
@@ -1859,39 +2111,44 @@ class XrayDriver(CoreDriver):
             self.store.delete_doc(self.key, _QUOTA_KIND, key)
             self.store.delete_doc(self.key, _DISABLED_KIND, key)
 
-    def reset_client_traffic(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
-        inbound = self.get_inbound(inbound_id)
+    async def reset_client_traffic(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
+        inbound = await self.get_inbound(inbound_id)
         current = self._find_client(inbound, client_key)
         if current is None:
             raise AgentError("CLIENT_NOT_FOUND", f"Client [{client_key}] not found", 404)
         email = str(current.get("email") or client_key)
-        self._api().reset_user_traffic(email)
+        await self._api_call("reset_user_traffic", email)
         return current
 
-    def client_ips(self, email: str) -> list[str]:
+    async def client_ips(self, email: str) -> list[str]:
         # Xray reports currently-online IPs, not an accumulating log.
         # Do not hide live addresses after a "clear" — the bot needs them for device lists.
-        return self._api().online_ips(email)
+        return await self._api_call("online_ips", email)
 
-    def client_ip_last_seen(self, email: str) -> dict[str, Any]:
+    async def client_ip_last_seen(self, email: str) -> dict[str, Any]:
         """``{ip: lastSeen}`` for sessions Xray still considers online."""
-        return self._api().online_ip_last_seen(email)
+        return await self._api_call("online_ip_last_seen", email)
 
     def clear_client_ips(self, email: str) -> bool:
         return True
 
-    def backup(self) -> dict[str, Any]:
+    async def backup(self) -> dict[str, Any]:
+        inbounds, outbounds, rules = await gather_independent(
+            self.list_inbounds(),
+            self._api_call("list_outbounds"),
+            self._api_call("list_rules"),
+        )
         return {
-            "inbounds": self.list_inbounds(),
-            "outbounds": self._api().list_outbounds(),
-            "rules": self._api().list_rules(),
+            "inbounds": inbounds,
+            "outbounds": outbounds,
+            "rules": rules,
         }
 
-    def restore(self, payload: dict[str, Any]) -> bool:
+    async def restore(self, payload: dict[str, Any]) -> bool:
         desired = list(payload.get("inbounds") or [])
-        existing = self.list_inbounds()
+        existing = await self.list_inbounds()
         if existing:
-            self._api().remove_inbounds([str(i.get("tag")) for i in existing if i.get("tag")])
+            await self._api_call("remove_inbounds", [str(i.get("tag")) for i in existing if i.get("tag")])
         cleaned = []
         for row in desired:
             item = deepcopy(row)
@@ -1900,34 +2157,34 @@ class XrayDriver(CoreDriver):
             settings["clients"] = [normalize_xray_client(c) for c in settings.get("clients") or []]
             cleaned.append(self._wire_inbound(item))
         if cleaned:
-            self._api().add_inbounds(cleaned)
+            await self._api_call("add_inbounds", cleaned)
         if payload.get("outbounds"):
             try:
-                self._api().add_outbounds(list(payload["outbounds"]))
+                await self._api_call("add_outbounds", list(payload["outbounds"]))
             except AgentError:
                 pass
         if payload.get("rules"):
             try:
-                self._api().add_rules(list(payload["rules"]))
+                await self._api_call("add_rules", list(payload["rules"]))
             except AgentError:
                 pass
         self.audit.record("restore", "xray")
         return True
 
-    def import_config(self, config: dict[str, Any], path: str | None = None) -> dict[str, Any]:
+    async def import_config(self, config: dict[str, Any], path: str | None = None) -> dict[str, Any]:
         binary = self._binary()
         if binary:
-            validate_xray_config(binary, config)
-        result = self._api().import_config(config, path=path)
+            await validate_xray_config(binary, config)
+        result = await self._api_call("import_config", config, path=path)
         self.audit.record("import", "xray/config")
         return result
 
-    def x25519(self) -> dict[str, str]:
+    async def x25519(self) -> dict[str, str]:
         binary = self._binary()
         if not binary:
             raise AgentError("UNSUPPORTED_CAPABILITY", "xray binary not found for x25519", 400)
         try:
-            result = subprocess.run([binary, "x25519"], capture_output=True, text=True, timeout=10, check=False)
+            result = await run([binary, "x25519"], timeout=10, check=False)
             keys: dict[str, str] = {}
             for line in (result.stdout or "").strip().splitlines():
                 if ":" in line:
@@ -1954,7 +2211,7 @@ class XrayDriver(CoreDriver):
     def dumped_config(self) -> dict[str, Any]:
         return redact_secrets(self.read_config())
 
-    def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
+    async def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(config, dict) or not config:
             raise AgentError("VALIDATION_ERROR", "Xray config must be a non-empty object", 422)
 
@@ -1982,7 +2239,7 @@ class XrayDriver(CoreDriver):
 
         binary = self._binary()
         if binary:
-            validate_xray_config(binary, payload)
+            await validate_xray_config(binary, payload)
 
         path.parent.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
@@ -1991,16 +2248,16 @@ class XrayDriver(CoreDriver):
         tmp.replace(path)
 
         try:
-            result = self._api().import_config(payload, path=str(path))
+            result = await self._api_call("import_config", payload, path=str(path))
         except AgentError:
             from agent.xray_service import ensure_xray_running
 
             xray = self.settings.xray
             # Prefer keep-alive: if the unit is already up, do not restart (drops connections).
             # When down, start loads the config we just wrote to disk.
-            if service_is_active(_XRAY_UNIT):
+            if await service_is_active(_XRAY_UNIT):
                 raise
-            result = ensure_xray_running(
+            result = await ensure_xray_running(
                 binary=xray.binary,
                 config_path=xray.config,
                 api_base=xray.api_base,
@@ -2016,7 +2273,7 @@ class XrayDriver(CoreDriver):
         self.audit.record("update", "xray/config")
         return result if isinstance(result, dict) else {"ok": True}
 
-    def replace_section(self, section: str, value: Any) -> dict[str, Any]:
+    async def replace_section(self, section: str, value: Any) -> dict[str, Any]:
         name = str(section or "").strip()
         if name not in MANAGED_SECTIONS:
             raise AgentError("VALIDATION_ERROR", f"Unsupported Xray section [{name}]", 422)
@@ -2038,9 +2295,9 @@ class XrayDriver(CoreDriver):
             config["routing"] = current
         else:
             config[name] = value
-        return self.apply_config(config)
+        return await self.apply_config(config)
 
-    def console(self) -> dict[str, Any]:
+    async def console(self) -> dict[str, Any]:
         config: dict[str, Any] = {}
         config_error: str | None = None
         try:
@@ -2053,8 +2310,10 @@ class XrayDriver(CoreDriver):
         api_ok = False
         api_error: str | None = None
         try:
-            outbounds = self.list_outbounds()
-            rules = self.list_rules()
+            outbounds, rules = await gather_independent(
+                self.list_outbounds(),
+                self.list_rules(),
+            )
             api_ok = True
         except AgentError as exc:
             api_error = exc.message
@@ -2115,32 +2374,32 @@ class XrayDriver(CoreDriver):
             "files": files,
         }
 
-    def restart_logger(self) -> dict[str, Any]:
-        result = self._api().restart_logger()
+    async def restart_logger(self) -> dict[str, Any]:
+        result = await self._api_call("restart_logger", )
         self.audit.record("update", "xray/logger")
         return result if isinstance(result, dict) else {"ok": True}
 
-    def list_outbounds(self) -> list[dict[str, Any]]:
-        return self._api().list_outbounds()
+    async def list_outbounds(self) -> list[dict[str, Any]]:
+        return await self._api_call("list_outbounds", )
 
-    def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._api().add_outbounds(outbounds)
+    async def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._api_call("add_outbounds", outbounds)
 
-    def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._api().edit_outbounds(outbounds)
+    async def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._api_call("edit_outbounds", outbounds)
 
-    def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
-        return self._api().remove_outbounds(tags)
+    async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
+        return await self._api_call("remove_outbounds", tags)
 
-    def list_rules(self) -> list[dict[str, Any]]:
-        return self._api().list_rules()
+    async def list_rules(self) -> list[dict[str, Any]]:
+        return await self._api_call("list_rules", )
 
-    def add_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._api().add_rules(rules)
+    async def add_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._api_call("add_rules", rules)
 
-    def append_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    async def append_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         """Xray POST /api/rules/add?should_append=true. Never replaces the rule list."""
-        result = self._api().add_rules(rules, should_append=True)
+        result = await self._api_call("add_rules", rules, should_append=True)
         self.restrict_config_permissions()
         self.audit.record("update", "xray/rules/append", f"count={len(rules)}")
         return result if isinstance(result, dict) else {"ok": True}
@@ -2184,23 +2443,23 @@ class XrayDriver(CoreDriver):
                 pass
         return self.httpapi_guard()
 
-    def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    async def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {"updated": 0}
         for rule in rules:
-            result = self._api().edit_rule(rule)
+            result = await self._api_call("edit_rule", rule)
         return result
 
-    def remove_rules(self, tags: list[str]) -> dict[str, Any]:
-        return self._api().remove_rules(tags)
+    async def remove_rules(self, tags: list[str]) -> dict[str, Any]:
+        return await self._api_call("remove_rules", tags)
 
-    def replace_rules(self, rules: list[dict[str, Any]], routing_extras: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def replace_rules(self, rules: list[dict[str, Any]], routing_extras: dict[str, Any] | None = None) -> dict[str, Any]:
         """Atomically replace routing.rules (native API when available, else config section)."""
         extras = dict(routing_extras or {})
         started = time.perf_counter()
         # Prefer native /api/rules/replace — full config import validates+reloads Xray
         # and made region sync / panel ops feel stuck after v0.4.64.
         try:
-            result = self._api().replace_rules(list(rules), **extras)
+            result = await self._api_call("replace_rules", list(rules), **extras)
         except AgentError as exc:
             # Older/buggy Xray builds: missing replace route, or replace returns
             # invalid_json / empty body — fall back to config section write.
@@ -2222,7 +2481,7 @@ class XrayDriver(CoreDriver):
                 if key in {"domainStrategy", "domainMatcher", "balancers"} and value is not None
             }
             routing["rules"] = list(rules)
-            result = self.replace_section("routing", routing)
+            result = await self.replace_section("routing", routing)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.audit.record(
             "update",
@@ -2236,7 +2495,7 @@ class XrayDriver(CoreDriver):
             "result": result if isinstance(result, dict) else {"ok": True},
         }
 
-    def upsert_rules(
+    async def upsert_rules(
         self,
         *,
         remove_tags: list[str] | None = None,
@@ -2247,11 +2506,11 @@ class XrayDriver(CoreDriver):
         started = time.perf_counter()
         removed = 0
         if tags:
-            self._api().remove_rules(tags)
+            await self._api_call("remove_rules", tags)
             removed = len(tags)
         added = 0
         if rows:
-            self._api().add_rules(rows, should_append=True)
+            await self._api_call("add_rules", rows, should_append=True)
             added = len(rows)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.audit.record(
@@ -2261,10 +2520,10 @@ class XrayDriver(CoreDriver):
         )
         return {"ok": True, "removed": removed, "added": added, "ms": elapsed_ms}
 
-    def test_routing(self, attrs: dict[str, Any]) -> dict[str, Any]:
+    async def test_routing(self, attrs: dict[str, Any]) -> dict[str, Any]:
         from agent.support.routing_test import test_routing_rules
 
-        rules = self.list_rules()
+        rules = await self.list_rules()
         if not rules:
             try:
                 config = self.read_config()
@@ -2284,15 +2543,18 @@ class XrayDriver(CoreDriver):
         result["rules_count"] = len(rules)
         return result
 
-    def block_source_ips(self, source_ips: list[str], **kwargs: Any) -> dict[str, Any]:
-        return self._api().block_source_ips(source_ips, **kwargs)
+    async def block_source_ips(self, source_ips: list[str], **kwargs: Any) -> dict[str, Any]:
+        return await self._api_call("block_source_ips", source_ips, **kwargs)
 
-    def usage_snapshot(self) -> UsageSnapshotModel:
-        inbounds = self.list_inbounds()
-        user_groups = self._api().stats_query_grouped("user>>>", "user")
-        inbound_groups = self._api().stats_query_grouped("inbound>>>", "inbound")
+    async def usage_snapshot(self) -> UsageSnapshotModel:
+        user_groups, inbound_groups = await gather_independent(
+            self._api_call("stats_query_grouped", "user>>>", "user"),
+            self._api_call("stats_query_grouped", "inbound>>>", "inbound"),
+        )
         user_traffic = dict(user_groups.get("user") or {})
         inbound_traffic = dict(inbound_groups.get("inbound") or {})
+        inbounds = self._disk_inbounds()
+        seen: set[str] = set()
 
         rows: list[InboundUsageModel] = []
         for inbound in inbounds:
@@ -2308,6 +2570,10 @@ class XrayDriver(CoreDriver):
                 traffic = dict(user_traffic.get(email) or {})
                 if not traffic and cid and cid in user_traffic:
                     traffic = dict(user_traffic.get(cid) or {})
+                if email:
+                    seen.add(email)
+                if cid:
+                    seen.add(cid)
                 canonical = cid or email
                 clients.append(
                     ClientUsageModel(
@@ -2327,25 +2593,49 @@ class XrayDriver(CoreDriver):
                     clients=clients,
                 )
             )
+
+        leftover: list[ClientUsageModel] = []
+        for email, traffic in user_traffic.items():
+            label = str(email or "").strip()
+            if not label or label in seen or not isinstance(traffic, dict):
+                continue
+            leftover.append(
+                ClientUsageModel(
+                    id=label,
+                    email=label,
+                    incoming=int(traffic.get("downlink") or 0),
+                    outgoing=int(traffic.get("uplink") or 0),
+                )
+            )
+        if leftover:
+            rows.append(
+                InboundUsageModel(
+                    id="stats",
+                    tag="stats",
+                    incoming=sum(c.incoming for c in leftover),
+                    outgoing=sum(c.outgoing for c in leftover),
+                    clients=leftover,
+                )
+            )
         return UsageSnapshotModel(inbounds=rows)
 
-    def online_users(self) -> list[str]:
-        if not self.running():
+    async def online_users(self) -> list[str]:
+        if not await self.running():
             return []
-        users = self._api().online_users()
+        users = await self._api_call("online_users", )
         alias = self._client_email_aliases()
         return [alias.get(str(item), str(item)) for item in users]
 
-    def online_ips_map(self) -> dict[str, Any]:
-        if not self.running():
+    async def online_ips_map(self) -> dict[str, Any]:
+        if not await self.running():
             return {}
         try:
-            body = self._api().online_all()
+            body = await self._api_call("online_all", )
         except AgentError as exc:
             if exc.status in (404, 405, 501, 422):
                 # Older Xray builds lack online/all — assemble from iplist locally
                 # so panel still gets one bulk /stats/online/ips (or /stats/live) call.
-                return self._online_ips_map_from_iplist()
+                return await self._online_ips_map_from_iplist()
             raise
 
         users = body.get("users") or []
@@ -2369,23 +2659,32 @@ class XrayDriver(CoreDriver):
                 out[cid] = ips
         return out
 
-    def _online_ips_map_from_iplist(self) -> dict[str, Any]:
+    async def _online_ips_map_from_iplist(self) -> dict[str, Any]:
         """Fallback when GET /api/stats/online/all is missing (localhost iplist loop)."""
         try:
-            raw_users = self._api().online_users()
+            raw_users = await self._api_call("online_users", )
         except AgentError:
             return {}
 
+        emails = [str(item).strip() for item in raw_users or [] if str(item).strip()]
         alias = self._client_email_aliases()
-        out: dict[str, Any] = {}
-        for item in raw_users or []:
-            email = str(item).strip()
-            if email == "":
-                continue
+
+        async def fetch(email: str) -> tuple[str, Any]:
             try:
-                ips = self._api().online_ips(email)
+                ips = await self._api_call("online_ips", email)
             except AgentError:
                 ips = []
+            return email, ips
+
+        parts = await bounded_gather(
+            [lambda email=email: fetch(email) for email in emails],
+            limit=_CLIENT_PARALLELISM,
+        )
+        out: dict[str, Any] = {}
+        for part in parts:
+            if not isinstance(part, tuple):
+                continue
+            email, ips = part
             out[email] = ips
             cid = alias.get(email)
             if cid and cid != email:
@@ -2395,7 +2694,7 @@ class XrayDriver(CoreDriver):
     def _client_email_aliases(self) -> dict[str, str]:
         alias: dict[str, str] = {}
         try:
-            for inbound in self.list_inbounds():
+            for inbound in self._disk_inbounds():
                 for row in (inbound.get("settings") or {}).get("clients") or []:
                     if not isinstance(row, dict):
                         continue
@@ -2407,29 +2706,21 @@ class XrayDriver(CoreDriver):
             return {}
         return alias
 
-    def online_traffic(self) -> dict[str, dict[str, int]]:
+    async def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot
 
         try:
-            body = self._api().online_traffic()
+            body = await self._api_call("online_traffic", )
         except AgentError as exc:
             if exc.status != 404:
                 raise
-            return online_traffic_from_snapshot(self)
+            return await online_traffic_from_snapshot(self)
 
         users = body.get("users") or {}
         if not isinstance(users, dict):
-            return online_traffic_from_snapshot(self)
+            return await online_traffic_from_snapshot(self)
         try:
-            alias = {}
-            for inbound in self.list_inbounds():
-                for row in (inbound.get("settings") or {}).get("clients") or []:
-                    if not isinstance(row, dict):
-                        continue
-                    email = str(row.get("email") or "").strip()
-                    cid = str(row.get("id") or "").strip()
-                    if email and cid:
-                        alias[email] = cid
+            alias = self._client_email_aliases()
         except Exception:
             alias = {}
         out: dict[str, dict[str, int]] = {}
@@ -2451,5 +2742,5 @@ class XrayDriver(CoreDriver):
             int(row.get("uplink") or 0) > 0 or int(row.get("downlink") or 0) > 0
             for row in out.values()
         ):
-            return online_traffic_from_snapshot(self)
+            return await online_traffic_from_snapshot(self)
         return out

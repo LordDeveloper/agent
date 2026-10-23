@@ -121,7 +121,7 @@ def domain_in_geosite(path: Path, category: str, domain: str) -> tuple[bool, str
     try:
         mapping = _load_geosite_map(str(path.resolve()))
     except Exception as exc:  # noqa: BLE001
-        return False, f"خواندن geosite.dat ناموفق: {exc}"
+        return False, f"failed to read geosite.dat: {exc}"
 
     entries = mapping.get(category)
     if entries is None:
@@ -129,7 +129,7 @@ def domain_in_geosite(path: Path, category: str, domain: str) -> tuple[bool, str
         base = category.split("@", 1)[0]
         entries = mapping.get(base)
     if entries is None:
-        return False, f"دسته geosite:{category} در فایل یافت نشد"
+        return False, f"geosite:{category} category was not found in the file"
 
     for dtype, value in entries:
         needle = value.strip().lower().rstrip(".")
@@ -201,17 +201,17 @@ def geoip_contains(path: Path, code: str, ip: str) -> tuple[bool, str | None]:
     try:
         target = ipaddress.ip_address(ip.strip())
     except ValueError:
-        return False, "آدرس IP نامعتبر است"
+        return False, "invalid IP address"
     try:
         mapping = _load_geoip_cidrs(str(path.resolve()))
     except Exception as exc:  # noqa: BLE001
-        return False, f"خواندن geoip.dat ناموفق: {exc}"
+        return False, f"failed to read geoip.dat: {exc}"
 
     cidrs = mapping.get(code)
     if cidrs is None:
-        return False, f"کد geoip:{code} در فایل یافت نشد"
+        return False, f"geoip:{code} was not found in the file"
     if not cidrs:
-        return False, f"geoip:{code} بدون CIDR قابل‌خواندن بود"
+        return False, f"geoip:{code} had no readable CIDR"
 
     for cidr in cidrs:
         try:

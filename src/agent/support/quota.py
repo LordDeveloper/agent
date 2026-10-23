@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.asyncutil import gather_independent, maybe_await
 from agent.support import record_is_enabled
 from agent.support.disable_reason import baseline_looks_like_raw_kernel, mark_quota_disabled
 
@@ -113,13 +114,13 @@ def reseed_baseline_if_stale(
     )
 
 
-def enforce_driver_quotas(driver: Any) -> int:
+async def enforce_driver_quotas(driver: Any) -> int:
     if driver.key == "xray":
-        return _enforce_xray(driver)
+        return await _enforce_xray(driver)
     if driver.key in {"wireguard", "amnezia"}:
-        return _enforce_wireguard(driver)
+        return await _enforce_wireguard(driver)
     if driver.key == "l2tp":
-        return _enforce_l2tp(driver)
+        return await _enforce_l2tp(driver)
     return 0
 
 
@@ -142,11 +143,11 @@ def _disabled_client_index(driver: Any) -> dict[str, dict[str, Any]]:
     return index
 
 
-def _enforce_xray(driver: Any) -> int:
-    if not driver.running():
+async def _enforce_xray(driver: Any) -> int:
+    if not await maybe_await(driver.running()):
         return 0
 
-    snapshot = driver.usage_snapshot()
+    snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
     traffic_by_id: dict[str, tuple[int, int]] = {}
 
@@ -157,10 +158,15 @@ def _enforce_xray(driver: Any) -> int:
             if client.id:
                 traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
 
-    disabled = 0
     disabled_index = _disabled_client_index(driver)
 
-    for inbound in driver.list_inbounds():
+    inbound_rows = getattr(driver, "list_quota_inbounds", None)
+    if callable(inbound_rows):
+        inbounds = inbound_rows()
+    else:
+        inbounds = await maybe_await(driver.list_inbounds())
+
+    async def handle(inbound: dict[str, Any]) -> int:
         inbound_id = inbound.get("id")
         to_disable: list[dict[str, Any]] = []
         to_reseed: list[dict[str, Any]] = []
@@ -206,21 +212,21 @@ def _enforce_xray(driver: Any) -> int:
             mark_quota_disabled(row, live[0], live[1])
             to_disable.append(row)
 
+        # Reseed then disable on the same inbound stay sequential.
         if to_reseed:
-            driver.batch_clients(inbound_id, clients=to_reseed, mode="update")
-
+            await maybe_await(driver.batch_clients(inbound_id, clients=to_reseed, mode="update"))
         if not to_disable:
-            continue
+            return 0
+        await maybe_await(driver.batch_clients(inbound_id, clients=to_disable, mode="update"))
+        return len(to_disable)
 
-        driver.batch_clients(inbound_id, clients=to_disable, mode="update")
-        disabled += len(to_disable)
-
-    return disabled
+    counts = await gather_independent(*(handle(inbound) for inbound in inbounds))
+    return sum(int(count) for count in counts if isinstance(count, int))
 
 
-def _enforce_wireguard(driver: Any) -> int:
-    driver.sync_peer_stats()
-    snapshot = driver.usage_snapshot()
+async def _enforce_wireguard(driver: Any) -> int:
+    await maybe_await(driver.sync_peer_stats())
+    snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
     traffic_by_id: dict[str, tuple[int, int]] = {}
 
@@ -231,9 +237,7 @@ def _enforce_wireguard(driver: Any) -> int:
             if client.id:
                 traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
 
-    disabled = 0
-
-    for iface in driver.list_interfaces():
+    async def handle(iface: dict[str, Any]) -> int:
         interface_id = iface.get("id")
         to_disable: list[dict[str, Any]] = []
         to_reseed: list[dict[str, Any]] = []
@@ -268,20 +272,19 @@ def _enforce_wireguard(driver: Any) -> int:
             to_disable.append(row)
 
         if to_reseed:
-            driver.batch_peers(interface_id, peers=to_reseed, mode="update")
-
+            await maybe_await(driver.batch_peers(interface_id, peers=to_reseed, mode="update"))
         if not to_disable:
-            continue
+            return 0
+        await maybe_await(driver.batch_peers(interface_id, peers=to_disable, mode="update"))
+        return len(to_disable)
 
-        driver.batch_peers(interface_id, peers=to_disable, mode="update")
-        disabled += len(to_disable)
-
-    return disabled
+    counts = await gather_independent(*(handle(iface) for iface in driver.list_interfaces()))
+    return sum(int(count) for count in counts if isinstance(count, int))
 
 
-def _enforce_l2tp(driver: Any) -> int:
-    driver.sync_user_stats()
-    snapshot = driver.usage_snapshot()
+async def _enforce_l2tp(driver: Any) -> int:
+    await maybe_await(driver.sync_user_stats())
+    snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
     traffic_by_id: dict[str, tuple[int, int]] = {}
 
@@ -292,9 +295,7 @@ def _enforce_l2tp(driver: Any) -> int:
             if client.id:
                 traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
 
-    disabled = 0
-
-    for server in driver.list_servers():
+    async def handle(server: dict[str, Any]) -> int:
         server_id = server.get('id')
         to_disable: list[dict[str, Any]] = []
         to_reseed: list[dict[str, Any]] = []
@@ -333,15 +334,14 @@ def _enforce_l2tp(driver: Any) -> int:
             to_disable.append(row)
 
         if to_reseed:
-            driver.batch_users(server_id, users=to_reseed, mode='update')
-
+            await maybe_await(driver.batch_users(server_id, users=to_reseed, mode='update'))
         if not to_disable:
-            continue
+            return 0
+        await maybe_await(driver.batch_users(server_id, users=to_disable, mode='update'))
+        return len(to_disable)
 
-        driver.batch_users(server_id, users=to_disable, mode='update')
-        disabled += len(to_disable)
-
-    return disabled
+    counts = await gather_independent(*(handle(server) for server in driver.list_servers()))
+    return sum(int(count) for count in counts if isinstance(count, int))
 
 
 def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:

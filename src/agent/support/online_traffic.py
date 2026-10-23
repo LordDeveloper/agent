@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.asyncutil import gather_independent, maybe_await
 from agent.drivers.base import CoreDriver
 from agent.models import UsageSnapshotModel
 
@@ -35,28 +36,18 @@ def traffic_from_snapshot(
     return out
 
 
-def online_traffic_from_snapshot(driver: CoreDriver) -> dict[str, dict[str, int]]:
+async def online_traffic_from_snapshot(driver: CoreDriver) -> dict[str, dict[str, int]]:
     """Fallback for cores without Xray /api/stats/online/traffic.
 
     Emits both peer id (panel node_id) and email keys so the panel enrich
     path can match the same way pending traffic does.
     """
-    return traffic_from_snapshot(driver.usage_snapshot(), driver.online_users())
+    snapshot, users = await gather_independent(
+        maybe_await(driver.usage_snapshot()),
+        maybe_await(driver.online_users()),
+    )
+    return traffic_from_snapshot(snapshot, users)
 
 
-def collect_online_traffic(registry, core: str | None = None) -> dict[str, dict[str, int]]:
-    if core:
-        driver = registry.get(core)
-        fn = getattr(driver, "online_traffic", None)
-        if callable(fn):
-            return fn()
-        return online_traffic_from_snapshot(driver)
-
-    merged: dict[str, dict[str, int]] = {}
-    for key in registry.settings.cores():
-        driver = registry.get(key)
-        fn = getattr(driver, "online_traffic", None)
-        rows = fn() if callable(fn) else online_traffic_from_snapshot(driver)
-        for email, stats in rows.items():
-            merged[str(email)] = stats
-    return merged
+async def collect_online_traffic(registry, core: str | None = None) -> dict[str, dict[str, int]]:
+    return await registry.online_traffic(core)

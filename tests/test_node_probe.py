@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,9 +29,9 @@ def test_curl_probe_accepts_http_301(monkeypatch):
 
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
     monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.1.1.1'])
-    ok, message, latency = _curl_probe(interface='de', runner=runner)
+    ok, message, latency = asyncio.run(_curl_probe(interface='de', runner=runner))
     assert ok is True
-    assert message == 'اتصال برقرار شد'
+    assert message == 'connection established'
     assert latency == 55
 
 
@@ -61,7 +62,7 @@ def test_probe_exit_interface_falls_back_to_handshake(_interfaces, _which, monke
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
     monkeypatch.setattr(node_probe, '_iface_ping_ms', lambda *a, **k: 42)
 
-    result = node_probe.probe_exit_interface('de', runner=runner)
+    result = asyncio.run(node_probe.probe_exit_interface('de', runner=runner))
     assert result['ok'] is True
     assert result.get('via') == 'handshake'
     assert result.get('latency_ms') == 42
@@ -85,7 +86,7 @@ def test_iface_ping_ms_prefers_wg_relay_ip(monkeypatch):
         )
 
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
-    assert node_probe._iface_ping_ms('de', runner=runner) == 27
+    assert asyncio.run(node_probe._iface_ping_ms('de', runner=runner)) == 27
     ping_cmds = [row for row in calls if row and row[0] == 'ping']
     assert ping_cmds
     assert '-I' in ping_cmds[0]
@@ -116,9 +117,9 @@ def test_curl_probe_continues_after_timeout(monkeypatch):
 
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
     monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.1.1.1', '1.0.0.1', '8.8.8.8'])
-    ok, message, latency = _curl_probe(interface='poland', runner=runner)
+    ok, message, latency = asyncio.run(_curl_probe(interface='poland', runner=runner))
     assert ok is True
-    assert message == 'اتصال برقرار شد'
+    assert message == 'connection established'
     assert latency == 42
     curl_urls = [row[-1] for row in calls if row and row[0] == 'curl']
     assert any('1.1.1.1' in item for item in curl_urls)
@@ -135,7 +136,7 @@ def test_host_routes_skipped_for_ip_bind(monkeypatch):
         return SimpleNamespace(returncode=0, stdout='200 0.01', stderr='')
 
     monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
-    ok, _message, _latency = _curl_probe(interface='10.64.0.2', runner=runner)
+    ok, _message, _latency = asyncio.run(_curl_probe(interface='10.64.0.2', runner=runner))
     assert ok is True
     assert not any(row and row[0] == 'ip' for row in calls)
 
@@ -171,17 +172,17 @@ def test_is_mullvad_exit_skips_table_off(tmp_path, monkeypatch):
 
 
 def test_probe_outbound_missing_tag():
-    result = node_probe.probe_outbound_tag('missing', [{'tag': 'direct', 'protocol': 'freedom'}])
+    result = asyncio.run(node_probe.probe_outbound_tag('missing', [{'tag': 'direct', 'protocol': 'freedom'}]))
     assert result['ok'] is False
 
 
 def test_probe_region_node_requires_path():
-    result = node_probe.probe_region_node(node_id=1, outbound_tag=None, exit_interface=None, outbounds=[])
+    result = asyncio.run(node_probe.probe_region_node(node_id=1, outbound_tag=None, exit_interface=None, outbounds=[]))
     assert result['ok'] is False
 
 
 def test_probe_exit_interface_missing():
-    result = node_probe.probe_exit_interface('eth999')
+    result = asyncio.run(node_probe.probe_exit_interface('eth999'))
     assert result['ok'] is False
 
 
@@ -221,13 +222,13 @@ def test_probe_region_node_passes_when_any_check_succeeds(_interfaces, _which, m
         },
     ]
 
-    result = node_probe.probe_region_node(
+    result = asyncio.run(node_probe.probe_region_node(
         node_id=7,
         outbound_tag='deegress',
         exit_interface='uk0',
         outbounds=outbounds,
         runner=fake_runner,
-    )
+    ))
 
     assert result['ok'] is True
     # Outbound already prefers exit_interface name — no duplicate exit curl.
@@ -263,13 +264,13 @@ def test_probe_region_node_skips_duplicate_exit_interface_check(_which):
         },
     ]
 
-    result = node_probe.probe_region_node(
+    result = asyncio.run(node_probe.probe_region_node(
         node_id=7,
         outbound_tag='ukegress',
         exit_interface='uk0',
         outbounds=outbounds,
         runner=fake_runner,
-    )
+    ))
 
     assert result['ok'] is True
     assert 'outbound' in result['checks']
@@ -312,13 +313,13 @@ def test_probe_prefers_exit_interface_over_shared_mullvad_ip(_interfaces, _which
         },
     ]
 
-    result = node_probe.probe_region_node(
+    result = asyncio.run(node_probe.probe_region_node(
         node_id=3,
         outbound_tag='region-node-se',
         exit_interface='se',
         outbounds=outbounds,
         runner=fake_runner,
-    )
+    ))
 
     assert result['ok'] is True
     assert all(item == 'se' for item in calls if item)
@@ -343,7 +344,7 @@ def test_curl_speed_mbps_binds_interface_name(_which, monkeypatch):
         return Result()
 
     monkeypatch.setattr(node_probe, '_resolve_ipv4_hosts', lambda hosts: ['1.2.3.4'])
-    ok, message, mbps = node_probe.curl_speed_mbps(interface='us', runner=fake_runner)
+    ok, message, mbps = asyncio.run(node_probe.curl_speed_mbps(interface='us', runner=fake_runner))
     assert ok is True
     assert mbps == 10.0
     assert '10.0' in message or 'Mbps' in message

@@ -1,3 +1,5 @@
+import asyncio
+
 from agent.support.quota import (
     apply_quota_meta,
     enforce_driver_quotas,
@@ -267,7 +269,7 @@ def test_enforcer_cuts_client_left_live_after_panel_disable():
         }],
     )
 
-    assert enforce_driver_quotas(driver) == 1
+    assert asyncio.run(enforce_driver_quotas(driver)) == 1
     assert driver.batches[0][0]["is_enabled"] is False
     assert driver.batches[0][0]["disabled_reason"] == "quota_exceeded"
 
@@ -284,5 +286,5 @@ def test_enforcer_leaves_a_client_with_remaining_quota():
         }],
     )
 
-    assert enforce_driver_quotas(driver) == 0
+    assert asyncio.run(enforce_driver_quotas(driver)) == 0
     assert driver.batches == []

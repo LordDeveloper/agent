@@ -76,7 +76,7 @@ def validate_wg_iface(iface: dict[str, Any]) -> None:
                 f"Peer [{peer.get('id') or peer.get('email')}] has invalid exit_interface [{exit_iface}]"
             )
 
-def validate_wg_conf_stripped(
+async def validate_wg_conf_stripped(
     conf_text: str,
     *,
     quick_bin: str,
@@ -92,10 +92,8 @@ def validate_wg_conf_stripped(
     os.close(fd)
     try:
         Path(temp_path).write_text(conf_text, encoding="utf-8")
-        strip = subprocess.run(
+        strip = await run(
             [quick_bin, "strip", temp_path],
-            capture_output=True,
-            text=True,
             timeout=30,
             check=False,
         )
@@ -174,7 +172,7 @@ def normalize_xray_config_shapes(config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
+async def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
     if not binary:
         raise _validation_error("Xray binary not found for config validation")
 
@@ -209,11 +207,9 @@ def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
         asset_dir = None
 
     try:
-        result = subprocess.run(
+        result = await run(
             [binary, "run", "-test", "-config", temp_path],
             check=False,
-            capture_output=True,
-            text=True,
             timeout=60,
             env=env,
         )
@@ -224,15 +220,15 @@ def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
         Path(temp_path).unlink(missing_ok=True)
 
 
-def validate_xray_config_mutation(
+async def validate_xray_config_mutation(
     binary: str,
     config_path: Path,
     mutate: Callable[[dict[str, Any]], None],
 ) -> None:
     if not config_path.is_file():
-        validate_xray_config(binary, {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": []})
+        await validate_xray_config(binary, {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": []})
         return
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     mutate(config)
-    validate_xray_config(binary, config)
+    await validate_xray_config(binary, config)

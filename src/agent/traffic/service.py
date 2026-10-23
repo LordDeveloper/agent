@@ -31,8 +31,10 @@ class TrafficService:
         self._emails: dict[str, str] = {}
         self._fetch_snapshot: dict[str, list[dict[str, Any]]] = {}
 
-    def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
+    async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from core counters (online not required)."""
+        from agent.asyncutil import gather_independent, maybe_await
+
         stats = {
             "clients_seen": 0,
             "pending": 0,
@@ -44,17 +46,29 @@ class TrafficService:
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
 
-        for core_key in cores:
+        async def snapshot_of(core_key: str):
+            driver = registry.get(core_key)
+            if core_key == "l2tp":
+                self._drop_linked_l2tp_billing(driver)
+            return core_key, await maybe_await(driver.usage_snapshot())
+
+        sampled = await gather_independent(
+            *(snapshot_of(core_key) for core_key in cores),
+            return_exceptions=True,
+        )
+
+        for item in sampled:
+            if isinstance(item, Exception):
+                log.exception("traffic sample failed: %s", item)
+                continue
+            core_key, snapshot = item
             try:
-                driver = registry.get(core_key)
-                if core_key == "l2tp":
-                    self._drop_linked_l2tp_billing(driver)
-                snapshot = driver.usage_snapshot()
+                inbounds = snapshot.inbounds
             except Exception:
                 log.exception("traffic sample failed core=%s", core_key)
                 continue
 
-            for inbound in snapshot.inbounds:
+            for inbound in inbounds:
                 for client in inbound.clients:
                     label = client_key(client)
                     if not label:
@@ -327,6 +341,9 @@ class TrafficService:
             if label and label not in seen:
                 seen.add(label)
                 self.reset_client(core, label)
+
+    def last_sample_age_ms(self) -> int | None:
+        return self._worker_lag_ms()
 
     def _worker_lag_ms(self) -> int | None:
         sampled_at = self.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY)

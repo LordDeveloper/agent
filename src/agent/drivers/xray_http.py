@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from threading import Lock
 from typing import Any
 
 import httpx
@@ -140,25 +140,32 @@ def format_xray_api_error(
 class XrayHttpClient:
     """Client for customized Xray-core HTTP API (`app/httpapi`)."""
 
-    def __init__(self, settings: XraySettings, transport: httpx.BaseTransport | None = None):
+    def __init__(self, settings: XraySettings, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
-        base = settings.api_base.rstrip("/")
-        auth = None
-        if settings.username and settings.password:
-            auth = (settings.username, settings.password)
-        self._lock = Lock()
-        self._client = httpx.Client(
-            base_url=base,
-            auth=auth,
+        self._client = httpx.AsyncClient(
+            base_url=settings.api_base.rstrip("/"),
+            auth=(
+                (settings.username, settings.password)
+                if settings.username and settings.password
+                else None
+            ),
             timeout=httpx.Timeout(settings.timeout, connect=settings.connect_timeout),
             headers={"Accept": "application/json"},
             transport=transport,
         )
 
-    def close(self) -> None:
-        self._client.close()
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
-    def _request(
+    def close(self) -> None:
+        try:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+    async def _request(
         self,
         method: str,
         path: str,
@@ -167,14 +174,15 @@ class XrayHttpClient:
         json_body: Any = None,
         files: Any = None,
         data: Any = None,
+        serialized: bool = True,
     ) -> Any:
         headers = {"Content-Type": "application/json"} if files is None and json_body is not None else None
         method_u = method.upper()
         route = f"{method_u} {path}"
         span = RuntimeTrace.safe_name(f"xray.{method_u}.{path.rstrip('/').split('/')[-1] or 'root'}")
         try:
-            with RuntimeTrace.span(span), self._lock:
-                response = self._client.request(
+            with RuntimeTrace.span(span):
+                response = await self._client.request(
                     method,
                     path,
                     params=params,
@@ -263,17 +271,17 @@ class XrayHttpClient:
         except Exception:
             return {"raw": response.text}
 
-    def get(self, path: str, params: dict | list | None = None) -> Any:
-        return self._request("GET", path, params=params)
+    async def get(self, path: str, params: dict | list | None = None) -> Any:
+        return await self._request("GET", path, params=params)
 
-    def post(self, path: str, payload: dict | None = None) -> Any:
-        return self._request("POST", path, json_body=payload or {})
+    async def post(self, path: str, payload: dict | None = None, *, serialized: bool = True) -> Any:
+        return await self._request("POST", path, json_body=payload or {}, serialized=serialized)
 
-    def system(self) -> dict[str, Any]:
-        return self.get("/api/stats/sys")
+    async def system(self) -> dict[str, Any]:
+        return await self.get("/api/stats/sys")
 
-    def online_users(self) -> list[str]:
-        body = self.get("/api/stats/online/users")
+    async def online_users(self) -> list[str]:
+        body = await self.get("/api/stats/online/users")
         users: list[str] = []
         for item in body.get("users") or []:
             if isinstance(item, str) and item.strip():
@@ -285,19 +293,19 @@ class XrayHttpClient:
                     users.append(str(value))
         return users
 
-    def online_ips(self, email: str) -> list[str]:
+    async def online_ips(self, email: str) -> list[str]:
         """Return currently-online client IPs.
 
         Xray returns 404 ``...>>>online not found`` when the user is offline.
         That is a normal empty result, not a missing config.
         iplist rows whose lastSeen is older than a minute are omitted.
         """
-        return list(self.online_ip_last_seen(email).keys())
+        return list((await self.online_ip_last_seen(email)).keys())
 
-    def online_ip_last_seen(self, email: str) -> dict[str, Any]:
+    async def online_ip_last_seen(self, email: str) -> dict[str, Any]:
         """Fresh iplist rows as ``{ip: lastSeen}``. Stale rows are omitted."""
         try:
-            body = self.get("/api/stats/online/iplist", params={"email": email})
+            body = await self.get("/api/stats/online/iplist", params={"email": email})
         except AgentError as exc:
             message = str(exc.message or "").lower()
             if (
@@ -312,17 +320,17 @@ class XrayHttpClient:
             return {str(ip): seen for ip, seen in ips.items() if str(ip).strip()}
         return {}
 
-    def online_all(self, emails: list[str] | None = None) -> dict[str, Any]:
+    async def online_all(self, emails: list[str] | None = None) -> dict[str, Any]:
         params = [("email", email) for email in emails] if emails else None
-        return self.get("/api/stats/online/all", params=params)
+        return await self.get("/api/stats/online/all", params=params)
 
-    def online_traffic(self, *, reset: bool = False) -> dict[str, Any]:
+    async def online_traffic(self, *, reset: bool = False) -> dict[str, Any]:
         params: dict[str, str] = {}
         if reset:
             params["reset"] = "true"
-        return self.get("/api/stats/online/traffic", params=params or None)
+        return await self.get("/api/stats/online/traffic", params=params or None)
 
-    def stats_query(
+    async def stats_query(
         self,
         pattern: str,
         *,
@@ -334,10 +342,10 @@ class XrayHttpClient:
             params["reset"] = "true"
         if online_only:
             params["online_only"] = "true"
-        body = self.get("/api/stats/query", params=params)
+        body = await self.get("/api/stats/query", params=params)
         return list(body.get("stat") or [])
 
-    def stats_query_grouped(
+    async def stats_query_grouped(
         self,
         pattern: str,
         group: str | None = None,
@@ -349,24 +357,26 @@ class XrayHttpClient:
             params["group"] = group
         if online_only:
             params["online_only"] = "true"
-        body = self.get("/api/stats/query", params=params)
+        body = await self.get("/api/stats/query", params=params)
         return dict(body.get("stats") or {})
 
-    def reset_user_traffic(self, email: str) -> None:
-        self.get("/api/stats", params={"name": f"user>>>{email}>>>traffic>>>uplink", "reset": "true"})
-        self.get("/api/stats", params={"name": f"user>>>{email}>>>traffic>>>downlink", "reset": "true"})
+    async def reset_user_traffic(self, email: str) -> None:
+        await asyncio.gather(
+            self.get("/api/stats", params={"name": f"user>>>{email}>>>traffic>>>uplink", "reset": "true"}),
+            self.get("/api/stats", params={"name": f"user>>>{email}>>>traffic>>>downlink", "reset": "true"}),
+        )
 
-    def restart_logger(self) -> dict[str, Any]:
-        return self.post("/api/logger/restart")
+    async def restart_logger(self) -> dict[str, Any]:
+        return await self.post("/api/logger/restart")
 
-    def list_inbounds(self) -> list[dict[str, Any]]:
-        body = self.get("/api/inbounds/list")
+    async def list_inbounds(self) -> list[dict[str, Any]]:
+        body = await self.get("/api/inbounds/list")
         return list(body.get("inbounds") or [])
 
-    def add_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post("/api/inbounds/add", {"inbounds": inbounds})
+    async def add_inbounds(self, inbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self.post("/api/inbounds/add", {"inbounds": inbounds})
 
-    def edit_inbounds(
+    async def edit_inbounds(
         self,
         inbounds: list[dict[str, Any]],
         *,
@@ -375,10 +385,10 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": inbounds}
         if preserve_clients is not None:
             payload["preserve_clients"] = bool(preserve_clients)
-        return self.post("/api/inbounds/edit", payload)
+        return await self.post("/api/inbounds/edit", payload)
 
-    def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
-        return self.post("/api/inbounds/remove", {"tags": tags})
+    async def remove_inbounds(self, tags: list[str]) -> dict[str, Any]:
+        return await self.post("/api/inbounds/remove", {"tags": tags})
 
     @staticmethod
     def _is_http_route_missing(exc: AgentError) -> bool:
@@ -424,16 +434,16 @@ class XrayHttpClient:
             payload["streamSettings"] = stream
         return payload
 
-    def _find_inbound_by_tag(self, tag: str) -> dict[str, Any]:
+    async def _find_inbound_by_tag(self, tag: str) -> dict[str, Any]:
         wanted = str(tag or "").strip()
-        for row in self.list_inbounds():
+        for row in await self.list_inbounds():
             if not isinstance(row, dict):
                 continue
             if str(row.get("tag") or "").strip() == wanted:
                 return dict(row)
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found", 404)
 
-    def _mutate_users_via_inbound_edit(
+    async def _mutate_users_via_inbound_edit(
         self,
         tag: str,
         clients: list[dict[str, Any]],
@@ -451,7 +461,7 @@ class XrayHttpClient:
         """
         from agent.support import xray_protocol_user
 
-        current = self._find_inbound_by_tag(tag)
+        current = await self._find_inbound_by_tag(tag)
         proto = str(protocol or current.get("protocol") or "vless").strip().lower()
         existing = self._inbound_clients(current)
         by_email: dict[str, dict[str, Any]] = {}
@@ -590,7 +600,7 @@ class XrayHttpClient:
         payload["tag"] = tag
         payload["protocol"] = proto
         payload["settings"] = settings
-        self.edit_inbounds([payload], preserve_clients=False)
+        await self.edit_inbounds([payload], preserve_clients=False)
 
         failed = len(errors)
         return {
@@ -603,7 +613,7 @@ class XrayHttpClient:
             "fallback": "inbounds/edit",
         }
 
-    def _users_request(
+    async def _users_request(
         self,
         path: str,
         payload: dict[str, Any],
@@ -614,14 +624,17 @@ class XrayHttpClient:
         protocol: str | None = None,
         inbound_settings: dict[str, Any] | None = None,
         remove_emails: list[str] | None = None,
+        parallel: bool = False,
     ) -> dict[str, Any]:
         try:
-            result = self.post(path, payload)
+            result = await self.post(path, payload, serialized=not parallel)
             return result if isinstance(result, dict) else {"status": "ok", "result": result}
         except AgentError as exc:
-            if not self._is_http_route_missing(exc):
+            # A parallel caller retries the whole chunk as one write. Falling
+            # back here would edit the inbound once per client, concurrently.
+            if parallel or not self._is_http_route_missing(exc):
                 raise
-            return self._mutate_users_via_inbound_edit(
+            return await self._mutate_users_via_inbound_edit(
                 tag,
                 clients,
                 mode=mode,
@@ -630,7 +643,7 @@ class XrayHttpClient:
                 remove_emails=remove_emails,
             )
 
-    def add_users(
+    async def add_users(
         self,
         tag: str,
         clients: list[dict[str, Any]],
@@ -638,6 +651,7 @@ class XrayHttpClient:
         protocol: str | None = None,
         inbound_settings: dict[str, Any] | None = None,
         atomic: bool = False,
+        parallel: bool = False,
     ) -> dict[str, Any]:
         from agent.support import xray_users_settings
 
@@ -650,7 +664,7 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self._users_request(
+        return await self._users_request(
             "/api/inbounds/users/add",
             payload,
             tag=tag,
@@ -658,9 +672,10 @@ class XrayHttpClient:
             mode="add",
             protocol=protocol,
             inbound_settings=inbound_settings,
+            parallel=parallel,
         )
 
-    def edit_users(
+    async def edit_users(
         self,
         tag: str,
         clients: list[dict[str, Any]],
@@ -668,6 +683,7 @@ class XrayHttpClient:
         protocol: str | None = None,
         inbound_settings: dict[str, Any] | None = None,
         atomic: bool = False,
+        parallel: bool = False,
     ) -> dict[str, Any]:
         from agent.support import xray_users_settings
 
@@ -680,7 +696,7 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self._users_request(
+        return await self._users_request(
             "/api/inbounds/users/edit",
             payload,
             tag=tag,
@@ -688,9 +704,10 @@ class XrayHttpClient:
             mode="edit",
             protocol=protocol,
             inbound_settings=inbound_settings,
+            parallel=parallel,
         )
 
-    def upsert_users(
+    async def upsert_users(
         self,
         tag: str,
         clients: list[dict[str, Any]],
@@ -710,7 +727,7 @@ class XrayHttpClient:
         payload: dict[str, Any] = {"inbounds": [inbound]}
         if atomic:
             payload["atomic"] = True
-        return self._users_request(
+        return await self._users_request(
             "/api/inbounds/users/upsert",
             payload,
             tag=tag,
@@ -720,76 +737,76 @@ class XrayHttpClient:
             inbound_settings=inbound_settings,
         )
 
-    def remove_users(self, tag: str, emails: list[str], *, atomic: bool = False) -> dict[str, Any]:
+    async def remove_users(self, tag: str, emails: list[str], *, atomic: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {"tag": tag, "emails": emails}
         if atomic:
             payload["atomic"] = True
         try:
-            result = self.post("/api/inbounds/users/remove", payload)
+            result = await self.post("/api/inbounds/users/remove", payload)
             return result if isinstance(result, dict) else {"status": "ok", "result": result}
         except AgentError as exc:
             if not self._is_http_route_missing(exc):
                 raise
-            return self._mutate_users_via_inbound_edit(
+            return await self._mutate_users_via_inbound_edit(
                 tag,
                 [],
                 mode="remove",
                 remove_emails=list(emails),
             )
 
-    def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
+    async def list_users(self, tag: str, email: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"tag": tag}
         if email:
             params["email"] = email
         try:
-            body = self.get("/api/inbounds/users", params=params)
+            body = await self.get("/api/inbounds/users", params=params)
             return list(body.get("users") or [])
         except AgentError as exc:
             if not self._is_http_route_missing(exc):
                 raise
-            users = self._inbound_clients(self._find_inbound_by_tag(tag))
+            users = self._inbound_clients(await self._find_inbound_by_tag(tag))
             if email:
                 wanted = str(email).strip()
                 users = [row for row in users if self._client_email(row) == wanted]
             return users
 
-    def list_outbounds(self) -> list[dict[str, Any]]:
-        body = self.get("/api/outbounds/list")
+    async def list_outbounds(self) -> list[dict[str, Any]]:
+        body = await self.get("/api/outbounds/list")
         return list(body.get("outbounds") or body.get("items") or [])
 
-    def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post("/api/outbounds/add", {"outbounds": outbounds})
+    async def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self.post("/api/outbounds/add", {"outbounds": outbounds})
 
-    def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.post("/api/outbounds/edit", {"outbounds": outbounds})
+    async def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self.post("/api/outbounds/edit", {"outbounds": outbounds})
 
-    def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
-        return self.post("/api/outbounds/remove", {"tags": tags})
+    async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
+        return await self.post("/api/outbounds/remove", {"tags": tags})
 
-    def list_rules(self) -> list[dict[str, Any]]:
-        body = self.get("/api/rules/list")
+    async def list_rules(self) -> list[dict[str, Any]]:
+        body = await self.get("/api/rules/list")
         return list(body.get("rules") or body.get("items") or [])
 
-    def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = False) -> dict[str, Any]:
-        return self._request(
+    async def add_rules(self, rules: list[dict[str, Any]], *, should_append: bool = False) -> dict[str, Any]:
+        return await self._request(
             "POST",
             "/api/rules/add",
             params={"should_append": "true" if should_append else "false"},
             json_body={"routing": {"rules": rules}},
         )
 
-    def edit_rule(self, rule: dict[str, Any]) -> dict[str, Any]:
+    async def edit_rule(self, rule: dict[str, Any]) -> dict[str, Any]:
         rule_tag = str(rule.get("ruleTag") or rule.get("tag") or "").strip()
         payload: dict[str, Any] = {"rule": rule}
         if rule_tag:
             payload["rule_tag"] = rule_tag
-        return self.post("/api/rules/edit", payload)
+        return await self.post("/api/rules/edit", payload)
 
-    def remove_rules(self, tags: list[str]) -> dict[str, Any]:
+    async def remove_rules(self, tags: list[str]) -> dict[str, Any]:
         # HTTPAPI accepts rule_tags / ruleTags / tags.
-        return self.post("/api/rules/remove", {"rule_tags": tags, "ruleTags": tags, "tags": tags})
+        return await self.post("/api/rules/remove", {"rule_tags": tags, "ruleTags": tags, "tags": tags})
 
-    def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
+    async def replace_rules(self, rules: list[dict[str, Any]], **routing_extras: Any) -> dict[str, Any]:
         """Atomically replace routing.rules. Omit balancers to keep existing ones."""
         allowed = {"domainStrategy", "domainMatcher", "balancers"}
         extras = {
@@ -802,16 +819,16 @@ class XrayHttpClient:
         # Prefer wrapped form (same as /api/rules/add). Flat body is accepted by
         # newer builds; older ones sometimes return invalid_json on flat payloads.
         try:
-            return self.post("/api/rules/replace", {"routing": routing})
+            return await self.post("/api/rules/replace", {"routing": routing})
         except AgentError as exc:
             message = (exc.message or "").lower()
             if exc.status != 400 and "invalid_json" not in message and "incomplete json" not in message:
                 raise
             flat: dict[str, Any] = {"rules": list(rules)}
             flat.update(extras)
-            return self.post("/api/rules/replace", flat)
+            return await self.post("/api/rules/replace", flat)
 
-    def block_source_ips(
+    async def block_source_ips(
         self,
         source_ips: list[str],
         *,
@@ -828,11 +845,11 @@ class XrayHttpClient:
         }
         if inbound:
             payload["inbound"] = inbound
-        return self.post("/api/sourceip/block", payload)
+        return await self.post("/api/sourceip/block", payload)
 
-    def import_config(self, config: dict[str, Any], path: str | None = None) -> dict[str, Any]:
+    async def import_config(self, config: dict[str, Any], path: str | None = None) -> dict[str, Any]:
         files = {
             "file": ("config.json", json.dumps(config).encode("utf-8"), "application/json"),
         }
         data = {"path": path} if path else None
-        return self._request("POST", "/api/config/import", files=files, data=data)
+        return await self._request("POST", "/api/config/import", files=files, data=data)

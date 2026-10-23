@@ -1,4 +1,5 @@
-from agent.drivers.base import CoreDriver
+import asyncio
+
 from agent.support.online_traffic import online_traffic_from_snapshot
 
 
@@ -34,6 +35,6 @@ def test_online_traffic_from_snapshot():
         ]
     )
     driver = _Driver(["a@x.com"], snap)
-    rows = online_traffic_from_snapshot(driver)  # type: ignore[arg-type]
+    rows = asyncio.run(online_traffic_from_snapshot(driver))  # type: ignore[arg-type]
     assert rows["a@x.com"] == {"uplink": 25, "downlink": 50}
     assert "b@x.com" not in rows
