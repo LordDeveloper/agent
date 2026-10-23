@@ -11,6 +11,10 @@ from agent.tls import (
     certbot_installed,
     ensure_acme,
     ensure_certbot,
+    export_acme_store,
+    export_files,
+    import_acme_store,
+    import_files,
     issue_cert,
     list_certs,
     renew_cert,
@@ -111,6 +115,51 @@ def tls_cert_info(domain: str):
         'exists': exists,
         **paths,
     }
+
+
+@router.post('/export-files')
+def tls_export_files(body: dict[str, Any] = Body()):
+    raw = body.get('paths')
+    if not isinstance(raw, list):
+        raise_agent_error('VALIDATION_ERROR', 'paths must be a list', 422)
+    try:
+        result = export_files([str(item) for item in raw])
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {'success': True, **result}
+
+
+@router.post('/import-files')
+def tls_import_files(body: dict[str, Any] = Body()):
+    raw = body.get('files')
+    if not isinstance(raw, list):
+        raise_agent_error('VALIDATION_ERROR', 'files must be a list', 422)
+    try:
+        result = import_files(raw)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {'success': True, **result}
+
+
+@router.get('/acme-store')
+def tls_export_acme_store():
+    try:
+        result = export_acme_store()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {'success': True, **result}
+
+
+@router.post('/acme-store')
+def tls_import_acme_store(body: dict[str, Any] = Body()):
+    raw = body.get('files')
+    if not isinstance(raw, list):
+        raise_agent_error('VALIDATION_ERROR', 'files must be a list', 422)
+    try:
+        result = import_acme_store(raw)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {'success': True, **result}
 
 
 @router.post('/revoke')

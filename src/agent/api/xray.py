@@ -259,6 +259,16 @@ def xray_console(xray: XrayDriver = Depends(get_xray)):
     return {"success": True, **payload}
 
 
+@router.get("/config/raw")
+def get_raw_config(xray: XrayDriver = Depends(get_xray)):
+    """Full on-disk config, including secrets. Used to move a server onto a new agent."""
+    try:
+        config = xray.read_config()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "config": config, "config_path": xray.settings.xray.config}
+
+
 @router.get("/config")
 def get_config(xray: XrayDriver = Depends(get_xray)):
     try:

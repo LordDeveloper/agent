@@ -637,3 +637,193 @@ def revoke_cert(domain: str) -> dict:
         removed = True
 
     return {'success': True, 'revoked': revoked, 'removed': removed, 'domain': domain}
+
+
+# ---------------------------------------------------------------------------
+# move a live certificate set onto another agent (same paths)
+# ---------------------------------------------------------------------------
+
+_EXPORT_SUFFIXES = {'.pem', '.cer', '.crt', '.key', '.csr', '.conf', '.txt'}
+_EXPORT_NAMES = {'account.conf', 'account.key', 'account.json'}
+_MAX_EXPORT_BYTES = 512_000
+
+
+def _allowed_roots() -> tuple[Path, ...]:
+    roots = [CERT_BASE, CERTBOT_LIVE, Path('/etc/letsencrypt'), ACME_HOME]
+    resolved: list[Path] = []
+    for root in roots:
+        try:
+            resolved.append(root.expanduser().resolve(strict=False))
+        except OSError:
+            continue
+    return tuple(resolved)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _allowed_cert_path(raw: str) -> Path:
+    text = str(raw or '').strip()
+    if text == '' or '\x00' in text:
+        raise AgentError('VALIDATION_ERROR', 'certificate path is empty')
+
+    path = Path(text)
+    if not path.is_absolute():
+        raise AgentError('VALIDATION_ERROR', f'certificate path must be absolute: {text}')
+
+    lexical = Path(os.path.abspath(text))
+    if any(part == '..' for part in lexical.parts):
+        raise AgentError('VALIDATION_ERROR', f'certificate path is not allowed: {text}')
+
+    roots = _allowed_roots()
+    if not any(_is_under(lexical, root) for root in roots):
+        raise AgentError('VALIDATION_ERROR', f'certificate path is not allowed: {text}')
+
+    if path.exists():
+        resolved = path.resolve(strict=False)
+        if not any(_is_under(resolved, root) for root in roots):
+            raise AgentError('VALIDATION_ERROR', f'certificate path escapes the certificate store: {text}')
+
+    return path
+
+
+def _chmod_quiet(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
+def _private_material(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith('.key') or 'privkey' in name or 'private' in name or name == 'account.key'
+
+
+def export_files(paths: list[str]) -> dict:
+    files: list[dict[str, str]] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+
+    for raw in paths:
+        path = _allowed_cert_path(str(raw))
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if not path.is_file():
+            missing.append(key)
+            continue
+
+        size = path.stat().st_size
+        if size > _MAX_EXPORT_BYTES:
+            raise AgentError('VALIDATION_ERROR', f'certificate file is too large: {key}')
+
+        try:
+            content = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise AgentError('VALIDATION_ERROR', f'cannot read certificate file {key}: {exc}') from exc
+
+        files.append({'path': key, 'content': content})
+
+    return {'files': files, 'missing': missing}
+
+
+def import_files(files: list[dict]) -> dict:
+    written: list[str] = []
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise AgentError('VALIDATION_ERROR', 'files entries must be objects')
+
+        path = _allowed_cert_path(str(item.get('path', '')))
+        content = item.get('content')
+        if not isinstance(content, str) or content.strip() == '':
+            raise AgentError('VALIDATION_ERROR', f'empty certificate content for {path}')
+        if len(content.encode('utf-8')) > _MAX_EXPORT_BYTES:
+            raise AgentError('VALIDATION_ERROR', f'certificate file is too large: {path}')
+        if '-----BEGIN ' not in content:
+            raise AgentError('VALIDATION_ERROR', f'certificate content is not PEM: {path}')
+
+        if path.is_symlink():
+            path.unlink()
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
+        _chmod_quiet(path, 0o600 if _private_material(path) else 0o644)
+        written.append(str(path))
+
+    return {'written': written, 'count': len(written)}
+
+
+def _include_acme_file(path: Path) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    if path.name in _EXPORT_NAMES or path.suffix.lower() in _EXPORT_SUFFIXES:
+        try:
+            return path.stat().st_size <= _MAX_EXPORT_BYTES
+        except OSError:
+            return False
+    return False
+
+
+def export_acme_store() -> dict:
+    if not ACME_HOME.is_dir():
+        return {'files': []}
+
+    files: list[dict[str, str]] = []
+    root = ACME_HOME.resolve(strict=False)
+
+    for path in sorted(ACME_HOME.rglob('*')):
+        if not _include_acme_file(path):
+            continue
+        try:
+            rel = path.resolve(strict=False).relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if '..' in rel.split('/'):
+            continue
+        try:
+            content = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            continue
+        files.append({'path': rel, 'content': content})
+
+    return {'files': files}
+
+
+def import_acme_store(files: list[dict]) -> dict:
+    written: list[str] = []
+    root = ACME_HOME.expanduser().resolve(strict=False)
+    root.mkdir(parents=True, exist_ok=True)
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise AgentError('VALIDATION_ERROR', 'acme store entries must be objects')
+
+        rel = str(item.get('path', '')).replace('\\', '/').lstrip('/')
+        content = item.get('content')
+        if rel == '' or rel.startswith('/') or '..' in rel.split('/'):
+            raise AgentError('VALIDATION_ERROR', f'acme store path is not allowed: {rel}')
+        if not isinstance(content, str) or content.strip() == '':
+            continue
+        if len(content.encode('utf-8')) > _MAX_EXPORT_BYTES:
+            raise AgentError('VALIDATION_ERROR', f'acme store file is too large: {rel}')
+
+        dest = (root / rel).resolve(strict=False)
+        try:
+            dest.relative_to(root)
+        except ValueError as exc:
+            raise AgentError('VALIDATION_ERROR', f'acme store path is not allowed: {rel}') from exc
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
+        _chmod_quiet(dest, 0o600 if _private_material(dest) else 0o644)
+        written.append(rel)
+
+    return {'written': written, 'count': len(written)}
