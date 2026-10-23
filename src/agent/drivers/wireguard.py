@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from copy import deepcopy
@@ -31,6 +32,36 @@ _AWG_MTU = 1280
 _PEER_BATCH_MAX = 200
 
 log = get_logger("wireguard")
+
+
+async def _apply_wg_syncconf(cli: str, name: str, stripped: str, *, directory: Path):
+    """Push a stripped config via a real file.
+
+    ``wg syncconf iface /dev/stdin`` does fopen() on that path. Under systemd the
+    agent's stdin is a pipe, and reopening ``/dev/stdin`` returns ENXIO
+    (``fopen: No such device or address``), which aborts a WireGuard restore.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{name}.",
+        suffix=".sync",
+        dir=directory,
+        delete=False,
+    )
+    path = Path(handle.name)
+    try:
+        text = stripped if stripped.endswith("\n") else stripped + "\n"
+        handle.write(text)
+        handle.close()
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return await run([cli, "syncconf", name, str(path)], check=False)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def peer_handshake_unix(peer: dict[str, Any]) -> int:
@@ -1929,7 +1960,7 @@ class WireGuardDriver(CoreDriver):
             if strip.returncode != 0 or not strip.stdout:
                 detail = (strip.stderr or strip.stdout or "wg-quick strip failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
-            sync = await run([cli, "syncconf", name, "/dev/stdin"], check=False, input_text=strip.stdout)
+            sync = await _apply_wg_syncconf(cli, name, strip.stdout, directory=conf_path.parent)
             if sync.returncode != 0:
                 detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
