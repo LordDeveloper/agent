@@ -858,19 +858,27 @@ class WireGuardDriver(CoreDriver):
         routing for every row, so a few hundred peers take minutes.
         """
         interfaces = list(payload.get("interfaces") or [])
+        from agent.logutil import report_progress
+
+        total = len(interfaces)
+        report_progress(0, total, f"{self.label}: {total} interface")
         for existing in list(self.list_interfaces()):
             await self.delete_interface(existing.get("id"))
-        for row in interfaces:
+        for index, row in enumerate(interfaces, start=1):
             peers = [peer for peer in (row.get("peers") or []) if isinstance(peer, dict)]
             body = {key: value for key, value in row.items() if key != "peers"}
+            name = str(body.get("name") or self.key)
+            report_progress(index - 1, total, f"{self.label} {name}: {len(peers)} peer")
             iface = await self.create_interface(body, apply=False)
             try:
                 if peers:
                     iface = await self._stage_peers(iface["id"], peers)
+                report_progress(index - 1, total, f"{self.label} {name}: bringing up")
                 up = await self._bring_up(iface)
                 if not up.get("ok"):
                     detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
                     raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
+                report_progress(index, total, f"{self.label} {name}: up")
             except Exception:
                 await self._drop_interface_quietly(iface.get("id"))
                 raise

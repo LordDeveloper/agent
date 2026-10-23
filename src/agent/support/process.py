@@ -36,6 +36,29 @@ def run_blocking(
         )
 
 
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill a timed-out child. A race with an already-exited pid is not an error."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await proc.wait()
+    except ProcessLookupError:
+        return
+
+
+async def _collect_output(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """Read leftover pipes after the child disappeared mid-communicate."""
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        stdout_b, stderr_b = b"", b""
+    return stdout_b or b"", stderr_b or b""
+
+
 async def run(
     args: list[str],
     *,
@@ -62,9 +85,10 @@ async def run(
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.communicate()
+            await _stop_process(proc)
             raise subprocess.TimeoutExpired(args, timeout) from exc
+        except ProcessLookupError:
+            stdout_b, stderr_b = await _collect_output(proc)
 
         result = subprocess.CompletedProcess(
             args,
