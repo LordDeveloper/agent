@@ -19,6 +19,7 @@ async def bootstrap_enabled_cores(
 ) -> None:
     """Start xray and bring up wireguard/amnezia interfaces for enabled cores."""
     logger = log or logging.getLogger("app")
+    _refresh_boot_egress(settings, registry, logger)
     enabled = set(settings.cores())
 
     for key in ("xray", "wireguard", "amnezia", "l2tp", "openvpn"):
@@ -66,6 +67,32 @@ async def bootstrap_enabled_cores(
                 await maybe_await(driver.enable())
         except Exception as exc:
             logger.warning("supervisor core=%s bootstrap failed: %s", key, exc)
+
+
+def _refresh_boot_egress(settings, registry, logger: logging.Logger) -> None:
+    """Rewrite egress before wg-quick so PostUp cannot sleep on a stale script.
+
+    Also retarget an installed agent unit whose ExecStartPost runs that script
+    inline. The running start is unaffected; the next start will not wait.
+    """
+    try:
+        from agent.ops import relax_agent_start_post
+
+        if relax_agent_start_post():
+            logger.info("supervisor retargeted agent ExecStartPost off peer-egress-apply.sh")
+    except Exception as exc:
+        logger.warning("supervisor agent unit refresh failed: %s", exc)
+
+    store = getattr(registry, "store", None)
+    data_dir = getattr(settings, "data_dir", None)
+    if store is None or not data_dir:
+        return
+    try:
+        from agent.support.peer_egress import persist_peer_egress
+
+        persist_peer_egress(store, data_dir=data_dir, force_start=False, start_unit=False)
+    except Exception as exc:
+        logger.warning("supervisor egress script refresh failed: %s", exc)
 
 
 def bootstrap_enabled_cores_sync(

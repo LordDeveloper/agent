@@ -440,19 +440,64 @@ def systemd_unit_path() -> Path:
 def default_unit_text() -> str:
     return """[Unit]
 Description=Netinja node agent API
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent serve
+# Re-apply peer egress without blocking activation. The apply script used to
+# sleep once per missing exit interface and held this unit in start-post.
+ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def relax_agent_start_post(unit_path: Path | None = None, runner=None) -> bool:
+    """Stop an already-installed unit from waiting on peer-egress-apply.sh.
+
+    Older units run that script as ExecStartPost. After a server transfer the
+    script sleeps for every peer whose exit interface is missing, so the
+    service stays in ``activating (start-post)``. Point the post step at the
+    separate oneshot and return. The current start is unchanged; the next
+    start no longer waits.
+    """
+    path = unit_path or systemd_unit_path()
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "peer-egress-apply.sh" not in text or "--no-block" in text:
+        return False
+    lines: list[str] = []
+    changed = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ExecStartPost=") and "peer-egress-apply" in stripped:
+            lines.append("ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service")
+            changed = True
+        else:
+            lines.append(line)
+    if not changed:
+        return False
+    try:
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    execute = runner or run_cmd
+    try:
+        execute(["systemctl", "daemon-reload"], check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return True
 
 
 def service_action(action: str) -> dict:

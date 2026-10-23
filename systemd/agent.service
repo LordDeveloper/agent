@@ -8,8 +8,9 @@ Type=simple
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent serve
-# Re-apply peer egress after agent start (covers reboot when wg-quick already up).
-ExecStartPost=-/bin/sh -c 'test -x /var/lib/agent/peer-egress-apply.sh && /var/lib/agent/peer-egress-apply.sh || true'
+# Re-apply peer egress without blocking activation. A missing exit interface
+# must not hold this unit in start-post.
+ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service
 Restart=on-failure
 RestartSec=3
 

@@ -193,9 +193,27 @@ def cmd_xray_status(_: argparse.Namespace) -> int:
 
 
 def cmd_service(args: argparse.Namespace) -> int:
+    if args.action == "reset":
+        return cmd_service_reset()
     result = service_action(args.action)
     _print_json({"success": bool(result.get("ok", True)), **result})
     return 0 if result.get("ok", True) else 1
+
+
+def cmd_service_reset() -> int:
+    from agent.factory_reset import RESET_WARNING, confirmation_accepted, factory_reset
+
+    print(RESET_WARNING)
+    try:
+        typed = input("Type CONFIRM to wipe the database and settings: ")
+    except EOFError:
+        typed = ""
+    if not confirmation_accepted(typed):
+        print("Reset cancelled.")
+        return 1
+    result = factory_reset()
+    _print_json({"success": True, **result})
+    return 0
 
 
 def cmd_wizard(args: argparse.Namespace) -> int:
@@ -683,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_service = sub.add_parser("service", help="Manage systemd service")
     p_service.add_argument(
         "action",
-        choices=["install", "uninstall", "start", "stop", "restart", "status", "enable", "disable"],
+        choices=["install", "uninstall", "start", "stop", "restart", "status", "enable", "disable", "reset"],
     )
     p_service.set_defaults(func=cmd_service)
 

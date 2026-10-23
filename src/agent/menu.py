@@ -211,6 +211,30 @@ def _show_core_list() -> None:
     _show_agent_status()
 
 
+def _factory_reset_action() -> None:
+    from agent.factory_reset import RESET_WARNING, confirmation_accepted, factory_reset
+
+    _print()
+    for line in RESET_WARNING.splitlines():
+        _print(paint(f"  {line}", YELLOW))
+    typed = prompt_text("Type CONFIRM to wipe the database and settings")
+    if not confirmation_accepted(typed):
+        _print(paint("  Reset cancelled.", DIM))
+        pause()
+        return
+
+    def _run() -> None:
+        result = factory_reset()
+        _print(kv("Result", "ok" if result.get("ok") else "failed", GREEN if result.get("ok") else RED))
+        removed = result.get("removed") or []
+        _print(kv("Removed", str(len(removed)), CYAN))
+        for path in removed[:12]:
+            _print(paint(f"  {path}", DIM))
+        _print(kv("Service", "restarted" if result.get("service_restarted") else "left stopped", WHITE))
+
+    _run_action("Factory reset", _run)
+
+
 def _show_service_action(action: str) -> None:
     if action == "status":
         active = service_is_active()
@@ -583,6 +607,7 @@ def _service_menu() -> None:
                 Choice("disable", "Disable on boot", WHITE, "7"),
                 Choice("uninstall", "Remove unit", RED, "8"),
                 Choice("serve", "Start API (foreground)", BLUE, "9"),
+                Choice("reset", "Factory reset", RED, "r"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -592,6 +617,9 @@ def _service_menu() -> None:
             from agent.cli import cmd_serve
 
             _run_action("API server", lambda: cmd_serve(SimpleNamespace(env_file=None, host=None, port=None)))
+            continue
+        if picked == "reset":
+            _factory_reset_action()
             continue
         if picked in {"uninstall", "stop"} and not confirm(f"{picked.capitalize()} agent service?", default=False):
             continue

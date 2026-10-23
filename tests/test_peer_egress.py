@@ -464,6 +464,8 @@ def test_render_apply_script_is_idempotent_shell():
     assert "netinja-egress-eth1" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
     assert "keeping existing rule" in script
+    assert "sleep" not in script
+    assert "flock -n 9" in script
     # Failure path must not tear down the lookup rule (region IP leak).
     else_idx = script.index("keeping existing rule")
     assert f'ip rule del from "10.80.0.2/32" lookup {table}' not in script[else_idx:]
