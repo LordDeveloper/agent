@@ -259,6 +259,33 @@ def xray_console(xray: XrayDriver = Depends(get_xray)):
     return {"success": True, **payload}
 
 
+@router.get("/geodata")
+def export_geodata_route(xray: XrayDriver = Depends(get_xray)):
+    from agent.xray_release import export_geodata
+
+    del xray
+    try:
+        payload = export_geodata()
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **payload}
+
+
+@router.post("/geodata")
+def import_geodata_route(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    from agent.xray_release import import_geodata
+
+    del xray
+    files = body.get("files")
+    if not isinstance(files, list):
+        raise_agent_error("VALIDATION_ERROR", "files must be a list", 422)
+    try:
+        result = import_geodata(files)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, **result}
+
+
 @router.get("/config/raw")
 def get_raw_config(xray: XrayDriver = Depends(get_xray)):
     """Full on-disk config, including secrets. Used to move a server onto a new agent."""

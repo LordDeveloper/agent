@@ -198,8 +198,25 @@ def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
         json.dump(config, handle)
         temp_path = handle.name
 
+    env = os.environ.copy()
     try:
-        result = run([binary, "run", "-test", "-config", temp_path], check=False, timeout=60)
+        from agent.xray_release import ensure_xray_geodata
+
+        asset_dir = ensure_xray_geodata(Path(binary), download=True)
+        if asset_dir is not None:
+            env["XRAY_LOCATION_ASSET"] = str(asset_dir)
+    except Exception:
+        asset_dir = None
+
+    try:
+        result = subprocess.run(
+            [binary, "run", "-test", "-config", temp_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "xray run -test failed").strip()
             raise _validation_error(f"Xray config test failed: {detail}")
