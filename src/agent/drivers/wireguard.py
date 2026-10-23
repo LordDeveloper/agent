@@ -2035,6 +2035,6 @@ class WireGuardDriver(CoreDriver):
         try:
             from agent.drivers.l2tp import L2tpDriver
 
-            L2tpDriver(self.settings, self.audit, self.store).reconcile_runtime(drop_keys=drop_keys)
+            await L2tpDriver(self.settings, self.audit, self.store).reconcile_runtime(drop_keys=drop_keys)
         except Exception:
             log.exception("linked l2tp companion reconcile failed")

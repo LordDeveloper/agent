@@ -22,6 +22,30 @@ def test_materialize_keeps_existing_keypair_without_wg(monkeypatch):
     assert peer == {"private_key": "priv", "public_key": "pub"}
 
 
+def test_sync_linked_l2tp_awaits_reconcile(tmp_path, monkeypatch):
+    import agent.drivers.l2tp as l2tp_mod
+
+    seen: dict = {}
+
+    class FakeL2tp:
+        def __init__(self, settings, audit, store):
+            seen["ready"] = True
+
+        async def reconcile_runtime(self, drop_keys=None):
+            seen["drop_keys"] = list(drop_keys or [])
+
+    monkeypatch.setattr(l2tp_mod, "L2tpDriver", FakeL2tp)
+    store = Store(tmp_path / "agent.db")
+    settings = AgentSettings(data_dir=str(tmp_path), db_path=str(store.path))
+    driver = WireGuardDriver(settings, _Audit(), store)
+
+    asyncio.run(driver._sync_linked_l2tp(["peer-1"]))
+
+    assert seen["ready"] is True
+    assert seen["drop_keys"] == ["peer-1"]
+    store.close()
+
+
 def test_restore_brings_each_interface_up_once(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
     settings = AgentSettings(
