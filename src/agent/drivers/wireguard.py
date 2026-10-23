@@ -185,6 +185,11 @@ async def _require_wg_pubkey(cli: str, private_key: str) -> str:
 async def _materialize_peer_keypair(peer: dict[str, Any], cli: str) -> None:
     """Ensure peer document always carries a matching private/public key pair."""
     private = str(peer.get("private_key") or "").strip()
+    public = str(peer.get("public_key") or "").strip()
+    if private and public:
+        peer["private_key"] = private
+        peer["public_key"] = public
+        return
     if private:
         peer["private_key"] = private
         peer["public_key"] = await _require_wg_pubkey(cli, private)
@@ -846,17 +851,52 @@ class WireGuardDriver(CoreDriver):
         return {"interfaces": self.list_interfaces(), "core": self.key}
 
     async def restore(self, payload: dict[str, Any]) -> bool:
+        """Replace interfaces in one apply per interface, not one apply per peer.
+
+        The panel transfer posts the whole backup at once. Adding each peer
+        through the live path rewrites WireGuard and rebuilds nft/policy
+        routing for every row, so a few hundred peers take minutes.
+        """
         interfaces = list(payload.get("interfaces") or [])
         for existing in list(self.list_interfaces()):
             await self.delete_interface(existing.get("id"))
         for row in interfaces:
-            peers = list(row.get("peers") or [])
-            body = {k: v for k, v in row.items() if k != "peers"}
-            iface = await self.create_interface(body)
-            for peer in peers:
-                await self.add_peer(iface["id"], peer)
+            peers = [peer for peer in (row.get("peers") or []) if isinstance(peer, dict)]
+            body = {key: value for key, value in row.items() if key != "peers"}
+            iface = await self.create_interface(body, apply=False)
+            try:
+                if peers:
+                    iface = await self._stage_peers(iface["id"], peers)
+                up = await self._bring_up(iface)
+                if not up.get("ok"):
+                    detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
+                    raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
+            except Exception:
+                await self._drop_interface_quietly(iface.get("id"))
+                raise
         self.audit.record("restore", self.key)
         return True
+
+    async def _stage_peers(self, interface_id: int | str, peers: list[dict[str, Any]]) -> dict[str, Any]:
+        """Store every peer, then let the caller bring the interface up once."""
+        iface = deepcopy(self.get_interface(interface_id))
+        rows = list(iface.get("peers") or [])
+        used_ips = {str(peer.get("address") or "") for peer in rows if peer.get("address")}
+        for raw in peers:
+            rows.append(await self._spawn_peer(iface, raw, used_ips))
+        iface["peers"] = rows
+        _ensure_interface_address(iface)
+        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        return iface
+
+    async def _drop_interface_quietly(self, interface_id: Any) -> None:
+        if interface_id is None:
+            return
+        try:
+            await self.delete_interface(interface_id)
+        except Exception:
+            self.store.delete_doc(self.key, self._kind, str(interface_id))
+            log.exception("restore cleanup failed interface=%s", interface_id)
 
     # --- interface / peer CRUD ---
     def list_interfaces(self) -> list[dict[str, Any]]:
@@ -871,7 +911,7 @@ class WireGuardDriver(CoreDriver):
                 return iface
         raise AgentError("CONFIG_NOT_FOUND", f"Interface [{interface_id}] not found", 404)
 
-    async def create_interface(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create_interface(self, payload: dict[str, Any], *, apply: bool = True) -> dict[str, Any]:
         iface_id = payload.get("id")
         if iface_id is None:
             existing_ids = []
@@ -905,6 +945,8 @@ class WireGuardDriver(CoreDriver):
         _ensure_interface_address(iface)
         self.store.put_doc(self.key, self._kind, str(iface_id), iface)
         self.audit.record("create", f"{self.key}/interface/{iface_id}")
+        if not apply:
+            return iface
         up = await self._bring_up(iface)
         if not up.get("ok"):
             self.store.delete_doc(self.key, self._kind, str(iface_id))

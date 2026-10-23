@@ -345,6 +345,40 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     store.close()
 
 
+def test_reconcile_probes_a_missing_exit_once(tmp_path, monkeypatch):
+    store = Store(tmp_path / "agent.db")
+    commands: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "link", "show"]:
+            return _Result(returncode=1, stderr="missing")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr(
+        "agent.support.peer_egress.ensure_peer_egress_unit",
+        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+    )
+    peers = [
+        {"address": f"10.90.68.{host}", "exit_interface": "tr", "is_enabled": True}
+        for host in (2, 5, 8)
+    ]
+    result = reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"name": "wg0", "peers": peers}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    probes = [cmd for cmd in commands if cmd[:4] == ["ip", "link", "show", "tr"]]
+    assert result["deferred"] == 3
+    assert probes == [["ip", "link", "show", "tr"]]
+    store.close()
+
+
 def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypatch):
     """Missing exit must not delete the prior lookup rule (avoids region primary IP leak)."""
     store = Store(tmp_path / "agent.db")

@@ -57,11 +57,21 @@ from typing import Any, Callable
 from agent.db import Store
 from agent.logutil import get_logger
 from agent.support import record_is_enabled
-from agent.support.process import run
+from agent.support.process import run_blocking
 
 log = get_logger("peer_egress")
 
 Runner = Callable[..., Any]
+
+
+def _default_runner(*args: Any, **kwargs: Any) -> Any:
+    """Run host commands for real.
+
+    ``process.run`` is async. Calling it from this sync reconciler returned a
+    coroutine, logged ``rc=?``, and never applied nft or policy rules. A
+    blocking subprocess is what this code waits on.
+    """
+    return run_blocking(*args, **kwargs)
 
 _IFACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,14}$")
 _STATE_KIND = "egress_state"
@@ -622,7 +632,7 @@ def ensure_peer_egress_unit(
     ``start`` should be true only when the apply script content actually changed;
     starting on every reconcile flushed nft NAT and caused periodic packet loss.
     """
-    execute = runner or run
+    execute = runner or _default_runner
     if not shutil.which("systemctl"):
         return {"ok": False, "skipped": True, "reason": "systemctl not found"}
 
@@ -711,7 +721,7 @@ def repair_peer_egress(
     Use after RX≈0 with healthy handshake, or after manual iptables experiments.
     ``force=False`` is a soft heal (idempotent reinstall of missing rules only).
     """
-    execute = runner or run
+    execute = runner or _default_runner
     _ensure_ip_forward(execute)
     sysctl_ok = _persist_sysctl_forward()
 
@@ -769,7 +779,7 @@ def reconcile_core_egress(
     ``force=True`` rebuilds NAT/FORWARD even when health checks look green
     (repair scenario after manual firewall edits).
     """
-    execute = runner or run
+    execute = runner or _default_runner
     if not shutil.which("ip"):
         return {"ok": False, "skipped": True, "reason": "ip not found"}
 
@@ -793,9 +803,13 @@ def reconcile_core_egress(
     switched: list[str] = []
     deferred: list[str] = []
     desired_addrs_all = {str(row["addr"]) for row in desired}
+    logged_absent: set[str] = set()
 
     # 1) Warm every desired exit table first (shared by many peers).
+    # One link probe per interface name. A transfer can aim hundreds of peers
+    # at the same missing exit (nl, tr, de); probing each peer is the slow part.
     warmed: set[tuple[str, int]] = set()
+    absent: set[str] = set()
     for row in desired:
         if str(row.get("action") or "lookup") == "prohibit":
             continue
@@ -804,7 +818,9 @@ def reconcile_core_egress(
         key = (iface, table)
         if key in warmed:
             continue
-        if not iface or not _iface_exists(execute, iface):
+        if not iface or iface in absent or not _iface_exists(execute, iface):
+            if iface:
+                absent.add(iface)
             continue
         _soften_rp_filter(execute, iface)
         if _install_default_route(execute, iface=iface, table=table):
@@ -838,6 +854,12 @@ def reconcile_core_egress(
         if (iface, table) not in warmed:
             # Keep the previous lookup (even if it targeted another exit) so we
             # never dump this peer onto the main table / region primary IP.
+            if iface not in logged_absent:
+                logged_absent.add(iface)
+                log.warning(
+                    "peer egress deferred: exit interface [%s] missing or route failed",
+                    iface,
+                )
             if old and str(old.get("action") or "lookup") == "lookup" and int(old.get("table") or 0) > 0:
                 retained = {
                     "addr": addr,
@@ -849,18 +871,7 @@ def reconcile_core_egress(
                 if retained["iface"]:
                     applied.append(retained)
                     deferred.append(addr)
-                    log.warning(
-                        "peer egress deferred %s: exit [%s] missing/route failed — retained [%s]",
-                        cidr,
-                        iface,
-                        retained["iface"],
-                    )
                     continue
-            log.warning(
-                "peer egress skipped %s: exit interface [%s] missing or route failed (no prior rule to retain)",
-                cidr,
-                iface,
-            )
             deferred.append(addr)
             continue
 

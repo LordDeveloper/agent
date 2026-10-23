@@ -24,10 +24,10 @@ class AmneziaDriver(WireGuardDriver):
     def capabilities(self) -> list[str]:
         return super().capabilities() + ["amnezia_obfuscation"]
 
-    async def create_interface(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create_interface(self, payload: dict[str, Any], *, apply: bool = True) -> dict[str, Any]:
         body = deepcopy(payload)
         body["obfuscation"] = fill_amnezia_obfuscation(body.get("obfuscation"))
-        return await super().create_interface(body)
+        return await super().create_interface(body, apply=apply)
 
     async def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         body = deepcopy(payload)
