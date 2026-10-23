@@ -22,8 +22,9 @@ from agent.support.peer_diagnose import (
     _route_table,
     normalize_peer_host,
 )
+from agent.asyncutil import gather_independent
 from agent.support.peer_egress import peer_source_cidr, rule_pref_for_addr, table_id_for_interface
-from agent.support.process import run
+from agent.support.process import run_dump
 
 Runner = Callable[..., Any]
 
@@ -62,24 +63,12 @@ def find_users_by_address(store: Store, core: str, address: str) -> list[dict[st
     return rows
 
 
-def _run_cmd(runner: Runner, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
-    try:
-        result = runner(args, timeout=timeout)
-    except TypeError:
-        result = runner(args)
-    except Exception as exc:
-        return {'ok': False, 'stdout': '', 'stderr': str(exc), 'returncode': -1}
-
-    return {
-        'ok': int(getattr(result, 'returncode', 1)) == 0,
-        'stdout': str(getattr(result, 'stdout', '') or ''),
-        'stderr': str(getattr(result, 'stderr', '') or ''),
-        'returncode': int(getattr(result, 'returncode', 1)),
-    }
+async def _run_cmd(runner: Runner | None, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
+    return await run_dump(runner, args, timeout=timeout)
 
 
-def _service_active(runner: Runner, unit: str) -> bool:
-    dump = _run_cmd(runner, ['systemctl', 'is-active', unit])
+async def _service_active(runner: Runner | None, unit: str) -> bool:
+    dump = await _run_cmd(runner, ['systemctl', 'is-active', unit])
     return dump.get('stdout', '').strip() == 'active'
 
 
@@ -152,14 +141,14 @@ def _live_for_user(
     return sessions.get(host)
 
 
-def diagnose_user_match(
+async def diagnose_user_match(
     *,
     core: str,
     host: str,
     server: dict[str, Any],
     user: dict[str, Any],
     server_doc: dict[str, Any],
-    runner: Runner,
+    runner: Runner | None,
     sessions: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
@@ -195,7 +184,7 @@ def diagnose_user_match(
 
     instance = str(server.get('instance') or instance_name_for_server(server_doc))
     unit = f'openvpn-server@{instance}.service'
-    unit_up = _service_active(runner, unit)
+    unit_up = await _service_active(runner, unit)
     checks.append({'name': 'openvpn_unit_active', 'ok': unit_up, 'unit': unit})
     if not unit_up:
         issues.append(
@@ -208,7 +197,7 @@ def diagnose_user_match(
         )
 
     tun = str(server.get('tun_dev') or tun_dev_for_server(server_doc))
-    tun_link = _iface_link(runner, tun)
+    tun_link = await _iface_link(runner, tun)
     checks.append({'name': 'tun_interface_up', 'ok': bool(tun_link.get('is_up')), 'interface': tun})
     if unit_up and not tun_link.get('is_up'):
         issues.append(
@@ -251,7 +240,7 @@ def diagnose_user_match(
     exit_iface = str(user.get('exit_interface') or '').strip() or None
     expected_table = table_id_for_interface(exit_iface) if exit_iface else None
     expected_pref = rule_pref_for_addr(host)
-    ip_rules = _ip_rules_for_source(runner, cidr)
+    ip_rules = await _ip_rules_for_source(runner, cidr)
     routing: dict[str, Any] = {
         'exit_interface': exit_iface,
         'cidr': cidr,
@@ -265,7 +254,7 @@ def diagnose_user_match(
     }
 
     if exit_iface:
-        exit_link = _iface_link(runner, exit_iface)
+        exit_link = await _iface_link(runner, exit_iface)
         routing['exit_link'] = exit_link
         checks.append({'name': 'exit_interface_up', 'ok': bool(exit_link.get('is_up'))})
         if not exit_link.get('is_up'):
@@ -278,7 +267,7 @@ def diagnose_user_match(
             )
 
         table = table_id_for_interface(exit_iface)
-        routes = _route_table(runner, table)
+        routes = await _route_table(runner, table)
         has_default = any(line.startswith('default') for line in routes)
         routing['policy_route'] = {'table': table, 'routes': routes, 'has_default': has_default}
         checks.append({'name': 'policy_table_default', 'ok': has_default})
@@ -312,7 +301,7 @@ def diagnose_user_match(
                 )
             )
 
-        nat = _nat_status(runner, exit_iface)
+        nat = await _nat_status(runner, exit_iface)
         routing['nat'] = nat
         checks.append({'name': 'exit_nat', 'ok': bool(nat.get('masquerade'))})
         if not nat.get('masquerade'):
@@ -320,7 +309,7 @@ def diagnose_user_match(
                 _issue('error', 'NAT_MISSING', f'No MASQUERADE for exit interface [{exit_iface}]')
             )
 
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, tun)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, tun)
     else:
         issues.append(
             _issue(
@@ -329,7 +318,7 @@ def diagnose_user_match(
                 'OpenVPN user has no exit_interface — traffic uses main routing table only',
             )
         )
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, tun)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, tun)
 
     ip_forward = _read_sysctl('/proc/sys/net/ipv4/ip_forward')
     checks.append({'name': 'ip_forward', 'ok': ip_forward == '1'})
@@ -364,7 +353,7 @@ def diagnose_user_match(
     }
 
 
-def diagnose_user_address(
+async def diagnose_user_address(
     store: Store,
     core: str,
     address: str,
@@ -372,7 +361,6 @@ def diagnose_user_address(
     runner: Runner | None = None,
     sessions: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    execute = runner or run
     host = normalize_peer_host(address)
     if not host:
         raise ValueError('address is required')
@@ -394,18 +382,20 @@ def diagnose_user_address(
     if live_sessions is None:
         live_sessions = collect_openvpn_sessions([row['server_doc'] for row in rows])
 
-    matches = [
-        diagnose_user_match(
-            core=core,
-            host=host,
-            server=row['server'],
-            user=row['user'],
-            server_doc=row['server_doc'],
-            runner=execute,
-            sessions=live_sessions,
+    matches = await gather_independent(
+        *(
+            diagnose_user_match(
+                core=core,
+                host=host,
+                server=row['server'],
+                user=row['user'],
+                server_doc=row['server_doc'],
+                runner=runner,
+                sessions=live_sessions,
+            )
+            for row in rows
         )
-        for row in rows
-    ]
+    )
 
     issue_count = sum(m['issue_counts']['error'] for m in matches)
     warning_count = sum(m['issue_counts']['warning'] for m in matches)

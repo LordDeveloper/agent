@@ -740,7 +740,7 @@ class WireGuardDriver(CoreDriver):
         from agent.support.peer_diagnose import diagnose_peer_address
 
         await self.sync_peer_stats()
-        return diagnose_peer_address(
+        return await diagnose_peer_address(
             self.store,
             self.key,
             address,
@@ -1602,7 +1602,7 @@ class WireGuardDriver(CoreDriver):
         await self.sync_peer_stats()
         from agent.support.l2tp_diagnose import live_linked_peer_keys
 
-        companion = live_linked_peer_keys(self.store)
+        companion = await live_linked_peer_keys(self.store)
         online: list[str] = []
         seen: set[str] = set()
         for iface in self.list_interfaces():
@@ -1623,7 +1623,7 @@ class WireGuardDriver(CoreDriver):
     async def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot
 
-        return online_traffic_from_snapshot(self)
+        return await online_traffic_from_snapshot(self)
 
     async def sync_peer_stats(self) -> None:
         ifaces = self.list_interfaces()

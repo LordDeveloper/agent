@@ -10,8 +10,9 @@ from typing import Any, Callable
 from agent.db import Store
 from agent.support import record_is_enabled
 from agent.support.disable_reason import explain_disabled
+from agent.asyncutil import gather_independent, maybe_await
 from agent.support.peer_egress import peer_source_cidr, rule_pref_for_addr, table_id_for_interface
-from agent.support.process import run
+from agent.support.process import run_dump
 
 Runner = Callable[..., Any]
 
@@ -88,21 +89,8 @@ def find_peers_by_address(store: Store, core: str, address: str) -> list[dict[st
     return rows
 
 
-def _run_cmd(runner: Runner, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
-    try:
-        result = runner(args, timeout=timeout)
-    except TypeError:
-        result = runner(args)
-    except Exception as exc:
-        return {'ok': False, 'stdout': '', 'stderr': str(exc), 'returncode': -1}
-
-    returncode = int(getattr(result, 'returncode', 1))
-    return {
-        'ok': returncode == 0,
-        'stdout': str(getattr(result, 'stdout', '') or ''),
-        'stderr': str(getattr(result, 'stderr', '') or ''),
-        'returncode': returncode,
-    }
+async def _run_cmd(runner: Runner | None, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
+    return await run_dump(runner, args, timeout=timeout)
 
 
 def _read_sysctl(path: str) -> str | None:
@@ -157,9 +145,9 @@ def _parse_wg_dump(stdout: str) -> tuple[dict[str, Any] | None, dict[str, dict[s
     return iface_row, peers
 
 
-def _ip_rules_for_source(runner: Runner, cidr: str) -> list[dict[str, Any]]:
+async def _ip_rules_for_source(runner: Runner | None, cidr: str) -> list[dict[str, Any]]:
     host = normalize_peer_host(cidr)
-    dump = _run_cmd(runner, ['ip', '-j', 'rule'])
+    dump = await _run_cmd(runner, ['ip', '-j', 'rule'])
     rows: list[dict[str, Any]] = []
     if dump['ok'] and dump['stdout'].strip():
         try:
@@ -184,7 +172,7 @@ def _ip_rules_for_source(runner: Runner, cidr: str) -> list[dict[str, Any]]:
             if rows:
                 return rows
 
-    text_dump = _run_cmd(runner, ['ip', 'rule', 'show'])
+    text_dump = await _run_cmd(runner, ['ip', 'rule', 'show'])
     for line in text_dump.get('stdout', '').splitlines():
         raw = line.strip()
         if not raw or host not in raw:
@@ -202,15 +190,15 @@ def _ip_rules_for_source(runner: Runner, cidr: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _route_table(runner: Runner, table: int | str) -> list[str]:
-    dump = _run_cmd(runner, ['ip', '-4', 'route', 'show', 'table', str(table)])
+async def _route_table(runner: Runner | None, table: int | str) -> list[str]:
+    dump = await _run_cmd(runner, ['ip', '-4', 'route', 'show', 'table', str(table)])
     if not dump['ok']:
         return []
     return [line.strip() for line in dump['stdout'].splitlines() if line.strip()]
 
 
-def _route_lookup_from(
-    runner: Runner,
+async def _route_lookup_from(
+    runner: Runner | None,
     dest: str,
     source: str,
     iif: str | None,
@@ -218,12 +206,12 @@ def _route_lookup_from(
     args = ['ip', 'route', 'get', dest, 'from', source]
     if iif:
         args.extend(['iif', iif])
-    dump = _run_cmd(runner, args)
+    dump = await _run_cmd(runner, args)
     return {'ok': dump['ok'], 'raw': dump['stdout'].strip()}
 
 
-def _iface_link(runner: Runner, name: str) -> dict[str, Any]:
-    dump = _run_cmd(runner, ['ip', '-j', 'link', 'show', name])
+async def _iface_link(runner: Runner | None, name: str) -> dict[str, Any]:
+    dump = await _run_cmd(runner, ['ip', '-j', 'link', 'show', name])
     if dump['ok'] and dump['stdout'].strip():
         try:
             rows = json.loads(dump['stdout'])
@@ -241,18 +229,18 @@ def _iface_link(runner: Runner, name: str) -> dict[str, Any]:
             'state': 'UP' if is_up else operstate or 'DOWN',
         }
 
-    text_dump = _run_cmd(runner, ['ip', 'link', 'show', name])
+    text_dump = await _run_cmd(runner, ['ip', 'link', 'show', name])
     raw = text_dump.get('stdout', '')
     is_up = 'state UP' in raw or ',UP,' in raw or '<UP,' in raw
     return {'name': name, 'is_up': is_up, 'state': 'UP' if is_up else 'DOWN', 'raw': raw.strip()}
 
 
-def _nat_status(runner: Runner, iface: str) -> dict[str, Any]:
+async def _nat_status(runner: Runner | None, iface: str) -> dict[str, Any]:
     comment = f'{_MASQ_PREFIX}{iface}'
     if shutil.which('nft'):
-        dump = _run_cmd(runner, ['nft', 'list', 'table', 'inet', 'netinja_egress'])
+        dump = await _run_cmd(runner, ['nft', 'list', 'table', 'inet', 'netinja_egress'])
         if not dump['ok']:
-            dump = _run_cmd(runner, ['nft', 'list', 'ruleset'])
+            dump = await _run_cmd(runner, ['nft', 'list', 'ruleset'])
         text = dump.get('stdout', '')
         patterns = (
             f'oifname "{iface}" masquerade',
@@ -269,7 +257,7 @@ def _nat_status(runner: Runner, iface: str) -> dict[str, Any]:
     for cmd in ('iptables', 'iptables-legacy'):
         if not shutil.which(cmd):
             continue
-        dump = _run_cmd(runner, [cmd, '-t', 'nat', '-S', 'POSTROUTING'])
+        dump = await _run_cmd(runner, [cmd, '-t', 'nat', '-S', 'POSTROUTING'])
         text = dump.get('stdout', '')
         masq = f'-o {iface}' in text and 'MASQUERADE' in text
         details = f'{cmd} POSTROUTING MASQUERADE with comment {comment}' if comment in text else (
@@ -286,14 +274,14 @@ def _issue(level: str, code: str, message: str, **extra: Any) -> dict[str, Any]:
     return row
 
 
-def diagnose_peer_match(
+async def diagnose_peer_match(
     *,
     core: str,
     host: str,
     cidr: str,
     iface: dict[str, Any],
     peer: dict[str, Any],
-    runner: Runner,
+    runner: Runner | None,
     peer_dump_fn: Callable[[str], dict[str, dict[str, Any]]] | None = None,
     interface_is_up_fn: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
@@ -315,7 +303,7 @@ def diagnose_peer_match(
             )
         )
 
-    wg_up = interface_is_up_fn(iface_name) if interface_is_up_fn and iface_name else None
+    wg_up = await maybe_await(interface_is_up_fn(iface_name)) if interface_is_up_fn and iface_name else None
     if wg_up is False:
         issues.append(
             _issue('error', 'INTERFACE_DOWN', f'WireGuard interface [{iface_name}] is not up')
@@ -325,9 +313,9 @@ def diagnose_peer_match(
     live_peers: dict[str, dict[str, Any]] = {}
     live_iface: dict[str, Any] | None = None
     if peer_dump_fn and iface_name:
-        live_peers = peer_dump_fn(iface_name) or {}
+        live_peers = await maybe_await(peer_dump_fn(iface_name)) or {}
     elif iface_name and shutil.which('wg'):
-        dump = _run_cmd(runner, ['wg', 'show', iface_name, 'dump'])
+        dump = await _run_cmd(runner, ['wg', 'show', iface_name, 'dump'])
         if dump['ok']:
             live_iface, parsed = _parse_wg_dump(dump['stdout'])
             live_peers = parsed
@@ -412,7 +400,7 @@ def diagnose_peer_match(
     exit_iface = str(peer.get('exit_interface') or '').strip() or None
     expected_table = table_id_for_interface(exit_iface) if exit_iface else None
     expected_pref = rule_pref_for_addr(host)
-    ip_rules = _ip_rules_for_source(runner, cidr)
+    ip_rules = await _ip_rules_for_source(runner, cidr)
     routing: dict[str, Any] = {
         'exit_interface': exit_iface,
         'cidr': cidr,
@@ -424,7 +412,7 @@ def diagnose_peer_match(
     }
 
     if exit_iface:
-        exit_link = _iface_link(runner, exit_iface)
+        exit_link = await _iface_link(runner, exit_iface)
         routing['exit_link'] = exit_link
         checks.append({'name': 'exit_interface_up', 'ok': bool(exit_link.get('is_up'))})
         if not exit_link.get('is_up'):
@@ -437,7 +425,7 @@ def diagnose_peer_match(
             )
 
         table = table_id_for_interface(exit_iface)
-        routes = _route_table(runner, table)
+        routes = await _route_table(runner, table)
         has_default = any(line.startswith('default') for line in routes)
         routing['policy_route'] = {'table': table, 'routes': routes, 'has_default': has_default}
         checks.append({'name': 'policy_table_default', 'ok': has_default})
@@ -471,7 +459,7 @@ def diagnose_peer_match(
                 )
             )
 
-        nat = _nat_status(runner, exit_iface)
+        nat = await _nat_status(runner, exit_iface)
         routing['nat'] = nat
         checks.append({'name': 'exit_nat', 'ok': bool(nat.get('masquerade'))})
         if not nat.get('masquerade'):
@@ -483,7 +471,7 @@ def diagnose_peer_match(
                 )
             )
 
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
     else:
         issues.append(
             _issue(
@@ -492,7 +480,7 @@ def diagnose_peer_match(
                 'Peer has no exit_interface — traffic uses main routing table only',
             )
         )
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
 
     ip_forward = _read_sysctl('/proc/sys/net/ipv4/ip_forward')
     host_info = {
@@ -538,7 +526,7 @@ def diagnose_peer_match(
     }
 
 
-def diagnose_peer_address(
+async def diagnose_peer_address(
     store: Store,
     core: str,
     address: str,
@@ -547,7 +535,6 @@ def diagnose_peer_address(
     peer_dump_fn: Callable[[str], dict[str, dict[str, Any]]] | None = None,
     interface_is_up_fn: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
-    execute = runner or run
     host = normalize_peer_host(address)
     if not host:
         raise ValueError('address is required')
@@ -576,19 +563,21 @@ def diagnose_peer_address(
             },
         }
 
-    matches = [
-        diagnose_peer_match(
-            core=core,
-            host=host,
-            cidr=cidr,
-            iface=row['interface'],
-            peer=row['peer'],
-            runner=execute,
-            peer_dump_fn=peer_dump_fn,
-            interface_is_up_fn=interface_is_up_fn,
+    matches = await gather_independent(
+        *(
+            diagnose_peer_match(
+                core=core,
+                host=host,
+                cidr=cidr,
+                iface=row['interface'],
+                peer=row['peer'],
+                runner=runner,
+                peer_dump_fn=peer_dump_fn,
+                interface_is_up_fn=interface_is_up_fn,
+            )
+            for row in rows
         )
-        for row in rows
-    ]
+    )
 
     for match, row in zip(matches, rows):
         companion = _find_l2tp_companion(store, row.get('peer') or {})

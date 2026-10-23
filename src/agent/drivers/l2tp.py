@@ -570,7 +570,7 @@ class L2tpDriver(CoreDriver):
             await self._ensure_services(start=True, restart=True)
 
         await self.sync_user_stats()
-        return diagnose_user_address(self.store, self.key, address)
+        return await diagnose_user_address(self.store, self.key, address)
 
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
@@ -627,7 +627,7 @@ class L2tpDriver(CoreDriver):
     async def online_traffic(self) -> dict[str, dict[str, int]]:
         from agent.support.online_traffic import online_traffic_from_snapshot
 
-        return online_traffic_from_snapshot(self)
+        return await online_traffic_from_snapshot(self)
 
     async def sync_user_stats(self) -> None:
         sessions = await self._collect_ppp_sessions()
@@ -1107,4 +1107,4 @@ class L2tpDriver(CoreDriver):
     async def _collect_ppp_sessions(self) -> dict[str, dict[str, Any]]:
         from agent.support.l2tp_diagnose import _collect_ppp_sessions
 
-        return await _collect_ppp_sessions(run)
+        return await _collect_ppp_sessions()

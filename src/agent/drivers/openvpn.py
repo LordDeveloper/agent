@@ -455,7 +455,7 @@ class OpenVpnDriver(CoreDriver):
         from agent.support.openvpn_diagnose import diagnose_user_address
 
         await self.sync_user_stats()
-        return diagnose_user_address(self.store, self.key, address)
+        return await diagnose_user_address(self.store, self.key, address)
 
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()

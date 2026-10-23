@@ -20,8 +20,9 @@ from agent.support.peer_diagnose import (
     _route_table,
     normalize_peer_host,
 )
+from agent.asyncutil import gather_independent
 from agent.support.peer_egress import peer_source_cidr, rule_pref_for_addr, table_id_for_interface
-from agent.support.process import run
+from agent.support.process import run_dump
 
 Runner = Callable[..., Any]
 
@@ -86,9 +87,9 @@ def find_users_by_linked_peer_id(store: Store, core: str, linked_peer_id: str) -
     return rows
 
 
-def live_linked_peer_keys(store: Store, *, runner: Runner | None = None) -> set[str]:
+async def live_linked_peer_keys(store: Store, *, runner: Runner | None = None) -> set[str]:
     """Ids/emails of WG/Amnezia peers whose L2TP companion currently has a PPP session."""
-    sessions = _collect_ppp_sessions(runner or run)
+    sessions = await _collect_ppp_sessions(runner)
     keys: set[str] = set()
     for server in store.list_docs('l2tp', _SERVER_KIND):
         if not isinstance(server, dict):
@@ -161,30 +162,18 @@ def find_linked_peer(store: Store, linked_peer_id: str) -> dict[str, Any] | None
     }
 
 
-def _run_cmd(runner: Runner, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
-    try:
-        result = runner(args, timeout=timeout)
-    except TypeError:
-        result = runner(args)
-    except Exception as exc:
-        return {'ok': False, 'stdout': '', 'stderr': str(exc), 'returncode': -1}
-
-    return {
-        'ok': int(getattr(result, 'returncode', 1)) == 0,
-        'stdout': str(getattr(result, 'stdout', '') or ''),
-        'stderr': str(getattr(result, 'stderr', '') or ''),
-        'returncode': int(getattr(result, 'returncode', 1)),
-    }
+async def _run_cmd(runner: Runner | None, args: list[str], *, timeout: float = 10.0) -> dict[str, Any]:
+    return await run_dump(runner, args, timeout=timeout)
 
 
-def _service_active(runner: Runner, unit: str) -> bool:
-    dump = _run_cmd(runner, ['systemctl', 'is-active', unit])
+async def _service_active(runner: Runner | None, unit: str) -> bool:
+    dump = await _run_cmd(runner, ['systemctl', 'is-active', unit])
     return dump.get('stdout', '').strip() == 'active'
 
 
-def _collect_ppp_sessions(runner: Runner) -> dict[str, dict[str, Any]]:
+async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[str, Any]]:
     """Map client IP -> session info from PPP interfaces."""
-    dump = _run_cmd(runner, ['ip', '-j', 'addr', 'show'])
+    dump = await _run_cmd(runner, ['ip', '-j', 'addr', 'show'])
     sessions: dict[str, dict[str, Any]] = {}
     if not dump['ok'] or not dump['stdout'].strip():
         return sessions
@@ -245,13 +234,13 @@ def _collect_ppp_sessions(runner: Runner) -> dict[str, dict[str, Any]]:
     return sessions
 
 
-def diagnose_user_match(
+async def diagnose_user_match(
     *,
     core: str,
     host: str,
     server: dict[str, Any],
     user: dict[str, Any],
-    runner: Runner,
+    runner: Runner | None,
     store: Store | None = None,
     ppp_sessions: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -330,8 +319,12 @@ def diagnose_user_match(
     if not username or not password:
         issues.append(_issue('error', 'CREDENTIALS_MISSING', 'L2TP username or password is missing in store'))
 
-    xl2tpd_up = _service_active(runner, 'xl2tpd')
-    ipsec_up = _service_active(runner, 'strongswan-starter') or _service_active(runner, 'ipsec')
+    xl2tpd_up, ipsec_strong, ipsec_legacy = await gather_independent(
+        _service_active(runner, 'xl2tpd'),
+        _service_active(runner, 'strongswan-starter'),
+        _service_active(runner, 'ipsec'),
+    )
+    ipsec_up = bool(ipsec_strong or ipsec_legacy)
     checks.append({'name': 'xl2tpd_active', 'ok': xl2tpd_up})
     checks.append({'name': 'ipsec_active', 'ok': ipsec_up})
     if not xl2tpd_up:
@@ -366,7 +359,7 @@ def diagnose_user_match(
             )
         )
 
-    sessions = ppp_sessions if ppp_sessions is not None else _collect_ppp_sessions(runner)
+    sessions = ppp_sessions if ppp_sessions is not None else await _collect_ppp_sessions(runner)
     live = sessions.get(host)
     checks.append({'name': 'ppp_session', 'ok': live is not None and live.get('is_up')})
     if live is None:
@@ -412,7 +405,7 @@ def diagnose_user_match(
 
     expected_table = table_id_for_interface(exit_iface) if exit_iface else None
     expected_pref = rule_pref_for_addr(host)
-    ip_rules = _ip_rules_for_source(runner, cidr)
+    ip_rules = await _ip_rules_for_source(runner, cidr)
     routing: dict[str, Any] = {
         'exit_interface': exit_iface,
         'linked_exit_interface': linked_exit,
@@ -444,7 +437,7 @@ def diagnose_user_match(
         checks.append({'name': 'exit_matches_linked', 'ok': True})
 
     if exit_iface:
-        exit_link = _iface_link(runner, exit_iface)
+        exit_link = await _iface_link(runner, exit_iface)
         routing['exit_link'] = exit_link
         checks.append({'name': 'exit_interface_up', 'ok': bool(exit_link.get('is_up'))})
         if not exit_link.get('is_up'):
@@ -457,7 +450,7 @@ def diagnose_user_match(
             )
 
         table = table_id_for_interface(exit_iface)
-        routes = _route_table(runner, table)
+        routes = await _route_table(runner, table)
         has_default = any(line.startswith('default') for line in routes)
         routing['policy_route'] = {'table': table, 'routes': routes, 'has_default': has_default}
         checks.append({'name': 'policy_table_default', 'ok': has_default})
@@ -491,7 +484,7 @@ def diagnose_user_match(
                 )
             )
 
-        nat = _nat_status(runner, exit_iface)
+        nat = await _nat_status(runner, exit_iface)
         routing['nat'] = nat
         checks.append({'name': 'exit_nat', 'ok': bool(nat.get('masquerade'))})
         if not nat.get('masquerade'):
@@ -500,7 +493,7 @@ def diagnose_user_match(
             )
 
         ppp_if = str((live or {}).get('interface') or '').strip() or None
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, ppp_if)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, ppp_if)
     else:
         issues.append(
             _issue(
@@ -509,7 +502,7 @@ def diagnose_user_match(
                 'L2TP user has no exit_interface — traffic uses main routing table only',
             )
         )
-        routing['simulated_egress'] = _route_lookup_from(runner, '1.1.1.1', host, None)
+        routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, None)
 
     ip_forward = _read_sysctl('/proc/sys/net/ipv4/ip_forward')
     checks.append({'name': 'ip_forward', 'ok': ip_forward == '1'})
@@ -546,7 +539,7 @@ def diagnose_user_match(
     }
 
 
-def diagnose_user_address(
+async def diagnose_user_address(
     store: Store,
     core: str,
     address: str,
@@ -554,7 +547,6 @@ def diagnose_user_address(
     runner: Runner | None = None,
     ppp_sessions: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    execute = runner or run
     host = normalize_peer_host(address)
     if not host:
         raise ValueError('address is required')
@@ -596,20 +588,22 @@ def diagnose_user_address(
 
     sessions = ppp_sessions
     if sessions is None:
-        sessions = _collect_ppp_sessions(execute)
+        sessions = await _collect_ppp_sessions(runner)
 
-    matches = [
-        diagnose_user_match(
-            core=core,
-            host=host,
-            server=row['server'],
-            user=row['user'],
-            runner=execute,
-            store=store,
-            ppp_sessions=sessions,
+    matches = await gather_independent(
+        *(
+            diagnose_user_match(
+                core=core,
+                host=host,
+                server=row['server'],
+                user=row['user'],
+                runner=runner,
+                store=store,
+                ppp_sessions=sessions,
+            )
+            for row in rows
         )
-        for row in rows
-    ]
+    )
 
     issue_count = sum(m['issue_counts']['error'] for m in matches)
     warning_count = sum(m['issue_counts']['warning'] for m in matches)

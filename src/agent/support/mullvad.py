@@ -1876,7 +1876,7 @@ class MullvadService:
                 if path.is_file() and not self._iface_up(iface):
                     await maybe_await(self._sync_iface(iface, path))
                     restored.append(iface)
-                if await self._ensure_persist_unit(iface).get("ok"):
+                if (await self._ensure_persist_unit(iface)).get("ok"):
                     persisted.append(iface)
             except Exception as exc:
                 log.warning("mullvad restore failed iface=%s: %s", iface, exc)

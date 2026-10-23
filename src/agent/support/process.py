@@ -96,6 +96,28 @@ async def execute(
     return result
 
 
+async def run_dump(
+    runner: Callable[..., Any] | None,
+    args: list[str],
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Run a command and return {ok, stdout, stderr, returncode} without raising."""
+    try:
+        result = await execute(runner, args, timeout=timeout, check=False)
+    except TypeError:
+        result = await execute(runner, args, check=False)
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": str(exc), "returncode": -1}
+    returncode = int(getattr(result, "returncode", 1))
+    return {
+        "ok": returncode == 0,
+        "stdout": str(getattr(result, "stdout", "") or ""),
+        "stderr": str(getattr(result, "stderr", "") or ""),
+        "returncode": returncode,
+    }
+
+
 async def systemctl(action: str, unit: str) -> dict[str, Any]:
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not available", 400)
