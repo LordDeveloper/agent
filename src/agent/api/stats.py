@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 
+from agent.asyncutil import maybe_await
 from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
 from agent.routing import resolve_core_key
@@ -62,6 +63,40 @@ async def stats_online_traffic(
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "users": users}
+
+
+@router.get("/stats/client")
+async def stats_client(
+    key: str = Query(...),
+    core: str | None = Query(None),
+    registry: CoreRegistry = Depends(get_registry),
+):
+    """Cumulative counters for one client.
+
+    Panel create/move used to download ``/stats/snapshot`` (every user) just to
+    read one email. Cores without a targeted lookup return 404 so the panel can
+    fall back to that snapshot.
+    """
+    label = str(key or "").strip()
+    core_key = resolve_core_key(core)
+    if label == "" or core_key is None:
+        raise_agent_error("VALIDATION_ERROR", "core and key are required", 422)
+    try:
+        driver = registry.get(core_key)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    getter = getattr(driver, "client_traffic_counters", None)
+    if not callable(getter):
+        raise_agent_error("UNSUPPORTED", "per-client counters are not available for this core", 404)
+    try:
+        incoming, outgoing = await maybe_await(getter(label))
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {
+        "success": True,
+        "incoming": int(incoming or 0),
+        "outgoing": int(outgoing or 0),
+    }
 
 
 @router.get("/stats/snapshot")

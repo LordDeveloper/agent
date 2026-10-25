@@ -67,6 +67,32 @@ def _is_missing_user_error(exc: AgentError) -> bool:
     return int(exc.status or 0) == 404 or "not found" in message or "does not exist" in message or "doesn't exist" in message
 
 
+def _is_inbound_missing_error(exc: AgentError) -> bool:
+    message = str(exc.message or "").lower()
+    return "inbound" in message and "not found" in message
+
+
+def clients_already_on_inbound(
+    clients: list[dict[str, Any]],
+    by_email: dict[str, dict[str, Any]],
+    by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rows whose email or id is already on this inbound.
+
+    A brand-new client has no Xray counters. Querying stats for it only adds a
+    round trip to create/move, which is what makes a single config feel stuck.
+    """
+    known: list[dict[str, Any]] = []
+    for raw in clients:
+        if not isinstance(raw, dict):
+            continue
+        email = str(raw.get("email") or "").strip()
+        cid = str(raw.get("id") or "").strip()
+        if (email and email in by_email) or (cid and cid in by_id):
+            known.append(raw)
+    return known
+
+
 def _is_existing_user_error(exc: AgentError) -> bool:
     message = str(exc.message or "").lower()
     if _is_missing_user_error(exc):
@@ -518,6 +544,13 @@ class XrayDriver(CoreDriver):
             by_email.update(extra_email)
             by_id.update(extra_id)
         return by_email, by_id
+
+    async def client_traffic_counters(self, key: str) -> tuple[int, int]:
+        """One user's cumulative counters. Does not dump every user on the node."""
+        label = str(key or "").strip()
+        if not label:
+            return 0, 0
+        return await self._live_counters_for(label, "")
 
     async def _live_counters_for(self, email: str, cid: str) -> tuple[int, int]:
         api = await self._api()
@@ -1362,9 +1395,12 @@ class XrayDriver(CoreDriver):
             by_id.update(live_id)
             # One client update does not need every user's counters. The grouped
             # query holds this lock until Xray finishes the whole node.
+            # New rows are not in the index, so a create does not query stats.
             if len(clients) <= _SMALL_CLIENT_BATCH:
                 traffic_index = {}
-                await self._prefetch_zero_baselines(clients)
+                known = clients_already_on_inbound(clients, by_email, by_id)
+                if known:
+                    await self._prefetch_zero_baselines(known)
             else:
                 _log.info(
                     "xray batch loading full user traffic index tag=%s clients=%s",
@@ -2134,19 +2170,32 @@ class XrayDriver(CoreDriver):
 
         tag, email = self._client_email_in_config(config, inbound_id, key)
         if not email:
+            # Panel sends the email as the path key. Remove that key directly.
+            # Listing every user is the 15s timeout on a busy inbound, and it
+            # only matters when the key is a uuid that config.json does not have.
             tag = self.inbound_tag(inbound_id)
-            email = await self._client_email_from_users(tag, key)
-        if not email:
-            raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
-
-        try:
-            await self._api_call("remove_users", tag, [email])
-        except AgentError as exc:
-            message = str(exc.message or "").lower()
-            missing = int(exc.status or 0) == 404 or "not found" in message
-            if missing:
-                raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
-            raise
+            try:
+                await self._api_call("remove_users", tag, [key])
+                email = key
+            except AgentError as exc:
+                if _is_inbound_missing_error(exc) or not _is_missing_user_error(exc):
+                    raise
+                email = await self._client_email_from_users(tag, key)
+                if not email or email == key:
+                    raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
+                try:
+                    await self._api_call("remove_users", tag, [email])
+                except AgentError as remove_exc:
+                    if _is_missing_user_error(remove_exc):
+                        raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from remove_exc
+                    raise
+        else:
+            try:
+                await self._api_call("remove_users", tag, [email])
+            except AgentError as exc:
+                if _is_missing_user_error(exc):
+                    raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
+                raise
 
         self._forget_client_keys([key, email])
         await self._release_emails_from_other_inbounds([email], tag, config)
