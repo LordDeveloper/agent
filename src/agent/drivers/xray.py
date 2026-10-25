@@ -53,6 +53,8 @@ from agent.xray_service import api_base_from_config, describe_httpapi_guard, xra
 _TAG_RE = re.compile(r"^inbound-(.+)$")
 _XRAY_UNIT = "xray"
 _CLIENT_BATCH_MAX = 200
+# A handful of clients should not wait on a stats dump of every user.
+_SMALL_CLIENT_BATCH = 8
 # Overlap per-client Xray writes. Wall time stays near one call, not N calls.
 _CLIENT_PARALLELISM = 32
 _QUOTA_KIND = "client_quota"
@@ -97,6 +99,7 @@ class XrayDriver(CoreDriver):
         self._settings_cache: tuple[int | None, XraySettings] | None = None
         self._api_ready_until = 0.0
         self._inbound_locks: dict[str, asyncio.Lock] = {}
+        self._config_cache: tuple[str, int, int, dict[str, Any]] | None = None
 
     def _resolved_xray_settings(self) -> XraySettings:
         base = self.settings.xray
@@ -435,7 +438,10 @@ class XrayDriver(CoreDriver):
     async def _inbound_shell(self, inbound_id: int | str) -> dict[str, Any]:
         """Inbound settings from disk (or one live row). Does not list every user."""
         tag = self.inbound_tag(inbound_id)
-        config = self._disk_config()
+        try:
+            config = await self._read_config()
+        except AgentError:
+            config = None
         if config is not None:
             for row in config.get("inbounds") or []:
                 if not isinstance(row, dict):
@@ -870,7 +876,7 @@ class XrayDriver(CoreDriver):
 
         tag = self.inbound_tag(inbound_id)
         try:
-            config = self.read_config()
+            config = await self._read_config()
         except AgentError:
             config = {}
         for inbound in config.get("inbounds") or []:
@@ -883,16 +889,9 @@ class XrayDriver(CoreDriver):
             if client is not None:
                 return self._with_stored_quota(normalize_xray_client(client), include_flags=True)
 
-        try:
-            inbound = await self.get_inbound(inbound_id)
-            client = self._find_client(inbound, key)
-            if client is not None:
-                return self._live_client_record(normalize_xray_client(client), key)
-        except AgentError:
-            pass
-
-        # users/add updates the users API. inbounds/list and config.json can
-        # omit that row, so a client that is live still looked missing here.
+        # users/add updates the users API. config.json can omit that row.
+        # get_inbound() would list every user first and sit past the panel's
+        # 15s timeout with no response bytes. Match this key only.
         live = await self._find_live_user(tag, key)
         if live is not None:
             return self._live_client_record(normalize_xray_client(live), key)
@@ -923,6 +922,10 @@ class XrayDriver(CoreDriver):
         for user in users:
             if isinstance(user, dict) and self._row_matches_key(user, key):
                 return user
+        # The users API filters by email only. A UUID that is not on disk has
+        # to walk every user. Log it before the call: the panel gives up at 15s
+        # and the access log is written only after this returns.
+        _log.warning("xray client lookup scanning all users tag=%s key=%s", tag, key)
         try:
             users = await self._api_call("list_users", tag)
         except AgentError:
@@ -1329,16 +1332,34 @@ class XrayDriver(CoreDriver):
         applied: list[dict[str, Any]] = []
 
         self._traffic_index_cache = None
-        async with self._inbound_lock(tag):
+        lock = self._inbound_lock(tag)
+        if lock.locked():
+            _log.warning("xray inbound lock busy tag=%s clients=%s", tag, len(clients))
+        wait_started = time.perf_counter()
+        async with lock:
+            waited_ms = (time.perf_counter() - wait_started) * 1000
+            if waited_ms >= 500:
+                _log.warning("xray inbound lock acquired tag=%s waited_ms=%.0f", tag, waited_ms)
             inbound = await self._inbound_shell(inbound_id)
             inbound = await self._ensure_shadowsocks_method(inbound)
             by_email, by_id = self._index_clients(inbound)
             live_email, live_id = await self._lookup_clients_for_batch(tag, clients)
             by_email.update(live_email)
             by_id.update(live_id)
-            traffic_index = await self._user_traffic_index()
-            if not traffic_index:
+            # One client update does not need every user's counters. The grouped
+            # query holds this lock until Xray finishes the whole node.
+            if len(clients) <= _SMALL_CLIENT_BATCH:
+                traffic_index = {}
                 await self._prefetch_zero_baselines(clients)
+            else:
+                _log.info(
+                    "xray batch loading full user traffic index tag=%s clients=%s",
+                    tag,
+                    len(clients),
+                )
+                traffic_index = await self._user_traffic_index()
+                if not traffic_index:
+                    await self._prefetch_zero_baselines(clients)
 
             to_add: list[dict[str, Any]] = []
             to_edit: list[dict[str, Any]] = []
@@ -2068,7 +2089,7 @@ class XrayDriver(CoreDriver):
         """
         if config is None:
             try:
-                config = self.read_config()
+                config = await self._read_config()
             except AgentError:
                 return
         plan = emails_on_other_inbounds(config, set(emails), keep_tag)
@@ -2093,7 +2114,7 @@ class XrayDriver(CoreDriver):
 
         config: dict[str, Any] | None
         try:
-            config = self.read_config()
+            config = await self._read_config()
         except AgentError:
             config = None
 
@@ -2141,6 +2162,16 @@ class XrayDriver(CoreDriver):
         return "", ""
 
     async def _client_email_from_users(self, tag: str, client_key: str) -> str:
+        try:
+            users = await self._api_call("list_users", tag, client_key)
+        except AgentError:
+            users = []
+        for row in users:
+            if not isinstance(row, dict) or not self._row_matches_key(row, client_key):
+                continue
+            email = str(row.get("email") or "").strip()
+            return email or client_key
+        _log.warning("xray client delete scanning all users tag=%s key=%s", tag, client_key)
         try:
             users = await self._api_call("list_users", tag)
         except AgentError:
@@ -2250,14 +2281,32 @@ class XrayDriver(CoreDriver):
     def read_config(self) -> dict[str, Any]:
         path = Path(self.settings.xray.config)
         if not path.is_file():
+            self._config_cache = None
             raise AgentError("CONFIG_NOT_FOUND", f"Xray config not found: {path}", 404)
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise AgentError("VALIDATION_ERROR", f"Invalid Xray config JSON: {exc}", 422) from exc
+        cached = self._config_cache
+        if (
+            cached is not None
+            and cached[0] == str(path)
+            and cached[1] == stat.st_mtime_ns
+            and cached[2] == stat.st_size
+        ):
+            return deepcopy(cached[3])
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise AgentError("VALIDATION_ERROR", f"Invalid Xray config JSON: {exc}", 422) from exc
         if not isinstance(data, dict):
             raise AgentError("VALIDATION_ERROR", "Xray config must be a JSON object", 422)
-        return data
+        self._config_cache = (str(path), stat.st_mtime_ns, stat.st_size, data)
+        return deepcopy(data)
+
+    async def _read_config(self) -> dict[str, Any]:
+        """Parse config.json off the event loop so one large file cannot stall every request."""
+        return await asyncio.to_thread(self.read_config)
 
     def dumped_config(self) -> dict[str, Any]:
         return redact_secrets(self.read_config())

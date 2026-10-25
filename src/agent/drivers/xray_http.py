@@ -13,6 +13,10 @@ from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
 
 _log = get_logger("xray.http")
+# Panel single-client calls give up at 15s. Warn while the Xray call is still
+# open so the hang is visible before that timeout, not only after it returns.
+_SLOW_CALL_WARN_SECONDS = 3.0
+_SLOW_CALL_INFO_SECONDS = 1.0
 
 # Xray iplist keeps addresses after the session ends. lastSeen older than this
 # is not a live connection (carrier flaps / leftover rows).
@@ -179,7 +183,11 @@ class XrayHttpClient:
         headers = {"Content-Type": "application/json"} if files is None and json_body is not None else None
         method_u = method.upper()
         route = f"{method_u} {path}"
+        if isinstance(params, dict) and params:
+            route = f"{route}?{self._route_query(path, params)}"
         span = RuntimeTrace.safe_name(f"xray.{method_u}.{path.rstrip('/').split('/')[-1] or 'root'}")
+        started = time.perf_counter()
+        slow = asyncio.create_task(self._warn_if_slow(route))
         try:
             with RuntimeTrace.span(span):
                 response = await self._client.request(
@@ -197,6 +205,12 @@ class XrayHttpClient:
                 f"Xray HTTP API unreachable [{route}]: {exc}",
                 502,
             ) from exc
+        finally:
+            slow.cancel()
+            elapsed = time.perf_counter() - started
+            if elapsed >= _SLOW_CALL_INFO_SECONDS:
+                level = _log.warning if elapsed >= _SLOW_CALL_WARN_SECONDS else _log.info
+                level("xray api call finished route=%s ms=%.0f", route, elapsed * 1000)
 
         # Prefer the concrete URL httpx resolved (includes query).
         try:
@@ -270,6 +284,31 @@ class XrayHttpClient:
             return response.json()
         except Exception:
             return {"raw": response.text}
+
+    @staticmethod
+    def _route_query(path: str, params: dict) -> str:
+        parts: list[str] = []
+        tag = params.get("tag")
+        email = params.get("email")
+        if tag:
+            parts.append(f"tag={tag}")
+        if email:
+            parts.append(f"email={email}")
+        elif str(path).rstrip("/").endswith("/inbounds/users"):
+            parts.append("users=all")
+        return "&".join(str(part) for part in parts) or "filtered"
+
+    @staticmethod
+    async def _warn_if_slow(route: str) -> None:
+        try:
+            await asyncio.sleep(_SLOW_CALL_WARN_SECONDS)
+        except asyncio.CancelledError:
+            return
+        _log.warning(
+            "xray api still waiting after %.0fs route=%s",
+            _SLOW_CALL_WARN_SECONDS,
+            route,
+        )
 
     async def get(self, path: str, params: dict | list | None = None) -> Any:
         return await self._request("GET", path, params=params)

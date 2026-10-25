@@ -1,7 +1,6 @@
 import asyncio
 import os
 import time
-from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -36,7 +35,6 @@ from agent.quota_enforcer import quota_enforcer_loop
 from agent.runtime import RuntimeTrace
 from agent.traffic.service import TrafficService
 from agent.traffic_worker import traffic_worker_loop
-from agent.whoami_hit import WhoamiHitService
 
 log = get_logger("http")
 
@@ -58,6 +56,9 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         RuntimeTrace.start()
         started = time.perf_counter()
         client = request.client.host if request.client else "-"
+        # Access log is written only after the handler returns. A client CRUD
+        # stuck in Xray otherwise leaves the panel timeout with an empty log.
+        watch = asyncio.create_task(self._warn_if_slow(request, client))
         try:
             response = await call_next(request)
         except Exception as exc:
@@ -89,7 +90,21 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
             )
             return response
         finally:
+            watch.cancel()
             RuntimeTrace.reset()
+
+    @staticmethod
+    async def _warn_if_slow(request: Request, client: str) -> None:
+        try:
+            await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            return
+        log.warning(
+            "request still running method=%s path=%s client=%s",
+            request.method,
+            request.url.path,
+            client,
+        )
 
 
 def create_app(env_file: str | None = None) -> FastAPI:
@@ -137,8 +152,6 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 mullvad_worker_loop(store, settings, stop_mullvad),
             )
 
-        app.state.whoami.start_if_configured()
-
         yield
 
         stop_mullvad.set()
@@ -153,7 +166,6 @@ def create_app(env_file: str | None = None) -> FastAPI:
         from agent.support.proxy_protocol_forwarder import stop_forwarders
 
         stop_forwarders(settings)
-        app.state.whoami.stop()
         app_log.info("agent stopping")
         store.close()
 
@@ -164,7 +176,6 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.state.errors = errors
     app.state.registry = registry
     app.state.traffic = traffic
-    app.state.whoami = WhoamiHitService(Path(settings.data_dir) / "whoami-webhook.key")
     app.add_middleware(CoreErrorCaptureMiddleware)
     app.add_middleware(RequestLogMiddleware)
 

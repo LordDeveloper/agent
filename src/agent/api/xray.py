@@ -488,31 +488,6 @@ async def append_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(
     return {"success": True, "result": result}
 
 
-@router.put("/whoami")
-async def put_whoami(body: dict[str, Any], request: Request, xray: XrayDriver = Depends(get_xray)):
-    token = str(body.get("token") or "")
-    service = getattr(request.app.state, "whoami", None)
-    if service is None:
-        raise_agent_error("UNSUPPORTED_CAPABILITY", "whoami receiver is not available", 404)
-    try:
-        service.set_token(token)
-    except ValueError:
-        raise_agent_error("VALIDATION_ERROR", "token rejected", 422)
-    try:
-        xray.restrict_config_permissions()
-    except OSError:
-        pass
-    return {"success": True}
-
-
-@router.get("/whoami/hits")
-async def whoami_hits(request: Request):
-    service = getattr(request.app.state, "whoami", None)
-    if service is None:
-        raise_agent_error("UNSUPPORTED_CAPABILITY", "whoami receiver is not available", 404)
-    return {"success": True, "hits": service.drain()}
-
-
 @router.post("/routing/rules/upsert")
 @router.post("/routing/rules:upsert")
 async def upsert_routing_rules(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
