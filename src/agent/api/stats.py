@@ -148,12 +148,12 @@ async def stats_clients_traffic_pending(
          email so only growth after the GET snapshot remains queued.
     """
     registry: CoreRegistry = request.app.state.registry
-    age = traffic.last_sample_age_ms()
+    age = await traffic.last_sample_age_ms()
     interval_ms = int(float(getattr(request.app.state.settings, "traffic_sample_interval", 30.0) or 30.0) * 1000)
     fresh_ms = max(3000, interval_ms // 2)
     if age is None or age > fresh_ms:
         await traffic.sample_all(registry)
-    payload = traffic.pending_payload()
+    payload = await traffic.pending_payload()
 
     return {
         "success": True,
@@ -184,7 +184,7 @@ async def stats_clients_traffic_pending_ack(
         raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)
 
     client_keys = [str(item).strip() for item in raw if str(item or "").strip()]
-    acked, not_found = traffic.ack_clients(client_keys)
+    acked, not_found = await traffic.ack_clients(client_keys)
 
     return {
         "success": True,

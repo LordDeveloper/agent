@@ -589,8 +589,8 @@ class MullvadService:
     async def _exec(self, args: list[str], **kwargs):
         return await execute(self.runner, args, **kwargs)
 
-    def settings(self) -> dict[str, Any]:
-        row = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+    async def settings(self) -> dict[str, Any]:
+        row = await self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         private_key = str(row.get("private_key") or "").strip()
         address = str(row.get("address") or "").strip()
         metric = normalize_relay_metric(row.get("relay_metric"))
@@ -610,14 +610,14 @@ class MullvadService:
             "auto_fallback_label": "on" if auto_fallback else "off",
         }
 
-    def relay_metric(self) -> str:
-        return normalize_relay_metric(self.settings().get("relay_metric"))
+    async def relay_metric(self) -> str:
+        return normalize_relay_metric(await self.settings().get("relay_metric"))
 
-    def relay_mode(self) -> str:
-        return normalize_relay_mode(self.settings().get("relay_mode"))
+    async def relay_mode(self) -> str:
+        return normalize_relay_mode(await self.settings().get("relay_mode"))
 
-    def auto_fallback_enabled(self) -> bool:
-        return bool(self.settings().get("auto_fallback", True))
+    async def auto_fallback_enabled(self) -> bool:
+        return bool(await self.settings().get("auto_fallback", True))
 
     @staticmethod
     def _coerce_auto_fallback(value: Any, *, default: bool = True) -> bool:
@@ -642,7 +642,7 @@ class MullvadService:
         selection_mode: str | None = None,
         auto_fallback: bool | None = None,
     ) -> dict[str, Any]:
-        current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+        current = await self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         key = str(private_key if private_key is not None else current.get("private_key") or "").strip()
         if private_key is not None and not _WG_KEY_RE.match(key):
             raise AgentError("VALIDATION_ERROR", "Invalid WireGuard private key", 422)
@@ -684,8 +684,8 @@ class MullvadService:
                 "selection_mode": mode,
                 "auto_fallback": auto,
             }
-            self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
-            return self.settings()
+            await self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
+            return await self.settings()
 
         addr = str(address if address is not None else current.get("address") or "").strip()
         if address is not None or (private_key is not None and not addr):
@@ -702,8 +702,8 @@ class MullvadService:
             "selection_mode": mode,
             "auto_fallback": auto,
         }
-        self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
-        result = self.settings()
+        await self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, payload)
+        result = await self.settings()
         # Changing account key/IP must rewrite every bound exit conf + live iface.
         # Previously only the store doc changed, so poland/pl/sw kept the old PrivateKey.
         if private_key is not None or address is not None:
@@ -744,7 +744,7 @@ class MullvadService:
         updated: list[str] = []
         failed: list[dict[str, str]] = []
         skipped: list[str] = []
-        for bind in self.bindings():
+        for bind in await self.bindings():
             iface = normalize_exit_interface(str(bind.get("iface") or ""))
             if not iface:
                 continue
@@ -790,24 +790,24 @@ class MullvadService:
             "failed_count": len(failed),
         }
 
-    def bindings(self) -> list[dict[str, Any]]:
+    async def bindings(self) -> list[dict[str, Any]]:
         rows = []
-        for row in self.store.list_docs(CORE, KIND_LOCATION):
+        for row in await self.store.list_docs(CORE, KIND_LOCATION):
             if isinstance(row, dict) and str(row.get("country_code") or "").strip():
                 rows.append(row)
         return rows
 
-    def binding_for(self, country_code: str) -> dict[str, Any] | None:
+    async def binding_for(self, country_code: str) -> dict[str, Any] | None:
         code = str(country_code or "").strip().lower()
         if not code:
             return None
-        row = self.store.get_doc(CORE, KIND_LOCATION, code)
+        row = await self.store.get_doc(CORE, KIND_LOCATION, code)
         return row if isinstance(row, dict) else None
 
     async def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
         relays = await maybe_await(fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch())
         await self.refresh_bindings(relays)
-        bound = {str(row.get("country_code") or "").lower(): row for row in self.bindings()}
+        bound = {str(row.get("country_code") or "").lower(): row for row in await self.bindings()}
         locations = []
         for item in group_locations(relays):
             code = item["country_code"]
@@ -831,7 +831,7 @@ class MullvadService:
         if ping:
             locations = await self._attach_pings(locations, relays)
         return {
-            "settings": {k: v for k, v in self.settings().items() if k != "private_key"},
+            "settings": {k: v for k, v in await self.settings().items() if k != "private_key"},
             "locations": locations,
         }
 
@@ -911,18 +911,18 @@ class MullvadService:
         catalog = relays if relays is not None else await maybe_await(self.fetch())
         claimed_ifaces = {
             str(row.get("iface") or "").strip()
-            for row in self.bindings()
+            for row in await self.bindings()
             if str(row.get("iface") or "").strip()
         }
         claimed_countries = {
             str(row.get("country_code") or "").strip().lower()
-            for row in self.bindings()
+            for row in await self.bindings()
             if str(row.get("country_code") or "").strip()
         }
 
         for iface, parsed, live in await self._scan_interfaces():
             if iface in claimed_ifaces:
-                self._seed_settings_from_conf(parsed)
+                await self._seed_settings_from_conf(parsed)
                 continue
             pubkey = ""
             endpoint = ""
@@ -940,7 +940,7 @@ class MullvadService:
             code = str(relay.get("country_code") or "").strip().lower()
             if not code or code in claimed_countries:
                 continue
-            self._put_binding(
+            await self._put_binding(
                 country_code=code,
                 iface=iface,
                 relay=relay,
@@ -948,9 +948,9 @@ class MullvadService:
             )
             claimed_ifaces.add(iface)
             claimed_countries.add(code)
-            self._seed_settings_from_conf(parsed)
+            await self._seed_settings_from_conf(parsed)
 
-        return self.bindings()
+        return await self.bindings()
 
     async def ensure(self, country_code: str) -> dict[str, Any]:
         code = str(country_code or "").strip().lower()
@@ -963,7 +963,7 @@ class MullvadService:
         if not candidates:
             raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
 
-        bind = self.binding_for(code)
+        bind = await self.binding_for(code)
         iface = str((bind or {}).get("iface") or "").strip() or await self._allocate_iface(code)
         normalized = normalize_exit_interface(iface)
         if not normalized:
@@ -990,8 +990,8 @@ class MullvadService:
             relay = candidates[0]
 
         await self._apply_relay(iface, relay)
-        self._put_binding(country_code=code, iface=iface, relay=relay, adopted=bool((bind or {}).get("adopted")))
-        return self._present_binding(self.binding_for(code) or {})
+        await self._put_binding(country_code=code, iface=iface, relay=relay, adopted=bool((bind or {}).get("adopted")))
+        return self._present_binding(await self.binding_for(code) or {})
 
     async def fallback_iface(self, iface: str) -> dict[str, Any] | None:
         name = str(iface or "").strip()
@@ -999,14 +999,14 @@ class MullvadService:
             return None
         relays = await maybe_await(self.fetch())
         await self.refresh_bindings(relays)
-        for bind in self.bindings():
+        for bind in await self.bindings():
             if str(bind.get("iface") or "").strip() == name:
                 return await self._fallback_one(bind, relays)
         code = country_for_iface_name(name)
         if not code:
             log.warning("mullvad fallback skipped iface=%s: no country binding", name)
             return None
-        bind = self.binding_for(code) or {}
+        bind = await self.binding_for(code) or {}
         live = await self._live_peer(name) or {}
         hostname = str(bind.get("hostname") or "")
         if not hostname:
@@ -1030,7 +1030,7 @@ class MullvadService:
     async def fallback(self, country_code: str | None = None, *, optimize: bool = False) -> dict[str, Any]:
         relays = await maybe_await(self.fetch())
         await self.refresh_bindings(relays)
-        targets = self.bindings()
+        targets = await self.bindings()
         if country_code:
             code = str(country_code).strip().lower()
             targets = [row for row in targets if str(row.get("country_code") or "").lower() == code]
@@ -1066,11 +1066,11 @@ class MullvadService:
         if not candidates:
             raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
 
-        bind = self.binding_for(code) or {}
+        bind = await self.binding_for(code) or {}
         current_host = str(bind.get("hostname") or "").strip().lower()
         current_fixed = bool(bind.get("fixed") or bind.get("pinned"))
-        metric = self.relay_metric()
-        mode = self.relay_mode()
+        metric = await self.relay_metric()
+        mode = await self.relay_mode()
         rows: list[dict[str, Any]] = []
 
         ping_by_host: dict[str, int | None] = {}
@@ -1143,7 +1143,7 @@ class MullvadService:
         if relay is None:
             raise AgentError("NOT_FOUND", f"Relay [{host}] not found for {code}", 404)
 
-        bind = self.binding_for(code)
+        bind = await self.binding_for(code)
         if not bind:
             raise AgentError("NOT_FOUND", f"No Mullvad binding for {code}; ensure the location first", 404)
 
@@ -1153,7 +1153,7 @@ class MullvadService:
 
         previous = str(bind.get("hostname") or "").strip()
         await self._apply_relay(iface, relay)
-        self._put_binding(
+        await self._put_binding(
             country_code=code,
             iface=iface,
             relay=relay,
@@ -1166,7 +1166,7 @@ class MullvadService:
                 "pinned": pin_fixed,
             },
         )
-        presented = self._present_binding(self.binding_for(code) or bind)
+        presented = self._present_binding(await self.binding_for(code) or bind)
         return {
             **presented,
             "status": "changed" if previous.lower() != host.lower() else "ok",
@@ -1183,13 +1183,13 @@ class MullvadService:
             ),
         }
 
-    def set_relay_fixed(self, country_code: str, fixed: bool) -> dict[str, Any]:
+    async def set_relay_fixed(self, country_code: str, fixed: bool) -> dict[str, Any]:
         """Pin/unpin current relay for one country without changing the peer."""
         code = str(country_code or "").strip().lower()
         if not re.fullmatch(r"[a-z]{2}", code or ""):
             raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
 
-        bind = self.binding_for(code)
+        bind = await self.binding_for(code)
         if not bind:
             raise AgentError("NOT_FOUND", f"No Mullvad binding for {code}; ensure the location first", 404)
 
@@ -1199,7 +1199,7 @@ class MullvadService:
 
         iface = str(bind.get("iface") or "").strip()
         pin_fixed = bool(fixed)
-        self._put_binding(
+        await self._put_binding(
             country_code=code,
             iface=iface,
             relay=None,
@@ -1211,7 +1211,7 @@ class MullvadService:
                 "last_error": "",
             },
         )
-        presented = self._present_binding(self.binding_for(code) or bind)
+        presented = self._present_binding(await self.binding_for(code) or bind)
         return {
             **presented,
             "status": "ok",
@@ -1269,10 +1269,10 @@ class MullvadService:
 
         rows = [
             row
-            for row in await gather_independent(*(_row(bind) for bind in self.bindings()))
+            for row in await gather_independent(*(_row(bind) for bind in await self.bindings()))
             if isinstance(row, dict)
         ]
-        settings = self.settings()
+        settings = await self.settings()
         settings.pop("private_key", None)
         return {"settings": settings, "tunnels": rows, "probed": bool(probe)}
 
@@ -1288,7 +1288,7 @@ class MullvadService:
         bind = next(
             (
                 row
-                for row in self.bindings()
+                for row in await self.bindings()
                 if normalize_exit_interface(str(row.get("iface") or "")) == name
             ),
             None,
@@ -1354,7 +1354,7 @@ class MullvadService:
             if normalize_exit_interface(str(name or ""))
         }
         targets = []
-        for bind in self.bindings():
+        for bind in await self.bindings():
             iface = normalize_exit_interface(str(bind.get("iface") or ""))
             if not iface:
                 continue
@@ -1461,7 +1461,7 @@ class MullvadService:
             log.warning("mullvad fallback no catalog relays country=%s iface=%s", code, iface)
             return {**presented, "status": "failed", "message": last_error}
 
-        metric = self.relay_metric()
+        metric = await self.relay_metric()
         if metric == RELAY_METRIC_SPEED:
             return await self._fallback_one_by_speed(
                 bind,
@@ -1530,7 +1530,7 @@ class MullvadService:
             relay_host = str(relay.get("hostname") or "").strip()
             try:
                 await self._apply_relay(iface, relay)
-                self._put_binding(
+                await self._put_binding(
                     country_code=code,
                     iface=iface,
                     relay=relay,
@@ -1545,7 +1545,7 @@ class MullvadService:
                 )
                 log.info("mullvad fallback country=%s iface=%s hostname=%s", code, iface, relay_host)
                 last_changed = {
-                    **self._present_binding(self.binding_for(code) or bind),
+                    **self._present_binding(await self.binding_for(code) or bind),
                     "status": "changed",
                     "message": f"switched to {relay_host}",
                 }
@@ -1661,7 +1661,7 @@ class MullvadService:
             try:
                 await self._apply_relay(iface, relay)
                 applied_host = relay_host
-                self._put_binding(
+                await self._put_binding(
                     country_code=code,
                     iface=iface,
                     relay=relay,
@@ -1741,7 +1741,7 @@ class MullvadService:
             if current_relay is not None and applied_host.lower() != hostname.lower():
                 try:
                     await self._apply_relay(iface, current_relay)
-                    self._put_binding(
+                    await self._put_binding(
                         country_code=code,
                         iface=iface,
                         relay=current_relay,
@@ -1766,7 +1766,7 @@ class MullvadService:
         if applied_host.lower() != best_host.lower():
             try:
                 await self._apply_relay(iface, best_relay)
-                self._put_binding(
+                await self._put_binding(
                     country_code=code,
                     iface=iface,
                     relay=best_relay,
@@ -1784,19 +1784,19 @@ class MullvadService:
 
         if best_host.lower() == hostname.lower():
             return {
-                **self._present_binding(self.binding_for(code) or bind),
+                **self._present_binding(await self.binding_for(code) or bind),
                 "status": "ok",
                 "message": f"already best by curl speed ({best_mbps} Mbps)",
             }
         return {
-            **self._present_binding(self.binding_for(code) or bind),
+            **self._present_binding(await self.binding_for(code) or bind),
             "status": "changed",
             "message": f"switched to {best_host} ({best_mbps} Mbps via curl --interface {iface})",
         }
 
     async def _allocate_iface(self, country_code: str) -> str:
         preferred = preferred_iface(country_code)
-        used = {str(row.get("iface") or "").strip() for row in self.bindings()}
+        used = {str(row.get("iface") or "").strip() for row in await self.bindings()}
         if preferred not in used:
             parsed = read_conf(conf_path(self.config_dir, preferred))
             if parsed is None or await self._conf_looks_mullvad(parsed):
@@ -1819,7 +1819,7 @@ class MullvadService:
         return match_relay(catalog, pubkey=str(peers[0].get("PublicKey") or ""), endpoint_host=str(peers[0].get("Endpoint") or "")) is not None
 
     async def _apply_relay(self, iface: str, relay: dict[str, Any]) -> None:
-        settings = self.settings()
+        settings = await self.settings()
         path = conf_path(self.config_dir, iface)
         parsed = read_conf(path) or {"interface": {}, "peers": []}
         interface = dict(parsed.get("interface") or {})
@@ -1862,7 +1862,7 @@ class MullvadService:
         except Exception as exc:
             log.warning("mullvad persist unit failed iface=%s: %s", iface, exc)
         # Seed account settings from conf only when missing — never wipe relay_metric.
-        current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+        current = await self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         if not str(current.get("private_key") or "").strip() or not str(current.get("address") or "").strip():
             seeded = dict(current) if isinstance(current, dict) else {}
             seeded["private_key"] = str(current.get("private_key") or private_key)
@@ -1873,7 +1873,7 @@ class MullvadService:
                 mode = normalize_relay_mode(settings.get("relay_mode") or settings.get("selection_mode"))
                 seeded["relay_mode"] = mode
                 seeded["selection_mode"] = mode
-            self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, seeded)
+            await self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, seeded)
 
     async def reload_bindings(self) -> dict[str, Any]:
         """Recreate missing Mullvad confs from stored bindings and bring tunnels up.
@@ -1885,7 +1885,7 @@ class MullvadService:
         restored: list[str] = []
         persisted: list[str] = []
         failed: list[dict[str, str]] = []
-        binds = self.bindings()
+        binds = await self.bindings()
         if not binds:
             return {
                 "ok": True,
@@ -1897,7 +1897,7 @@ class MullvadService:
                 "failed": failed,
             }
 
-        account = self.settings()
+        account = await self.settings()
         for bind in binds:
             iface = normalize_exit_interface(str(bind.get("iface") or ""))
             if not iface:
@@ -1960,7 +1960,7 @@ class MullvadService:
         restored: list[str] = []
         persisted: list[str] = []
         failed: list[str] = []
-        for bind in self.bindings():
+        for bind in await self.bindings():
             iface = normalize_exit_interface(str(bind.get("iface") or ""))
             if not iface:
                 continue
@@ -2163,17 +2163,17 @@ class MullvadService:
             return None
         return {"public_key": parts[0], "endpoint": parts[2] if parts[2] != "(none)" else ""}
 
-    def _seed_settings_from_conf(self, parsed: dict[str, Any]) -> None:
+    async def _seed_settings_from_conf(self, parsed: dict[str, Any]) -> None:
         interface = parsed.get("interface") or {}
         private_key = str(interface.get("PrivateKey") or "").strip()
         address = str(interface.get("Address") or "").strip()
-        current = self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
+        current = await self.store.get_doc(CORE, KIND_SETTINGS, SETTINGS_ID) or {}
         if current.get("private_key") and current.get("address"):
             return
         if not private_key and not address:
             return
         mode = normalize_relay_mode(current.get("relay_mode") or current.get("selection_mode"))
-        self.store.put_doc(
+        await self.store.put_doc(
             CORE,
             KIND_SETTINGS,
             SETTINGS_ID,
@@ -2186,7 +2186,7 @@ class MullvadService:
             },
         )
 
-    def _put_binding(
+    async def _put_binding(
         self,
         *,
         country_code: str,
@@ -2195,7 +2195,7 @@ class MullvadService:
         adopted: bool,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        current = self.binding_for(country_code) or {}
+        current = await self.binding_for(country_code) or {}
         payload = {
             "country_code": country_code,
             "country_name": str((relay or {}).get("country_name") or current.get("country_name") or country_code),
@@ -2213,7 +2213,7 @@ class MullvadService:
         }
         if extra:
             payload.update(extra)
-        self.store.put_doc(CORE, KIND_LOCATION, country_code, payload)
+        await self.store.put_doc(CORE, KIND_LOCATION, country_code, payload)
 
     def _present_binding(self, bind: dict[str, Any]) -> dict[str, Any]:
         fixed = bool(bind.get("fixed") or bind.get("pinned"))

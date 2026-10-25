@@ -104,35 +104,39 @@ def _runner(args, timeout=30, check=False, input_text=None):
 
 
 def test_mullvad_reload_rewrites_a_deleted_conf(tmp_path):
-    store = Store(tmp_path / "agent.db")
-    try:
-        store.put_doc(
-            "mullvad",
-            "settings",
-            "account",
-            {"private_key": "privkeyprivkeyprivkeyprivkeyprivkey12=", "address": "10.64.0.8/32"},
-        )
-        store.put_doc(
-            "mullvad",
-            "location",
-            "de",
-            {
-                "country_code": "de",
-                "iface": "de",
-                "pubkey": "relayrelayrelayrelayrelayrelayrelayrelayrelay=",
-                "endpoint": "185.213.154.0:51820",
-            },
-        )
-        service = MullvadService(
-            store,
-            config_dir=tmp_path / "wg",
-            runner=_runner,
-            persist_script=tmp_path / "bin" / "hold.sh",
-            persist_unit_path=tmp_path / "unit" / "mullvad.conf",
-        )
-        result = asyncio.run(service.reload_bindings())
-    finally:
-        store.close()
+    async def run():
+        store = Store(tmp_path / "agent.db")
+        await store.open()
+        try:
+            await store.put_doc(
+                "mullvad",
+                "settings",
+                "account",
+                {"private_key": "privkeyprivkeyprivkeyprivkeyprivkey12=", "address": "10.64.0.8/32"},
+            )
+            await store.put_doc(
+                "mullvad",
+                "location",
+                "de",
+                {
+                    "country_code": "de",
+                    "iface": "de",
+                    "pubkey": "relayrelayrelayrelayrelayrelayrelayrelayrelay=",
+                    "endpoint": "185.213.154.0:51820",
+                },
+            )
+            service = MullvadService(
+                store,
+                config_dir=tmp_path / "wg",
+                runner=_runner,
+                persist_script=tmp_path / "bin" / "hold.sh",
+                persist_unit_path=tmp_path / "unit" / "mullvad.conf",
+            )
+            return await service.reload_bindings()
+        finally:
+            await store.close()
+
+    result = asyncio.run(run())
 
     text = (tmp_path / "wg" / "de.conf").read_text(encoding="utf-8")
     assert result["ok"] is True
@@ -144,7 +148,6 @@ def test_mullvad_reload_rewrites_a_deleted_conf(tmp_path):
 
 
 def test_mullvad_reload_keeps_a_live_conf(tmp_path):
-    store = Store(tmp_path / "agent.db")
     conf = tmp_path / "wg" / "de.conf"
     conf.parent.mkdir()
     original = (
@@ -157,35 +160,41 @@ def test_mullvad_reload_keeps_a_live_conf(tmp_path):
         "Endpoint = 185.213.154.0:51820\n"
     )
     conf.write_text(original, encoding="utf-8")
-    try:
-        store.put_doc(
-            "mullvad",
-            "settings",
-            "account",
-            {"private_key": "privkeyprivkeyprivkeyprivkeyprivkey12=", "address": "10.64.0.8/32"},
-        )
-        store.put_doc(
-            "mullvad",
-            "location",
-            "de",
-            {
-                "country_code": "de",
-                "iface": "de",
-                "pubkey": "relayrelayrelayrelayrelayrelayrelayrelayrelay=",
-                "endpoint": "185.213.154.0:51820",
-            },
-        )
-        service = MullvadService(
-            store,
-            config_dir=tmp_path / "wg",
-            runner=_runner,
-            persist_script=tmp_path / "bin" / "hold.sh",
-            persist_unit_path=tmp_path / "unit" / "mullvad.conf",
-        )
-        service._iface_up = lambda iface: True
-        result = asyncio.run(service.reload_bindings())
-    finally:
-        store.close()
+
+    async def run():
+        store = Store(tmp_path / "agent.db")
+        await store.open()
+        try:
+            await store.put_doc(
+                "mullvad",
+                "settings",
+                "account",
+                {"private_key": "privkeyprivkeyprivkeyprivkeyprivkey12=", "address": "10.64.0.8/32"},
+            )
+            await store.put_doc(
+                "mullvad",
+                "location",
+                "de",
+                {
+                    "country_code": "de",
+                    "iface": "de",
+                    "pubkey": "relayrelayrelayrelayrelayrelayrelayrelayrelay=",
+                    "endpoint": "185.213.154.0:51820",
+                },
+            )
+            service = MullvadService(
+                store,
+                config_dir=tmp_path / "wg",
+                runner=_runner,
+                persist_script=tmp_path / "bin" / "hold.sh",
+                persist_unit_path=tmp_path / "unit" / "mullvad.conf",
+            )
+            service._iface_up = lambda iface: True
+            return await service.reload_bindings()
+        finally:
+            await store.close()
+
+    result = asyncio.run(run())
 
     assert result["ok"] is True
     assert result["rebuilt"] == []

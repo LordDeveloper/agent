@@ -13,7 +13,12 @@ class _Result:
 
 def test_diagnose_reports_missing_user(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    report = asyncio.run(diagnose_user_address(store, 'openvpn', '10.8.0.5', runner=lambda *a, **k: _Result()))
+
+    async def run():
+        await store.open()
+        return await diagnose_user_address(store, 'openvpn', '10.8.0.5', runner=lambda *a, **k: _Result())
+
+    report = asyncio.run(run())
     assert report['found'] is False
     assert report['summary']['healthy'] is False
     assert report['issues'][0]['code'] == 'USER_NOT_FOUND'
@@ -21,29 +26,34 @@ def test_diagnose_reports_missing_user(tmp_path):
 
 def test_diagnose_finds_user_and_flags_down_unit(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    store.put_doc(
-        'openvpn',
-        'server',
-        '1',
-        {
-            'id': 1,
-            'name': 'ovpn-1',
-            'subnet': '10.8.0.0/24',
-            'listen_port': 1194,
-            'tun_dev': 'ovpn1',
-            'users': [
-                {
-                    'id': 'u1',
-                    'email': 'u1@test',
-                    'username': 'alice',
-                    'password': 'pass',
-                    'address': '10.8.0.5',
-                    'is_enabled': True,
-                    'exit_interface': 'eth0',
-                }
-            ],
-        },
-    )
+
+    async def seed():
+        await store.open()
+        await store.put_doc(
+            'openvpn',
+            'server',
+            '1',
+            {
+                'id': 1,
+                'name': 'ovpn-1',
+                'subnet': '10.8.0.0/24',
+                'listen_port': 1194,
+                'tun_dev': 'ovpn1',
+                'users': [
+                    {
+                        'id': 'u1',
+                        'email': 'u1@test',
+                        'username': 'alice',
+                        'password': 'pass',
+                        'address': '10.8.0.5',
+                        'is_enabled': True,
+                        'exit_interface': 'eth0',
+                    }
+                ],
+            },
+        )
+
+    asyncio.run(seed())
 
     def runner(args, timeout=10):
         if args[:3] == ['systemctl', 'is-active', 'openvpn-server@ovpn-1.service']:

@@ -10,6 +10,9 @@ dev:
 test:
 	pytest -q
 
+check-sync-io:
+	python scripts/check_no_sync_io.py
+
 smoke:
 	python scripts/smoke.py
 

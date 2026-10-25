@@ -3,12 +3,11 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from agent.asyncutil import run_sync
 from agent.errors import AgentError
+from agent.support.process import run as async_run
 
 KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
 
@@ -17,40 +16,31 @@ def which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
 
-def run_cmd(
+async def run_cmd(
     args: list[str],
     check: bool = True,
     *,
     timeout: float = 300,
-    cwd: str | None = None,
     env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        check=check,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd=cwd,
-        env=env,
-    )
+) -> Any:
+    return await async_run(args, check=check, timeout=timeout, env=env)
 
 
-def _prepare_xray_service(result: dict) -> dict:
+async def _prepare_xray_service(result: dict) -> dict:
     try:
         from agent.xray_service import ensure_xray_running
 
         # Keep-alive semantics: start only when inactive (never bounce a live unit).
-        result["service"] = run_sync(ensure_xray_running(
+        result["service"] = await ensure_xray_running(
             binary=str(result.get("binary") or os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")),
             api_base=str(result.get("api_base") or os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080")),
-        ))
+        )
     except AgentError as exc:
         result["service_error"] = exc.message
     return result
 
 
-def install_xray(
+async def install_xray(
     *,
     github_token: str | None = None,
     force: bool = False,
@@ -68,7 +58,7 @@ def install_xray(
     ready = dest.is_file() and binary_has_httpapi(dest)
     had_stock = dest.is_file() and not ready
     if ready and not force and not tag:
-        return _prepare_xray_service({
+        return await _prepare_xray_service({
             "core": "xray",
             "installed": True,
             "downloaded": False,
@@ -88,11 +78,11 @@ def install_xray(
 
     if dest.is_file():
         try:
-            run_sync(stop_xray_service())
+            await stop_xray_service()
         except AgentError:
             pass
 
-    result = install_xray_binary(dest, token=github_token, tag=tag)
+    result = await install_xray_binary(dest, token=github_token, tag=tag)
     result["replaced_stock"] = had_stock
     result["httpapi_capable"] = binary_has_httpapi(dest)
     if dest.is_file() and not result["httpapi_capable"]:
@@ -102,16 +92,16 @@ def install_xray(
             "Confirm LordDeveloper/xray release zip is the customized fork "
             "(not stock XTLS), and GITHUB_TOKEN can read that repo if private.",
         )
-    result = _prepare_xray_service(result)
+    result = await _prepare_xray_service(result)
     return result
 
 
-def install_wireguard() -> dict:
+async def install_wireguard() -> dict:
     if which("wg"):
         return {"core": "wireguard", "installed": True, "message": "already installed"}
     if which("apt-get"):
-        run_cmd(["apt-get", "update", "-y"], check=False)
-        run_cmd(["apt-get", "install", "-y", "wireguard"], check=False)
+        await run_cmd(["apt-get", "update", "-y"], check=False)
+        await run_cmd(["apt-get", "install", "-y", "wireguard"], check=False)
     if not which("wg"):
         raise AgentError("VALIDATION_ERROR", "wireguard tools (wg) not available after install")
     return {"core": "wireguard", "installed": True, "message": "installed"}
@@ -184,7 +174,7 @@ def ensure_stroke_plugin_enabled() -> None:
             ) from exc
 
 
-def _apt_install(packages: list[str]) -> str:
+async def _apt_install(packages: list[str]) -> str:
     if not which('apt-get'):
         raise AgentError(
             'VALIDATION_ERROR',
@@ -192,8 +182,8 @@ def _apt_install(packages: list[str]) -> str:
             f'(need {", ".join(packages)})',
         )
     # libcharon-extra-plugins is in universe on Ubuntu.
-    run_cmd(['apt-get', 'update', '-y'], check=False)
-    proc = run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+    await run_cmd(['apt-get', 'update', '-y'], check=False)
+    proc = await run_cmd(['apt-get', 'install', '-y', *packages], check=False)
     out = ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
     if proc.returncode != 0:
         raise AgentError(
@@ -204,7 +194,7 @@ def _apt_install(packages: list[str]) -> str:
     return out
 
 
-def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
+async def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
     """
     Ensure xl2tpd + strongSwan starter/stroke are installed and stroke is loadable.
 
@@ -227,7 +217,7 @@ def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
     apt_log = ''
 
     if need_pkgs:
-        apt_log = _apt_install(packages)
+        apt_log = await _apt_install(packages)
 
     if not which('xl2tpd'):
         raise AgentError('VALIDATION_ERROR', 'xl2tpd not available after install')
@@ -267,12 +257,12 @@ def ensure_l2tp_ipsec_runtime(*, force_apt: bool = False) -> dict[str, Any]:
     }
 
 
-def install_l2tp() -> dict:
+async def install_l2tp() -> dict:
     """Install xl2tpd, ppp, and strongSwan via apt when available."""
-    return ensure_l2tp_ipsec_runtime(force_apt=False)
+    return await ensure_l2tp_ipsec_runtime(force_apt=False)
 
 
-def install_openvpn() -> dict:
+async def install_openvpn() -> dict:
     """Install OpenVPN via apt when available."""
     packages = ['openvpn', 'openssl']
     have_bin = bool(which('openvpn'))
@@ -283,8 +273,8 @@ def install_openvpn() -> dict:
                 'VALIDATION_ERROR',
                 'apt-get missing; cannot install OpenVPN package',
             )
-        run_cmd(['apt-get', 'update', '-y'], check=False)
-        proc = run_cmd(['apt-get', 'install', '-y', *packages], check=False)
+        await run_cmd(['apt-get', 'update', '-y'], check=False)
+        proc = await run_cmd(['apt-get', 'install', '-y', *packages], check=False)
         apt_log = ((proc.stdout or '') + (proc.stderr or ''))[-800:]
         if proc.returncode != 0 and not which('openvpn'):
             raise AgentError(
@@ -310,7 +300,7 @@ def install_openvpn() -> dict:
     )
     try:
         dropin.write_text(body, encoding='utf-8')
-        run_cmd(['systemctl', 'daemon-reload'], check=False)
+        await run_cmd(['systemctl', 'daemon-reload'], check=False)
     except OSError:
         pass
 
@@ -346,7 +336,7 @@ INSTALLERS = {
 }
 
 
-def install_core(
+async def install_core(
     name: str,
     *,
     github_token: str | None = None,
@@ -358,10 +348,10 @@ def install_core(
     if installer is None:
         raise AgentError("CONFIG_NOT_FOUND", f"Unknown core [{name}]. Known: {', '.join(KNOWN_CORES)}")
     if key == "xray":
-        return installer(github_token=github_token, force=force, tag=tag)
+        return await installer(github_token=github_token, force=force, tag=tag)
     if key == "amnezia":
         return installer(github_token=github_token, force=force)
-    return installer()
+    return await installer()
 
 
 def write_env_file(
@@ -460,7 +450,7 @@ WantedBy=multi-user.target
 """
 
 
-def relax_agent_start_post(unit_path: Path | None = None, runner=None) -> bool:
+async def relax_agent_start_post(unit_path: Path | None = None, runner=None) -> bool:
     """Stop an already-installed unit from waiting on peer-egress-apply.sh.
 
     Older units run that script as ExecStartPost. After a server transfer the
@@ -493,36 +483,37 @@ def relax_agent_start_post(unit_path: Path | None = None, runner=None) -> bool:
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     except OSError:
         return False
-    execute = runner or run_cmd
+    from agent.support.process import execute as run_process
+
     try:
-        execute(["systemctl", "daemon-reload"], check=False, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
+        await run_process(runner, ["systemctl", "daemon-reload"], check=False, timeout=30)
+    except (OSError, TimeoutError):
         pass
     return True
 
 
-def service_action(action: str) -> dict:
+async def service_action(action: str) -> dict:
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found (Linux systemd required)")
     if action == "install":
         unit = systemd_unit_path()
         unit.write_text(default_unit_text(), encoding="utf-8")
-        run_cmd(["systemctl", "daemon-reload"], check=False)
-        run_cmd(["systemctl", "enable", "agent"], check=False)
+        await run_cmd(["systemctl", "daemon-reload"], check=False)
+        await run_cmd(["systemctl", "enable", "agent"], check=False)
         return {"action": "install", "unit": str(unit), "ok": True}
     if action == "uninstall":
-        run_cmd(["systemctl", "stop", "agent"], check=False)
-        run_cmd(["systemctl", "disable", "agent"], check=False)
+        await run_cmd(["systemctl", "stop", "agent"], check=False)
+        await run_cmd(["systemctl", "disable", "agent"], check=False)
         unit = systemd_unit_path()
         if unit.exists():
             unit.unlink()
-        run_cmd(["systemctl", "daemon-reload"], check=False)
+        await run_cmd(["systemctl", "daemon-reload"], check=False)
         return {"action": "uninstall", "ok": True}
 
     allowed = {"start", "stop", "restart", "status", "enable", "disable"}
     if action not in allowed:
         raise AgentError("VALIDATION_ERROR", f"Unknown service action [{action}]")
-    proc = run_cmd(["systemctl", action, "agent"], check=False)
+    proc = await run_cmd(["systemctl", action, "agent"], check=False)
     return {
         "action": action,
         "ok": proc.returncode == 0,
@@ -532,17 +523,17 @@ def service_action(action: str) -> dict:
     }
 
 
-def service_is_active() -> bool:
+async def service_is_active() -> bool:
     if not which("systemctl"):
         return False
-    proc = run_cmd(["systemctl", "is-active", "agent"], check=False)
+    proc = await run_cmd(["systemctl", "is-active", "agent"], check=False)
     return (proc.stdout or "").strip() == "active"
 
 
-def service_logs(limit: int = 16) -> list[str]:
+async def service_logs(limit: int = 16) -> list[str]:
     if not which("journalctl"):
         return []
-    proc = run_cmd(
+    proc = await run_cmd(
         ["journalctl", "-u", "agent", "-n", str(max(1, limit)), "--no-pager", "-o", "short-iso"],
         check=False,
     )

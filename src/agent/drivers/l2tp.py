@@ -104,7 +104,7 @@ class L2tpDriver(CoreDriver):
     async def install(self) -> dict[str, Any]:
         from agent.ops import install_l2tp
 
-        result = install_l2tp()
+        result = await install_l2tp()
         # Apply conf + clean-restart strongSwan so stroke/charon.ctl take effect now.
         try:
             await self._apply_all_configs()
@@ -118,7 +118,7 @@ class L2tpDriver(CoreDriver):
         await self._apply_all_configs()
         await self._ensure_services(start=True)
         await self._sync_peer_egress()
-        return {'enabled': True, 'servers': len(self.list_servers())}
+        return {'enabled': True, 'servers': len(await self.list_servers())}
 
     async def reconcile_runtime(self, *, drop_keys: list[str] | None = None) -> None:
         """Re-derive companion egress from WG peers without bouncing xl2tpd."""
@@ -133,14 +133,14 @@ class L2tpDriver(CoreDriver):
         await self._ensure_services(start=True, restart=True)
         return {'restarted': True}
 
-    def list_servers(self) -> list[dict[str, Any]]:
-        return self.store.list_docs(self.key, self._kind)
+    async def list_servers(self) -> list[dict[str, Any]]:
+        return await self.store.list_docs(self.key, self._kind)
 
-    def get_server(self, server_id: int | str) -> dict[str, Any]:
-        doc = self.store.get_doc(self.key, self._kind, str(server_id))
+    async def get_server(self, server_id: int | str) -> dict[str, Any]:
+        doc = await self.store.get_doc(self.key, self._kind, str(server_id))
         if doc:
             return doc
-        for row in self.list_servers():
+        for row in await self.list_servers():
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
                 return row
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
@@ -149,7 +149,7 @@ class L2tpDriver(CoreDriver):
         server_id = payload.get('id')
         if server_id is None:
             existing = []
-            for row in self.list_servers():
+            for row in await self.list_servers():
                 try:
                     existing.append(int(row.get('id', 0)))
                 except (TypeError, ValueError):
@@ -157,7 +157,7 @@ class L2tpDriver(CoreDriver):
             server_id = max(existing + [0]) + 1
 
         name = str(payload.get('name') or f'l2tp-{server_id}')
-        subnet = normalize_l2tp_subnet(str(payload.get('subnet') or self._default_subnet(server_id)))
+        subnet = normalize_l2tp_subnet(str(payload.get('subnet') or await self._default_subnet(server_id)))
         psk = str(payload.get('ipsec_psk') or '').strip() or DEFAULT_IPSEC_PSK
         templates = normalize_templates(payload.get('templates'))
         server = {
@@ -171,14 +171,14 @@ class L2tpDriver(CoreDriver):
             'templates': templates,
             'users': list(payload.get('users') or []),
         }
-        self.store.put_doc(self.key, self._kind, str(server_id), server)
-        self.audit.record('create', f'{self.key}/server/{server_id}')
+        await self.store.put_doc(self.key, self._kind, str(server_id), server)
+        await self.audit.record('create', f'{self.key}/server/{server_id}')
         await self._apply_all_configs()
         await self._ensure_services(start=True)
         return server
 
-    def _default_subnet(self, server_id: int | str) -> str:
-        used = {normalize_l2tp_subnet(str(r.get('subnet') or '')) for r in self.list_servers()}
+    async def _default_subnet(self, server_id: int | str) -> str:
+        used = {normalize_l2tp_subnet(str(r.get('subnet') or '')) for r in await self.list_servers()}
         base = 160
         sid = int(server_id) if str(server_id).isdigit() else 0
         second = base + (sid % 32)
@@ -191,14 +191,14 @@ class L2tpDriver(CoreDriver):
                 return candidate
         raise AgentError('VALIDATION_ERROR', 'No free /16 subnet for L2TP server')
 
-    def _used_addresses_for_subnet(self, subnet: str) -> set[str]:
+    async def _used_addresses_for_subnet(self, subnet: str) -> set[str]:
         """Collect assigned IPs across all L2TP servers that share this /16."""
         try:
             target = normalize_l2tp_subnet(subnet)
         except AgentError:
             return set()
         used: set[str] = set()
-        for row in self.list_servers():
+        for row in await self.list_servers():
             try:
                 if normalize_l2tp_subnet(str(row.get('subnet') or '')) != target:
                     continue
@@ -210,7 +210,7 @@ class L2tpDriver(CoreDriver):
                     used.add(addr)
         return used
 
-    def _allocate_l2tp_address(
+    async def _allocate_l2tp_address(
         self,
         subnet: str,
         *,
@@ -218,9 +218,9 @@ class L2tpDriver(CoreDriver):
         exclude_user_id: str | None = None,
     ) -> str:
         """Pick a free L2TP client IP unique across every server on this /16."""
-        used = self._used_addresses_for_subnet(subnet)
+        used = await self._used_addresses_for_subnet(subnet)
         if exclude_user_id is not None:
-            for row in self.list_servers():
+            for row in await self.list_servers():
                 for user in row.get('users') or []:
                     if str(user.get('id')) == str(exclude_user_id):
                         used.discard(str(user.get('address') or '').strip())
@@ -236,11 +236,11 @@ class L2tpDriver(CoreDriver):
 
         return next_l2tp_ip(subnet, used)
 
-    def _repair_duplicate_addresses(self) -> int:
+    async def _repair_duplicate_addresses(self) -> int:
         """Reassign client IPs that collide across companion/pure L2TP servers."""
         # address -> list of (server_id, user_index)
         collisions: dict[str, list[tuple[str, int]]] = {}
-        servers = list(self.list_servers())
+        servers = list(await self.list_servers())
         by_id = {str(row.get('id')): row for row in servers}
 
         for row in servers:
@@ -268,12 +268,12 @@ class L2tpDriver(CoreDriver):
                     continue
                 subnet = str(server.get('subnet') or '')
                 user = (server.get('users') or [])[idx]
-                new_addr = self._allocate_l2tp_address(
+                new_addr = await self._allocate_l2tp_address(
                     subnet,
                     exclude_user_id=str(user.get('id') or ''),
                 )
                 server['users'][idx]['address'] = new_addr
-                self.store.put_doc(self.key, self._kind, sid, server)
+                await self.store.put_doc(self.key, self._kind, sid, server)
                 changed += 1
                 log.warning(
                     'reassigned duplicate L2TP IP %s -> %s (server=%s user=%s)',
@@ -284,7 +284,7 @@ class L2tpDriver(CoreDriver):
                 )
         return changed
 
-    def _align_server_subnets_to_users(self) -> int:
+    async def _align_server_subnets_to_users(self) -> int:
         """If every client IP sits in another /16, move the server subnet to match.
 
         Panel used to rewrite companion subnet from inbound-id while users kept
@@ -293,7 +293,7 @@ class L2tpDriver(CoreDriver):
         import ipaddress
 
         changed = 0
-        for server in self.list_servers():
+        for server in await self.list_servers():
             votes: dict[str, int] = {}
             for user in server.get('users') or []:
                 if not isinstance(user, dict):
@@ -321,7 +321,7 @@ class L2tpDriver(CoreDriver):
             sid = str(server.get('id'))
             server['subnet'] = inferred
             server['gateway'] = l2tp_gateway(inferred)
-            self.store.put_doc(self.key, self._kind, sid, server)
+            await self.store.put_doc(self.key, self._kind, sid, server)
             changed += 1
             log.warning(
                 'l2tp aligned server %s subnet %s -> %s from client addresses',
@@ -332,7 +332,7 @@ class L2tpDriver(CoreDriver):
         return changed
 
     async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
         if 'subnet' in updates and updates['subnet'] is not None:
             new_subnet = normalize_l2tp_subnet(str(updates['subnet']))
@@ -365,16 +365,16 @@ class L2tpDriver(CoreDriver):
         if 'templates' in updates:
             updates['templates'] = normalize_templates(updates.get('templates'))
         server.update(updates)
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
         return server
 
     async def delete_server(self, server_id: int | str) -> bool:
-        server = self.get_server(server_id)
-        if not self.store.delete_doc(self.key, self._kind, str(server.get('id'))):
+        server = await self.get_server(server_id)
+        if not await self.store.delete_doc(self.key, self._kind, str(server.get('id'))):
             raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
-        self.audit.record('delete', f'{self.key}/server/{server_id}')
+        await self.audit.record('delete', f'{self.key}/server/{server_id}')
         await self._apply_all_configs()
         return True
 
@@ -385,7 +385,7 @@ class L2tpDriver(CoreDriver):
         *,
         apply: bool = True,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         user = normalize_peer(payload)
         user.setdefault('id', str(uuid.uuid4()))
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
@@ -400,7 +400,7 @@ class L2tpDriver(CoreDriver):
                     if existing_addr:
                         assert_l2tp_address(subnet, existing_addr)
                     # Another companion server may already own this IP — force a new one.
-                    used_by_others = self._used_addresses_for_subnet(subnet)
+                    used_by_others = await self._used_addresses_for_subnet(subnet)
                     used_by_others.discard(existing_addr)
                     if existing_addr and existing_addr in used_by_others:
                         raise AgentError('VALIDATION_ERROR', f'Duplicate L2TP address [{existing_addr}]')
@@ -417,7 +417,7 @@ class L2tpDriver(CoreDriver):
                         str(existing.get('id') or existing.get('email')),
                         apply=apply,
                     )
-                    server = self.get_server(server_id)
+                    server = await self.get_server(server_id)
                     break
             if same_email:
                 # Peer identity rotate: drop the stale user so username/password/address can change.
@@ -426,12 +426,12 @@ class L2tpDriver(CoreDriver):
                     str(existing.get('id') or existing.get('email')),
                     apply=apply,
                 )
-                server = self.get_server(server_id)
+                server = await self.get_server(server_id)
                 break
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        user['address'] = self._allocate_l2tp_address(
+        user['address'] = await self._allocate_l2tp_address(
             str(server.get('subnet') or ''),
             preferred=str(user.get('address') or '') or None,
         )
@@ -444,11 +444,11 @@ class L2tpDriver(CoreDriver):
         user.setdefault('connected_at', None)
         user.setdefault('max_connection', 0)
         user.setdefault('ip_logs', [])
-        self._ensure_user_exit_interface(user)
+        await self._ensure_user_exit_interface(user)
 
         server.setdefault('users', []).append(user)
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        self.audit.record('create', f'{self.key}/user/{user.get("id")}')
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.audit.record('create', f'{self.key}/user/{user.get("id")}')
         if apply:
             await self._commit_user_runtime()
         return user
@@ -461,7 +461,7 @@ class L2tpDriver(CoreDriver):
         *,
         apply: bool = True,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
                 merged = deepcopy(user)
@@ -477,9 +477,9 @@ class L2tpDriver(CoreDriver):
                     from agent.support.disable_reason import clear_disabled_metadata
 
                     clear_disabled_metadata(merged)
-                self._ensure_user_exit_interface(merged)
+                await self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
-                self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
                 if apply:
                     # Soft ensure — never restart xl2tpd/ipsec (keeps existing PPP sessions).
                     await self._commit_user_runtime()
@@ -487,17 +487,17 @@ class L2tpDriver(CoreDriver):
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
     async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
         if len(filtered) == len(users):
             raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
         server['users'] = filtered
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         if apply:
             # chap-secrets update only — do not bounce live tunnels.
             await self._commit_user_runtime()
-        self.audit.record('delete', f'{self.key}/user/{user_id}')
+        await self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
     async def _commit_user_runtime(self) -> None:
@@ -528,7 +528,7 @@ class L2tpDriver(CoreDriver):
                 continue
             try:
                 uid = str(row.get('id') or row.get('email') or '')
-                existing = self._find_user(server_id, uid) if uid else None
+                existing = await self._find_user(server_id, uid) if uid else None
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
@@ -549,22 +549,22 @@ class L2tpDriver(CoreDriver):
 
         return {'applied': applied, 'failed': failed, 'errors': errors}
 
-    def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
-        server = self.get_server(server_id)
+    async def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
+        server = await self.get_server(server_id)
         for user in server.get('users') or []:
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
                 return user
         return None
 
-    def user_config_bundle(
+    async def user_config_bundle(
         self,
         server_id: int | str,
         user_id: str,
         *,
         endpoint_host: str | None = None,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
-        user = self._find_user(server_id, user_id)
+        server = await self.get_server(server_id)
+        user = await self._find_user(server_id, user_id)
         if user is None:
             raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
@@ -606,7 +606,7 @@ class L2tpDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
         rows: list[InboundUsageModel] = []
-        for server in self.list_servers():
+        for server in await self.list_servers():
             clients = []
             for user in server.get('users') or []:
                 if not record_is_enabled(user):
@@ -639,7 +639,7 @@ class L2tpDriver(CoreDriver):
         await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
-        for server in self.list_servers():
+        for server in await self.list_servers():
             for user in server.get('users') or []:
                 if not user.get('online') or not record_is_enabled(user):
                     continue
@@ -663,7 +663,7 @@ class L2tpDriver(CoreDriver):
     async def sync_user_stats(self) -> None:
         sessions = await self._collect_ppp_sessions()
         now = int(time.time())
-        for server in self.list_servers():
+        for server in await self.list_servers():
             changed = False
             for user in server.get('users') or []:
                 if not isinstance(user, dict):
@@ -688,7 +688,7 @@ class L2tpDriver(CoreDriver):
                     if linked:
                         # Bill the WireGuard/Amnezia peer — L2TP is only the access layer.
                         if delta_in or delta_out:
-                            self._credit_linked_peer(linked, delta_in, delta_out)
+                            await self._credit_linked_peer(linked, delta_in, delta_out)
                     else:
                         user['incoming'] = int(user.get('incoming') or 0) + delta_in
                         user['outgoing'] = int(user.get('outgoing') or 0) + delta_out
@@ -701,9 +701,9 @@ class L2tpDriver(CoreDriver):
                 ):
                     changed = True
             if changed:
-                self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
 
-    def _credit_linked_peer(self, linked_peer_id: str, delta_in: int, delta_out: int) -> bool:
+    async def _credit_linked_peer(self, linked_peer_id: str, delta_in: int, delta_out: int) -> bool:
         """Add companion PPP bytes to the linked WG/Amnezia peer cumulative counters."""
         if delta_in <= 0 and delta_out <= 0:
             return False
@@ -712,7 +712,7 @@ class L2tpDriver(CoreDriver):
             return False
 
         for core in ('wireguard', 'amnezia'):
-            for iface in self.store.list_docs(core, 'interface'):
+            for iface in await self.store.list_docs(core, 'interface'):
                 if not isinstance(iface, dict):
                     continue
                 peers = iface.get('peers') or []
@@ -726,7 +726,7 @@ class L2tpDriver(CoreDriver):
                         continue
                     peer['incoming'] = int(peer.get('incoming') or 0) + delta_in
                     peer['outgoing'] = int(peer.get('outgoing') or 0) + delta_out
-                    self.store.put_doc(core, 'interface', str(iface.get('id')), iface)
+                    await self.store.put_doc(core, 'interface', str(iface.get('id')), iface)
                     log.info(
                         'l2tp credited %s/%s bytes to %s peer %s',
                         delta_in,
@@ -755,21 +755,21 @@ class L2tpDriver(CoreDriver):
                 return None
         return None
 
-    def backup(self) -> dict[str, Any]:
-        return {'servers': self.list_servers()}
+    async def backup(self) -> dict[str, Any]:
+        return {'servers': await self.list_servers()}
 
     async def restore(self, payload: dict[str, Any]) -> None:
         servers = payload.get('servers')
         if not isinstance(servers, list):
             raise AgentError('VALIDATION_ERROR', 'backup.servers must be a list', 422)
-        for row in self.store.list_docs(self.key, self._kind):
-            self.store.delete_doc(self.key, self._kind, str(row.get('id')))
+        for row in await self.store.list_docs(self.key, self._kind):
+            await self.store.delete_doc(self.key, self._kind, str(row.get('id')))
         for server in servers:
             if isinstance(server, dict) and server.get('id') is not None:
-                self.store.put_doc(self.key, self._kind, str(server['id']), server)
+                await self.store.put_doc(self.key, self._kind, str(server['id']), server)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
-        self.audit.record('restore', self.key)
+        await self.audit.record('restore', self.key)
 
     def _config_dir(self) -> Path:
         return Path(self.settings.l2tp.config_dir)
@@ -781,9 +781,9 @@ class L2tpDriver(CoreDriver):
 
     async def _apply_all_configs(self) -> None:
         # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
-        self._repair_duplicate_addresses()
-        self._align_server_subnets_to_users()
-        servers = self.list_servers()
+        await self._repair_duplicate_addresses()
+        await self._align_server_subnets_to_users()
+        servers = await self.list_servers()
         templates = resolve_templates(servers)
         staging = self._staging_dir()
         try:
@@ -810,23 +810,23 @@ class L2tpDriver(CoreDriver):
         await self._install_to_system(staging)
         await self._sync_peer_egress()
 
-    def _egress_interfaces(self) -> list[dict[str, Any]]:
+    async def _egress_interfaces(self) -> list[dict[str, Any]]:
         from agent.support.peer_egress import l2tp_servers_as_interfaces
 
-        servers = self.list_servers()
+        servers = await self.list_servers()
         for server in servers:
             for user in server.get('users') or []:
                 if isinstance(user, dict):
-                    self._ensure_user_exit_interface(user)
+                    await self._ensure_user_exit_interface(user)
         return l2tp_servers_as_interfaces(servers)
 
-    def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
+    async def _ensure_user_exit_interface(self, user: dict[str, Any]) -> None:
         """Keep companion users aligned with the linked WireGuard/Amnezia peer."""
         from agent.support.l2tp_companion import apply_linked_state, is_companion_user
         from agent.support.peer_egress import normalize_exit_interface
 
         if is_companion_user(user):
-            apply_linked_state(user, self.store)
+            await apply_linked_state(user, self.store)
             return
 
         current = normalize_exit_interface(user.get('exit_interface'))
@@ -838,7 +838,7 @@ class L2tpDriver(CoreDriver):
             from agent.support.l2tp_companion import sync_companions
             from agent.support.peer_egress import reconcile_core_egress
 
-            result = sync_companions(self.store, drop_keys=drop_keys)
+            result = await sync_companions(self.store, drop_keys=drop_keys)
             if result.get('changed'):
                 log.info(
                     'l2tp companions synced updated=%s removed=%s',
@@ -848,10 +848,10 @@ class L2tpDriver(CoreDriver):
                 await self._apply_all_configs()
                 await self._ensure_services(start=True)
 
-            reconcile_core_egress(
+            await reconcile_core_egress(
                 self.store,
                 self.key,
-                self._egress_interfaces(),
+                await self._egress_interfaces(),
                 data_dir=self.settings.data_dir,
             )
             await self._install_ppp_egress_hook()
@@ -929,7 +929,7 @@ class L2tpDriver(CoreDriver):
         from agent.ops import charon_ctl_ready, ensure_l2tp_ipsec_runtime
 
         try:
-            ensure_l2tp_ipsec_runtime()
+            await ensure_l2tp_ipsec_runtime()
         except Exception as exc:
             log.error('l2tp ipsec runtime ensure failed: %s', exc)
             if not self.installed():

@@ -33,7 +33,7 @@ async def mullvad_worker_loop(
 
     while not stop_event.is_set():
         try:
-            # These methods are async. to_thread() only calls them, so the
+            # These methods are async; await repair on the loop directly.
             # return value is an unawaited coroutine and .get() crashes.
             restored = await service.restore_interfaces()
             if restored.get("restored") or restored.get("failed"):
@@ -63,8 +63,7 @@ async def mullvad_worker_loop(
             # exit ifaces are up again. Force only when exits were touched.
             touched = bool(restored.get("restored") or changed)
             try:
-                repair = await asyncio.to_thread(
-                    repair_peer_egress,
+                repair = await repair_peer_egress(
                     store,
                     data_dir=settings.data_dir,
                     force=touched,

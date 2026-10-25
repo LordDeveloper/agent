@@ -23,7 +23,7 @@ from agent.adguard import (
     remove_agent_adguard_systemd_unit,
     restore_resolved_stub_listener,
 )
-from agent.asyncutil import maybe_await
+from agent.asyncutil import maybe_await, run_sync
 from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.support.host_interfaces import list_host_interfaces
@@ -127,7 +127,7 @@ _MULLVAD_IFACE_CACHE_AT = 0.0
 _MULLVAD_IFACE_CACHE_TTL = 30.0
 
 
-def _mullvad_bound_ifaces(*, force: bool = False) -> set[str]:
+async def _mullvad_bound_ifaces(*, force: bool = False) -> set[str]:
     """Iface names bound as Mullvad region exits in the Agent store.
 
     Cached: v0.4.65 opened a fresh Store per interface check and thrashed SQLite
@@ -163,7 +163,8 @@ def _mullvad_bound_ifaces(*, force: bool = False) -> set[str]:
             return set()
         # Read-only snapshot via a short-lived connection; never hold across calls.
         store = Store(db_path)
-        for row in store.list_docs('mullvad', 'location'):
+        await store.open()
+        for row in await store.list_docs('mullvad', 'location'):
             if not isinstance(row, dict):
                 continue
             iface = str(row.get('iface') or '').strip()
@@ -174,7 +175,7 @@ def _mullvad_bound_ifaces(*, force: bool = False) -> set[str]:
     finally:
         if store is not None:
             try:
-                store.close()
+                await store.close()
             except Exception:
                 pass
 
@@ -202,7 +203,7 @@ def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> b
     lowered = str(name or '').strip().lower()
     if not lowered:
         return False
-    bound_names = _mullvad_bound_ifaces() if bound is None else bound
+    bound_names = run_sync(_mullvad_bound_ifaces()) if bound is None else bound
     if lowered in bound_names:
         return True
 
@@ -215,7 +216,7 @@ def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> b
 def _mullvad_exit_gateway_ips(*, bound: set[str] | None = None) -> set[str]:
     """Tunnel Address IPs used by Mullvad exits — never bind AdGuard here."""
     ips: set[str] = set()
-    bound_names = _mullvad_bound_ifaces() if bound is None else bound
+    bound_names = run_sync(_mullvad_bound_ifaces()) if bound is None else bound
     names = set(bound_names)
     for directory in _wg_conf_dirs():
         if not directory.is_dir():
@@ -413,7 +414,7 @@ async def discover_vpn_interfaces(*, runner: Runner | None = None) -> list[dict[
     seen_names: set[str] = set()
     seen_gateways: set[str] = set()
     # One store snapshot per discover pass — never reopen SQLite per iface.
-    bound = _mullvad_bound_ifaces()
+    bound = await _mullvad_bound_ifaces()
     mullvad_gateways = _mullvad_exit_gateway_ips(bound=bound)
 
     for item in await maybe_await(list_host_interfaces(runner=runner)):
@@ -870,9 +871,9 @@ async def ensure_dns_leak_unit(script_path: Path, *, runner: Runner | None = Non
     }
 
 
-def _filter_client_vpn_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _filter_client_vpn_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop Mullvad exits / shared exit Addresses from ads/dns targets."""
-    bound = _mullvad_bound_ifaces()
+    bound = await _mullvad_bound_ifaces()
     mullvad_gateways = _mullvad_exit_gateway_ips(bound=bound)
     out: list[dict[str, Any]] = []
     for row in targets:
@@ -893,7 +894,7 @@ async def cleanup_mullvad_exit_dns_artifacts(*, runner: Runner | None = None) ->
     if not shutil.which('resolvectl'):
         return []
     actions: list[str] = []
-    bound = _mullvad_bound_ifaces()
+    bound = await _mullvad_bound_ifaces()
     names: set[str] = set(bound)
     for directory in _wg_conf_dirs():
         if not directory.is_dir():
@@ -940,7 +941,7 @@ async def ensure_vpn_dns_resolver(
                 'VPN interface list has no IPv4 gateway addresses',
             )
 
-    targets = _filter_client_vpn_targets(targets)
+    targets = await _filter_client_vpn_targets(targets)
     if not targets:
         raise AgentError(
             'VALIDATION_ERROR',

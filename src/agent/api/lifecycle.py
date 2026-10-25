@@ -45,13 +45,11 @@ def attach_lifecycle(router: APIRouter, *, core: str, get_driver: Callable) -> N
         tag_raw = payload.get("tag") or payload.get("version") or payload.get("release_tag")
         tag = tag_raw.strip() if isinstance(tag_raw, str) and tag_raw.strip() else None
         try:
-            result = await maybe_await(
-                run_install(
-                    core,
-                    github_token=token if isinstance(token, str) else None,
-                    force=force,
-                    tag=tag,
-                )
+            result = await run_install(
+                core,
+                github_token=token if isinstance(token, str) else None,
+                force=force,
+                tag=tag,
             )
         except AgentError as exc:
             raise_agent_error(exc.code, exc.message, exc.status)

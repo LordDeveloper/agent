@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,8 +23,10 @@ DISABLED_QDISC = 'pfifo_fast'
 DISABLED_CC = 'cubic'
 
 
-def _run(args: list[str], *, timeout: int = 60, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=check)
+async def _run(args: list[str], *, timeout: int = 60, check: bool = False):
+    from agent.support.process import run
+
+    return await run(args, timeout=timeout, check=check)
 
 
 def _require_linux() -> None:
@@ -39,8 +40,8 @@ def _require_root() -> None:
         raise AgentError('VALIDATION_ERROR', 'BBR management requires root (run with sudo)')
 
 
-def _read_sysctl(key: str) -> str:
-    proc = _run(['sysctl', '-n', key], timeout=10)
+async def _read_sysctl(key: str) -> str:
+    proc = await _run(['sysctl', '-n', key], timeout=10)
     if proc.returncode != 0:
         return ''
     return (proc.stdout or '').strip()
@@ -50,8 +51,8 @@ def _module_loaded() -> bool:
     return Path('/sys/module/tcp_bbr').is_dir()
 
 
-def _kernel_supports_bbr() -> bool:
-    available = _read_sysctl('net.ipv4.tcp_available_congestion_control')
+async def _kernel_supports_bbr() -> bool:
+    available = await _read_sysctl('net.ipv4.tcp_available_congestion_control')
     return 'bbr' in {part.strip() for part in available.split() if part.strip()}
 
 
@@ -68,12 +69,12 @@ def _persisted_settings() -> dict[str, str]:
     return out
 
 
-def bbr_status() -> dict[str, Any]:
+async def bbr_status() -> dict[str, Any]:
     _require_linux()
-    current_cc = _read_sysctl('net.ipv4.tcp_congestion_control')
-    current_qdisc = _read_sysctl('net.core.default_qdisc')
-    available = _read_sysctl('net.ipv4.tcp_available_congestion_control')
-    supported = _kernel_supports_bbr()
+    current_cc = await _read_sysctl('net.ipv4.tcp_congestion_control')
+    current_qdisc = await _read_sysctl('net.core.default_qdisc')
+    available = await _read_sysctl('net.ipv4.tcp_available_congestion_control')
+    supported = await _kernel_supports_bbr()
     enabled = current_cc == 'bbr'
     return {
         'supported': supported,
@@ -115,38 +116,38 @@ def _write_sysctl(settings: dict[str, str]) -> dict[str, Any]:
     return {'path': str(BBR_SYSCTL_PATH), 'written': written}
 
 
-def _load_module() -> dict[str, Any]:
+async def _load_module() -> dict[str, Any]:
     if _module_loaded():
         return {'loaded': True, 'modprobe': False}
     modprobe = shutil.which('modprobe')
     if not modprobe:
         raise AgentError('VALIDATION_ERROR', 'modprobe not found; cannot load tcp_bbr module')
-    proc = _run([modprobe, 'tcp_bbr'], timeout=30)
+    proc = await _run([modprobe, 'tcp_bbr'], timeout=30)
     if proc.returncode != 0 and not _module_loaded():
         detail = (proc.stderr or proc.stdout or '').strip()[:300]
         raise AgentError('VALIDATION_ERROR', f'Failed to load tcp_bbr: {detail or "unknown error"}')
     return {'loaded': _module_loaded(), 'modprobe': True}
 
 
-def bbr_install(*, apply: bool = False) -> dict[str, Any]:
+async def bbr_install(*, apply: bool = False) -> dict[str, Any]:
     """Prepare tcp_bbr module persistence and sysctl drop-in."""
     _require_linux()
     _require_root()
-    if not _kernel_supports_bbr():
-        loaded = _load_module()
-        if not _kernel_supports_bbr():
+    if not await _kernel_supports_bbr():
+        loaded = await _load_module()
+        if not await _kernel_supports_bbr():
             raise AgentError(
                 'UNSUPPORTED_CAPABILITY',
                 'Kernel does not expose BBR (upgrade kernel or enable CONFIG_TCP_CONGESTION_BBR)',
             )
     else:
-        loaded = _load_module()
+        loaded = await _load_module()
 
     module = _write_module_load()
     sysctl = _write_sysctl(BBR_SETTINGS)
     applied: dict[str, str] | None = None
     if apply:
-        applied = _apply_sysctl(BBR_SETTINGS)
+        applied = await _apply_sysctl(BBR_SETTINGS)
     return {
         'installed': True,
         'module': loaded,
@@ -157,10 +158,10 @@ def bbr_install(*, apply: bool = False) -> dict[str, Any]:
     }
 
 
-def _apply_sysctl(settings: dict[str, str]) -> dict[str, str]:
+async def _apply_sysctl(settings: dict[str, str]) -> dict[str, str]:
     applied: dict[str, str] = {}
     for key, value in settings.items():
-        proc = _run(['sysctl', '-w', f'{key}={value}'], timeout=15)
+        proc = await _run(['sysctl', '-w', f'{key}={value}'], timeout=15)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or '').strip()[:200]
             raise AgentError('VALIDATION_ERROR', f'Failed to apply {key}={value}: {detail or "unknown error"}')
@@ -168,13 +169,13 @@ def _apply_sysctl(settings: dict[str, str]) -> dict[str, str]:
     return applied
 
 
-def bbr_enable() -> dict[str, Any]:
+async def bbr_enable() -> dict[str, Any]:
     _require_linux()
     _require_root()
-    install = bbr_install(apply=False)
-    applied = _apply_sysctl(BBR_SETTINGS)
+    install = await bbr_install(apply=False)
+    applied = await _apply_sysctl(BBR_SETTINGS)
     _write_sysctl(BBR_SETTINGS)
-    status = bbr_status()
+    status = await bbr_status()
     return {
         'enabled': status['enabled'],
         'installed': True,
@@ -184,10 +185,10 @@ def bbr_enable() -> dict[str, Any]:
     }
 
 
-def bbr_disable(*, remove_persistence: bool = False) -> dict[str, Any]:
+async def bbr_disable(*, remove_persistence: bool = False) -> dict[str, Any]:
     _require_linux()
     _require_root()
-    applied = _apply_sysctl(
+    applied = await _apply_sysctl(
         {
             'net.ipv4.tcp_congestion_control': DISABLED_CC,
             'net.core.default_qdisc': DISABLED_QDISC,
@@ -203,7 +204,7 @@ def bbr_disable(*, remove_persistence: bool = False) -> dict[str, Any]:
         BBR_SYSCTL_PATH.unlink()
         removed.append(str(BBR_SYSCTL_PATH))
 
-    status = bbr_status()
+    status = await bbr_status()
     return {
         'enabled': status['enabled'],
         'applied': applied,

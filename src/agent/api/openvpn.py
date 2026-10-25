@@ -35,7 +35,7 @@ async def status(openvpn: OpenVpnDriver = Depends(get_openvpn)):
 
 @router.get('/servers')
 async def list_servers(openvpn: OpenVpnDriver = Depends(get_openvpn)):
-    return {'success': True, 'servers': openvpn.list_servers()}
+    return {'success': True, 'servers': await openvpn.list_servers()}
 
 
 @router.post('/servers')
@@ -50,7 +50,7 @@ async def create_server(payload: OpenVpnServerPayload, openvpn: OpenVpnDriver = 
 @router.get('/servers/{server_id}')
 async def get_server(server_id: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
     try:
-        server = openvpn.get_server(server_id)
+        server = await openvpn.get_server(server_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
@@ -134,7 +134,7 @@ async def user_config(
     openvpn: OpenVpnDriver = Depends(get_openvpn),
 ):
     try:
-        bundle = openvpn.user_config_bundle(server_id, user_id, endpoint_host=endpoint or None)
+        bundle = await openvpn.user_config_bundle(server_id, user_id, endpoint_host=endpoint or None)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, **bundle}

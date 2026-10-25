@@ -90,7 +90,7 @@ class OpenVpnDriver(CoreDriver):
         return shutil.which('openvpn') is not None
 
     async def running(self) -> bool:
-        for server in self.list_servers():
+        for server in await self.list_servers():
             if await self._unit_active(self._unit_name(server)):
                 return True
         return False
@@ -106,7 +106,7 @@ class OpenVpnDriver(CoreDriver):
     async def install(self) -> dict[str, Any]:
         from agent.ops import install_openvpn
 
-        result = install_openvpn()
+        result = await install_openvpn()
         try:
             await self._apply_all_configs()
             await self._ensure_services(start=True)
@@ -116,7 +116,7 @@ class OpenVpnDriver(CoreDriver):
         return result
 
     async def enable(self) -> dict[str, Any]:
-        servers = self.list_servers()
+        servers = await self.list_servers()
         if not servers:
             raise AgentError(
                 'VALIDATION_ERROR',
@@ -128,20 +128,20 @@ class OpenVpnDriver(CoreDriver):
         await self._sync_peer_egress()
         return {
             'enabled': True,
-            'servers': len(self.list_servers()),
+            'servers': len(await self.list_servers()),
             'units': units,
             'running': await self.running(),
         }
 
     async def disable(self) -> dict[str, Any]:
-        for server in self.list_servers():
+        for server in await self.list_servers():
             unit = self._unit_name(server)
             await run(['systemctl', 'stop', unit], check=False, timeout=30)
             await run(['systemctl', 'disable', unit], check=False, timeout=30)
         return {'enabled': False}
 
     async def restart(self) -> dict[str, Any]:
-        servers = self.list_servers()
+        servers = await self.list_servers()
         if not servers:
             raise AgentError(
                 'VALIDATION_ERROR',
@@ -152,14 +152,14 @@ class OpenVpnDriver(CoreDriver):
         units = await self._ensure_services(start=True, restart=True)
         return {'restarted': True, 'units': units, 'running': await self.running()}
 
-    def list_servers(self) -> list[dict[str, Any]]:
-        return self.store.list_docs(self.key, self._kind)
+    async def list_servers(self) -> list[dict[str, Any]]:
+        return await self.store.list_docs(self.key, self._kind)
 
-    def get_server(self, server_id: int | str) -> dict[str, Any]:
-        doc = self.store.get_doc(self.key, self._kind, str(server_id))
+    async def get_server(self, server_id: int | str) -> dict[str, Any]:
+        doc = await self.store.get_doc(self.key, self._kind, str(server_id))
         if doc:
             return doc
-        for row in self.list_servers():
+        for row in await self.list_servers():
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
                 return row
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN server [{server_id}] not found', 404)
@@ -168,7 +168,7 @@ class OpenVpnDriver(CoreDriver):
         server_id = payload.get('id')
         if server_id is None:
             existing = []
-            for row in self.list_servers():
+            for row in await self.list_servers():
                 try:
                     existing.append(int(row.get('id', 0)))
                 except (TypeError, ValueError):
@@ -176,7 +176,7 @@ class OpenVpnDriver(CoreDriver):
             server_id = max(existing + [0]) + 1
 
         name = str(payload.get('name') or f'openvpn-{server_id}')
-        subnet = normalize_openvpn_subnet(str(payload.get('subnet') or self._default_subnet(server_id)))
+        subnet = normalize_openvpn_subnet(str(payload.get('subnet') or await self._default_subnet(server_id)))
         proto = str(payload.get('proto') or 'udp').strip().lower()
         if proto not in {'udp', 'tcp'}:
             proto = 'udp'
@@ -192,15 +192,15 @@ class OpenVpnDriver(CoreDriver):
             'public_host': str(payload.get('public_host') or ''),
             'users': list(payload.get('users') or []),
         }
-        self.store.put_doc(self.key, self._kind, str(server_id), server)
-        self.audit.record('create', f'{self.key}/server/{server_id}')
+        await self.store.put_doc(self.key, self._kind, str(server_id), server)
+        await self.audit.record('create', f'{self.key}/server/{server_id}')
         await self._apply_all_configs()
         await self._ensure_services(start=True)
         return server
 
-    def _default_subnet(self, server_id: int | str) -> str:
+    async def _default_subnet(self, server_id: int | str) -> str:
         used = set()
-        for row in self.list_servers():
+        for row in await self.list_servers():
             try:
                 used.add(normalize_openvpn_subnet(str(row.get('subnet') or '')))
             except AgentError:
@@ -217,13 +217,13 @@ class OpenVpnDriver(CoreDriver):
                 return normalized
         raise AgentError('VALIDATION_ERROR', 'No free /24 subnet for OpenVPN server')
 
-    def _used_addresses(self, subnet: str) -> set[str]:
+    async def _used_addresses(self, subnet: str) -> set[str]:
         try:
             target = normalize_openvpn_subnet(subnet)
         except AgentError:
             return set()
         used: set[str] = set()
-        for row in self.list_servers():
+        for row in await self.list_servers():
             try:
                 if normalize_openvpn_subnet(str(row.get('subnet') or '')) != target:
                     continue
@@ -235,16 +235,16 @@ class OpenVpnDriver(CoreDriver):
                     used.add(addr.split('/', 1)[0])
         return used
 
-    def _allocate_address(
+    async def _allocate_address(
         self,
         subnet: str,
         *,
         preferred: str | None = None,
         exclude_user_id: str | None = None,
     ) -> str:
-        used = self._used_addresses(subnet)
+        used = await self._used_addresses(subnet)
         if exclude_user_id is not None:
-            for row in self.list_servers():
+            for row in await self.list_servers():
                 for user in row.get('users') or []:
                     if str(user.get('id')) == str(exclude_user_id):
                         used.discard(str(user.get('address') or '').split('/', 1)[0].strip())
@@ -259,7 +259,7 @@ class OpenVpnDriver(CoreDriver):
         return next_openvpn_ip(subnet, used)
 
     async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
         if 'subnet' in updates and updates['subnet'] is not None:
             updates['subnet'] = normalize_openvpn_subnet(str(updates['subnet']))
@@ -274,13 +274,13 @@ class OpenVpnDriver(CoreDriver):
         server.update(updates)
         if not server.get('tun_dev'):
             server['tun_dev'] = tun_dev_for_server(server)
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
         return server
 
     async def delete_server(self, server_id: int | str) -> bool:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         unit = self._unit_name(server)
         await run(['systemctl', 'stop', unit], check=False, timeout=30)
         await run(['systemctl', 'disable', unit], check=False, timeout=30)
@@ -294,9 +294,9 @@ class OpenVpnDriver(CoreDriver):
                 shutil.rmtree(server_dir, ignore_errors=True)
         except OSError as exc:
             log.warning('openvpn cleanup failed: %s', exc)
-        if not self.store.delete_doc(self.key, self._kind, str(server.get('id'))):
+        if not await self.store.delete_doc(self.key, self._kind, str(server.get('id'))):
             raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN server [{server_id}] not found', 404)
-        self.audit.record('delete', f'{self.key}/server/{server_id}')
+        await self.audit.record('delete', f'{self.key}/server/{server_id}')
         await self._sync_peer_egress()
         return True
 
@@ -307,7 +307,7 @@ class OpenVpnDriver(CoreDriver):
         *,
         apply: bool = True,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         user = normalize_peer(payload)
         user.setdefault('id', str(uuid.uuid4()))
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
@@ -325,7 +325,7 @@ class OpenVpnDriver(CoreDriver):
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        user['address'] = self._allocate_address(
+        user['address'] = await self._allocate_address(
             str(server.get('subnet') or ''),
             preferred=str(user.get('address') or '') or None,
         )
@@ -340,8 +340,8 @@ class OpenVpnDriver(CoreDriver):
         self._ensure_user_exit_interface(user)
 
         server.setdefault('users', []).append(user)
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        self.audit.record('create', f'{self.key}/user/{user.get("id")}')
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.audit.record('create', f'{self.key}/user/{user.get("id")}')
         if apply:
             await self._commit_user_runtime(server)
         return user
@@ -354,7 +354,7 @@ class OpenVpnDriver(CoreDriver):
         *,
         apply: bool = True,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
                 merged = deepcopy(user)
@@ -372,23 +372,23 @@ class OpenVpnDriver(CoreDriver):
                     clear_disabled_metadata(merged)
                 self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
-                self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
                 if apply:
                     await self._commit_user_runtime(server)
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
     async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
-        server = self.get_server(server_id)
+        server = await self.get_server(server_id)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
         if len(filtered) == len(users):
             raise AgentError('CLIENT_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
         server['users'] = filtered
-        self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         if apply:
             await self._commit_user_runtime(server)
-        self.audit.record('delete', f'{self.key}/user/{user_id}')
+        await self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
     async def _commit_user_runtime(self, server: dict[str, Any]) -> None:
@@ -417,7 +417,7 @@ class OpenVpnDriver(CoreDriver):
                 continue
             try:
                 uid = str(row.get('id') or row.get('email') or '')
-                existing = self._find_user(server_id, uid) if uid else None
+                existing = await self._find_user(server_id, uid) if uid else None
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
@@ -430,33 +430,33 @@ class OpenVpnDriver(CoreDriver):
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
                     if applied:
-                        await self._commit_user_runtime(self.get_server(server_id))
+                        await self._commit_user_runtime(await self.get_server(server_id))
                     raise
         if applied:
-            await self._commit_user_runtime(self.get_server(server_id))
+            await self._commit_user_runtime(await self.get_server(server_id))
         return {'applied': applied, 'failed': failed, 'errors': errors}
 
-    def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
-        server = self.get_server(server_id)
+    async def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
+        server = await self.get_server(server_id)
         for user in server.get('users') or []:
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
                 return user
         return None
 
-    def user_config_bundle(
+    async def user_config_bundle(
         self,
         server_id: int | str,
         user_id: str,
         *,
         endpoint_host: str | None = None,
     ) -> dict[str, Any]:
-        server = self.get_server(server_id)
-        user = self._find_user(server_id, user_id)
+        server = await self.get_server(server_id)
+        user = await self._find_user(server_id, user_id)
         if user is None:
             raise AgentError('CLIENT_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
         host = endpoint_host or server.get('public_host') or '127.0.0.1'
-        pki = self._pki_texts(server)
+        pki = await self._pki_texts(server)
         ovpn = render_client_ovpn(
             server,
             user,
@@ -487,7 +487,7 @@ class OpenVpnDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
         rows: list[InboundUsageModel] = []
-        for server in self.list_servers():
+        for server in await self.list_servers():
             clients = []
             for user in server.get('users') or []:
                 if not record_is_enabled(user):
@@ -517,7 +517,7 @@ class OpenVpnDriver(CoreDriver):
         await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
-        for server in self.list_servers():
+        for server in await self.list_servers():
             for user in server.get('users') or []:
                 if not user.get('online') or not record_is_enabled(user):
                     continue
@@ -546,7 +546,7 @@ class OpenVpnDriver(CoreDriver):
     async def sync_user_stats(self) -> None:
         sessions_by_user: dict[str, dict[str, Any]] = {}
         sessions_by_ip: dict[str, dict[str, Any]] = {}
-        for server in self.list_servers():
+        for server in await self.list_servers():
             text = ''
             for status_path in self._status_log_paths(server):
                 if not status_path.is_file():
@@ -568,7 +568,7 @@ class OpenVpnDriver(CoreDriver):
                     sessions_by_ip[vip] = row
 
         now = int(time.time())
-        for server in self.list_servers():
+        for server in await self.list_servers():
             changed = False
             for user in server.get('users') or []:
                 if not isinstance(user, dict):
@@ -620,7 +620,7 @@ class OpenVpnDriver(CoreDriver):
                 ):
                     changed = True
             if changed:
-                self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
 
     def _connected_unix(self, user: dict[str, Any]) -> int | None:
         value = user.get('connected_at')
@@ -629,19 +629,19 @@ class OpenVpnDriver(CoreDriver):
         except (TypeError, ValueError):
             return None
 
-    def backup(self) -> dict[str, Any]:
-        return {'servers': self.list_servers()}
+    async def backup(self) -> dict[str, Any]:
+        return {'servers': await self.list_servers()}
 
     async def restore(self, payload: dict[str, Any]) -> None:
         servers = payload.get('servers') if isinstance(payload, dict) else None
         if not isinstance(servers, list):
             raise AgentError('VALIDATION_ERROR', 'backup.servers must be a list', 422)
-        for row in list(self.list_servers()):
-            self.store.delete_doc(self.key, self._kind, str(row.get('id')))
+        for row in list(await self.list_servers()):
+            await self.store.delete_doc(self.key, self._kind, str(row.get('id')))
         for row in servers:
             if not isinstance(row, dict) or row.get('id') is None:
                 continue
-            self.store.put_doc(self.key, self._kind, str(row['id']), row)
+            await self.store.put_doc(self.key, self._kind, str(row['id']), row)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
 
@@ -659,8 +659,8 @@ class OpenVpnDriver(CoreDriver):
     def _pki_dir(self, server: dict[str, Any]) -> Path:
         return self._staging_dir() / 'pki' / instance_name_for_server(server)
 
-    def _pki_texts(self, server: dict[str, Any]) -> dict[str, str]:
-        return ensure_server_pki(
+    async def _pki_texts(self, server: dict[str, Any]) -> dict[str, str]:
+        return await ensure_server_pki(
             self._pki_dir(server),
             common_name=instance_name_for_server(server),
         )
@@ -778,14 +778,14 @@ class OpenVpnDriver(CoreDriver):
         staging.mkdir(parents=True, exist_ok=True)
         _SYSTEM_SERVER_ROOT.mkdir(parents=True, exist_ok=True)
 
-        for server in self.list_servers():
+        for server in await self.list_servers():
             instance = instance_name_for_server(server)
             server_dir = _SYSTEM_SERVER_ROOT / instance
             ccd_dir = server_dir / 'ccd'
             server_dir.mkdir(parents=True, exist_ok=True)
             ccd_dir.mkdir(parents=True, exist_ok=True)
 
-            pki = ensure_server_pki(self._pki_dir(server), common_name=instance)
+            pki = await ensure_server_pki(self._pki_dir(server), common_name=instance)
             for name, key in (
                 ('ca.crt', 'ca_crt'),
                 ('server.crt', 'server_crt'),
@@ -878,7 +878,7 @@ class OpenVpnDriver(CoreDriver):
         self._install_unit_dropin()
         await run(['systemctl', 'daemon-reload'], check=False, timeout=30)
 
-        servers = self.list_servers()
+        servers = await self.list_servers()
         if not servers:
             return []
 
@@ -945,10 +945,10 @@ class OpenVpnDriver(CoreDriver):
         if current:
             user['exit_interface'] = current
 
-    def _egress_interfaces(self) -> list[dict[str, Any]]:
+    async def _egress_interfaces(self) -> list[dict[str, Any]]:
         from agent.support.peer_egress import openvpn_servers_as_interfaces
 
-        servers = self.list_servers()
+        servers = await self.list_servers()
         for server in servers:
             for user in server.get('users') or []:
                 if isinstance(user, dict):
@@ -959,10 +959,10 @@ class OpenVpnDriver(CoreDriver):
         try:
             from agent.support.peer_egress import reconcile_core_egress
 
-            reconcile_core_egress(
+            await reconcile_core_egress(
                 self.store,
                 self.key,
-                self._egress_interfaces(),
+                await self._egress_interfaces(),
                 data_dir=self.settings.data_dir,
             )
         except Exception:

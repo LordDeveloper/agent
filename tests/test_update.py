@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -68,22 +69,24 @@ def test_fetch_latest_release(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *args):
+        async def __aexit__(self, *args):
             return False
 
-        def get(self, url, headers=None):
+        async def get(self, url, headers=None):
             assert "releases/latest" in url
             assert headers["Authorization"] == "Bearer secret-token"
             return FakeResponse()
 
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    release = fetch_latest_release(
-        repo="LordDeveloper/agent",
-        token="secret-token",
-        asset_name="agent-linux-gnu-amd64",
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    release = asyncio.run(
+        fetch_latest_release(
+            repo="LordDeveloper/agent",
+            token="secret-token",
+            asset_name="agent-linux-gnu-amd64",
+        ),
     )
     assert release.version == "0.2.0"
     assert release.asset_id == 42

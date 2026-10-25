@@ -299,7 +299,9 @@ def test_group_locations_uses_alias_iface():
 
 
 def _service(tmp_path: Path, runner=None, probe=None, egress=None) -> MullvadService:
-    store = Store(tmp_path / "agent.db")
+    from tests.conftest import open_store
+
+    store = open_store(tmp_path / "agent.db")
     conf = tmp_path / "wg"
     conf.mkdir()
     svc = MullvadService(

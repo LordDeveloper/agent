@@ -22,29 +22,34 @@ class _Result(SimpleNamespace):
 
 def _store_with_peer(tmp_path) -> Store:
     store = Store(tmp_path / "agent.db")
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "name": "wg1",
-            "listen_port": 51820,
-            "subnet": "10.80.0.0/24",
-            "public_key": "iface-pub",
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "user@test",
-                    "address": "10.80.0.5",
-                    "allowed_ips": "10.80.0.5/32",
-                    "public_key": "peer-pub-key",
-                    "exit_interface": "eth1",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
+
+    async def seed():
+        await store.open()
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "name": "wg1",
+                "listen_port": 51820,
+                "subnet": "10.80.0.0/24",
+                "public_key": "iface-pub",
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "user@test",
+                        "address": "10.80.0.5",
+                        "allowed_ips": "10.80.0.5/32",
+                        "public_key": "peer-pub-key",
+                        "exit_interface": "eth1",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+
+    asyncio.run(seed())
     return store
 
 
@@ -61,16 +66,21 @@ def test_allowed_ips_cover_host_does_not_use_substring_match():
 
 def test_find_peers_by_address(tmp_path):
     store = _store_with_peer(tmp_path)
-    rows = find_peers_by_address(store, "wireguard", "10.80.0.5")
+    rows = asyncio.run(find_peers_by_address(store, "wireguard", "10.80.0.5"))
     assert len(rows) == 1
     assert rows[0]["peer"]["email"] == "user@test"
 
 
 def test_diagnose_reports_missing_peer(tmp_path):
     store = Store(tmp_path / "empty.db")
-    report = asyncio.run(
-        diagnose_peer_address(store, "wireguard", "10.80.0.99", runner=lambda *a, **k: _Result())
-    )
+
+    async def run():
+        await store.open()
+        return await diagnose_peer_address(
+            store, "wireguard", "10.80.0.99", runner=lambda *a, **k: _Result()
+        )
+
+    report = asyncio.run(run())
     assert report["found"] is False
     assert report["issues"][0]["code"] == "PEER_NOT_FOUND"
 
@@ -135,9 +145,13 @@ def test_diagnose_detects_routing_and_live_peer(tmp_path, monkeypatch):
 
 def test_diagnose_flags_missing_exit_and_live_peer(tmp_path, monkeypatch):
     store = _store_with_peer(tmp_path)
-    iface = store.get_doc("wireguard", "interface", "1")
-    iface["peers"][0].pop("exit_interface", None)
-    store.put_doc("wireguard", "interface", "1", iface)
+
+    async def tweak():
+        iface = await store.get_doc("wireguard", "interface", "1")
+        iface["peers"][0].pop("exit_interface", None)
+        await store.put_doc("wireguard", "interface", "1", iface)
+
+    asyncio.run(tweak())
 
     monkeypatch.setattr("agent.support.peer_diagnose._read_sysctl", lambda path: "1")
 

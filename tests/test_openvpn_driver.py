@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.audit import AuditLog
-from agent.db import Store
+from tests.conftest import open_store
 from agent.drivers.openvpn import OpenVpnDriver
 from agent.support.openvpn_config import (
     parse_status_v2,
@@ -41,7 +41,7 @@ async def _async_none(*_args, **_kwargs):
 
 
 def _driver(tmp_path: Path) -> OpenVpnDriver:
-    store = Store(tmp_path / "agent.db")
+    store = open_store(tmp_path / "agent.db")
     settings = _settings(tmp_path)
     audit = AuditLog(store)
     drv = OpenVpnDriver(settings, audit, store)
@@ -132,7 +132,14 @@ CLIENT_LIST,alice,1.2.3.4:1194,10.8.0.2,,10485760,31457280,2026-09-25 12:00:00,1
     assert rows[0]["bytes_sent"] == 31_457_280
 
 
-def test_openvpn_crud_users(tmp_path: Path):
+def test_openvpn_crud_users(tmp_path: Path, monkeypatch):
+    async def _noop_egress(*_a, **_k):
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "agent.support.peer_egress.reconcile_core_egress",
+        _noop_egress,
+    )
     drv = _driver(tmp_path)
     drv._pki_texts = lambda _server: {  # type: ignore[method-assign]
         "ca_crt": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
@@ -142,18 +149,19 @@ def test_openvpn_crud_users(tmp_path: Path):
         server = await drv.create_server({"name": "main", "subnet": "10.8.1.0/24", "public_host": "1.2.3.4"})
         user = await drv.add_user(1, {"email": "u1@test", "exit_interface": "us"})
         updated = await drv.update_user(1, user["id"], {"exit_interface": "de", "is_enabled": True})
-        bundle = drv.user_config_bundle(1, user["id"], endpoint_host="vpn.test")
+        bundle = await drv.user_config_bundle(1, user["id"], endpoint_host="vpn.test")
         deleted = await drv.delete_user(1, user["id"])
-        return server, user, updated, bundle, deleted
+        listed = await drv.list_servers()
+        remaining = await drv.get_server(1)
+        return server, user, updated, bundle, deleted, listed, remaining
 
-    server, user, updated, bundle, deleted = asyncio.run(scenario())
+    server, user, updated, bundle, deleted, listed, remaining = asyncio.run(scenario())
     assert server["id"] == 1
     assert server["gateway"] == "10.8.1.1"
     assert user["username"]
     assert user["address"].startswith("10.8.1.")
     assert user["exit_interface"] == "us"
 
-    listed = drv.list_servers()
     assert len(listed) == 1
     assert listed[0]["users"] == []
 
@@ -163,7 +171,7 @@ def test_openvpn_crud_users(tmp_path: Path):
     assert "remote vpn.test" in bundle["ovpn"]
     assert "TEST" in bundle["ovpn"]
     assert deleted is True
-    assert drv.get_server(1)["users"] == []
+    assert remaining["users"] == []
 
 
 def test_openvpn_batch_users_commits_runtime_once(tmp_path: Path):
@@ -210,7 +218,7 @@ def test_openvpn_servers_as_interfaces_for_egress():
     assert ifaces[0]["peers"][0]["address"] == "10.8.2.10"
 
 
-@patch("agent.drivers.openvpn.ensure_server_pki")
+@patch("agent.drivers.openvpn.ensure_server_pki", new_callable=lambda: __import__("unittest.mock").mock.AsyncMock)
 def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
     mock_pki.return_value = {
         "ca_crt": "CA",
@@ -224,10 +232,10 @@ def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
 
     async def scenario():
         await drv.create_server({"name": "main"})
-        return await drv.add_user(1, {"email": "a@b"})
+        user = await drv.add_user(1, {"email": "a@b"})
+        bundle = await drv.user_config_bundle(1, user["id"], endpoint_host="h")
+        return bundle
 
-    user = asyncio.run(scenario())
-    # Re-enable real bundle path without apply
-    bundle = OpenVpnDriver.user_config_bundle(drv, 1, user["id"], endpoint_host="h")
+    bundle = asyncio.run(scenario())
     assert "CA" in bundle["ovpn"]
     assert "TC" in bundle["ovpn"]

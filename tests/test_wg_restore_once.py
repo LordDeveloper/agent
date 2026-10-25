@@ -8,7 +8,7 @@ from agent.drivers.wireguard import WireGuardDriver, _materialize_peer_keypair
 
 
 class _Audit:
-    def record(self, *args, **kwargs) -> None:
+    async def record(self, *args, **kwargs) -> None:
         return None
 
 
@@ -36,14 +36,18 @@ def test_sync_linked_l2tp_awaits_reconcile(tmp_path, monkeypatch):
 
     monkeypatch.setattr(l2tp_mod, "L2tpDriver", FakeL2tp)
     store = Store(tmp_path / "agent.db")
-    settings = AgentSettings(data_dir=str(tmp_path), db_path=str(store.path))
-    driver = WireGuardDriver(settings, _Audit(), store)
 
-    asyncio.run(driver._sync_linked_l2tp(["peer-1"]))
+    async def run():
+        await store.open()
+        settings = AgentSettings(data_dir=str(tmp_path), db_path=str(store.path))
+        driver = WireGuardDriver(settings, _Audit(), store)
+        await driver._sync_linked_l2tp(["peer-1"])
+        await store.close()
+
+    asyncio.run(run())
 
     assert seen["ready"] is True
     assert seen["drop_keys"] == ["peer-1"]
-    store.close()
 
 
 def test_restore_brings_each_interface_up_once(tmp_path, monkeypatch):
@@ -59,7 +63,7 @@ def test_restore_brings_each_interface_up_once(tmp_path, monkeypatch):
     async def create_interface(payload, *, apply=True):
         calls.append(("create", apply, payload.get("name")))
         iface = {"id": 7, "name": payload.get("name") or "wg0", "peers": []}
-        store.put_doc("wireguard", "interface", "7", iface)
+        await store.put_doc("wireguard", "interface", "7", iface)
         return iface
 
     async def stage_peers(interface_id, peers):
@@ -79,25 +83,35 @@ def test_restore_brings_each_interface_up_once(tmp_path, monkeypatch):
     monkeypatch.setattr(driver, "_stage_peers", stage_peers)
     monkeypatch.setattr(driver, "_bring_up", bring_up)
     monkeypatch.setattr(driver, "delete_interface", delete_interface)
-    store.put_doc("wireguard", "interface", "1", {"id": 1, "name": "old"})
 
-    asyncio.run(
-        driver.restore(
-            {
-                "interfaces": [
-                    {
-                        "name": "wg0",
-                        "private_key": "server",
-                        "public_key": "serverpub",
-                        "peers": [
-                            {"id": "a", "public_key": "p1", "private_key": "k1", "address": "10.90.68.2"},
-                            {"id": "b", "public_key": "p2", "private_key": "k2", "address": "10.90.68.5"},
-                        ],
-                    }
-                ]
-            }
-        )
-    )
+    async def run():
+        await store.open()
+        try:
+            await store.put_doc(
+                "wireguard",
+                "interface",
+                "1",
+                {"id": 1, "name": "old", "subnet": "10.90.0.0/16"},
+            )
+            await driver.restore(
+                {
+                    "interfaces": [
+                        {
+                            "name": "wg0",
+                            "private_key": "server",
+                            "public_key": "serverpub",
+                            "peers": [
+                                {"id": "a", "public_key": "p1", "private_key": "k1", "address": "10.90.68.2"},
+                                {"id": "b", "public_key": "p2", "private_key": "k2", "address": "10.90.68.5"},
+                            ],
+                        }
+                    ]
+                }
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
     assert calls == [
         ("delete", 1),
@@ -105,4 +119,3 @@ def test_restore_brings_each_interface_up_once(tmp_path, monkeypatch):
         ("stage", 7, 2),
         ("up", 2),
     ]
-    store.close()

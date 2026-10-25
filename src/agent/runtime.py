@@ -24,11 +24,13 @@ class Runtime:
     audit: AuditLog
     registry: CoreRegistry
 
-    def close(self) -> None:
-        self.store.close()
+    async def close(self) -> None:
+        await self.store.close()
 
 
 def open_runtime(env_file: str | None = None) -> Runtime:
+    import asyncio
+
     from agent.audit import AuditLog
     from agent.config import load_settings
     from agent.db import Store
@@ -36,6 +38,7 @@ def open_runtime(env_file: str | None = None) -> Runtime:
 
     settings = load_settings(env_file)
     store = Store(settings.resolve_db_path())
+    asyncio.run(store.open())
     audit = AuditLog(store)
     registry = CoreRegistry(settings, audit, store)
     return Runtime(settings=settings, store=store, audit=audit, registry=registry)

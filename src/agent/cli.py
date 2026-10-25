@@ -136,10 +136,12 @@ def cmd_core_list(args: argparse.Namespace) -> int:
 
 def cmd_core_install(args: argparse.Namespace) -> int:
     tag = getattr(args, "tag", None)
-    result = install_core(
-        args.name,
-        force=bool(getattr(args, "force", False)),
-        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    result = run_sync(
+        install_core(
+            args.name,
+            force=bool(getattr(args, "force", False)),
+            tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+        )
     )
     _print_json({"success": True, **result})
     return 0
@@ -147,10 +149,12 @@ def cmd_core_install(args: argparse.Namespace) -> int:
 
 def cmd_xray_install(args: argparse.Namespace) -> int:
     tag = getattr(args, "tag", None)
-    result = install_core(
-        "xray",
-        force=bool(getattr(args, "force", False)) or bool(tag),
-        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    result = run_sync(
+        install_core(
+            "xray",
+            force=bool(getattr(args, "force", False)) or bool(tag),
+            tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+        )
     )
     _print_json({"success": True, **result})
     return 0
@@ -158,10 +162,12 @@ def cmd_xray_install(args: argparse.Namespace) -> int:
 
 def cmd_xray_update(args: argparse.Namespace) -> int:
     tag = getattr(args, "tag", None)
-    result = install_core(
-        "xray",
-        force=True,
-        tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+    result = run_sync(
+        install_core(
+            "xray",
+            force=True,
+            tag=tag.strip() if isinstance(tag, str) and tag.strip() else None,
+        )
     )
     _print_json({"success": True, **result})
     return 0
@@ -184,7 +190,7 @@ def cmd_xray_status(_: argparse.Namespace) -> int:
         try:
             from agent.ops import run_cmd
 
-            proc = run_cmd([str(path), "version"], check=False, timeout=15)
+            proc = run_sync(run_cmd([str(path), "version"], check=False, timeout=15))
             payload["version"] = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or None
         except OSError:
             pass
@@ -197,7 +203,7 @@ def cmd_service(args: argparse.Namespace) -> int:
         return cmd_service_reset()
     if args.action == "reload":
         return cmd_service_reload()
-    result = service_action(args.action)
+    result = run_sync(service_action(args.action))
     _print_json({"success": bool(result.get("ok", True)), **result})
     return 0 if result.get("ok", True) else 1
 
@@ -226,7 +232,7 @@ def cmd_service_reset() -> int:
     if not confirmation_accepted(typed):
         print("Reset cancelled.")
         return 1
-    result = factory_reset()
+    result = run_sync(factory_reset())
     _print_json({"success": True, **result})
     return 0
 
@@ -254,7 +260,7 @@ def cmd_wizard(args: argparse.Namespace) -> int:
         for core in cores:
             print(f"Installing {core}...")
             try:
-                result = install_core(core)
+                result = run_sync(install_core(core))
                 print(f"  ok: {result.get('message')}")
             except AgentError as exc:
                 print(f"  failed: {exc.message}", file=sys.stderr)
@@ -266,8 +272,8 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     svc = input("Install/enable systemd service? [y/N]: ").strip().lower() in {"y", "yes"}
     if svc:
         try:
-            service_action("install")
-            service_action("restart")
+            run_sync(service_action("install"))
+            run_sync(service_action("restart"))
             print("Service installed and restarted.")
         except AgentError as exc:
             print(f"Service setup failed: {exc.message}", file=sys.stderr)
@@ -356,27 +362,37 @@ def cmd_tls_revoke(args: argparse.Namespace) -> int:
 
 
 def cmd_bbr_status(_: argparse.Namespace) -> int:
+    from agent.asyncutil import run_sync
     from agent.bbr import bbr_status
-    _print_json({'success': True, **bbr_status()})
+
+    _print_json({'success': True, **run_sync(bbr_status())})
     return 0
 
 
 def cmd_bbr_install(args: argparse.Namespace) -> int:
+    from agent.asyncutil import run_sync
     from agent.bbr import bbr_install
-    result = bbr_install(apply=bool(getattr(args, 'apply', False)))
+
+    result = run_sync(bbr_install(apply=bool(getattr(args, 'apply', False))))
     _print_json({'success': True, **result})
     return 0
 
 
 def cmd_bbr_enable(_: argparse.Namespace) -> int:
+    from agent.asyncutil import run_sync
     from agent.bbr import bbr_enable
-    _print_json({'success': True, **bbr_enable()})
+
+    _print_json({'success': True, **run_sync(bbr_enable())})
     return 0
 
 
 def cmd_bbr_disable(args: argparse.Namespace) -> int:
+    from agent.asyncutil import run_sync
     from agent.bbr import bbr_disable
-    result = bbr_disable(remove_persistence=bool(getattr(args, 'remove_persistence', False)))
+
+    result = run_sync(
+        bbr_disable(remove_persistence=bool(getattr(args, 'remove_persistence', False))),
+    )
     _print_json({'success': True, **result})
     return 0
 

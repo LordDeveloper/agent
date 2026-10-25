@@ -112,16 +112,18 @@ def test_list_log_errors_filters_by_core_and_level(tmp_path: Path):
     assert [row["message"] for row in wg] == ["wg err"]
 
 
-def test_store_does_not_keep_core_errors_table(tmp_path: Path):
+async def test_store_does_not_keep_core_errors_table(tmp_path: Path):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     try:
-        row = store._conn.execute(
+        cursor = await store._connection().execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='core_errors'"
-        ).fetchone()
+        )
+        row = await cursor.fetchone()
         assert row is None
         assert not hasattr(store, "record_error")
     finally:
-        store.close()
+        await store.close()
 
 
 def test_core_errors_are_written_to_agent_log(wg_client):

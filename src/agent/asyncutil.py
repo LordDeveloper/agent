@@ -39,13 +39,6 @@ def run_sync(value: T | Awaitable[T]) -> T:
     )
 
 
-async def invoke(fn: Callable[..., T | Awaitable[T]], /, *args: Any, **kwargs: Any) -> T:
-    """Run an async function natively, or a sync function in a worker thread."""
-    if asyncio.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-    return await asyncio.to_thread(fn, *args, **kwargs)
-
-
 async def gather_independent(
     *coros: Coroutine[Any, Any, T] | Awaitable[T],
     return_exceptions: bool = False,

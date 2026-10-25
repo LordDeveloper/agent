@@ -57,21 +57,16 @@ from typing import Any, Callable
 from agent.db import Store
 from agent.logutil import get_logger
 from agent.support import record_is_enabled
-from agent.support.process import run_blocking
+from agent.support import aiofs
+from agent.support.process import execute, run as process_run
 
 log = get_logger("peer_egress")
 
 Runner = Callable[..., Any]
 
 
-def _default_runner(*args: Any, **kwargs: Any) -> Any:
-    """Run host commands for real.
-
-    ``process.run`` is async. Calling it from this sync reconciler returned a
-    coroutine, logged ``rc=?``, and never applied nft or policy rules. A
-    blocking subprocess is what this code waits on.
-    """
-    return run_blocking(*args, **kwargs)
+async def _default_runner(*args: Any, **kwargs: Any) -> Any:
+    return await process_run(*args, **kwargs)
 
 _IFACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,14}$")
 _STATE_KIND = "egress_state"
@@ -129,20 +124,20 @@ def tunnel_interface_names(interfaces: list[dict[str, Any]]) -> list[str]:
     )
 
 
-def all_tunnel_interface_names(store: Store) -> list[str]:
+async def all_tunnel_interface_names(store: Store) -> list[str]:
     names: set[str] = set()
     for core in _EGRESS_CORES:
         if core == "l2tp":
-            if _l2tp_has_egress_users(store):
+            if await _l2tp_has_egress_users(store):
                 names.add(_PPP_TUNNEL)
                 names.update(live_ppp_interface_names())
             continue
         if core == "openvpn":
-            if _openvpn_has_egress_users(store):
-                names.update(_openvpn_tunnel_names(store))
+            if await _openvpn_has_egress_users(store):
+                names.update(await _openvpn_tunnel_names(store))
                 names.add(_OPENVPN_TUNNEL)
             continue
-        for row in store.list_docs(core, _IFACE_KIND):
+        for row in await store.list_docs(core, _IFACE_KIND):
             name = str(row.get("name") or "").strip()
             if name:
                 names.add(name)
@@ -156,8 +151,8 @@ def live_ppp_interface_names() -> list[str]:
     return sorted(p.name for p in net.iterdir() if p.name.startswith("ppp") and p.is_dir())
 
 
-def _l2tp_has_egress_users(store: Store) -> bool:
-    for server in store.list_docs("l2tp", _L2TP_KIND):
+async def _l2tp_has_egress_users(store: Store) -> bool:
+    for server in await store.list_docs("l2tp", _L2TP_KIND):
         for user in server.get("users") or []:
             if not isinstance(user, dict) or not record_is_enabled(user):
                 continue
@@ -166,8 +161,8 @@ def _l2tp_has_egress_users(store: Store) -> bool:
     return False
 
 
-def _openvpn_has_egress_users(store: Store) -> bool:
-    for server in store.list_docs("openvpn", _OPENVPN_KIND):
+async def _openvpn_has_egress_users(store: Store) -> bool:
+    for server in await store.list_docs("openvpn", _OPENVPN_KIND):
         for user in server.get("users") or []:
             if not isinstance(user, dict) or not record_is_enabled(user):
                 continue
@@ -176,9 +171,9 @@ def _openvpn_has_egress_users(store: Store) -> bool:
     return False
 
 
-def _openvpn_tunnel_names(store: Store) -> list[str]:
+async def _openvpn_tunnel_names(store: Store) -> list[str]:
     names: set[str] = set()
-    for server in store.list_docs("openvpn", _OPENVPN_KIND):
+    for server in await store.list_docs("openvpn", _OPENVPN_KIND):
         if not isinstance(server, dict):
             continue
         tun = str(server.get("tun_dev") or "").strip()
@@ -287,14 +282,14 @@ def desired_rules_from_interfaces(interfaces: list[dict[str, Any]]) -> list[dict
     return rules
 
 
-def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
+async def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
     """Prefer live interface docs; fall back to last applied egress_state."""
     merged: list[dict[str, str | int]] = []
     seen: set[str] = set()
     for core in _EGRESS_CORES:
         if core in {"l2tp", "openvpn"}:
             kind = _L2TP_KIND if core == "l2tp" else _OPENVPN_KIND
-            servers = store.list_docs(core, kind)
+            servers = await store.list_docs(core, kind)
             if servers:
                 source = (
                     desired_rules_from_l2tp_servers(servers)
@@ -302,7 +297,7 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                     else desired_rules_from_openvpn_servers(servers)
                 )
             else:
-                state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
+                state = await store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
                 source = []
                 for row in state.get("rules") or []:
                     if not isinstance(row, dict):
@@ -336,11 +331,11 @@ def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int]]:
                         }
                     )
         else:
-            ifaces = store.list_docs(core, _IFACE_KIND)
+            ifaces = await store.list_docs(core, _IFACE_KIND)
             if ifaces:
                 source = desired_rules_from_interfaces(ifaces)
             else:
-                state = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
+                state = await store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
                 source = []
                 for row in state.get("rules") or []:
                     if not isinstance(row, dict):
@@ -605,23 +600,22 @@ def _append_iptables_firewall_shell(
         )
 
 
-def write_apply_script(
+async def write_apply_script(
     rules: list[dict[str, str | int]],
     *,
     data_dir: str | Path | None = None,
     tunnel_ifaces: list[str] | None = None,
 ) -> Path:
     path = apply_script_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_apply_script(rules, tunnel_ifaces), encoding="utf-8")
+    await aiofs.atomic_write(path, render_apply_script(rules, tunnel_ifaces), encoding="utf-8")
     try:
-        path.chmod(0o755)
-    except OSError:
+        await aiofs.chmod(path, 0o755)
+    except (OSError, AttributeError):
         pass
     return path
 
 
-def ensure_peer_egress_unit(
+async def ensure_peer_egress_unit(
     script_path: Path,
     *,
     runner: Runner | None = None,
@@ -632,7 +626,6 @@ def ensure_peer_egress_unit(
     ``start`` should be true only when the apply script content actually changed;
     starting on every reconcile flushed nft NAT and caused periodic packet loss.
     """
-    execute = runner or _default_runner
     if not shutil.which("systemctl"):
         return {"ok": False, "skipped": True, "reason": "systemctl not found"}
 
@@ -656,18 +649,20 @@ def ensure_peer_egress_unit(
 
     try:
         _UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        previous = _UNIT_PATH.read_text(encoding="utf-8") if _UNIT_PATH.is_file() else ""
+        previous = (
+            await aiofs.read_text(_UNIT_PATH, encoding="utf-8") if _UNIT_PATH.is_file() else ""
+        )
         if previous != unit:
-            _UNIT_PATH.write_text(unit, encoding="utf-8")
-            execute(["systemctl", "daemon-reload"], check=False, timeout=30)
+            await aiofs.atomic_write(_UNIT_PATH, unit, encoding="utf-8")
+            await execute(runner, ["systemctl", "daemon-reload"], check=False, timeout=30)
     except OSError as exc:
         log.warning("peer egress unit write failed: %s", exc)
         return {"ok": False, "skipped": False, "reason": str(exc)}
 
-    enable = execute(["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
+    enable = await execute(runner, ["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
     started = False
     if start:
-        start_result = execute(["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
+        start_result = await execute(runner, ["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
         started = getattr(start_result, "returncode", 1) == 0
     return {
         "ok": getattr(enable, "returncode", 1) == 0,
@@ -677,7 +672,7 @@ def ensure_peer_egress_unit(
     }
 
 
-def persist_peer_egress(
+async def persist_peer_egress(
     store: Store,
     *,
     data_dir: str | Path | None = None,
@@ -685,25 +680,24 @@ def persist_peer_egress(
     force_start: bool = False,
     start_unit: bool | None = None,
 ) -> dict[str, Any]:
-    rules = all_desired_rules_from_store(store)
-    tunnels = all_tunnel_interface_names(store)
+    rules = await all_desired_rules_from_store(store)
+    tunnels = await all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
     new_text = render_apply_script(rules, tunnels)
-    previous = path.read_text(encoding="utf-8") if path.is_file() else None
+    previous = await aiofs.read_text(path, encoding="utf-8") if path.is_file() else None
     changed = previous != new_text
     if changed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new_text, encoding="utf-8")
+        await aiofs.atomic_write(path, new_text, encoding="utf-8")
         try:
-            path.chmod(0o755)
-        except OSError:
+            await aiofs.chmod(path, 0o755)
+        except (OSError, AttributeError):
             pass
     should_start = (changed or force_start) if start_unit is None else bool(start_unit)
-    unit = ensure_peer_egress_unit(path, runner=runner, start=should_start)
+    unit = await ensure_peer_egress_unit(path, runner=runner, start=should_start)
     return {"script": str(path), "rules": len(rules), "changed": changed, "unit": unit}
 
 
-def repair_peer_egress(
+async def repair_peer_egress(
     store: Store,
     *,
     data_dir: str | Path | None = None,
@@ -721,47 +715,47 @@ def repair_peer_egress(
     Use after RX≈0 with healthy handshake, or after manual iptables experiments.
     ``force=False`` is a soft heal (idempotent reinstall of missing rules only).
     """
-    execute = runner or _default_runner
-    _ensure_ip_forward(execute)
-    sysctl_ok = _persist_sysctl_forward()
+    await _ensure_ip_forward(runner)
+    sysctl_ok = await _persist_sysctl_forward()
 
     cores: dict[str, Any] = {}
     for core in _EGRESS_CORES:
         if core == "l2tp":
-            servers = store.list_docs(core, _L2TP_KIND)
+            servers = await store.list_docs(core, _L2TP_KIND)
             ifaces = l2tp_servers_as_interfaces(servers) if servers else []
         elif core == "openvpn":
-            servers = store.list_docs(core, _OPENVPN_KIND)
+            servers = await store.list_docs(core, _OPENVPN_KIND)
             ifaces = openvpn_servers_as_interfaces(servers) if servers else []
         else:
-            ifaces = store.list_docs(core, _IFACE_KIND)
-        state = store.get_doc(core, _STATE_KIND, _STATE_ID)
+            ifaces = await store.list_docs(core, _IFACE_KIND)
+        state = await store.get_doc(core, _STATE_KIND, _STATE_ID)
         if not ifaces and not state:
             continue
         # Empty synthetic iface with no peers still needs force when state exists.
-        cores[core] = reconcile_core_egress(
+        cores[core] = await reconcile_core_egress(
             store,
             core,
             ifaces,
-            runner=execute,
+            runner=runner,
             data_dir=data_dir,
             force=force,
         )
 
-    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=force)
+    persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
     ok = all(bool(row.get("ok")) for row in cores.values()) if cores else True
+    rules = await all_desired_rules_from_store(store)
     return {
         "ok": ok,
         "sysctl_persist": sysctl_ok,
         "cores": cores,
         "persist": persist,
-        "tunnels": all_tunnel_interface_names(store),
-        "rules": len(all_desired_rules_from_store(store)),
+        "tunnels": await all_tunnel_interface_names(store),
+        "rules": len(rules),
         "forced": force,
     }
 
 
-def reconcile_core_egress(
+async def reconcile_core_egress(
     store: Store,
     core: str,
     interfaces: list[dict[str, Any]],
@@ -779,12 +773,11 @@ def reconcile_core_egress(
     ``force=True`` rebuilds NAT/FORWARD even when health checks look green
     (repair scenario after manual firewall edits).
     """
-    execute = runner or _default_runner
     if not shutil.which("ip"):
         return {"ok": False, "skipped": True, "reason": "ip not found"}
 
     desired = desired_rules_from_interfaces(interfaces)
-    previous = store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
+    previous = await store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
     prev_rules = [row for row in (previous.get("rules") or []) if isinstance(row, dict)]
     prev_by_addr = {
         str(row.get("addr") or ""): {
@@ -797,7 +790,7 @@ def reconcile_core_egress(
         if str(row.get("addr") or "").strip()
     }
 
-    _ensure_ip_forward(execute)
+    await _ensure_ip_forward(runner)
 
     applied: list[dict[str, str | int]] = []
     switched: list[str] = []
@@ -818,12 +811,12 @@ def reconcile_core_egress(
         key = (iface, table)
         if key in warmed:
             continue
-        if not iface or iface in absent or not _iface_exists(execute, iface):
+        if not iface or iface in absent or not await _iface_exists(runner, iface):
             if iface:
                 absent.add(iface)
             continue
-        _soften_rp_filter(execute, iface)
-        if _install_default_route(execute, iface=iface, table=table):
+        await _soften_rp_filter(runner, iface)
+        if await _install_default_route(runner, iface=iface, table=table):
             warmed.add(key)
 
     # 2) Install desired rules BEFORE removing stale ones (atomic switch).
@@ -837,14 +830,14 @@ def reconcile_core_egress(
         old = prev_by_addr.get(addr)
         old_action = str((old or {}).get("action") or "lookup")
         if action == "prohibit":
-            if not _has_from_prohibit_rule(execute, cidr=cidr):
-                if not _ip(execute, ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"]):
+            if not await _has_from_prohibit_rule(runner, cidr=cidr):
+                if not await _ip(runner, ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"]):
                     log.warning("peer egress skipped %s: failed to add prohibit rule", cidr)
                     continue
             if old and old_action != "prohibit":
                 old_table = int(old.get("table") or 0)
                 if old_table > 0:
-                    _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                    await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
                 switched.append(addr)
             applied.append(row)
             continue
@@ -876,13 +869,13 @@ def reconcile_core_egress(
             continue
 
         switching = bool(old and (int(old["table"]) != table or str(old["iface"]) != iface or old_action != "lookup"))
-        already = _has_from_lookup_rule(execute, cidr=cidr, table=table)
+        already = await _has_from_lookup_rule(runner, cidr=cidr, table=table)
 
         if switching and not already:
             # Cutover pref beats any lingering old rule briefly.
             cutover = max(100, pref - 1)
-            if not _ip(
-                execute,
+            if not await _ip(
+                runner,
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(cutover)],
             ):
                 log.warning("peer egress skipped %s: failed to add cutover rule → %s", cidr, iface)
@@ -900,14 +893,14 @@ def reconcile_core_egress(
                 continue
             old_table = int(old["table"])
             if old_table > 0:
-                _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
             # Normalize to stable preference.
-            _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table), "pref", str(cutover)])
-            _ip(execute, ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)])
+            await _ip(runner, ["rule", "del", "from", cidr, "lookup", str(table), "pref", str(cutover)])
+            await _ip(runner, ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)])
             switched.append(addr)
         elif not already:
-            if not _ip(
-                execute,
+            if not await _ip(
+                runner,
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)],
             ):
                 log.warning("peer egress skipped %s: failed to add rule → %s", cidr, iface)
@@ -926,11 +919,11 @@ def reconcile_core_egress(
         elif switching:
             old_table = int(old["table"])
             if old_table > 0:
-                _ip(execute, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
             switched.append(addr)
 
         if old_action == "prohibit":
-            _ip(execute, ["rule", "del", "from", cidr, "prohibit"])
+            await _ip(runner, ["rule", "del", "from", cidr, "prohibit"])
             switched.append(addr)
 
         applied.append(row)
@@ -955,15 +948,15 @@ def reconcile_core_egress(
         cidr = peer_source_cidr(addr) or f"{addr}/32"
         prev_action = str(row.get("action") or "lookup")
         if prev_action == "prohibit":
-            _ip(execute, ["rule", "del", "from", cidr, "prohibit"])
+            await _ip(runner, ["rule", "del", "from", cidr, "prohibit"])
             switched.append(addr)
         elif table:
-            _ip(execute, ["rule", "del", "from", cidr, "lookup", str(table)])
+            await _ip(runner, ["rule", "del", "from", cidr, "lookup", str(table)])
             switched.append(addr)
 
     # 4) Flush conntrack so old NAT paths do not stick after exit change/removal.
     for addr in dict.fromkeys(switched):
-        _flush_conntrack(execute, addr)
+        await _flush_conntrack(runner, addr)
 
     desired_tables = {int(row["table"]): str(row["iface"]) for row in applied if int(row.get("table") or 0) > 0}
     prev_tables = {
@@ -974,21 +967,21 @@ def reconcile_core_egress(
 
     for table in prev_tables:
         if table not in desired_tables:
-            _ip(execute, ["route", "flush", "table", str(table)])
+            await _ip(runner, ["route", "flush", "table", str(table)])
 
     masq_ifaces = sorted({str(row["iface"]) for row in applied if str(row.get("iface") or "").strip()})
     # Keep MASQUERADE on recently-used exits too (switch italy→deutch must not
     # briefly leave the new exit without SNAT if apply races).
     for iface in previous.get("masq") or []:
         name = str(iface or "").strip()
-        if name and _iface_exists(execute, name):
+        if name and await _iface_exists(runner, name):
             masq_ifaces = sorted(set(masq_ifaces) | {name})
     # Merge masq with other cores so we don't drop shared exits while reconciling one core.
     other_masq: set[str] = set()
     for other in _EGRESS_CORES:
         if other == core:
             continue
-        other_state = store.get_doc(other, _STATE_KIND, _STATE_ID) or {}
+        other_state = await store.get_doc(other, _STATE_KIND, _STATE_ID) or {}
         for iface in other_state.get("masq") or []:
             name = str(iface or "").strip()
             if name:
@@ -1001,15 +994,15 @@ def reconcile_core_egress(
 
     prev_masq_set = {str(x).strip() for x in previous_masq if str(x).strip()}
     new_masq_set = set(effective_masq)
-    tunnel_ifaces = sorted(set(tunnel_interface_names(interfaces)) | set(all_tunnel_interface_names(store)))
-    nat_ok = _nat_already_healthy(effective_masq, runner=execute)
-    forward_ok = _forward_already_healthy(tunnel_ifaces, runner=execute)
+    tunnel_ifaces = sorted(set(tunnel_interface_names(interfaces)) | set(await all_tunnel_interface_names(store)))
+    nat_ok = await _nat_already_healthy(effective_masq, runner=runner)
+    forward_ok = await _forward_already_healthy(tunnel_ifaces, runner=runner)
     nat_rebuilt = False
     if force or new_masq_set != prev_masq_set or not nat_ok or (tunnel_ifaces and not forward_ok):
-        _sync_masquerade(
+        await _sync_masquerade(
             effective_masq,
             previous_ifaces=previous_masq,
-            runner=execute,
+            runner=runner,
             tunnel_ifaces=tunnel_ifaces,
         )
         nat_rebuilt = True
@@ -1027,9 +1020,9 @@ def reconcile_core_egress(
         "tables": sorted(desired_tables.keys()),
         "masq": masq_ifaces,
     }
-    store.put_doc(core, _STATE_KIND, _STATE_ID, state)
+    await store.put_doc(core, _STATE_KIND, _STATE_ID, state)
 
-    persist = persist_peer_egress(store, data_dir=data_dir, runner=execute, force_start=force)
+    persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
     return {
         "ok": True,
         "skipped": False,
@@ -1044,9 +1037,9 @@ def reconcile_core_egress(
     }
 
 
-def _ip(runner: Runner, args: list[str]) -> bool:
+async def _ip(runner: Runner, args: list[str]) -> bool:
     try:
-        result = runner(["ip", *args], check=False, timeout=10)
+        result = await execute(runner, ["ip", *args], check=False, timeout=10)
     except Exception as exc:
         log.warning("ip %s failed: %s", " ".join(args), exc)
         return False
@@ -1060,14 +1053,14 @@ def _ip(runner: Runner, args: list[str]) -> bool:
     return True
 
 
-def _iface_exists(runner: Runner, iface: str) -> bool:
-    return _ip(runner, ["link", "show", iface])
+async def _iface_exists(runner: Runner, iface: str) -> bool:
+    return await _ip(runner, ["link", "show", iface])
 
 
-def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
+async def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
     """True when an identical from/lookup policy rule already exists."""
     try:
-        result = runner(["ip", "-j", "rule", "show"], check=False, timeout=5)
+        result = await execute(runner, ["ip", "-j", "rule", "show"], check=False, timeout=5)
     except Exception:
         result = None
     if result is not None and getattr(result, "returncode", 1) == 0:
@@ -1098,7 +1091,7 @@ def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
 
     # Fallback: plain-text show filtered by src.
     try:
-        result = runner(["ip", "rule", "show", "from", cidr], check=False, timeout=5)
+        result = await execute(runner, ["ip", "rule", "show", "from", cidr], check=False, timeout=5)
     except Exception:
         return False
     if getattr(result, "returncode", 1) != 0:
@@ -1109,10 +1102,10 @@ def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
     return needle_a in text or needle_b in text
 
 
-def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
+async def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
     host = cidr.split("/", 1)[0]
     try:
-        result = runner(["ip", "-j", "rule", "show"], check=False, timeout=5)
+        result = await execute(runner, ["ip", "-j", "rule", "show"], check=False, timeout=5)
     except Exception:
         result = None
     if result is not None and getattr(result, "returncode", 1) == 0:
@@ -1133,7 +1126,7 @@ def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
     try:
-        result = runner(["ip", "rule", "show", "from", cidr], check=False, timeout=5)
+        result = await execute(runner, ["ip", "rule", "show", "from", cidr], check=False, timeout=5)
     except Exception:
         return False
     if getattr(result, "returncode", 1) != 0:
@@ -1141,12 +1134,13 @@ def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
     return "prohibit" in str(getattr(result, "stdout", "") or "").lower()
 
 
-def _soften_rp_filter(runner: Runner, iface: str) -> None:
+async def _soften_rp_filter(runner: Runner, iface: str) -> None:
     """Strict rp_filter breaks multi-exit WG tunnels that share similar addressing."""
     if not shutil.which("sysctl"):
         return
     try:
-        runner(
+        await execute(
+            runner,
             ["sysctl", "-w", f"net.ipv4.conf.{iface}.rp_filter=0"],
             check=False,
             timeout=5,
@@ -1155,7 +1149,7 @@ def _soften_rp_filter(runner: Runner, iface: str) -> None:
         pass
 
 
-def _flush_conntrack(runner: Runner, addr: str) -> None:
+async def _flush_conntrack(runner: Runner, addr: str) -> None:
     """Drop sticky NAT/forward states so the peer immediately uses the new exit."""
     host = str(addr or "").split("/", 1)[0].strip()
     if not host:
@@ -1163,24 +1157,24 @@ def _flush_conntrack(runner: Runner, addr: str) -> None:
     if shutil.which("conntrack"):
         for direction in ("-s", "-d"):
             try:
-                runner(["conntrack", "-D", direction, host], check=False, timeout=5)
+                await execute(runner, ["conntrack", "-D", direction, host], check=False, timeout=5)
             except Exception:
                 pass
         return
     # nft / iptables cannot easily wipe by IP here; conntrack-tools is preferred.
 
 
-def _install_default_route(runner: Runner, *, iface: str, table: int) -> bool:
+async def _install_default_route(runner: Runner, *, iface: str, table: int) -> bool:
     """Prefer `default via <gw> dev <iface>` when main table has a gateway on that NIC."""
-    via = _gateway_for_iface(runner, iface)
+    via = await _gateway_for_iface(runner, iface)
     if via:
-        return _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
-    return _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
+        return await _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
+    return await _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
 
 
-def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
+async def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
     try:
-        result = runner(["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+        result = await execute(runner, ["ip", "-4", "route", "show", "default"], check=False, timeout=5)
     except Exception:
         return None
     if getattr(result, "returncode", 1) != 0:
@@ -1205,7 +1199,7 @@ def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
     return None
 
 
-def _ensure_ip_forward(runner: Runner) -> None:
+async def _ensure_ip_forward(runner: Runner) -> None:
     try:
         path = "/proc/sys/net/ipv4/ip_forward"
         with open(path, "w", encoding="utf-8") as handle:
@@ -1213,7 +1207,7 @@ def _ensure_ip_forward(runner: Runner) -> None:
     except OSError:
         if shutil.which("sysctl"):
             try:
-                runner(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
+                await execute(runner, ["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
             except Exception:
                 pass
 
@@ -1221,7 +1215,8 @@ def _ensure_ip_forward(runner: Runner) -> None:
     if shutil.which("sysctl"):
         for key in ("all", "default"):
             try:
-                runner(
+                await execute(
+                    runner,
                     ["sysctl", "-w", f"net.ipv4.conf.{key}.rp_filter=0"],
                     check=False,
                     timeout=5,
@@ -1229,10 +1224,10 @@ def _ensure_ip_forward(runner: Runner) -> None:
             except Exception:
                 pass
 
-    _persist_sysctl_forward()
+    await _persist_sysctl_forward()
 
 
-def _persist_sysctl_forward() -> bool:
+async def _persist_sysctl_forward() -> bool:
     """Survive reboot without relying on manual host firewall edits."""
     content = (
         "# Managed by Netinja agent peer egress — do not edit.\n"
@@ -1242,81 +1237,87 @@ def _persist_sysctl_forward() -> bool:
     )
     try:
         _SYSCTL_DROPIN.parent.mkdir(parents=True, exist_ok=True)
-        previous = _SYSCTL_DROPIN.read_text(encoding="utf-8") if _SYSCTL_DROPIN.is_file() else ""
+        previous = (
+            await aiofs.read_text(_SYSCTL_DROPIN, encoding="utf-8") if _SYSCTL_DROPIN.is_file() else ""
+        )
         if previous != content:
-            _SYSCTL_DROPIN.write_text(content, encoding="utf-8")
+            await aiofs.atomic_write(_SYSCTL_DROPIN, content, encoding="utf-8")
         return True
     except OSError as exc:
         log.warning("peer egress sysctl drop-in failed: %s", exc)
         return False
 
 
-def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
+async def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
     """True when the preferred NAT backend already covers every exit iface."""
     if not ifaces:
         return True
     if shutil.which("nft"):
-        return _nft_has_masquerade_for(ifaces, runner=runner)
+        return await _nft_has_masquerade_for(ifaces, runner=runner)
     if shutil.which("iptables-legacy"):
-        return all(
-            _iptables(
-                runner,
-                ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
-                quiet=True,
-                binary="iptables-legacy",
-            )
-            or _iptables(
-                runner,
-                [
-                    "-t",
-                    "nat",
-                    "-C",
-                    "POSTROUTING",
-                    "-o",
-                    iface,
-                    "-m",
-                    "comment",
-                    "--comment",
-                    f"{_MASQ_COMMENT_PREFIX}{iface}",
-                    "-j",
-                    "MASQUERADE",
-                ],
-                quiet=True,
-                binary="iptables-legacy",
-            )
-            for iface in ifaces
-        )
+        for iface in ifaces:
+            if not (
+                await _iptables(
+                    runner,
+                    ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+                    quiet=True,
+                    binary="iptables-legacy",
+                )
+                or await _iptables(
+                    runner,
+                    [
+                        "-t",
+                        "nat",
+                        "-C",
+                        "POSTROUTING",
+                        "-o",
+                        iface,
+                        "-m",
+                        "comment",
+                        "--comment",
+                        f"{_MASQ_COMMENT_PREFIX}{iface}",
+                        "-j",
+                        "MASQUERADE",
+                    ],
+                    quiet=True,
+                    binary="iptables-legacy",
+                )
+            ):
+                return False
+        return True
     if shutil.which("iptables"):
-        return all(
-            _iptables(
-                runner,
-                ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
-                quiet=True,
-            )
-            or _iptables(
-                runner,
-                [
-                    "-t",
-                    "nat",
-                    "-C",
-                    "POSTROUTING",
-                    "-o",
-                    iface,
-                    "-m",
-                    "comment",
-                    "--comment",
-                    f"{_MASQ_COMMENT_PREFIX}{iface}",
-                    "-j",
-                    "MASQUERADE",
-                ],
-                quiet=True,
-            )
-            for iface in ifaces
-        )
+        for iface in ifaces:
+            if not (
+                await _iptables(
+                    runner,
+                    ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
+                    quiet=True,
+                )
+                or await _iptables(
+                    runner,
+                    [
+                        "-t",
+                        "nat",
+                        "-C",
+                        "POSTROUTING",
+                        "-o",
+                        iface,
+                        "-m",
+                        "comment",
+                        "--comment",
+                        f"{_MASQ_COMMENT_PREFIX}{iface}",
+                        "-j",
+                        "MASQUERADE",
+                    ],
+                    quiet=True,
+                )
+            ):
+                return False
+        return True
     return False
 
 
-def _sync_masquerade(
+async def _sync_masquerade(
     ifaces: list[str],
     *,
     previous_ifaces: list[str],
@@ -1331,31 +1332,31 @@ def _sync_masquerade(
     targets = sorted({*ifaces, *[str(x) for x in previous_ifaces if str(x).strip()]})
     nft_ok = False
     if shutil.which("nft"):
-        _sync_masquerade_nft(ifaces, runner=runner, tunnel_ifaces=tunnel_ifaces or [])
-        nft_ok = _nft_has_masquerade_for(ifaces, runner=runner)
+        await _sync_masquerade_nft(ifaces, runner=runner, tunnel_ifaces=tunnel_ifaces or [])
+        nft_ok = await _nft_has_masquerade_for(ifaces, runner=runner)
 
     if nft_ok:
         for binary in ("iptables", "iptables-legacy"):
             if shutil.which(binary):
-                _purge_iptables_exit_masq(targets, runner=runner, binary=binary)
+                await _purge_iptables_exit_masq(targets, runner=runner, binary=binary)
         return
 
     if shutil.which("iptables-legacy"):
-        _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
-        _sync_forward(
+        await _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
+        await _sync_forward(
             ifaces,
             previous_ifaces=previous_ifaces,
             runner=runner,
             tunnel_ifaces=tunnel_ifaces or [],
             binary="iptables-legacy",
         )
-        if shutil.which("iptables") and _iptables_is_nft(runner):
-            _purge_iptables_exit_masq(targets, runner=runner, binary="iptables")
+        if shutil.which("iptables") and await _iptables_is_nft(runner):
+            await _purge_iptables_exit_masq(targets, runner=runner, binary="iptables")
         return
 
     if shutil.which("iptables"):
-        _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
-        _sync_forward(
+        await _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
+        await _sync_forward(
             ifaces,
             previous_ifaces=previous_ifaces,
             runner=runner,
@@ -1364,7 +1365,7 @@ def _sync_masquerade(
         )
 
 
-def _sync_forward(
+async def _sync_forward(
     ifaces: list[str],
     *,
     previous_ifaces: list[str],
@@ -1373,7 +1374,7 @@ def _sync_forward(
     binary: str | None = None,
 ) -> None:
     # nft FORWARD (+ MSS clamp) lives in _sync_masquerade_nft.
-    if shutil.which("nft") and _nft_has_masquerade_for(ifaces, runner=runner):
+    if shutil.which("nft") and await _nft_has_masquerade_for(ifaces, runner=runner):
         return
     chosen = binary
     if not chosen:
@@ -1383,7 +1384,7 @@ def _sync_forward(
             chosen = "iptables"
         else:
             return
-    _sync_forward_iptables(
+    await _sync_forward_iptables(
         ifaces,
         previous_ifaces=previous_ifaces,
         runner=runner,
@@ -1391,20 +1392,21 @@ def _sync_forward(
         tunnel_ifaces=tunnel_ifaces or [],
     )
 
-def _iptables_is_nft(runner: Runner) -> bool:
+async def _iptables_is_nft(runner: Runner) -> bool:
     try:
-        result = runner(["iptables", "-V"], check=False, timeout=5)
+        result = await execute(runner, ["iptables", "-V"], check=False, timeout=5)
     except Exception:
         return False
     text = f"{getattr(result, 'stdout', '')} {getattr(result, 'stderr', '')}".lower()
     return "nf_tables" in text
 
 
-def _nft_has_masquerade_for(ifaces: list[str], *, runner: Runner) -> bool:
+async def _nft_has_masquerade_for(ifaces: list[str], *, runner: Runner) -> bool:
     if not ifaces:
         return True
     try:
-        result = runner(
+        result = await execute(
+            runner,
             ["nft", "-j", "list", "chain", "inet", "netinja_egress", "postrouting"],
             check=False,
             timeout=10,
@@ -1414,7 +1416,8 @@ def _nft_has_masquerade_for(ifaces: list[str], *, runner: Runner) -> bool:
     if getattr(result, "returncode", 1) != 0:
         # Fallback: plain text list
         try:
-            result = runner(
+            result = await execute(
+                runner,
                 ["nft", "list", "chain", "inet", "netinja_egress", "postrouting"],
                 check=False,
                 timeout=10,
@@ -1458,14 +1461,14 @@ def _nft_has_masquerade_for(ifaces: list[str], *, runner: Runner) -> bool:
     return all(iface in found for iface in ifaces)
 
 
-def _purge_iptables_exit_masq(ifaces: list[str], *, runner: Runner, binary: str) -> None:
+async def _purge_iptables_exit_masq(ifaces: list[str], *, runner: Runner, binary: str) -> None:
     for iface in ifaces:
         if not iface:
             continue
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
         # Uncommented duplicates from manual ops / older agent.
         for _ in range(8):
-            if not _iptables(
+            if not await _iptables(
                 runner,
                 ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
                 quiet=True,
@@ -1473,7 +1476,7 @@ def _purge_iptables_exit_masq(ifaces: list[str], *, runner: Runner, binary: str)
             ):
                 break
         for _ in range(8):
-            if not _iptables(
+            if not await _iptables(
                 runner,
                 [
                     "-t",
@@ -1495,7 +1498,7 @@ def _purge_iptables_exit_masq(ifaces: list[str], *, runner: Runner, binary: str)
                 break
 
 
-def _sync_forward_iptables(
+async def _sync_forward_iptables(
     ifaces: list[str],
     *,
     previous_ifaces: list[str],
@@ -1515,7 +1518,7 @@ def _sync_forward_iptables(
         ):
             jump = "TCPMSS" if comment.endswith("-mss") else "ACCEPT"
             extra = ["--clamp-mss-to-pmtu"] if jump == "TCPMSS" else []
-            _iptables(
+            await _iptables(
                 runner,
                 ["-D", "FORWARD", *args, "-m", "comment", "--comment", comment, "-j", jump, *extra],
                 binary=binary,
@@ -1525,7 +1528,7 @@ def _sync_forward_iptables(
         mss_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-mss"
         out_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out"
         in_comment = f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-in"
-        if not _iptables(
+        if not await _iptables(
             runner,
             [
                 "-C",
@@ -1548,7 +1551,7 @@ def _sync_forward_iptables(
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 [
                     "-I",
@@ -1571,18 +1574,18 @@ def _sync_forward_iptables(
                 ],
                 binary=binary,
             )
-        if not _iptables(
+        if not await _iptables(
             runner,
             ["-C", "FORWARD", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 ["-I", "FORWARD", "1", "-o", iface, "-m", "comment", "--comment", out_comment, "-j", "ACCEPT"],
                 binary=binary,
             )
-        if not _iptables(
+        if not await _iptables(
             runner,
             [
                 "-C",
@@ -1603,7 +1606,7 @@ def _sync_forward_iptables(
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 [
                     "-I",
@@ -1627,9 +1630,9 @@ def _sync_forward_iptables(
 
     for tunnel in tunnels:
         if not _is_wildcard_iface(tunnel):
-            _soften_rp_filter(runner, tunnel)
+            await _soften_rp_filter(runner, tunnel)
         tunnel_comment = _tunnel_egress_comment(tunnel)
-        if not _iptables(
+        if not await _iptables(
             runner,
             [
                 "-C",
@@ -1652,7 +1655,7 @@ def _sync_forward_iptables(
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 [
                     "-I",
@@ -1675,36 +1678,37 @@ def _sync_forward_iptables(
                 ],
                 binary=binary,
             )
-        if not _iptables(
+        if not await _iptables(
             runner,
             ["-C", "FORWARD", "-i", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-in", "-j", "ACCEPT"],
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 ["-I", "FORWARD", "1", "-i", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-in", "-j", "ACCEPT"],
                 binary=binary,
             )
-        if not _iptables(
+        if not await _iptables(
             runner,
             ["-C", "FORWARD", "-o", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-out", "-j", "ACCEPT"],
             quiet=True,
             binary=binary,
         ):
-            _iptables(
+            await _iptables(
                 runner,
                 ["-I", "FORWARD", "1", "-o", tunnel, "-m", "comment", "--comment", f"{tunnel_comment}-out", "-j", "ACCEPT"],
                 binary=binary,
             )
 
 
-def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> bool:
+async def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> bool:
     if not tunnel_ifaces:
         return True
     if shutil.which("nft"):
         try:
-            result = runner(
+            result = await execute(
+                runner,
                 ["nft", "list", "chain", "inet", "netinja_egress", "forward"],
                 check=False,
                 timeout=10,
@@ -1725,7 +1729,7 @@ def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> boo
         return False
     for tunnel in tunnel_ifaces:
         comment = f"{_tunnel_egress_comment(tunnel)}-in"
-        if not _iptables(
+        if not await _iptables(
             runner,
             ["-C", "FORWARD", "-i", tunnel, "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
             quiet=True,
@@ -1734,14 +1738,14 @@ def _forward_already_healthy(tunnel_ifaces: list[str], *, runner: Runner) -> boo
             return False
     return True
 
-def _sync_masquerade_nft(
+async def _sync_masquerade_nft(
     ifaces: list[str],
     *,
     runner: Runner,
     tunnel_ifaces: list[str] | None = None,
 ) -> None:
-    _nft(runner, ["add", "table", "inet", "netinja_egress"])
-    _nft(
+    await _nft(runner, ["add", "table", "inet", "netinja_egress"])
+    await _nft(
         runner,
         [
             "add",
@@ -1752,7 +1756,7 @@ def _sync_masquerade_nft(
             "{ type nat hook postrouting priority srcnat; policy accept; }",
         ],
     )
-    _nft(
+    await _nft(
         runner,
         [
             "add",
@@ -1763,10 +1767,10 @@ def _sync_masquerade_nft(
             "{ type filter hook forward priority filter; policy accept; }",
         ],
     )
-    _nft(runner, ["flush", "chain", "inet", "netinja_egress", _NFT_CHAIN])
-    _nft(runner, ["flush", "chain", "inet", "netinja_egress", "forward"])
+    await _nft(runner, ["flush", "chain", "inet", "netinja_egress", _NFT_CHAIN])
+    await _nft(runner, ["flush", "chain", "inet", "netinja_egress", "forward"])
     for iface in ifaces:
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1782,7 +1786,7 @@ def _sync_masquerade_nft(
             ],
         )
         # Clamp MSS for WG MTU (1420) — reduces blackhole-looking TCP loss.
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1808,7 +1812,7 @@ def _sync_masquerade_nft(
                 f"{_MASQ_COMMENT_PREFIX}{iface}-mss",
             ],
         )
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1823,7 +1827,7 @@ def _sync_masquerade_nft(
                 f"{_MASQ_COMMENT_PREFIX}{iface}-fwd-out",
             ],
         )
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1845,10 +1849,10 @@ def _sync_masquerade_nft(
         if not tunnel:
             continue
         if not _is_wildcard_iface(tunnel):
-            _soften_rp_filter(runner, tunnel)
+            await _soften_rp_filter(runner, tunnel)
         match = _nft_iface_match(tunnel)
         tunnel_comment = _tunnel_egress_comment(tunnel)
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1874,7 +1878,7 @@ def _sync_masquerade_nft(
                 f"{tunnel_comment}-mss",
             ],
         )
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1889,7 +1893,7 @@ def _sync_masquerade_nft(
                 f"{tunnel_comment}-in",
             ],
         )
-        _nft(
+        await _nft(
             runner,
             [
                 "add",
@@ -1906,7 +1910,7 @@ def _sync_masquerade_nft(
         )
 
 
-def _sync_masquerade_iptables(
+async def _sync_masquerade_iptables(
     ifaces: list[str],
     *,
     previous_ifaces: list[str],
@@ -1918,13 +1922,13 @@ def _sync_masquerade_iptables(
         if iface in wanted:
             continue
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
-        _iptables(
+        await _iptables(
             runner,
             ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             binary=binary,
         )
         # Also drop un-commented legacy rules we may have installed manually.
-        _iptables(
+        await _iptables(
             runner,
             ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
             quiet=True,
@@ -1932,7 +1936,7 @@ def _sync_masquerade_iptables(
         )
     for iface in ifaces:
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
-        check = _iptables(
+        check = await _iptables(
             runner,
             ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             quiet=True,
@@ -1941,14 +1945,14 @@ def _sync_masquerade_iptables(
         if check:
             continue
         # Prefer commented rule; if an uncommented twin exists, keep one path working.
-        if _iptables(
+        if await _iptables(
             runner,
             ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"],
             quiet=True,
             binary=binary,
         ):
             continue
-        _iptables(
+        await _iptables(
             runner,
             ["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             binary=binary,
@@ -1968,7 +1972,7 @@ def _is_wildcard_iface(name: str) -> bool:
     return "+" in text or "*" in text
 
 
-def _nft(runner: Runner, args: list[str]) -> bool:
+async def _nft(runner: Runner, args: list[str]) -> bool:
     fixed: list[str] = []
     index = 0
     while index < len(args):
@@ -1983,7 +1987,7 @@ def _nft(runner: Runner, args: list[str]) -> bool:
         index += 1
 
     try:
-        result = runner(["nft", *fixed], check=False, timeout=10)
+        result = await execute(runner, ["nft", *fixed], check=False, timeout=10)
     except Exception as exc:
         log.warning("nft %s failed: %s", " ".join(fixed), exc)
         return False
@@ -1996,9 +2000,9 @@ def _nft(runner: Runner, args: list[str]) -> bool:
     return True
 
 
-def _iptables(runner: Runner, args: list[str], *, quiet: bool = False, binary: str = "iptables") -> bool:
+async def _iptables(runner: Runner, args: list[str], *, quiet: bool = False, binary: str = "iptables") -> bool:
     try:
-        result = runner([binary, *args], check=False, timeout=10)
+        result = await execute(runner, [binary, *args], check=False, timeout=10)
     except Exception as exc:
         if not quiet:
             log.warning("%s %s failed: %s", binary, " ".join(args), exc)

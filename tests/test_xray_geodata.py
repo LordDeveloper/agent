@@ -1,9 +1,12 @@
 import base64
 
+import pytest
+
 from agent.xray_release import ensure_xray_geodata, export_geodata, import_geodata
 
 
-def test_ensure_copies_geodata_next_to_the_binary(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_ensure_copies_geodata_next_to_the_binary(tmp_path, monkeypatch):
     binary = tmp_path / "bin" / "xray"
     binary.parent.mkdir()
     binary.write_bytes(b"#!/bin/xray\n")
@@ -14,7 +17,7 @@ def test_ensure_copies_geodata_next_to_the_binary(tmp_path, monkeypatch):
     monkeypatch.setenv("XRAY_BINARY", str(binary))
     monkeypatch.setenv("XRAY_GEO_DIR", str(share))
 
-    asset = ensure_xray_geodata(binary, download=False)
+    asset = await ensure_xray_geodata(binary, download=False)
 
     assert asset == binary.parent
     assert (binary.parent / "geosite.dat").read_bytes() == b"geosite-bytes"

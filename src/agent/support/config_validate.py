@@ -200,7 +200,7 @@ async def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
     try:
         from agent.xray_release import ensure_xray_geodata
 
-        asset_dir = ensure_xray_geodata(Path(binary), download=True)
+        asset_dir = await ensure_xray_geodata(Path(binary), download=True)
         if asset_dir is not None:
             env["XRAY_LOCATION_ASSET"] = str(asset_dir)
     except Exception:

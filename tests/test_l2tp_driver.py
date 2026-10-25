@@ -29,7 +29,9 @@ def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
         data_dir=str(tmp_path),
         l2tp_config_dir=str(tmp_path / 'l2tp'),
     )
-    store = Store(settings.resolve_db_path())
+    from tests.conftest import open_store
+
+    store = open_store(settings.resolve_db_path())
     audit = AuditLog(store)
     driver = L2tpDriver(settings, audit, store)
 
@@ -42,7 +44,9 @@ def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
     assert user['username']
     assert user['password']
 
-    bundle = driver.user_config_bundle(server['id'], 'peer-1', endpoint_host='vpn.example.com')
+    bundle = asyncio.run(
+        driver.user_config_bundle(server['id'], 'peer-1', endpoint_host='vpn.example.com'),
+    )
     assert bundle['type'] == 'L2TP/IPsec'
     assert bundle['server'] == 'vpn.example.com'
     assert 'IPsec PSK' in bundle['text'] or bundle['ipsec_psk']
@@ -67,8 +71,10 @@ def test_batch_users_commits_runtime_once(tmp_path, monkeypatch):
     monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _count_ensure)
     monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._sync_peer_egress', _count_egress)
 
+    from tests.conftest import open_store
+
     settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
-    store = Store(settings.resolve_db_path())
+    store = open_store(settings.resolve_db_path())
     driver = L2tpDriver(settings, AuditLog(store), store)
 
     async def scenario():

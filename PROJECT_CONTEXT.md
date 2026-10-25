@@ -1,17 +1,17 @@
 # Agent PROJECT_CONTEXT
 
-Future changes to this node agent follow this file. The process is already an async service (FastAPI + asyncio). Do not add a second, blocking execution style beside it.
+Future changes to this node agent follow this file. The process is an async service (FastAPI + asyncio). **No synchronous I/O in `src/agent`** — use native async drivers (`aiosqlite`, `aiofiles`, `httpx.AsyncClient`, `process.run`).
 
 ## Execution model
 
-- I/O methods are `async def`: driver commands, subprocess, HTTP to Xray, DNS, systemd.
+- I/O methods are `async def`: store, driver commands, subprocess, HTTP to Xray, DNS, systemd.
 - Async callers `await` the result. A coroutine is not a dict. Never call `.get()`, iterate, or subscript it.
-- Sync entry points only — CLI (`agent/cli.py`), the text menu (`agent/menu.py`), and config renderers that are still plain functions — go through `run_sync()` from `agent/asyncutil.py`.
+- CLI / menu entry points call `asyncio.run(...)` (or `run_sync(...)` for one coroutine) and use the same async stack as the server — no sync `Store`, no `subprocess.run`, no `asyncio.to_thread` for I/O.
 - `maybe_await()` is for a value that might already be a dict or might be a coroutine. It is not a substitute for `await` on a known async call.
 
 ```python
 report = await driver.diagnose_address(address)          # async route / driver
-report = run_sync(driver.diagnose_address(address))      # CLI / menu
+report = run_sync(driver.diagnose_address(address))      # CLI / menu (top-level only)
 ```
 
 `await obj.method()[key]` is wrong. Subscript binds first and crashes on the coroutine. Use `(await obj.method())[key]`.
@@ -39,7 +39,7 @@ A per-row response (succeeded / failed / errors) is still returned. The expensiv
 
 When a single grouped call exists, use it. Xray renewal baselines come from `stats_query_grouped` (`_user_traffic_index`). Per-user `stats_query` runs only as a parallel fallback when that index is empty.
 
-`XrayDriver._api_call` goes through `invoke`. Async client methods stay on the loop. A sync client runs in `asyncio.to_thread`, so `bounded_gather` still overlaps. Do not call a sync function directly inside an async gather task; that blocks the loop and the wave becomes serial.
+`XrayDriver._api_call` uses the async HTTP client (`maybe_await` only). Do not call blocking functions inside `bounded_gather` tasks.
 
 ## What stays serial
 

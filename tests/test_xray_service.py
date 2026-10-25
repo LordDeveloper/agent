@@ -316,15 +316,21 @@ def test_install_xray_binary_from_release_zip(tmp_path, monkeypatch):
             zf.writestr("geoip.dat", b"geo")
         return dest_path
 
-    monkeypatch.setattr("agent.xray_release.download_release_asset", fake_download)
+    async def fake_download_async(release, dest_path, token=None, timeout=300.0):
+        return fake_download(release, dest_path, token=token, timeout=timeout)
+
+    monkeypatch.setattr("agent.xray_release._download_release_asset", fake_download_async)
     monkeypatch.setattr("agent.xray_release.which", lambda cmd: None)
-    monkeypatch.setattr(
-        "agent.xray_release.run_cmd",
-        lambda *args, **kwargs: type("P", (), {"stdout": "Xray 1.0.7\n", "stderr": "", "returncode": 0})(),
-    )
+
+    async def fake_run_cmd(*args, **kwargs):
+        return type("P", (), {"stdout": "Xray 1.0.7\n", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr("agent.xray_release.run_cmd", fake_run_cmd)
     monkeypatch.setenv("XRAY_GEO_DIR", str(tmp_path / "geo"))
 
-    result = install_xray_binary(dest, tag="v1.0.7")
+    import asyncio
+
+    result = asyncio.run(install_xray_binary(dest, tag="v1.0.7"))
     assert dest.is_file()
     assert result["source"] == "release"
     assert result["release_tag"] == "v1.0.7"

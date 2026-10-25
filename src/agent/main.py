@@ -121,6 +121,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await store.open()
         app_log.info(
             "agent started version=%s listen=%s cores=%s log=%s",
             __version__,
@@ -167,7 +168,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
         stop_forwarders(settings)
         app_log.info("agent stopping")
-        store.close()
+        await store.close()
 
     app = FastAPI(title="Agent", version=__version__, lifespan=lifespan)
     app.state.settings = settings

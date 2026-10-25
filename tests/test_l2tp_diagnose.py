@@ -13,35 +13,45 @@ class _Result:
 
 def test_diagnose_reports_missing_user(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    report = asyncio.run(diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=lambda *a, **k: _Result()))
+
+    async def run():
+        await store.open()
+        return await diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=lambda *a, **k: _Result())
+
+    report = asyncio.run(run())
     assert report['found'] is False
     assert report['summary']['healthy'] is False
 
 
 def test_diagnose_finds_user(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    store.put_doc(
-        'l2tp',
-        'server',
-        '1',
-        {
-            'id': 1,
-            'name': 'l2tp-1',
-            'subnet': '10.90.0.0/16',
-            'listen_port': 1701,
-            'ipsec_psk': 'secret',
-            'users': [
-                {
-                    'id': 'u1',
-                    'email': 'u1@test',
-                    'username': 'alice',
-                    'password': 'pass',
-                    'address': '10.90.128.50',
-                    'is_enabled': True,
-                }
-            ],
-        },
-    )
+
+    async def seed():
+        await store.open()
+        await store.put_doc(
+            'l2tp',
+            'server',
+            '1',
+            {
+                'id': 1,
+                'name': 'l2tp-1',
+                'subnet': '10.90.0.0/16',
+                'listen_port': 1701,
+                'ipsec_psk': 'secret',
+                'users': [
+                    {
+                        'id': 'u1',
+                        'email': 'u1@test',
+                        'username': 'alice',
+                        'password': 'pass',
+                        'address': '10.90.128.50',
+                        'is_enabled': True,
+                    }
+                ],
+            },
+        )
+
+    asyncio.run(seed())
 
     def runner(args, timeout=10):
         if args[:3] == ['systemctl', 'is-active', 'xl2tpd']:

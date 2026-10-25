@@ -61,7 +61,7 @@ class AmneziaDriver(WireGuardDriver):
         iface["obfuscation"] = fill_amnezia_obfuscation(current)
         iface_id = iface.get("id")
         if iface_id is not None:
-            self.store.put_doc(self.key, self._kind, str(iface_id), iface)
+            await self.store.put_doc(self.key, self._kind, str(iface_id), iface)
         if apply:
             await self._bring_up(iface)
         return iface

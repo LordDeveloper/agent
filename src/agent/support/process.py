@@ -15,27 +15,6 @@ def which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
 
-def run_blocking(
-    args: list[str],
-    *,
-    check: bool = False,
-    timeout: float = 30,
-    input_text: str | None = None,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Sync subprocess for injectable Runner helpers (tests / leftover sync cores)."""
-    with RuntimeTrace.span(command_span_name(args)):
-        return subprocess.run(
-            args,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=check,
-            env=env,
-        )
-
-
 async def _stop_process(proc: asyncio.subprocess.Process) -> None:
     """Kill a timed-out child. A race with an already-exited pid is not an error."""
     if proc.returncode is not None:

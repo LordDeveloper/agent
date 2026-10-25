@@ -274,6 +274,29 @@ def test_enforcer_cuts_client_left_live_after_panel_disable():
     assert driver.batches[0][0]["disabled_reason"] == "quota_exceeded"
 
 
+def test_enforcer_reuses_cached_snapshot_instead_of_dumping_again():
+    driver = _LiveXray(
+        clients=[{
+            "id": "node-1",
+            "email": "ok@x",
+            "is_enabled": True,
+            "volume": 1_000_000,
+            "_incoming": 10,
+            "_outgoing": 0,
+        }],
+    )
+    cached = driver.usage_snapshot()
+
+    def fail_dump():
+        raise AssertionError("quota must not start a second full stats dump")
+
+    driver.cached_usage_snapshot = lambda: cached
+    driver.usage_snapshot = fail_dump
+
+    assert asyncio.run(enforce_driver_quotas(driver)) == 0
+    assert driver.batches == []
+
+
 def test_enforcer_leaves_a_client_with_remaining_quota():
     driver = _LiveXray(
         clients=[{

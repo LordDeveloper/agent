@@ -247,70 +247,82 @@ def test_accumulate_transfer_migrates_legacy_raw_baseline():
 
 
 def test_reset_peer_traffic_removes_and_readds_live_peer(tmp_path, monkeypatch):
+    import asyncio
+
     from agent.audit import AuditLog
     from agent.config import AgentSettings
     from agent.db import Store
 
-    store = Store(tmp_path / "agent.db")
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "name": "wg1",
-            "listen_port": 51820,
-            "subnet": "10.80.0.0/24",
-            "private_key": "iface-priv",
-            "public_key": "iface-pub",
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "user@test",
-                    "address": "10.80.0.5",
-                    "allowed_ips": "10.80.0.5/32",
-                    "public_key": "peer-pub-key",
-                    "is_enabled": True,
-                    "incoming": 50_000_000_000,
-                    "outgoing": 1_000_000_000,
-                    "_incoming": 50_000_000_000,
-                    "_outgoing": 1_000_000_000,
-                    "_raw_incoming": 123456,
-                    "_raw_outgoing": 654321,
-                }
-            ],
-        },
-    )
+    async def scenario():
+        store = Store(tmp_path / "agent.db")
+        await store.open()
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "name": "wg1",
+                "listen_port": 51820,
+                "subnet": "10.80.0.0/24",
+                "private_key": "iface-priv",
+                "public_key": "iface-pub",
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "user@test",
+                        "address": "10.80.0.5",
+                        "allowed_ips": "10.80.0.5/32",
+                        "public_key": "peer-pub-key",
+                        "is_enabled": True,
+                        "incoming": 50_000_000_000,
+                        "outgoing": 1_000_000_000,
+                        "_incoming": 50_000_000_000,
+                        "_outgoing": 1_000_000_000,
+                        "_raw_incoming": 123456,
+                        "_raw_outgoing": 654321,
+                    }
+                ],
+            },
+        )
 
-    settings = AgentSettings()
-    audit = AuditLog(store)
-    driver = WireGuardDriver(settings, audit, store)
-    calls: list[str] = []
+        settings = AgentSettings()
+        audit = AuditLog(store)
+        driver = WireGuardDriver(settings, audit, store)
+        calls: list[str] = []
 
-    monkeypatch.setattr(driver, "_interface_is_up", lambda _name: True)
-    monkeypatch.setattr(
-        driver,
-        "_remove_live_peer",
-        lambda iface_name, public_key: calls.append(f"remove:{iface_name}:{public_key}") or True,
-    )
-    monkeypatch.setattr(
-        driver,
-        "_add_live_peer",
-        lambda iface_name, peer: calls.append(f"add:{iface_name}:{peer['public_key']}") or True,
-    )
+        async def interface_is_up(_name):
+            return True
 
-    result = driver.reset_peer_traffic(1, "peer-1")
+        async def remove_live_peer(iface_name, public_key):
+            calls.append(f"remove:{iface_name}:{public_key}")
+            return True
 
-    assert result["incoming"] == 0
-    assert result["outgoing"] == 0
-    assert result["_incoming"] == 0
-    assert result["_outgoing"] == 0
-    assert result["_raw_incoming"] == 0
-    assert result["_raw_outgoing"] == 0
+        async def add_live_peer(iface_name, peer):
+            calls.append(f"add:{iface_name}:{peer['public_key']}")
+            return True
+
+        monkeypatch.setattr(driver, "_interface_is_up", interface_is_up)
+        monkeypatch.setattr(driver, "_remove_live_peer", remove_live_peer)
+        monkeypatch.setattr(driver, "_add_live_peer", add_live_peer)
+
+        result = await driver.reset_peer_traffic(1, "peer-1")
+
+        assert result["incoming"] == 0
+        assert result["outgoing"] == 0
+        assert result["_incoming"] == 0
+        assert result["_outgoing"] == 0
+        assert result["_raw_incoming"] == 0
+        assert result["_raw_outgoing"] == 0
+        assert calls == ["remove:wg1:peer-pub-key", "add:wg1:peer-pub-key"]
+
+        persisted = await store.get_doc("wireguard", "interface", "1")
+        assert persisted["peers"][0]["incoming"] == 0
+        await store.close()
+        return calls
+
+    calls = asyncio.run(scenario())
     assert calls == ["remove:wg1:peer-pub-key", "add:wg1:peer-pub-key"]
-
-    persisted = store.get_doc("wireguard", "interface", "1")
-    assert persisted["peers"][0]["incoming"] == 0
 
 
 def test_accumulate_transfer_no_handshake_keeps_previous_offline():

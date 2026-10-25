@@ -32,14 +32,14 @@ def is_companion_user(user: dict[str, Any]) -> bool:
     return bool(companion_link_id(user))
 
 
-def find_linked_peer(store: Store, user: dict[str, Any]) -> dict[str, Any] | None:
+async def find_linked_peer(store: Store, user: dict[str, Any]) -> dict[str, Any] | None:
     needle = companion_link_id(user)
     if not needle:
         needle = str(user.get("id") or "").strip()
     if not needle:
         return None
     for core in _WG_CORES:
-        for iface in store.list_docs(core, _IFACE_KIND):
+        for iface in await store.list_docs(core, _IFACE_KIND):
             if not isinstance(iface, dict):
                 continue
             for peer in iface.get("peers") or []:
@@ -53,10 +53,10 @@ def find_linked_peer(store: Store, user: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
-def apply_linked_state(user: dict[str, Any], store: Store) -> bool:
+async def apply_linked_state(user: dict[str, Any], store: Store) -> bool:
     """Mutate a companion user to match the linked WG peer. Pure L2TP is untouched."""
     linked = companion_link_id(user)
-    peer = find_linked_peer(store, user)
+    peer = await find_linked_peer(store, user)
     if not linked:
         if peer is None:
             return False
@@ -129,11 +129,11 @@ def _user_keys(user: dict[str, Any]) -> set[str]:
     }
 
 
-def sync_companions(store: Store, *, drop_keys: Iterable[str] | None = None) -> dict[str, Any]:
+async def sync_companions(store: Store, *, drop_keys: Iterable[str] | None = None) -> dict[str, Any]:
     drop = {str(key).strip() for key in (drop_keys or []) if str(key).strip()}
     removed = 0
     updated = 0
-    for server in store.list_docs("l2tp", _L2TP_KIND):
+    for server in await store.list_docs("l2tp", _L2TP_KIND):
         if not isinstance(server, dict):
             continue
         users = [row for row in (server.get("users") or []) if isinstance(row, dict)]
@@ -141,7 +141,7 @@ def sync_companions(store: Store, *, drop_keys: Iterable[str] | None = None) -> 
         dirty = False
         for user in users:
             if drop and (_user_keys(user) & drop) and (
-                is_companion_user(user) or find_linked_peer(store, user) is not None
+                is_companion_user(user) or await find_linked_peer(store, user) is not None
             ):
                 log.info(
                     "l2tp companion %s removed; linked wireguard peer deleted",
@@ -150,11 +150,11 @@ def sync_companions(store: Store, *, drop_keys: Iterable[str] | None = None) -> 
                 removed += 1
                 dirty = True
                 continue
-            if apply_linked_state(user, store):
+            if await apply_linked_state(user, store):
                 updated += 1
                 dirty = True
             kept.append(user)
         if dirty:
             server["users"] = kept
-            store.put_doc("l2tp", _L2TP_KIND, str(server.get("id")), server)
+            await store.put_doc("l2tp", _L2TP_KIND, str(server.get("id")), server)
     return {"removed": removed, "updated": updated, "changed": (removed + updated) > 0}

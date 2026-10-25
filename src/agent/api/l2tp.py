@@ -40,7 +40,7 @@ async def status(l2tp: L2tpDriver = Depends(get_l2tp)):
 
 @router.get('/servers')
 async def list_servers(l2tp: L2tpDriver = Depends(get_l2tp)):
-    return {'success': True, 'servers': l2tp.list_servers()}
+    return {'success': True, 'servers': await l2tp.list_servers()}
 
 
 @router.post('/servers')
@@ -55,7 +55,7 @@ async def create_server(payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(g
 @router.get('/servers/{server_id}')
 async def get_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     try:
-        server = l2tp.get_server(server_id)
+        server = await l2tp.get_server(server_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}
@@ -134,7 +134,7 @@ async def user_config(
     l2tp: L2tpDriver = Depends(get_l2tp),
 ):
     try:
-        bundle = l2tp.user_config_bundle(server_id, user_id, endpoint_host=endpoint or None)
+        bundle = await l2tp.user_config_bundle(server_id, user_id, endpoint_host=endpoint or None)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, **bundle}

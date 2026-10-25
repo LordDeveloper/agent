@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import secrets
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -37,15 +36,15 @@ def instance_name_for_server(server: dict[str, Any]) -> str:
     return sanitize_instance_name(server.get('name') or f"ovpn{server.get('id') or 0}")
 
 
-def _run_openssl(args: list[str], *, cwd: Path | None = None) -> None:
+async def _run_openssl(args: list[str], *, cwd: Path | None = None) -> None:
+    from agent.support.process import run
+
     try:
-        proc = subprocess.run(
+        proc = await run(
             ['openssl', *args],
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
             timeout=60,
             check=False,
+            env=None,
         )
     except FileNotFoundError as exc:
         raise AgentError('VALIDATION_ERROR', 'openssl is required to issue OpenVPN certificates', 500) from exc
@@ -54,7 +53,7 @@ def _run_openssl(args: list[str], *, cwd: Path | None = None) -> None:
         raise AgentError('EXEC_ERROR', f'openssl failed: {detail[:400]}', 500)
 
 
-def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') -> dict[str, str]:
+async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') -> dict[str, str]:
     """Create CA + server cert/key (+ tls-crypt key) under pki_dir if missing."""
     pki_dir.mkdir(parents=True, exist_ok=True)
     ca_key = pki_dir / 'ca.key'
@@ -65,8 +64,8 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
     # dh.pem unused: server conf uses `dh none` (ECDH). Never run openssl dhparam.
 
     if not ca_key.is_file() or not ca_crt.is_file():
-        _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
-        _run_openssl(
+        await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
+        await _run_openssl(
             [
                 'req',
                 '-new',
@@ -88,8 +87,8 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
 
     if not server_key.is_file() or not server_crt.is_file():
         req = pki_dir / 'server.csr'
-        _run_openssl(['genrsa', '-out', str(server_key), '2048'])
-        _run_openssl(
+        await _run_openssl(['genrsa', '-out', str(server_key), '2048'])
+        await _run_openssl(
             [
                 'req',
                 '-new',
@@ -101,7 +100,7 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
                 f'/CN={common_name}-server',
             ]
         )
-        _run_openssl(
+        await _run_openssl(
             [
                 'x509',
                 '-req',
@@ -127,13 +126,9 @@ def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') ->
     if not tls_crypt.is_file():
         # Prefer openvpn --genkey; fall back to openssl rand.
         try:
-            proc = subprocess.run(
-                ['openvpn', '--genkey', 'secret', str(tls_crypt)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
+            from agent.support.process import run
+
+            proc = await run(['openvpn', '--genkey', 'secret', str(tls_crypt)], check=False, timeout=30)
             if proc.returncode != 0 or not tls_crypt.is_file():
                 raise FileNotFoundError('openvpn genkey failed')
         except FileNotFoundError:

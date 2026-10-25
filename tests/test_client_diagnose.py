@@ -18,7 +18,7 @@ class _FakeXrayDriver:
             return int(tail) if tail.isdigit() else tail
         return None
 
-    def read_config(self):
+    async def read_config(self):
         return {
             "inbounds": [
                 {

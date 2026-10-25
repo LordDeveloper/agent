@@ -32,13 +32,13 @@ _ONLINE_SECONDS = 180
 _PEER_CORES = ('wireguard', 'amnezia')
 
 
-def find_users_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
+async def find_users_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
     host = normalize_peer_host(address)
     if not host:
         return []
 
     rows: list[dict[str, Any]] = []
-    for server in store.list_docs(core, _SERVER_KIND):
+    for server in await store.list_docs(core, _SERVER_KIND):
         for user in server.get('users') or []:
             if not isinstance(user, dict):
                 continue
@@ -60,13 +60,13 @@ def find_users_by_address(store: Store, core: str, address: str) -> list[dict[st
     return rows
 
 
-def find_users_by_linked_peer_id(store: Store, core: str, linked_peer_id: str) -> list[dict[str, Any]]:
+async def find_users_by_linked_peer_id(store: Store, core: str, linked_peer_id: str) -> list[dict[str, Any]]:
     linked = str(linked_peer_id or '').strip()
     if not linked:
         return []
 
     rows: list[dict[str, Any]] = []
-    for server in store.list_docs(core, _SERVER_KIND):
+    for server in await store.list_docs(core, _SERVER_KIND):
         for user in server.get('users') or []:
             if not isinstance(user, dict):
                 continue
@@ -91,7 +91,7 @@ async def live_linked_peer_keys(store: Store, *, runner: Runner | None = None) -
     """Ids/emails of WG/Amnezia peers whose L2TP companion currently has a PPP session."""
     sessions = await _collect_ppp_sessions(runner)
     keys: set[str] = set()
-    for server in store.list_docs('l2tp', _SERVER_KIND):
+    for server in await store.list_docs('l2tp', _SERVER_KIND):
         if not isinstance(server, dict):
             continue
         for user in server.get('users') or []:
@@ -112,14 +112,14 @@ async def live_linked_peer_keys(store: Store, *, runner: Runner | None = None) -
     return keys
 
 
-def find_linked_peer(store: Store, linked_peer_id: str) -> dict[str, Any] | None:
+async def find_linked_peer(store: Store, linked_peer_id: str) -> dict[str, Any] | None:
     """Resolve WireGuard/Amnezia peer referenced by L2TP companion linked_peer_id."""
     linked = str(linked_peer_id or '').strip()
     if not linked:
         return None
 
     for peer_core in _PEER_CORES:
-        for iface in store.list_docs(peer_core, _IFACE_KIND):
+        for iface in await store.list_docs(peer_core, _IFACE_KIND):
             if not isinstance(iface, dict):
                 continue
             for peer in iface.get('peers') or []:
@@ -262,7 +262,7 @@ async def diagnose_user_match(
     subnet = str(server.get('subnet') or '')
     sibling_subnets: list[str] = []
     if store is not None:
-        for row in store.list_docs(core, _SERVER_KIND):
+        for row in await store.list_docs(core, _SERVER_KIND):
             raw = str((row or {}).get('subnet') or '').strip()
             if raw:
                 sibling_subnets.append(raw)
@@ -370,7 +370,7 @@ async def diagnose_user_match(
     linked = str(user.get('linked_peer_id') or '').strip()
     linked_peer: dict[str, Any] | None = None
     if linked and store is not None:
-        linked_peer = find_linked_peer(store, linked)
+        linked_peer = await find_linked_peer(store, linked)
         found = bool(linked_peer and linked_peer.get('found'))
         checks.append(
             {
@@ -573,7 +573,7 @@ async def diagnose_user_address(
     except ValueError:
         pass
 
-    rows = find_users_by_address(store, core, host)
+    rows = await find_users_by_address(store, core, host)
     if not rows:
         issue = _issue('error', 'USER_NOT_FOUND', f'No L2TP user with address [{host}] in store')
         return {

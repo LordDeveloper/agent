@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from types import SimpleNamespace
 
 from agent.db import Store
@@ -8,6 +10,7 @@ from agent.support.host_interfaces import list_host_interfaces
 from agent.support.peer_egress import (
     desired_rules_from_interfaces,
     reconcile_core_egress,
+    repair_peer_egress,
     render_apply_script,
     table_id_for_interface,
 )
@@ -16,6 +19,14 @@ from agent.support.peer_egress import (
 class _Result(SimpleNamespace):
     def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
         super().__init__(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+async def _stub_peer_egress_unit(_script_path, *, runner=None, start=False, **_kwargs):
+    return {"ok": True, "skipped": True, "started": start}
+
+
+async def _stub_true(*_args, **_kwargs):
+    return True
 
 
 def test_table_id_for_interface_is_stable():
@@ -69,7 +80,8 @@ def test_desired_rules_prohibit_disabled_companion():
     ]
 
 
-def test_list_host_interfaces_filters_loopback(monkeypatch):
+@pytest.mark.asyncio
+async def test_list_host_interfaces_filters_loopback(monkeypatch):
     payload = [
         {
             "ifname": "lo",
@@ -101,14 +113,16 @@ def test_list_host_interfaces_filters_loopback(monkeypatch):
         return _Result(stdout=json.dumps(payload))
 
     monkeypatch.setattr("agent.support.host_interfaces.shutil.which", lambda cmd: "/sbin/ip" if cmd == "ip" else None)
-    rows = list_host_interfaces(runner=fake_run)
+    rows = await list_host_interfaces(runner=fake_run)
     assert [row["name"] for row in rows] == ["eth1", "wg-de"]
     assert rows[0]["addresses"] == ["10.0.0.8/24"]
     assert rows[1]["link_type"] == "wireguard"
 
 
-def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
     live_rules: set[tuple[str, int]] = set()
 
@@ -151,10 +165,11 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
-    first = reconcile_core_egress(
+    first = await reconcile_core_egress(
         store,
         "wireguard",
         [
@@ -201,7 +216,7 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
 
     # Idempotent re-reconcile: do not churn rules or rebuild NAT when already healthy.
     commands.clear()
-    again = reconcile_core_egress(
+    again = await reconcile_core_egress(
         store,
         "wireguard",
         [
@@ -224,7 +239,7 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert not any(cmd[:1] == ["nft"] and "flush" in cmd for cmd in commands)
 
     commands.clear()
-    second = reconcile_core_egress(
+    second = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": []}],
@@ -236,12 +251,14 @@ def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
     assert ["ip", "rule", "del", "from", "10.80.0.2/32", "lookup", str(table)] in commands
     assert ["ip", "route", "flush", "table", str(table)] in commands
     assert ["conntrack", "-D", "-s", "10.80.0.2"] in commands
-    store.close()
+    await store.close()
 
 
-def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     """Server change: add new exit rule before deleting the old one."""
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
     live_rules: set[tuple[str, int]] = set()
 
@@ -267,13 +284,14 @@ def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
     poland = table_id_for_interface("poland")
     sweden = table_id_for_interface("sweden")
 
-    first = reconcile_core_egress(
+    first = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.72.174.10", "exit_interface": "poland", "is_enabled": True}]}],
@@ -285,7 +303,7 @@ def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     assert ("10.72.174.10/32", poland) in live_rules
 
     commands.clear()
-    switched = reconcile_core_egress(
+    switched = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.72.174.10", "exit_interface": "sweden", "is_enabled": True}]}],
@@ -309,11 +327,13 @@ def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     assert ["conntrack", "-D", "-s", "10.72.174.10"] in commands
     assert ("10.72.174.10/32", sweden) in live_rules
     assert ("10.72.174.10/32", poland) not in live_rules
-    store.close()
+    await store.close()
 
 
-def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -327,11 +347,12 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
     table = table_id_for_interface("usa")
-    result = reconcile_core_egress(
+    result = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
@@ -342,11 +363,13 @@ def test_reconcile_skips_missing_exit_interface(tmp_path, monkeypatch):
     assert result["rules"] == 0
     assert result.get("deferred") == 1
     assert ["ip", "rule", "add", "from", "10.90.68.3/32", "lookup", str(table)] not in commands
-    store.close()
+    await store.close()
 
 
-def test_reconcile_probes_a_missing_exit_once(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_probes_a_missing_exit_once(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -360,13 +383,14 @@ def test_reconcile_probes_a_missing_exit_once(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
     peers = [
         {"address": f"10.90.68.{host}", "exit_interface": "tr", "is_enabled": True}
         for host in (2, 5, 8)
     ]
-    result = reconcile_core_egress(
+    result = await reconcile_core_egress(
         store,
         "wireguard",
         [{"name": "wg0", "peers": peers}],
@@ -376,12 +400,14 @@ def test_reconcile_probes_a_missing_exit_once(tmp_path, monkeypatch):
     probes = [cmd for cmd in commands if cmd[:4] == ["ip", "link", "show", "tr"]]
     assert result["deferred"] == 3
     assert probes == [["ip", "link", "show", "tr"]]
-    store.close()
+    await store.close()
 
 
-def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypatch):
     """Missing exit must not delete the prior lookup rule (avoids region primary IP leak)."""
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
     live_rules: set[tuple[str, int]] = set()
     usa_up = True
@@ -412,11 +438,12 @@ def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypa
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
     table = table_id_for_interface("usa")
-    first = reconcile_core_egress(
+    first = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
@@ -429,7 +456,7 @@ def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypa
 
     commands.clear()
     usa_up = False
-    deferred = reconcile_core_egress(
+    deferred = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.90.68.3", "exit_interface": "usa", "is_enabled": True}]}],
@@ -443,13 +470,15 @@ def test_reconcile_retains_rule_when_exit_temporarily_missing(tmp_path, monkeypa
     assert ["ip", "route", "flush", "table", str(table)] not in commands
     assert ("10.90.68.3/32", table) in live_rules
 
-    state = store.get_doc("wireguard", "egress_state", "applied") or {}
+    state = await store.get_doc("wireguard", "egress_state", "applied") or {}
     assert state.get("rules") == [{"addr": "10.90.68.3", "table": table, "iface": "usa", "action": "lookup"}]
-    store.close()
+    await store.close()
 
 
-def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -464,11 +493,12 @@ def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeyp
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
     table = table_id_for_interface("uk")
-    result = reconcile_core_egress(
+    result = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.90.68.3", "exit_interface": "uk", "is_enabled": True}]}],
@@ -477,7 +507,7 @@ def test_reconcile_uses_dev_only_when_exit_has_no_main_gateway(tmp_path, monkeyp
     )
     assert result["ok"] is True
     assert ["ip", "route", "replace", "default", "dev", "uk", "table", str(table)] in commands
-    store.close()
+    await store.close()
 
 
 def test_render_apply_script_is_idempotent_shell():
@@ -505,8 +535,10 @@ def test_render_apply_script_is_idempotent_shell():
     assert f'ip rule del from "10.80.0.2/32" lookup {table}' not in script[else_idx:]
 
 
-def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
+    await store.open()
     commands: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -537,10 +569,11 @@ def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
 
-    result = reconcile_core_egress(
+    result = await reconcile_core_egress(
         store,
         "wireguard",
         [{"peers": [{"address": "10.90.68.3", "exit_interface": "deutch", "is_enabled": True}]}],
@@ -557,7 +590,7 @@ def test_reconcile_prefers_nft_and_purges_iptables_masq(tmp_path, monkeypatch):
     )
     # Must NOT keep installing MASQUERADE on iptables while nft is healthy.
     assert not any(cmd[:1] == ["iptables"] and "-A" in cmd and "MASQUERADE" in cmd for cmd in commands)
-    store.close()
+    await store.close()
 
 
 def test_render_apply_script_includes_tunnel_forward_and_mss_rules():
@@ -576,11 +609,11 @@ def test_render_apply_script_includes_tunnel_forward_and_mss_rules():
     assert "tunnel-wg0-in" in script
 
 
-def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
-    from agent.support.peer_egress import repair_peer_egress
-
+@pytest.mark.asyncio
+async def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
     store = Store(tmp_path / "agent.db")
-    store.put_doc(
+    await store.open()
+    await store.put_doc(
         "wireguard",
         "interface",
         "1",
@@ -600,6 +633,8 @@ def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
 
     def fake_run(args, **kwargs):
         commands.append(list(args))
+        if args[:3] == ["ip", "rule", "add"]:
+            return _Result()
         if args[:3] == ["ip", "-j", "rule"]:
             return _Result(stdout="[]")
         if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
@@ -614,18 +649,20 @@ def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agent.support.peer_egress.ensure_peer_egress_unit",
-        lambda script_path, runner=None, start=False: {"ok": True, "skipped": True, "started": start},
+        _stub_peer_egress_unit,
     )
-    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", lambda: True)
-    monkeypatch.setattr("agent.support.peer_egress._iface_exists", lambda runner, iface: True)
-    monkeypatch.setattr("agent.support.peer_egress._install_default_route", lambda runner, iface, table: True)
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
+    monkeypatch.setattr("agent.support.peer_egress._iface_exists", _stub_true)
+    monkeypatch.setattr("agent.support.peer_egress._install_default_route", _stub_true)
 
-    result = repair_peer_egress(store, data_dir=tmp_path, runner=fake_run)
-    assert result["ok"] is True
-    assert "wireguard" in result["cores"]
-    assert result["cores"]["wireguard"].get("forced") is True
-    assert result["cores"]["wireguard"].get("nat_rebuilt") is True
-    script = (tmp_path / "peer-egress-apply.sh").read_text(encoding="utf-8")
-    assert 'iptables -C FORWARD -i "wg0"' in script
-    assert "tunnel-wg0-in" in script
-    store.close()
+    try:
+        result = await repair_peer_egress(store, data_dir=tmp_path, runner=fake_run)
+        assert result["ok"] is True
+        assert "wireguard" in result["cores"]
+        assert result["cores"]["wireguard"].get("forced") is True
+        assert result["cores"]["wireguard"].get("nat_rebuilt") is True
+        script = (tmp_path / "peer-egress-apply.sh").read_text(encoding="utf-8")
+        assert 'iptables -C FORWARD -i "wg0"' in script
+        assert "tunnel-wg0-in" in script
+    finally:
+        await store.close()

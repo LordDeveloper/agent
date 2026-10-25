@@ -74,8 +74,14 @@ def _host_info() -> dict[str, str]:
         "org": "unavailable",
     }
     try:
-        response = httpx.get("https://ipinfo.io/json", timeout=2.5)
-        payload = response.json()
+        from agent.asyncutil import run_sync
+
+        async def _fetch() -> dict:
+            async with httpx.AsyncClient(timeout=2.5) as client:
+                response = await client.get("https://ipinfo.io/json")
+                return response.json()
+
+        payload = run_sync(_fetch())
         city = str(payload.get("city") or "").strip()
         country = str(payload.get("country") or "").strip()
         location = ", ".join(part for part in (city, country) if part) or "unavailable"
@@ -92,7 +98,7 @@ def _host_info() -> dict[str, str]:
 
 def _service_state() -> tuple[str, str]:
     try:
-        if service_is_active():
+        if run_sync(service_is_active()):
             return "Running", GREEN
         return "Stopped", RED
     except AgentError:
@@ -224,7 +230,7 @@ def _factory_reset_action() -> None:
         return
 
     def _run() -> None:
-        result = factory_reset()
+        result = run_sync(factory_reset())
         _print(kv("Result", "ok" if result.get("ok") else "failed", GREEN if result.get("ok") else RED))
         removed = result.get("removed") or []
         _print(kv("Removed", str(len(removed)), CYAN))
@@ -305,9 +311,9 @@ def _reload_detail(row: dict) -> str:
 
 def _show_service_action(action: str) -> None:
     if action == "status":
-        active = service_is_active()
+        active = run_sync(service_is_active())
         _print(kv("Active", "running" if active else "stopped", GREEN if active else RED))
-        logs = service_logs(12)
+        logs = run_sync(service_logs(12))
         if logs:
             _print()
             _print(paint("  Recent logs:", DIM))
@@ -315,7 +321,7 @@ def _show_service_action(action: str) -> None:
                 _print(paint(f"  {line}", WHITE))
         return
 
-    result = service_action(action)
+    result = run_sync(service_action(action))
     ok = bool(result.get("ok", True))
     _print(kv("Result", "ok" if ok else "failed", GREEN if ok else RED))
     if result.get("unit"):
@@ -329,7 +335,7 @@ def _show_service_action(action: str) -> None:
 
 
 def _show_install(name: str, *, force: bool = False, tag: str | None = None) -> None:
-    result = install_core(name, force=force, tag=tag)
+    result = run_sync(install_core(name, force=force, tag=tag))
     _print(kv("Core", str(result.get("core") or name), CYAN))
     _print(kv("Installed", "yes" if result.get("installed") else "no", GREEN))
     if result.get("release_tag") or result.get("tag"):
@@ -357,7 +363,7 @@ def _show_xray_status() -> None:
     capable = binary_has_httpapi(path)
     _print(kv("HTTP API", "yes" if capable else "no", GREEN if capable else RED))
     try:
-        proc = run_cmd([str(path), "version"], check=False, timeout=15)
+        proc = run_sync(run_cmd([str(path), "version"], check=False, timeout=15))
         version = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or "-"
     except OSError:
         version = "-"
@@ -643,7 +649,7 @@ def _wizard() -> None:
         for core in cores:
             _print(paint(f"  Installing {core}...", CYAN))
             try:
-                result = install_core(core)
+                result = run_sync(install_core(core))
                 _print(paint(f"  ok: {result.get('message')}", GREEN))
             except AgentError as exc:
                 _print(paint(f"  failed: {exc.message}", RED))
@@ -654,8 +660,8 @@ def _wizard() -> None:
 
     if confirm("Install and restart systemd service?", default=False):
         try:
-            service_action("install")
-            service_action("restart")
+            run_sync(service_action("install"))
+            run_sync(service_action("restart"))
             _print(paint("  Service installed and restarted.", GREEN))
         except AgentError as exc:
             _print(paint(f"  Service setup failed: {exc.message}", RED))

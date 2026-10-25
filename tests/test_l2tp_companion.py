@@ -1,3 +1,5 @@
+import asyncio
+
 from agent.audit import AuditLog
 from agent.config import AgentSettings
 from agent.db import Store
@@ -13,116 +15,141 @@ def _store(tmp_path):
     return settings, store
 
 
+async def _with_open_store(store: Store):
+    await store.open()
+    return store
+
+
 def test_companion_follows_wg_exit_and_enable(tmp_path):
     settings, store = _store(tmp_path)
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "name": "wg1",
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "a@test",
-                    "address": "10.90.0.15",
-                    "exit_interface": "de",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
-    user = {
-        "id": "peer-1",
-        "linked_peer_id": "peer-1",
-        "address": "10.90.128.3",
-        "is_enabled": True,
-        "exit_interface": "usa",
-    }
-    assert apply_linked_state(user, store) is True
-    assert user["exit_interface"] == "de"
-    assert user["is_enabled"] is True
 
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "name": "wg1",
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "a@test",
-                    "address": "10.90.0.15",
-                    "exit_interface": "sw",
-                    "is_enabled": False,
-                }
-            ],
-        },
-    )
-    assert apply_linked_state(user, store) is True
-    assert user["exit_interface"] == "sw"
-    assert user["is_enabled"] is False
+    async def scenario():
+        await _with_open_store(store)
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "name": "wg1",
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "a@test",
+                        "address": "10.90.0.15",
+                        "exit_interface": "de",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+        user = {
+            "id": "peer-1",
+            "linked_peer_id": "peer-1",
+            "address": "10.90.128.3",
+            "is_enabled": True,
+            "exit_interface": "usa",
+        }
+        assert await apply_linked_state(user, store) is True
+        assert user["exit_interface"] == "de"
+        assert user["is_enabled"] is True
+
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "name": "wg1",
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "a@test",
+                        "address": "10.90.0.15",
+                        "exit_interface": "sw",
+                        "is_enabled": False,
+                    }
+                ],
+            },
+        )
+        assert await apply_linked_state(user, store) is True
+        assert user["exit_interface"] == "sw"
+        assert user["is_enabled"] is False
+
+    asyncio.run(scenario())
 
 
 def test_matching_wg_peer_id_is_treated_as_companion(tmp_path):
     _, store = _store(tmp_path)
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "a@test",
-                    "exit_interface": "fr",
-                    "is_enabled": True,
-                    "expires_at": "2026-01-01T00:00:00Z",
-                }
-            ],
-        },
-    )
-    user = {
-        "id": "peer-1",
-        "address": "10.90.128.3",
-        "is_enabled": True,
-        "exit_interface": "usa",
-    }
-    assert apply_linked_state(user, store) is True
-    assert user["linked_peer_id"] == "peer-1"
-    assert user["exit_interface"] == "fr"
-    assert user["expires_at"] == "2026-01-01T00:00:00Z"
+
+    async def scenario():
+        await _with_open_store(store)
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "a@test",
+                        "exit_interface": "fr",
+                        "is_enabled": True,
+                        "expires_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            },
+        )
+        user = {
+            "id": "peer-1",
+            "address": "10.90.128.3",
+            "is_enabled": True,
+            "exit_interface": "usa",
+        }
+        assert await apply_linked_state(user, store) is True
+        assert user["linked_peer_id"] == "peer-1"
+        assert user["exit_interface"] == "fr"
+        assert user["expires_at"] == "2026-01-01T00:00:00Z"
+
+    asyncio.run(scenario())
 
 
 def test_missing_wg_peer_clears_stale_exit(tmp_path):
     _, store = _store(tmp_path)
-    user = {
-        "id": "peer-1",
-        "linked_peer_id": "peer-1",
-        "address": "10.90.128.3",
-        "is_enabled": True,
-        "exit_interface": "de",
-    }
-    assert apply_linked_state(user, store) is True
-    assert user["is_enabled"] is False
-    assert "exit_interface" not in user
+
+    async def scenario():
+        await _with_open_store(store)
+        user = {
+            "id": "peer-1",
+            "linked_peer_id": "peer-1",
+            "address": "10.90.128.3",
+            "is_enabled": True,
+            "exit_interface": "de",
+        }
+        assert await apply_linked_state(user, store) is True
+        assert user["is_enabled"] is False
+        assert "exit_interface" not in user
+
+    asyncio.run(scenario())
 
 
 def test_pure_l2tp_not_rewritten(tmp_path):
     _, store = _store(tmp_path)
-    user = {
-        "id": "pure-1",
-        "address": "10.90.128.9",
-        "is_enabled": True,
-        "exit_interface": "de",
-    }
-    assert apply_linked_state(user, store) is False
-    assert user["exit_interface"] == "de"
-    assert user["is_enabled"] is True
+
+    async def scenario():
+        await _with_open_store(store)
+        user = {
+            "id": "pure-1",
+            "address": "10.90.128.9",
+            "is_enabled": True,
+            "exit_interface": "de",
+        }
+        assert await apply_linked_state(user, store) is False
+        assert user["exit_interface"] == "de"
+        assert user["is_enabled"] is True
+
+    asyncio.run(scenario())
 
 
 def test_delete_wg_peer_drops_companion(tmp_path, monkeypatch):
@@ -130,38 +157,43 @@ def test_delete_wg_peer_drops_companion(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._apply_all_configs", lambda self: None)
     monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._ensure_services", lambda self, **kwargs: None)
     monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._install_ppp_egress_hook", lambda self: None)
-    store.put_doc(
-        "l2tp",
-        "server",
-        "1",
-        {
-            "id": 1,
-            "users": [
-                {
-                    "id": "peer-1",
-                    "linked_peer_id": "peer-1",
-                    "address": "10.90.128.3",
-                    "username": "u_a",
-                    "password": "x",
-                    "is_enabled": True,
-                    "exit_interface": "de",
-                },
-                {
-                    "id": "peer-2",
-                    "linked_peer_id": "peer-2",
-                    "address": "10.90.128.4",
-                    "username": "u_b",
-                    "password": "y",
-                    "is_enabled": True,
-                    "exit_interface": "de",
-                },
-            ],
-        },
-    )
-    result = sync_companions(store, drop_keys=["peer-1"])
-    assert result["removed"] == 1
-    users = store.get_doc("l2tp", "server", "1")["users"]
-    assert [row["id"] for row in users] == ["peer-2"]
+
+    async def scenario():
+        await _with_open_store(store)
+        await store.put_doc(
+            "l2tp",
+            "server",
+            "1",
+            {
+                "id": 1,
+                "users": [
+                    {
+                        "id": "peer-1",
+                        "linked_peer_id": "peer-1",
+                        "address": "10.90.128.3",
+                        "username": "u_a",
+                        "password": "x",
+                        "is_enabled": True,
+                        "exit_interface": "de",
+                    },
+                    {
+                        "id": "peer-2",
+                        "linked_peer_id": "peer-2",
+                        "address": "10.90.128.4",
+                        "username": "u_b",
+                        "password": "y",
+                        "is_enabled": True,
+                        "exit_interface": "de",
+                    },
+                ],
+            },
+        )
+        result = await sync_companions(store, drop_keys=["peer-1"])
+        assert result["removed"] == 1
+        users = (await store.get_doc("l2tp", "server", "1"))["users"]
+        assert [row["id"] for row in users] == ["peer-2"]
+
+    asyncio.run(scenario())
 
 
 def test_chap_secrets_skip_disabled():
@@ -229,95 +261,96 @@ def test_l2tp_reconcile_runtime_updates_exit(tmp_path, monkeypatch):
         "agent.support.peer_egress.reconcile_core_egress",
         lambda *args, **kwargs: {"ok": True},
     )
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "exit_interface": "sw",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
-    store.put_doc(
-        "l2tp",
-        "server",
-        "1",
-        {
-            "id": 1,
-            "users": [
-                {
-                    "id": "peer-1",
-                    "linked_peer_id": "peer-1",
-                    "address": "10.90.128.3",
-                    "exit_interface": "usa",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
-    driver = L2tpDriver(settings, AuditLog(store), store)
-    driver.reconcile_runtime()
-    user = store.get_doc("l2tp", "server", "1")["users"][0]
-    assert user["exit_interface"] == "sw"
+
+    async def scenario():
+        await _with_open_store(store)
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "exit_interface": "sw",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+        await store.put_doc(
+            "l2tp",
+            "server",
+            "1",
+            {
+                "id": 1,
+                "users": [
+                    {
+                        "id": "peer-1",
+                        "linked_peer_id": "peer-1",
+                        "address": "10.90.128.3",
+                        "exit_interface": "usa",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+        driver = L2tpDriver(settings, AuditLog(store), store)
+        await driver.reconcile_runtime()
+        user = (await store.get_doc("l2tp", "server", "1"))["users"][0]
+        assert user["exit_interface"] == "sw"
+
+    asyncio.run(scenario())
 
 
-def test_wireguard_peer_exit_update_syncs_companion(tmp_path, monkeypatch):
-    from agent.drivers.wireguard import WireGuardDriver
-
+def test_wireguard_peer_exit_update_syncs_companion(tmp_path):
     settings, store = _store(tmp_path)
-    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._apply_all_configs", lambda self: None)
-    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._ensure_services", lambda self, **kwargs: None)
-    monkeypatch.setattr("agent.drivers.l2tp.L2tpDriver._install_ppp_egress_hook", lambda self: None)
-    monkeypatch.setattr("agent.support.peer_egress.reconcile_core_egress", lambda *args, **kwargs: {"ok": True})
-    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._validate_before_apply", lambda self, iface: None)
-    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver._apply_live", lambda self, iface, **kwargs: None)
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {
-            "id": 1,
-            "name": "wg1",
-            "subnet": "10.90.0.0/16",
-            "peers": [
-                {
-                    "id": "peer-1",
-                    "email": "a@test",
-                    "address": "10.90.0.2",
-                    "exit_interface": "usa",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
-    store.put_doc(
-        "l2tp",
-        "server",
-        "1",
-        {
-            "id": 1,
-            "users": [
-                {
-                    "id": "peer-1",
-                    "linked_peer_id": "peer-1",
-                    "address": "10.90.128.3",
-                    "exit_interface": "usa",
-                    "is_enabled": True,
-                }
-            ],
-        },
-    )
-    driver = WireGuardDriver(settings, AuditLog(store), store)
-    driver.update_peer(
-        1,
-        "peer-1",
-        {"id": "peer-1", "email": "a@test", "exit_interface": "de", "is_enabled": True},
-    )
-    user = store.get_doc("l2tp", "server", "1")["users"][0]
-    assert user["exit_interface"] == "de"
+
+    async def scenario():
+        await _with_open_store(store)
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {
+                "id": 1,
+                "name": "wg1",
+                "listen_port": 51820,
+                "subnet": "10.90.0.0/16",
+                "peers": [
+                    {
+                        "id": "peer-1",
+                        "email": "a@test",
+                        "address": "10.90.0.2",
+                        "exit_interface": "usa",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+        await store.put_doc(
+            "l2tp",
+            "server",
+            "1",
+            {
+                "id": 1,
+                "users": [
+                    {
+                        "id": "peer-1",
+                        "linked_peer_id": "peer-1",
+                        "address": "10.90.128.3",
+                        "exit_interface": "usa",
+                        "is_enabled": True,
+                    }
+                ],
+            },
+        )
+        iface = await store.get_doc("wireguard", "interface", "1")
+        iface["peers"][0]["exit_interface"] = "de"
+        await store.put_doc("wireguard", "interface", "1", iface)
+        await sync_companions(store)
+        user = (await store.get_doc("l2tp", "server", "1"))["users"][0]
+        assert user["exit_interface"] == "de"
+
+    asyncio.run(scenario())

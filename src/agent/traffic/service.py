@@ -49,7 +49,7 @@ class TrafficService:
         async def snapshot_of(core_key: str):
             driver = registry.get(core_key)
             if core_key == "l2tp":
-                self._drop_linked_l2tp_billing(driver)
+                await self._drop_linked_l2tp_billing(driver)
             return core_key, await maybe_await(driver.usage_snapshot())
 
         sampled = await gather_independent(
@@ -57,6 +57,7 @@ class TrafficService:
             return_exceptions=True,
         )
 
+        samples: list[dict[str, Any]] = []
         for item in sampled:
             if isinstance(item, Exception):
                 log.exception("traffic sample failed: %s", item)
@@ -77,25 +78,206 @@ class TrafficService:
                     email = str(getattr(client, "email", "") or "").strip()
                     client_id = str(getattr(client, "id", "") or "").strip()
                     self._remember_identity(label, email, client_id)
-
-                    stats["clients_seen"] += 1
-                    self._migrate_legacy_client_key(core_key, label, email, client_id)
-                    outcome = self._process_sample(
-                        core_key,
-                        label,
-                        int(client.incoming or 0),
-                        int(client.outgoing or 0),
+                    samples.append(
+                        {
+                            "core": core_key,
+                            "label": label,
+                            "email": email,
+                            "client_id": client_id,
+                            "incoming": int(client.incoming or 0),
+                            "outgoing": int(client.outgoing or 0),
+                        }
                     )
-                    stats[outcome] = stats.get(outcome, 0) + 1
 
-        pending = self.store.count_traffic_pending()
-        stats["pending"] = pending
-        self.store.set_meta(
-            AGENT_META_CORE,
-            LAST_SAMPLE_META_KEY,
-            datetime.now(timezone.utc).isoformat(),
-        )
+        sampled_at = datetime.now(timezone.utc).isoformat()
+        stored = await self._commit_samples(samples, sampled_at)
+        stats.update(stored)
         return stats
+
+    async def _commit_samples(self, samples: list[dict[str, Any]], sampled_at: str) -> dict[str, int]:
+        def plan(acks: dict, pending: dict) -> dict[str, Any]:
+            return self._plan_sample(samples, acks, pending, sampled_at)
+
+        return await self.store.apply_traffic_sample(plan)
+
+    def _plan_sample(
+        self,
+        samples: list[dict[str, Any]],
+        acks: dict[tuple[str, str], tuple[int, int]],
+        pending: dict[tuple[str, str], dict[str, int]],
+        sampled_at: str,
+    ) -> dict[str, Any]:
+        stats = {
+            "clients_seen": 0,
+            "pending": 0,
+            "initialized": 0,
+            "regressed": 0,
+            "unchanged": 0,
+        }
+        ack_upserts: list[tuple[str, str, int, int]] = []
+        ack_deletes: list[tuple[str, str]] = []
+        pending_upserts: list[dict[str, Any]] = []
+        pending_deletes: list[tuple[str, str]] = []
+
+        def set_ack(core: str, key: str, incoming: int, outgoing: int) -> None:
+            acks[(core, key)] = (incoming, outgoing)
+            ack_upserts.append((core, key, incoming, outgoing))
+
+        def delete_ack(core: str, key: str) -> None:
+            if (core, key) not in acks:
+                return
+            del acks[(core, key)]
+            ack_deletes.append((core, key))
+
+        def set_pending(
+            core: str,
+            key: str,
+            delta_incoming: int,
+            delta_outgoing: int,
+            current_incoming: int,
+            current_outgoing: int,
+        ) -> None:
+            row = {
+                "delta_incoming": delta_incoming,
+                "delta_outgoing": delta_outgoing,
+                "current_incoming": current_incoming,
+                "current_outgoing": current_outgoing,
+            }
+            pending[(core, key)] = row
+            pending_upserts.append({"core": core, "client_key": key, **row})
+
+        def delete_pending(core: str, key: str) -> None:
+            if (core, key) not in pending:
+                return
+            del pending[(core, key)]
+            pending_deletes.append((core, key))
+
+        for sample in samples:
+            core = str(sample["core"])
+            label = str(sample["label"])
+            email = str(sample["email"] or "")
+            client_id = str(sample["client_id"] or "")
+            current_incoming = int(sample["incoming"])
+            current_outgoing = int(sample["outgoing"])
+            stats["clients_seen"] += 1
+            self._migrate_legacy_keys(
+                core,
+                label,
+                email,
+                client_id,
+                set_ack=set_ack,
+                delete_ack=delete_ack,
+                set_pending=set_pending,
+                delete_pending=delete_pending,
+                acks=acks,
+                pending=pending,
+            )
+            outcome = self._classify_sample(
+                core,
+                label,
+                current_incoming,
+                current_outgoing,
+                acks=acks,
+                set_ack=set_ack,
+                set_pending=set_pending,
+                delete_pending=delete_pending,
+            )
+            stats[outcome] = stats.get(outcome, 0) + 1
+
+        return {
+            "stats": stats,
+            "ack_upserts": ack_upserts,
+            "ack_deletes": ack_deletes,
+            "pending_upserts": pending_upserts,
+            "pending_deletes": pending_deletes,
+            "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
+        }
+
+    @staticmethod
+    def _migrate_legacy_keys(
+        core: str,
+        canonical_key: str,
+        email: str,
+        client_id: str,
+        *,
+        set_ack,
+        delete_ack,
+        set_pending,
+        delete_pending,
+        acks: dict[tuple[str, str], tuple[int, int]],
+        pending: dict[tuple[str, str], dict[str, int]],
+    ) -> None:
+        """Move pre-node_id traffic rows to the canonical client id."""
+        if not client_id or not email or client_id == email:
+            return
+
+        legacy_pending = pending.get((core, email))
+        if legacy_pending is not None:
+            if (core, canonical_key) not in pending:
+                set_pending(
+                    core,
+                    canonical_key,
+                    int(legacy_pending["delta_incoming"]),
+                    int(legacy_pending["delta_outgoing"]),
+                    int(legacy_pending["current_incoming"]),
+                    int(legacy_pending["current_outgoing"]),
+                )
+            delete_pending(core, email)
+
+        legacy_ack = acks.get((core, email))
+        if legacy_ack is not None:
+            if (core, canonical_key) not in acks:
+                set_ack(core, canonical_key, int(legacy_ack[0]), int(legacy_ack[1]))
+            delete_ack(core, email)
+
+    @staticmethod
+    def _classify_sample(
+        core: str,
+        client_key_label: str,
+        current_incoming: int,
+        current_outgoing: int,
+        *,
+        acks: dict[tuple[str, str], tuple[int, int]],
+        set_ack,
+        set_pending,
+        delete_pending,
+    ) -> str:
+        ack = acks.get((core, client_key_label))
+        if ack is None:
+            set_ack(core, client_key_label, current_incoming, current_outgoing)
+            delete_pending(core, client_key_label)
+            return "initialized"
+
+        ack_in, ack_out = int(ack[0]), int(ack[1])
+        if current_incoming < ack_in or current_outgoing < ack_out:
+            log.warning(
+                "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s)",
+                core,
+                client_key_label,
+                ack_in,
+                ack_out,
+                current_incoming,
+                current_outgoing,
+            )
+            set_ack(core, client_key_label, current_incoming, current_outgoing)
+            delete_pending(core, client_key_label)
+            return "regressed"
+
+        delta_in = current_incoming - ack_in
+        delta_out = current_outgoing - ack_out
+        if delta_in > 0 or delta_out > 0:
+            set_pending(
+                core,
+                client_key_label,
+                delta_in,
+                delta_out,
+                current_incoming,
+                current_outgoing,
+            )
+            return "pending"
+
+        delete_pending(core, client_key_label)
+        return "unchanged"
 
     def _remember_identity(self, canonical: str, email: str, client_id: str) -> None:
         self._aliases[canonical] = canonical
@@ -108,95 +290,11 @@ class TrafficService:
     def _canonical_key(self, label: str) -> str:
         return self._aliases.get(label, label)
 
-    def _migrate_legacy_client_key(
-        self,
-        core: str,
-        canonical_key: str,
-        email: str,
-        client_id: str,
-    ) -> None:
-        """Move pre-node_id traffic rows to the canonical client id."""
-        if not client_id or not email or client_id == email:
-            return
-
-        legacy_pending = self.store.get_traffic_pending(core, email)
-        if legacy_pending is not None:
-            current_pending = self.store.get_traffic_pending(core, canonical_key)
-            if current_pending is None:
-                self.store.upsert_traffic_pending(
-                    core,
-                    canonical_key,
-                    int(legacy_pending["delta_incoming"]),
-                    int(legacy_pending["delta_outgoing"]),
-                    int(legacy_pending["current_incoming"]),
-                    int(legacy_pending["current_outgoing"]),
-                )
-            self.store.delete_traffic_pending(core, email)
-
-        legacy_ack = self.store.get_traffic_ack(core, email)
-        if legacy_ack is not None:
-            if self.store.get_traffic_ack(core, canonical_key) is None:
-                self.store.set_traffic_ack(
-                    core,
-                    canonical_key,
-                    int(legacy_ack["incoming"]),
-                    int(legacy_ack["outgoing"]),
-                )
-            self.store.delete_traffic_ack(core, email)
-
-    def _process_sample(
-        self,
-        core: str,
-        client_key_label: str,
-        current_incoming: int,
-        current_outgoing: int,
-    ) -> str:
-        ack = self.store.get_traffic_ack(core, client_key_label)
-
-        if ack is None:
-            self.store.set_traffic_ack(core, client_key_label, current_incoming, current_outgoing)
-            self.store.delete_traffic_pending(core, client_key_label)
-            return "initialized"
-
-        ack_in = int(ack["incoming"])
-        ack_out = int(ack["outgoing"])
-
-        if current_incoming < ack_in or current_outgoing < ack_out:
-            log.warning(
-                "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s)",
-                core,
-                client_key_label,
-                ack_in,
-                ack_out,
-                current_incoming,
-                current_outgoing,
-            )
-            self.store.set_traffic_ack(core, client_key_label, current_incoming, current_outgoing)
-            self.store.delete_traffic_pending(core, client_key_label)
-            return "regressed"
-
-        delta_in = current_incoming - ack_in
-        delta_out = current_outgoing - ack_out
-
-        if delta_in > 0 or delta_out > 0:
-            self.store.upsert_traffic_pending(
-                core,
-                client_key_label,
-                delta_in,
-                delta_out,
-                current_incoming,
-                current_outgoing,
-            )
-            return "pending"
-
-        self.store.delete_traffic_pending(core, client_key_label)
-        return "unchanged"
-
-    def pending_payload(self) -> dict[str, Any]:
-        rows = self.store.list_traffic_pending()
+    async def pending_payload(self) -> dict[str, Any]:
+        rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
-        linked_l2tp = self._linked_l2tp_client_keys()
+        linked_l2tp = await self._linked_l2tp_client_keys()
 
         for row in rows:
             label = str(row["client_key"])
@@ -218,19 +316,18 @@ class TrafficService:
         self._fetch_snapshot = snapshot
 
         return {
-            "sampled_at": self.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY),
-            "worker_lag_ms": self._worker_lag_ms(),
+            "sampled_at": await self.store.get_meta(
+                AGENT_META_CORE,
+                LAST_SAMPLE_META_KEY,
+            ),
+            "worker_lag_ms": await self._worker_lag_ms(),
             "users": users,
         }
 
-    def ack_pending(self) -> int:
-        rows = self.store.list_traffic_pending()
-        acked = 0
-
-        for row in rows:
-            self._ack_pending_row(row)
-            acked += 1
-
+    async def ack_pending(self) -> int:
+        rows = await self.store.list_traffic_pending()
+        await self.store.ack_traffic_rows(rows)
+        acked = len(rows)
         self._fetch_snapshot = {}
 
         if acked:
@@ -238,7 +335,7 @@ class TrafficService:
 
         return acked
 
-    def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
+    async def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
         """Ack provided ids: panel node_id and/or email."""
         requested = []
         seen: set[str] = set()
@@ -250,12 +347,13 @@ class TrafficService:
             requested.append(label)
 
         rows_by_key: dict[str, list[dict[str, Any]]] = {}
-        for row in self.store.list_traffic_pending():
+        for row in await self.store.list_traffic_pending():
             label = str(row["client_key"])
             rows_by_key.setdefault(label, []).append(row)
 
         acked: list[str] = []
         not_found: list[str] = []
+        to_ack: list[dict[str, Any]] = []
 
         for label in requested:
             canonical = self._canonical_key(label)
@@ -270,28 +368,18 @@ class TrafficService:
                 not_found.append(label)
                 continue
 
-            for row in rows:
-                self._ack_pending_row(row)
-
+            to_ack.extend(rows)
             acked.append(label)
             log.info("traffic ack client=%s rows=%s", label, len(rows))
 
+        await self.store.ack_traffic_rows(to_ack)
         return acked, not_found
 
-    def _ack_pending_row(self, row: dict[str, Any]) -> None:
-        self.store.set_traffic_ack(
-            row["core"],
-            row["client_key"],
-            int(row["current_incoming"]),
-            int(row["current_outgoing"]),
-        )
-        self.store.delete_traffic_pending(row["core"], row["client_key"])
-
-    def _linked_l2tp_client_keys(self) -> set[str]:
+    async def _linked_l2tp_client_keys(self) -> set[str]:
         """Canonical ids/emails of L2TP users linked to a WireGuard/Amnezia peer."""
         keys: set[str] = set()
         try:
-            docs = self.store.list_docs("l2tp", "server")
+            docs = await self.store.list_docs("l2tp", "server")
         except Exception:
             return keys
         for doc in docs:
@@ -308,10 +396,12 @@ class TrafficService:
                         keys.add(label)
         return keys
 
-    def _drop_linked_l2tp_billing(self, driver: Any) -> None:
+    async def _drop_linked_l2tp_billing(self, driver: Any) -> None:
         """Remove pending/ack rows for companion L2TP users (WG peer owns billing)."""
+        from agent.asyncutil import maybe_await
+
         try:
-            servers = driver.list_servers()
+            servers = await maybe_await(driver.list_servers())
         except Exception:
             return
         for server in servers or []:
@@ -322,14 +412,19 @@ class TrafficService:
                     continue
                 if not str(user.get("linked_peer_id") or "").strip():
                     continue
-                self.reset_client_record("l2tp", user)
+                await self.reset_client_record("l2tp", user)
 
-    def reset_client(self, core: str, client_key_label: str) -> None:
+    async def reset_client(self, core: str, client_key_label: str) -> None:
         """Drop ack/pending rows after panel delete or renew."""
-        self.store.delete_traffic_ack(core, client_key_label)
-        self.store.delete_traffic_pending(core, client_key_label)
+        await self.store.delete_traffic_ack(core, client_key_label)
+        await self.store.delete_traffic_pending(core, client_key_label)
 
-    def reset_client_record(self, core: str, record: dict[str, Any], *extra_labels: str) -> None:
+    async def reset_client_record(
+        self,
+        core: str,
+        record: dict[str, Any],
+        *extra_labels: str,
+    ) -> None:
         """Clear traffic worker state for every identifier the panel may use."""
         seen: set[str] = set()
         for candidate in (
@@ -340,13 +435,13 @@ class TrafficService:
             label = str(candidate or "").strip()
             if label and label not in seen:
                 seen.add(label)
-                self.reset_client(core, label)
+                await self.reset_client(core, label)
 
-    def last_sample_age_ms(self) -> int | None:
-        return self._worker_lag_ms()
+    async def last_sample_age_ms(self) -> int | None:
+        return await self._worker_lag_ms()
 
-    def _worker_lag_ms(self) -> int | None:
-        sampled_at = self.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY)
+    async def _worker_lag_ms(self) -> int | None:
+        sampled_at = await self.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY)
         if not sampled_at:
             return None
 

@@ -40,7 +40,7 @@ async def status(wg: WireGuardDriver = Depends(get_wg)):
 
 @router.get("/interfaces")
 async def list_interfaces(wg: WireGuardDriver = Depends(get_wg)):
-    return {"success": True, "interfaces": wg.list_interfaces()}
+    return {"success": True, "interfaces": await wg.list_interfaces()}
 
 
 @router.post("/interfaces")
@@ -55,7 +55,7 @@ async def create_interface(payload: WgInterfacePayload, wg: WireGuardDriver = De
 @router.get("/interfaces/{interface_id}")
 async def get_interface(interface_id: str, wg: WireGuardDriver = Depends(get_wg)):
     try:
-        iface = wg.get_interface(interface_id)
+        iface = await wg.get_interface(interface_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "interface": iface}
@@ -151,7 +151,7 @@ async def reset_peer_traffic(
         peer = await wg.reset_peer_traffic(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    traffic.reset_client_record("wireguard", peer, peer_id)
+    await traffic.reset_client_record("wireguard", peer, peer_id)
     return {"success": True, "peer": peer}
 
 

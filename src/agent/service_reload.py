@@ -295,8 +295,7 @@ async def _reload_mullvad(settings: Any, store: Any) -> dict[str, Any]:
 async def _reload_peer_egress(settings: Any, store: Any) -> dict[str, Any]:
     from agent.support.peer_egress import repair_peer_egress
 
-    result = await asyncio.to_thread(
-        repair_peer_egress,
+    result = await repair_peer_egress(
         store,
         data_dir=settings.data_dir,
         force=True,

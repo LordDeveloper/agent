@@ -4,20 +4,21 @@ from __future__ import annotations
 
 import base64
 import os
-import shutil
 import tempfile
-import urllib.error
-import urllib.request
 import zipfile
 from pathlib import Path
 
+import aiofiles
+import aiofiles.os
+import httpx
+
 from agent.errors import AgentError
 from agent.ops import run_cmd, which
+from agent.support import aiofs
 from agent.update import (
     ReleaseInfo,
     detect_arch,
     detect_host_platform,
-    download_release_asset,
     fetch_release_for_asset,
     resolve_token,
 )
@@ -110,7 +111,46 @@ def _pick_zip_member(names: list[str], filename: str) -> str | None:
     return exact[0]
 
 
-def _extract_xray_zip(archive: Path, dest_binary: Path, geo_dir: Path) -> list[str]:
+async def _download_release_asset(
+    release: ReleaseInfo,
+    dest: Path,
+    *,
+    token: str | None = None,
+    timeout: float = 300.0,
+) -> Path:
+    auth = resolve_token(token)
+    headers = {"Accept": "application/octet-stream", "User-Agent": "netinja-agent"}
+    if auth:
+        headers["Authorization"] = f"Bearer {auth}"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", release.asset_url, headers=headers) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                    raise AgentError(
+                        "UPSTREAM_ERROR",
+                        f"Asset download failed HTTP {response.status_code}: {body}",
+                    )
+                async with aiofiles.open(tmp, "wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        await handle.write(chunk)
+    except AgentError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except httpx.HTTPError as exc:
+        tmp.unlink(missing_ok=True)
+        raise AgentError("UPSTREAM_ERROR", f"Asset download failed: {exc}") from exc
+
+    await aiofs.chmod(tmp, 0o755)
+    await aiofiles.os.replace(tmp, dest)
+    return dest
+
+
+async def _extract_xray_zip(archive: Path, dest_binary: Path, geo_dir: Path) -> list[str]:
     written: list[str] = []
     with zipfile.ZipFile(archive, "r") as zf:
         names = zf.namelist()
@@ -123,10 +163,11 @@ def _extract_xray_zip(archive: Path, dest_binary: Path, geo_dir: Path) -> list[s
 
         dest_binary.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest_binary.with_suffix(dest_binary.suffix + ".partial")
-        with zf.open(binary_member) as src, tmp.open("wb") as out:
-            shutil.copyfileobj(src, out)
-        tmp.chmod(0o755)
-        os.replace(tmp, dest_binary)
+        with zf.open(binary_member) as src:
+            data = src.read()
+        await aiofs.write_bytes(tmp, data)
+        await aiofs.chmod(tmp, 0o755)
+        await aiofiles.os.replace(tmp, dest_binary)
         written.append(str(dest_binary))
 
         geo_dir.mkdir(parents=True, exist_ok=True)
@@ -135,14 +176,15 @@ def _extract_xray_zip(archive: Path, dest_binary: Path, geo_dir: Path) -> list[s
             if member is None:
                 continue
             target = geo_dir / geo_name
-            with zf.open(member) as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out)
+            with zf.open(member) as src:
+                geo_data = src.read()
+            await aiofs.write_bytes(target, geo_data)
             written.append(str(target))
 
     return written
 
 
-def install_xray_binary(
+async def install_xray_binary(
     dest: Path,
     *,
     repo: str | None = None,
@@ -166,11 +208,11 @@ def install_xray_binary(
 
     with tempfile.TemporaryDirectory(prefix="xray-release-") as tmp:
         archive = Path(tmp) / release.asset_name
-        download_release_asset(release, archive, token=resolve_token(token), timeout=timeout)
+        await _download_release_asset(release, archive, token=resolve_token(token), timeout=timeout)
         geo_dir = Path(os.environ.get("XRAY_GEO_DIR") or DEFAULT_GEO_DIR)
-        extracted = _extract_xray_zip(archive, dest, geo_dir)
+        extracted = await _extract_xray_zip(archive, dest, geo_dir)
 
-    placed = ensure_xray_geodata(dest, download=True)
+    placed = await ensure_xray_geodata(dest, download=True)
     if placed:
         extracted.extend(str(placed / name) for name in GEODATA_NAMES if (placed / name).is_file())
 
@@ -187,7 +229,7 @@ def install_xray_binary(
 
     version: str | None = None
     try:
-        proc = run_cmd([str(dest), "version"], check=False, timeout=30)
+        proc = await run_cmd([str(dest), "version"], check=False, timeout=30)
         version = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or None
     except OSError:
         version = release.version
@@ -246,11 +288,11 @@ def geodata_write_dirs(binary: Path | None = None) -> list[Path]:
     return _unique_dirs([binary.parent, configured])
 
 
-def _copy_geodata(src: Path, dest: Path) -> None:
+async def _copy_geodata(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".partial")
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dest)
+    await aiofs.write_bytes(tmp, await aiofs.read_bytes(src))
+    await aiofiles.os.replace(tmp, dest)
 
 
 def _find_geodata(name: str, binary: Path) -> Path | None:
@@ -261,27 +303,32 @@ def _find_geodata(name: str, binary: Path) -> Path | None:
     return None
 
 
-def _download_geodata(name: str, dest: Path) -> bool:
+async def _download_geodata(name: str, dest: Path) -> bool:
     url = GEODATA_URLS.get(name)
     if not url:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".partial")
-    request = urllib.request.Request(url, headers={"User-Agent": "netinja-agent"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
-        if tmp.stat().st_size <= 0 or tmp.stat().st_size > _GEODATA_MAX_BYTES:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            async with client.stream("GET", url, headers={"User-Agent": "netinja-agent"}) as response:
+                if response.status_code >= 400:
+                    return False
+                async with aiofiles.open(tmp, "wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        await handle.write(chunk)
+        size = (await aiofiles.os.stat(str(tmp))).st_size
+        if size <= 0 or size > _GEODATA_MAX_BYTES:
             tmp.unlink(missing_ok=True)
             return False
-        os.replace(tmp, dest)
+        await aiofiles.os.replace(tmp, dest)
         return True
-    except (OSError, urllib.error.URLError):
+    except (OSError, httpx.HTTPError):
         tmp.unlink(missing_ok=True)
         return False
 
 
-def ensure_xray_geodata(binary: Path | None = None, *, download: bool = True) -> Path | None:
+async def ensure_xray_geodata(binary: Path | None = None, *, download: bool = True) -> Path | None:
     """Put geosite.dat and geoip.dat next to the Xray binary.
 
     Xray's config test looks beside the executable (/usr/local/bin), while the
@@ -301,10 +348,10 @@ def ensure_xray_geodata(binary: Path | None = None, *, download: bool = True) ->
             continue
         found = _find_geodata(name, binary)
         if found is not None and found.resolve() != target.resolve():
-            _copy_geodata(found, target)
+            await _copy_geodata(found, target)
             continue
         if download:
-            _download_geodata(name, target)
+            await _download_geodata(name, target)
 
     for name in GEODATA_NAMES:
         src = asset / name
@@ -317,7 +364,7 @@ def ensure_xray_geodata(binary: Path | None = None, *, download: bool = True) ->
             if dest.is_file() and dest.stat().st_size > 0:
                 continue
             try:
-                _copy_geodata(src, dest)
+                await _copy_geodata(src, dest)
             except OSError:
                 continue
 

@@ -181,16 +181,17 @@ async def egress_repair(request: Request):
     """
     store: Store = request.app.state.store
     data_dir = getattr(request.app.state.settings, "data_dir", None)
-    result = repair_peer_egress(store, data_dir=data_dir)
+    result = await repair_peer_egress(store, data_dir=data_dir)
     return {"success": bool(result.get("ok")), **result}
 
 
 @router.get("/egress/status")
 async def egress_status(request: Request):
     store: Store = request.app.state.store
+    rules = await all_desired_rules_from_store(store)
     return {
         "success": True,
-        "rules": all_desired_rules_from_store(store),
-        "tunnels": all_tunnel_interface_names(store),
-        "rule_count": len(all_desired_rules_from_store(store)),
+        "rules": rules,
+        "tunnels": await all_tunnel_interface_names(store),
+        "rule_count": len(rules),
     }

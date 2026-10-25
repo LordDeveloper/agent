@@ -40,7 +40,7 @@ async def status(amnezia: AmneziaDriver = Depends(get_amnezia)):
 
 @router.get("/interfaces")
 async def list_interfaces(amnezia: AmneziaDriver = Depends(get_amnezia)):
-    return {"success": True, "interfaces": amnezia.list_interfaces()}
+    return {"success": True, "interfaces": await amnezia.list_interfaces()}
 
 
 @router.post("/interfaces")
@@ -58,7 +58,7 @@ async def create_interface(payload: AmneziaInterfacePayload, amnezia: AmneziaDri
 @router.get("/interfaces/{interface_id}")
 async def get_interface(interface_id: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
     try:
-        iface = amnezia.get_interface(interface_id)
+        iface = await amnezia.get_interface(interface_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "interface": iface}
@@ -163,7 +163,7 @@ async def reset_peer_traffic(
         peer = await amnezia.reset_peer_traffic(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    traffic.reset_client_record("amnezia", peer, peer_id)
+    await traffic.reset_client_record("amnezia", peer, peer_id)
     return {"success": True, "peer": peer}
 
 

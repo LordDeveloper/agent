@@ -700,23 +700,22 @@ class WireGuardDriver(CoreDriver):
         self.settings = settings
         self.audit = audit
         self.store = store
-        self._migrate_keepalive_opt_in()
 
-    def _migrate_keepalive_opt_in(self) -> None:
+    async def _migrate_keepalive_opt_in(self) -> None:
         """
         One-shot: drop stored peer PersistentKeepalive defaults (25/1/True).
         Keepalive is opt-in from panel interface/format settings only.
         """
         meta_key = "keepalive_opt_in_v2"
-        if self.store.get_meta(self.key, meta_key):
+        if await self.store.get_meta(self.key, meta_key):
             return
 
-        for iface in list(self.store.list_docs(self.key, self._kind)):
+        for iface in list(await self.store.list_docs(self.key, self._kind)):
             for peer in list(iface.get("peers") or []):
                 _strip_peer_keepalive_fields(peer)
 
             iface_id = iface.get("id")
-            self.store.put_doc(self.key, self._kind, str(iface_id), iface)
+            await self.store.put_doc(self.key, self._kind, str(iface_id), iface)
             try:
                 # Rewrite conf without PersistentKeepalive lines.
                 self._sync_conf(iface)
@@ -724,8 +723,8 @@ class WireGuardDriver(CoreDriver):
                 log.exception("keepalive opt-in conf rewrite failed iface=%s", iface_id)
             # Live keepalive clear happens on the next async apply; __init__ cannot await.
 
-        self.store.set_meta(self.key, meta_key, True)
-        self.audit.record("migrate", f"{self.key}/keepalive_opt_in_v2")
+        await self.store.set_meta(self.key, meta_key, True)
+        await self.audit.record("migrate", f"{self.key}/keepalive_opt_in_v2")
 
     def capabilities(self) -> list[str]:
         return [
@@ -753,18 +752,18 @@ class WireGuardDriver(CoreDriver):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def install(self) -> dict[str, Any]:
+    async def install(self) -> dict[str, Any]:
         from agent.ops import install_amnezia, install_wireguard
 
-        return install_amnezia() if self.key == "amnezia" else install_wireguard()
+        return install_amnezia() if self.key == "amnezia" else await install_wireguard()
 
     async def enable(self) -> dict[str, Any]:
-        ifaces = self.list_interfaces()
+        ifaces = await self.list_interfaces()
         results = await gather_independent(*(self._bring_up(iface) for iface in ifaces))
         return {"enabled": True, "interfaces": [row for row in results if isinstance(row, dict)]}
 
     async def disable(self) -> dict[str, Any]:
-        ifaces = self.list_interfaces()
+        ifaces = await self.list_interfaces()
         results = await gather_independent(*(self._bring_down(iface) for iface in ifaces))
         return {"enabled": False, "interfaces": [row for row in results if isinstance(row, dict)]}
 
@@ -774,7 +773,7 @@ class WireGuardDriver(CoreDriver):
 
     async def peer_ips(self, email: str) -> list[str]:
         await self.sync_peer_stats()
-        for iface in self.list_interfaces():
+        for iface in await self.list_interfaces():
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     return recent_peer_ips(peer)
@@ -793,15 +792,15 @@ class WireGuardDriver(CoreDriver):
             interface_is_up_fn=self._interface_is_up,
         )
 
-    def clear_peer_ips(self, email: str) -> bool:
+    async def clear_peer_ips(self, email: str) -> bool:
         changed = False
-        for iface in self.list_interfaces():
+        for iface in await self.list_interfaces():
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     peer["ip_logs"] = []
                     changed = True
             if changed:
-                self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         return True
 
     async def reset_peer_traffic(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
@@ -811,7 +810,7 @@ class WireGuardDriver(CoreDriver):
         Kernel rx/tx only reset when the peer is removed and re-added on the live
         interface; clearing agent store fields alone would re-bill old usage.
         """
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         iface_name = str(iface.get("name") or "")
         target_idx: int | None = None
         target: dict[str, Any] | None = None
@@ -844,7 +843,7 @@ class WireGuardDriver(CoreDriver):
         clear_disabled_metadata(reset_peer)
 
         iface["peers"][target_idx] = reset_peer
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
 
         if was_enabled and pub and live_up and not await self._add_live_peer(iface_name, reset_peer):
             raise AgentError(
@@ -853,11 +852,11 @@ class WireGuardDriver(CoreDriver):
                 422,
             )
 
-        self.audit.record("reset_traffic", f"{self.key}/peer/{peer_id}")
+        await self.audit.record("reset_traffic", f"{self.key}/peer/{peer_id}")
         return reset_peer
 
-    def backup(self) -> dict[str, Any]:
-        return {"interfaces": self.list_interfaces(), "core": self.key}
+    async def backup(self) -> dict[str, Any]:
+        return {"interfaces": await self.list_interfaces(), "core": self.key}
 
     async def restore(self, payload: dict[str, Any]) -> bool:
         """Replace interfaces in one apply per interface, not one apply per peer.
@@ -871,7 +870,7 @@ class WireGuardDriver(CoreDriver):
 
         total = len(interfaces)
         report_progress(0, total, f"{self.label}: {total} interface")
-        for existing in list(self.list_interfaces()):
+        for existing in list(await self.list_interfaces()):
             await self.delete_interface(existing.get("id"))
         for index, row in enumerate(interfaces, start=1):
             peers = [peer for peer in (row.get("peers") or []) if isinstance(peer, dict)]
@@ -891,12 +890,12 @@ class WireGuardDriver(CoreDriver):
             except Exception:
                 await self._drop_interface_quietly(iface.get("id"))
                 raise
-        self.audit.record("restore", self.key)
+        await self.audit.record("restore", self.key)
         return True
 
     async def _stage_peers(self, interface_id: int | str, peers: list[dict[str, Any]]) -> dict[str, Any]:
         """Store every peer, then let the caller bring the interface up once."""
-        iface = deepcopy(self.get_interface(interface_id))
+        iface = deepcopy(await self.get_interface(interface_id))
         rows = list(iface.get("peers") or [])
         used_ips = {str(peer.get("address") or "") for peer in rows if peer.get("address")}
         await self._prefetch_create_keypairs(peers, {}, {}, "add")
@@ -908,7 +907,7 @@ class WireGuardDriver(CoreDriver):
             rows.append(await self._spawn_peer(iface, raw, used_ips))
         iface["peers"] = rows
         _ensure_interface_address(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         return iface
 
     async def _drop_interface_quietly(self, interface_id: Any) -> None:
@@ -917,18 +916,19 @@ class WireGuardDriver(CoreDriver):
         try:
             await self.delete_interface(interface_id)
         except Exception:
-            self.store.delete_doc(self.key, self._kind, str(interface_id))
+            await self.store.delete_doc(self.key, self._kind, str(interface_id))
             log.exception("restore cleanup failed interface=%s", interface_id)
 
     # --- interface / peer CRUD ---
-    def list_interfaces(self) -> list[dict[str, Any]]:
-        return self.store.list_docs(self.key, self._kind)
+    async def list_interfaces(self) -> list[dict[str, Any]]:
+        await self._migrate_keepalive_opt_in()
+        return await self.store.list_docs(self.key, self._kind)
 
-    def get_interface(self, interface_id: int | str) -> dict[str, Any]:
-        by_id = self.store.get_doc(self.key, self._kind, str(interface_id))
+    async def get_interface(self, interface_id: int | str) -> dict[str, Any]:
+        by_id = await self.store.get_doc(self.key, self._kind, str(interface_id))
         if by_id:
             return by_id
-        for iface in self.list_interfaces():
+        for iface in await self.list_interfaces():
             if iface.get("name") == interface_id or str(iface.get("id")) == str(interface_id):
                 return iface
         raise AgentError("CONFIG_NOT_FOUND", f"Interface [{interface_id}] not found", 404)
@@ -937,7 +937,7 @@ class WireGuardDriver(CoreDriver):
         iface_id = payload.get("id")
         if iface_id is None:
             existing_ids = []
-            for row in self.list_interfaces():
+            for row in await self.list_interfaces():
                 try:
                     existing_ids.append(int(row.get("id", 0)))
                 except (TypeError, ValueError):
@@ -956,7 +956,7 @@ class WireGuardDriver(CoreDriver):
             "id": iface_id,
             "name": name,
             "listen_port": int(payload.get("listen_port", 51820)),
-            "subnet": self._unique_subnet(payload.get("subnet"), exclude_id=iface_id),
+            "subnet": await self._unique_subnet(payload.get("subnet"), exclude_id=iface_id),
             "private_key": private_key,
             "public_key": public_key,
             "peers": list(payload.get("peers") or []),
@@ -965,22 +965,22 @@ class WireGuardDriver(CoreDriver):
             iface["obfuscation"] = payload["obfuscation"]
 
         _ensure_interface_address(iface)
-        self.store.put_doc(self.key, self._kind, str(iface_id), iface)
-        self.audit.record("create", f"{self.key}/interface/{iface_id}")
+        await self.store.put_doc(self.key, self._kind, str(iface_id), iface)
+        await self.audit.record("create", f"{self.key}/interface/{iface_id}")
         if not apply:
             return iface
         up = await self._bring_up(iface)
         if not up.get("ok"):
-            self.store.delete_doc(self.key, self._kind, str(iface_id))
+            await self.store.delete_doc(self.key, self._kind, str(iface_id))
             self._conf_file(iface["name"]).unlink(missing_ok=True)
             detail = up.get("stderr") or up.get("message") or "wg-quick up failed"
             raise AgentError("VALIDATION_ERROR", f"WireGuard interface failed to start: {detail}")
         return iface
 
-    def _unique_subnet(self, requested: Any, *, exclude_id: int | str | None = None) -> str:
+    async def _unique_subnet(self, requested: Any, *, exclude_id: int | str | None = None) -> str:
         used = {
             str(row.get("subnet") or "")
-            for row in self.list_interfaces()
+            for row in await self.list_interfaces()
             if exclude_id is None or str(row.get("id")) != str(exclude_id)
         }
         wanted = str(requested or "").strip()
@@ -997,7 +997,7 @@ class WireGuardDriver(CoreDriver):
         raise AgentError("VALIDATION_ERROR", "No free subnet for WireGuard/Amnezia interface")
 
     async def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         previous = deepcopy(iface)
         updates = {k: v for k, v in payload.items() if k not in ("id",)}
         old_subnet = str(previous.get("subnet") or "")
@@ -1007,25 +1007,25 @@ class WireGuardDriver(CoreDriver):
         _ensure_interface_address(iface, previous_subnet=old_subnet or None)
         bring_up = _interface_needs_recycle(previous, iface)
         await self._validate_before_apply(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             await self._apply_live(iface, force_bring_up=bring_up)
         except AgentError:
-            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
         return iface
 
     async def delete_interface(self, interface_id: int | str) -> bool:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         await self._bring_down(iface)
         self._conf_file(iface["name"]).unlink(missing_ok=True)
-        if not self.store.delete_doc(self.key, self._kind, str(iface.get("id"))):
+        if not await self.store.delete_doc(self.key, self._kind, str(iface.get("id"))):
             raise AgentError("CONFIG_NOT_FOUND", f"Interface [{interface_id}] not found", 404)
-        self.audit.record("delete", f"{self.key}/interface/{interface_id}")
+        await self.audit.record("delete", f"{self.key}/interface/{interface_id}")
         return True
 
     async def add_peer(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         peer = normalize_peer(payload)
         peer.setdefault("id", str(uuid.uuid4()))
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
@@ -1060,11 +1060,11 @@ class WireGuardDriver(CoreDriver):
 
         iface.setdefault("peers", []).append(peer)
         await self.update_interface(interface_id, iface)
-        self.audit.record("create", f"{self.key}/peer/{peer['id']}")
+        await self.audit.record("create", f"{self.key}/peer/{peer['id']}")
         return peer
 
     async def update_peer(self, interface_id: int | str, peer_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         for idx, peer in enumerate(iface.get("peers", [])):
             if str(peer.get("id")) == peer_id or str(peer.get("email")) == peer_id:
                 before = deepcopy(peer)
@@ -1105,13 +1105,13 @@ class WireGuardDriver(CoreDriver):
                     await self.update_interface(interface_id, iface)
                     await self._sync_linked_l2tp()
                 else:
-                    self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                    await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                     await self._sync_peer_egress()
                 return merged
         raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
     async def delete_peer(self, interface_id: int | str, peer_id: str) -> bool:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         peers = iface.get("peers", [])
         drop_keys: list[str] = []
         filtered: list[dict[str, Any]] = []
@@ -1127,7 +1127,7 @@ class WireGuardDriver(CoreDriver):
             raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
         iface["peers"] = filtered
         await self.update_interface(interface_id, iface)
-        self.audit.record("delete", f"{self.key}/peer/{peer_id}")
+        await self.audit.record("delete", f"{self.key}/peer/{peer_id}")
         if drop_keys:
             await self._sync_linked_l2tp(drop_keys=drop_keys)
         return True
@@ -1285,7 +1285,7 @@ class WireGuardDriver(CoreDriver):
             )
 
         started = time.perf_counter()
-        iface = deepcopy(self.get_interface(interface_id))
+        iface = deepcopy(await self.get_interface(interface_id))
         previous = deepcopy(iface)
         by_id, by_email = self._peer_index(iface)
         rows: list[dict[str, Any]] = list(iface.get("peers", []))
@@ -1382,7 +1382,7 @@ class WireGuardDriver(CoreDriver):
         _ensure_interface_address(iface, previous_subnet=str(previous.get("subnet") or "") or None)
         bring_up = _interface_needs_recycle(previous, iface)
         await self._validate_before_apply(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             if wg_apply:
                 await self._apply_live(iface, force_bring_up=bring_up)
@@ -1390,10 +1390,10 @@ class WireGuardDriver(CoreDriver):
                 await self._sync_peer_egress()
             await self._sync_linked_l2tp()
         except AgentError:
-            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
 
-        self.audit.record(
+        await self.audit.record(
             "update",
             f"{self.key}/interface/{interface_id}/peers/batch",
             f"mode={mode_key} succeeded={succeeded} failed={failed} ms={elapsed_ms}",
@@ -1426,7 +1426,7 @@ class WireGuardDriver(CoreDriver):
             )
 
         started = time.perf_counter()
-        iface = deepcopy(self.get_interface(interface_id))
+        iface = deepcopy(await self.get_interface(interface_id))
         previous = deepcopy(iface)
         remove_keys = set(email_keys + id_keys)
         errors: list[dict[str, str]] = []
@@ -1467,15 +1467,15 @@ class WireGuardDriver(CoreDriver):
 
         iface["peers"] = filtered
         await self._validate_before_apply(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             await self._apply_live(iface)
         except AgentError:
-            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
-        self.audit.record(
+        await self.audit.record(
             "delete",
             f"{self.key}/interface/{interface_id}/peers/batch",
             f"removed={succeeded} failed={failed} ms={elapsed_ms}",
@@ -1511,13 +1511,13 @@ class WireGuardDriver(CoreDriver):
 
         return ""
 
-    def _save_peer_row(self, iface: dict[str, Any], peer: dict[str, Any]) -> None:
+    async def _save_peer_row(self, iface: dict[str, Any], peer: dict[str, Any]) -> None:
         peer_id = str(peer.get("id") or "")
         email = str(peer.get("email") or "")
         for idx, row in enumerate(iface.get("peers", [])):
             if str(row.get("id")) == peer_id or (email and str(row.get("email")) == email):
                 iface["peers"][idx] = peer
-                self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                 return
 
     async def _assert_peer_keys_match_live(
@@ -1570,13 +1570,13 @@ class WireGuardDriver(CoreDriver):
         await self._assert_peer_keys_match_live(iface, peer, derived, retry_apply=True)
 
         if changed:
-            self._save_peer_row(iface, peer)
+            await self._save_peer_row(iface, peer)
 
         return peer
 
     async def repair_peer_private_key(self, interface_id: int | str, peer_id: str, private_key: str) -> dict[str, Any]:
         """One-time store repair when panel still has the private key matching live wg public key."""
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         peer = None
         idx = None
         for i, row in enumerate(iface.get("peers", [])):
@@ -1606,18 +1606,18 @@ class WireGuardDriver(CoreDriver):
         repaired["public_key"] = derived
         iface["peers"][idx] = repaired
         await self._validate_before_apply(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         if stored_pub != derived or (live_pub and live_pub != stored_pub):
             try:
                 await self._apply_live(iface)
             except AgentError:
                 pass
-        self.audit.record("repair", f"{self.key}/peer/{peer_id}/keys")
+        await self.audit.record("repair", f"{self.key}/peer/{peer_id}/keys")
         return repaired
 
     async def reset_peer_keys(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
         """Regenerate key material when store/DB no longer match live wg (keeps id/email/address)."""
-        iface = deepcopy(self.get_interface(interface_id))
+        iface = deepcopy(await self.get_interface(interface_id))
         previous = deepcopy(iface)
         peer = None
         idx = None
@@ -1637,11 +1637,11 @@ class WireGuardDriver(CoreDriver):
 
         iface["peers"][idx] = reset
         await self._validate_before_apply(iface)
-        self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             await self._apply_live(iface)
         except AgentError:
-            self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+            await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
 
         # Verify live kernel reflects the regenerated pair for this client slot.
@@ -1653,7 +1653,7 @@ class WireGuardDriver(CoreDriver):
                 500,
             )
 
-        self.audit.record("reset_keys", f"{self.key}/peer/{peer_id}")
+        await self.audit.record("reset_keys", f"{self.key}/peer/{peer_id}")
         return reset
 
     def _format_client_config(
@@ -1687,7 +1687,7 @@ class WireGuardDriver(CoreDriver):
         peer_id: str,
         endpoint_host: str = "127.0.0.1",
     ) -> dict[str, str]:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         peer = None
         for row in iface.get("peers", []):
             if str(row.get("id")) == peer_id or str(row.get("email")) == peer_id:
@@ -1713,7 +1713,7 @@ class WireGuardDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_peer_stats()
         rows: list[InboundUsageModel] = []
-        for iface in self.list_interfaces():
+        for iface in await self.list_interfaces():
             clients = []
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
@@ -1747,7 +1747,7 @@ class WireGuardDriver(CoreDriver):
         companion = await live_linked_peer_keys(self.store)
         online: list[str] = []
         seen: set[str] = set()
-        for iface in self.list_interfaces():
+        for iface in await self.list_interfaces():
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
                     continue
@@ -1768,7 +1768,7 @@ class WireGuardDriver(CoreDriver):
         return await online_traffic_from_snapshot(self)
 
     async def sync_peer_stats(self) -> None:
-        ifaces = self.list_interfaces()
+        ifaces = await self.list_interfaces()
         dumps = await gather_independent(
             *(self._peer_dump(str(iface.get("name") or "")) for iface in ifaces)
         )
@@ -1819,7 +1819,7 @@ class WireGuardDriver(CoreDriver):
                     changed = True
 
             if changed:
-                self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
 
     async def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
         """AdGuard gateway when ads-block is on; otherwise a public resolver."""
@@ -2016,7 +2016,7 @@ class WireGuardDriver(CoreDriver):
     async def _bring_down(self, iface: dict[str, Any]) -> dict[str, Any]:
         remaining = [
             row
-            for row in self.list_interfaces()
+            for row in await self.list_interfaces()
             if str(row.get("id")) != str(iface.get("id"))
         ]
         await self._sync_peer_egress(remaining)
@@ -2087,8 +2087,8 @@ class WireGuardDriver(CoreDriver):
         try:
             from agent.support.peer_egress import reconcile_core_egress
 
-            rows = interfaces if interfaces is not None else self.list_interfaces()
-            reconcile_core_egress(
+            rows = interfaces if interfaces is not None else await self.list_interfaces()
+            await reconcile_core_egress(
                 self.store,
                 self.key,
                 rows,

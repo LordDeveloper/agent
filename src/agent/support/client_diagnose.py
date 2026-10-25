@@ -306,7 +306,7 @@ async def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str
     if not key:
         raise ValueError('client key is required')
 
-    config = driver.read_config()
+    config = await driver.read_config()
     located = _find_config_clients_by_key(config, key)
     if not located:
         return _not_found_report(inbound_id=None, key=key)
@@ -351,7 +351,7 @@ async def diagnose_xray_client(driver: Any, inbound_id: str | int, client_key: s
         raise ValueError('client key is required')
 
     tag = driver.inbound_tag(inbound_id)
-    config = driver.read_config()
+    config = await driver.read_config()
     config_client, inbound_summary = _find_config_client(config, tag, str(inbound_id), key)
 
     if config_client is None:

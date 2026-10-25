@@ -15,6 +15,7 @@ from pathlib import Path
 
 from agent import __version__
 from agent.errors import AgentError
+from agent.asyncutil import run_sync
 from agent.ops import run_cmd, service_action, which
 
 DEFAULT_REPO = "LordDeveloper/agent"
@@ -62,7 +63,7 @@ def detect_libc() -> str:
         return forced
 
     try:
-        proc = run_cmd(["ldd", "--version"], check=False)
+        proc = run_sync(run_cmd(["ldd", "--version"], check=False))
         blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
         if "musl" in blob:
             return "musl"
@@ -270,7 +271,7 @@ def _parse_release_payload(
     )
 
 
-def _fetch_release_payload(
+async def _fetch_release_payload(
     repo_id: str,
     *,
     tag: str | None = None,
@@ -288,8 +289,8 @@ def _fetch_release_payload(
         url = f"{GITHUB_API}/repos/{repo_id}/releases/latest"
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            response = client.get(url, headers=_auth_headers(auth))
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=_auth_headers(auth))
     except httpx.HTTPError as exc:
         raise AgentError("UPSTREAM_ERROR", f"GitHub request failed: {exc}") from exc
 
@@ -315,16 +316,16 @@ def _fetch_release_payload(
     return response.json()
 
 
-def _fetch_latest_release_payload(
+async def _fetch_latest_release_payload(
     repo_id: str,
     *,
     token: str | None = None,
     timeout: float = 60.0,
 ) -> dict:
-    return _fetch_release_payload(repo_id, token=token, timeout=timeout)
+    return await _fetch_release_payload(repo_id, token=token, timeout=timeout)
 
 
-def fetch_release_for_asset(
+async def fetch_release_for_asset(
     *,
     repo: str,
     asset_name: str,
@@ -335,7 +336,7 @@ def fetch_release_for_asset(
 ) -> ReleaseInfo:
     repo_id = repo.strip().strip("/")
     wanted = asset_name.strip()
-    payload = _fetch_release_payload(repo_id, tag=tag, token=token, timeout=timeout)
+    payload = await _fetch_release_payload(repo_id, tag=tag, token=token, timeout=timeout)
     try:
         return _parse_release_payload(payload, repo_id=repo_id, wanted=wanted, prefix=prefix)
     except AgentError as exc:
@@ -348,7 +349,7 @@ def fetch_release_for_asset(
         return _parse_release_payload(payload, repo_id=repo_id, wanted=gnu, prefix=prefix)
 
 
-def fetch_latest_release(
+async def fetch_latest_release(
     *,
     repo: str | None = None,
     token: str | None = None,
@@ -357,11 +358,11 @@ def fetch_latest_release(
 ) -> ReleaseInfo:
     repo_id = resolve_repo(repo)
     wanted = resolve_asset_name(asset_name)
-    payload = _fetch_latest_release_payload(repo_id, token=token, timeout=timeout)
+    payload = await _fetch_latest_release_payload(repo_id, token=token, timeout=timeout)
     return _parse_release_payload(payload, repo_id=repo_id, wanted=wanted, prefix="agent")
 
 
-def download_release_asset(
+async def download_release_asset(
     release: ReleaseInfo,
     dest: Path,
     *,
@@ -376,17 +377,20 @@ def download_release_asset(
     tmp = dest.with_suffix(dest.suffix + ".partial")
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            with client.stream("GET", release.asset_url, headers=headers) as response:
+        from agent.support import aiofs
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", release.asset_url, headers=headers) as response:
                 if response.status_code >= 400:
-                    body = response.read().decode("utf-8", errors="replace")[:300]
+                    body = (await response.aread()).decode("utf-8", errors="replace")[:300]
                     raise AgentError(
                         "UPSTREAM_ERROR",
                         f"Asset download failed HTTP {response.status_code}: {body}",
                     )
-                with tmp.open("wb") as fh:
-                    for chunk in response.iter_bytes():
-                        fh.write(chunk)
+                chunks: list[bytes] = []
+                async for chunk in response.aiter_bytes():
+                    chunks.append(chunk)
+        await aiofs.write_bytes(tmp, b"".join(chunks))
     except AgentError:
         tmp.unlink(missing_ok=True)
         raise
@@ -415,10 +419,10 @@ def apply_binary(new_binary: Path, target: Path) -> None:
 def maybe_restart_service() -> dict | None:
     if not which("systemctl"):
         return None
-    status = run_cmd(["systemctl", "is-active", "agent"], check=False)
+    status = run_sync(run_cmd(["systemctl", "is-active", "agent"], check=False))
     if (status.stdout or "").strip() != "active":
         return {"restarted": False, "reason": "service not active"}
-    result = service_action("restart")
+    result = run_sync(service_action("restart"))
     return {"restarted": bool(result.get("ok")), **result}
 
 
@@ -430,7 +434,7 @@ def check_for_update(
     current: str | None = None,
 ) -> dict:
     host = detect_host_platform()
-    release = fetch_latest_release(repo=repo, token=token, asset_name=asset_name)
+    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=asset_name))
     current_version = normalize_version(current or __version__)
     newer = version_is_newer(release.version, current_version)
     return {
@@ -455,7 +459,7 @@ def perform_update(
 ) -> dict:
     host = _assert_supported_host()
     binary = current_binary_path()
-    release = fetch_latest_release(repo=repo, token=token, asset_name=asset_name)
+    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=asset_name))
     current_version = normalize_version(__version__)
     newer = version_is_newer(release.version, current_version)
 
@@ -473,7 +477,7 @@ def perform_update(
 
     with tempfile.TemporaryDirectory(prefix="agent-update-") as tmp:
         download_path = Path(tmp) / release.asset_name
-        download_release_asset(release, download_path, token=token)
+        run_sync(download_release_asset(release, download_path, token=token))
         apply_binary(download_path, binary)
 
     result: dict = {

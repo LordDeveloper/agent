@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 from typing import Any
 
 from agent.asyncutil import gather_independent, maybe_await
@@ -149,7 +147,14 @@ async def _enforce_xray(driver: Any) -> int:
     if not await maybe_await(driver.running()):
         return 0
 
-    snapshot = await maybe_await(driver.usage_snapshot())
+    # The traffic worker already dumped user>>> . A second dump every 10s is
+    # the call that makes the next panel request sit with zero bytes.
+    snapshot = None
+    cached = getattr(driver, "cached_usage_snapshot", None)
+    if callable(cached):
+        snapshot = cached()
+    if snapshot is None:
+        snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
     traffic_by_id: dict[str, tuple[int, int]] = {}
 
@@ -166,7 +171,7 @@ async def _enforce_xray(driver: Any) -> int:
     if callable(inbound_rows):
         # Parses the whole on-disk client list. On the loop that stalls every
         # other request once the inbound is large.
-        inbounds = await asyncio.to_thread(inbound_rows)
+        inbounds = await inbound_rows()
     else:
         inbounds = await maybe_await(driver.list_inbounds())
 

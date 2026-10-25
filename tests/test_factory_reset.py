@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -48,14 +49,19 @@ def test_factory_reset_wipes_database_and_managed_state(tmp_path):
         xray_config=str(xray_config),
     )
     store = Store(settings.resolve_db_path())
-    store.put_doc(
-        "wireguard",
-        "interface",
-        "1",
-        {"id": 1, "name": "wg0", "peers": [{"address": "10.90.68.2", "exit_interface": "nl"}]},
-    )
-    store.put_doc("wireguard", "interface", "evil", {"id": "evil", "name": "../outside"})
-    store.close()
+
+    async def seed():
+        await store.open()
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {"id": 1, "name": "wg0", "peers": [{"address": "10.90.68.2", "exit_interface": "nl"}]},
+        )
+        await store.put_doc("wireguard", "interface", "evil", {"id": "evil", "name": "../outside"})
+        await store.close()
+
+    asyncio.run(seed())
 
     calls: list[list[str]] = []
 
@@ -67,7 +73,7 @@ def test_factory_reset_wipes_database_and_managed_state(tmp_path):
             )
         return _Result()
 
-    result = factory_reset(settings, runner=runner, stop_service=False)
+    result = asyncio.run(factory_reset(settings, runner=runner, stop_service=False))
 
     assert result["ok"] is True
     assert not (data / "agent.db").exists()
@@ -103,9 +109,11 @@ def test_relax_agent_start_post_stops_waiting_on_the_script(tmp_path):
         calls.append(list(args))
         return _Result()
 
-    assert relax_agent_start_post(unit, runner=runner) is True
+    import asyncio
+
+    assert asyncio.run(relax_agent_start_post(unit, runner=runner)) is True
     text = unit.read_text(encoding="utf-8")
     assert "peer-egress-apply.sh" not in text
     assert "systemctl start --no-block agent-peer-egress.service" in text
     assert calls == [["systemctl", "daemon-reload"]]
-    assert relax_agent_start_post(unit, runner=runner) is False
+    assert asyncio.run(relax_agent_start_post(unit, runner=runner)) is False

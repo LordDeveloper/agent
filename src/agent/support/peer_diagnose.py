@@ -62,13 +62,13 @@ def allowed_ips_lists_match(store_allowed: str, live_allowed: str, host: str) ->
     return str(store_allowed or '').strip() == str(live_allowed or '').strip()
 
 
-def find_peers_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
+async def find_peers_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
     host = normalize_peer_host(address)
     if not host:
         return []
 
     rows: list[dict[str, Any]] = []
-    for iface in store.list_docs(core, _IFACE_KIND):
+    for iface in await store.list_docs(core, _IFACE_KIND):
         for peer in iface.get('peers') or []:
             peer_host = normalize_peer_host(peer.get('address'))
             if peer_host != host:
@@ -540,7 +540,7 @@ async def diagnose_peer_address(
         raise ValueError('address is required')
 
     cidr = peer_source_cidr(address) or f'{host}/32'
-    rows = find_peers_by_address(store, core, host)
+    rows = await find_peers_by_address(store, core, host)
     if not rows:
         issue = _issue(
             'error',
@@ -580,7 +580,7 @@ async def diagnose_peer_address(
     )
 
     for match, row in zip(matches, rows):
-        companion = _find_l2tp_companion(store, row.get('peer') or {})
+        companion = await _find_l2tp_companion(store, row.get('peer') or {})
         if companion is not None:
             match['l2tp_companion'] = companion
             if companion.get('found'):
@@ -614,7 +614,7 @@ async def diagnose_peer_address(
     }
 
 
-def _find_l2tp_companion(store: Store, peer: dict[str, Any]) -> dict[str, Any] | None:
+async def _find_l2tp_companion(store: Store, peer: dict[str, Any]) -> dict[str, Any] | None:
     """Attach L2TP companion summary when diagnosing a WireGuard/Amnezia peer."""
     peer_id = str(peer.get('id') or '').strip()
     peer_email = str(peer.get('email') or '').strip()
@@ -629,7 +629,7 @@ def _find_l2tp_companion(store: Store, peer: dict[str, Any]) -> dict[str, Any] |
     for key in (peer_id, peer_email):
         if not key:
             continue
-        rows = find_users_by_linked_peer_id(store, 'l2tp', key)
+        rows = await find_users_by_linked_peer_id(store, 'l2tp', key)
         if not rows:
             continue
         row = rows[0]

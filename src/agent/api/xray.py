@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -204,7 +203,7 @@ async def reset_traffic(
         raise_agent_error(exc.code, exc.message, exc.status)
     except Exception as exc:
         raise_agent_error("INTERNAL_ERROR", f"{type(exc).__name__}: {exc}", 500)
-    traffic.reset_client_record("xray", client, client_key)
+    await traffic.reset_client_record("xray", client, client_key)
     return {"success": True, "client": client}
 
 
@@ -304,7 +303,7 @@ async def get_raw_config(xray: XrayDriver = Depends(get_xray)):
 @router.get("/config")
 async def get_config(xray: XrayDriver = Depends(get_xray)):
     try:
-        config = await asyncio.to_thread(xray.dumped_config)
+        config = await xray.dumped_config()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config, "config_path": xray.settings.xray.config}
@@ -357,7 +356,7 @@ async def ensure_traffic_stats(xray: XrayDriver = Depends(get_xray)):
 @router.get("/logs")
 async def xray_logs(kind: str = "error", lines: int = 200, xray: XrayDriver = Depends(get_xray)):
     try:
-        payload = xray.tail_logs(kind=kind, lines=lines)
+        payload = await xray.tail_logs(kind=kind, lines=lines)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

@@ -39,7 +39,7 @@ def confirmation_accepted(typed: str | None) -> bool:
     return str(typed or "").strip() == CONFIRM_TEXT
 
 
-def factory_reset(
+async def factory_reset(
     settings: AgentSettings | None = None,
     *,
     runner: Runner | None = None,
@@ -54,7 +54,7 @@ def factory_reset(
     masked = False
     result: dict[str, Any] | None = None
 
-    managed = _managed_configs(cfg)
+    managed = await _managed_configs(cfg)
     try:
         if stop_service and which("systemctl"):
             _run(execute, ["systemctl", "mask", "agent"])
@@ -116,19 +116,20 @@ def _wipe(
     }
 
 
-def _managed_configs(settings: AgentSettings) -> list[tuple[str, Path, str]]:
+async def _managed_configs(settings: AgentSettings) -> list[tuple[str, Path, str]]:
     db_path = settings.resolve_db_path()
     if not db_path.is_file():
         return []
     store = Store(db_path)
     try:
+        await store.open()
         rows: list[tuple[str, Path, str]] = []
         for core, config_dir, quick in (
             ("wireguard", settings.wireguard.config_dir, "wg-quick"),
             ("amnezia", settings.amnezia.config_dir, "awg-quick"),
         ):
             root = Path(config_dir)
-            for doc in store.list_docs(core, "interface"):
+            for doc in await store.list_docs(core, "interface"):
                 name = str(doc.get("name") or "").strip()
                 if not _IFACE_NAME.match(name):
                     continue
@@ -138,7 +139,7 @@ def _managed_configs(settings: AgentSettings) -> list[tuple[str, Path, str]]:
                 rows.append((quick, conf, name))
         return rows
     finally:
-        store.close()
+        await store.close()
 
 
 def _delete_database(db_path: Path) -> list[str]:

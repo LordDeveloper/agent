@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import time
-
-from agent.db import Store
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.traffic.service import TrafficService
 
@@ -35,12 +31,11 @@ class FakeRegistry:
         return self._driver
 
 
-def _sample(traffic: TrafficService, registry: FakeRegistry):
-    return asyncio.run(traffic.sample_all(registry))
+async def _sample(traffic: TrafficService, registry: FakeRegistry):
+    return await traffic.sample_all(registry)
 
 
-def test_traffic_service_tracks_pending_delta(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_traffic_service_tracks_pending_delta(store):
     traffic = TrafficService(store)
     driver = FakeDriver(
         [
@@ -54,54 +49,52 @@ def test_traffic_service_tracks_pending_delta(tmp_path):
     )
     registry = FakeRegistry(["xray"], driver)
 
-    stats = _sample(traffic, registry)
+    stats = await _sample(traffic, registry)
     assert stats["initialized"] == 1
-    assert traffic.pending_payload()["users"] == {}
+    assert (await traffic.pending_payload())["users"] == {}
 
     driver._clients[0].incoming = 1_200_000
     driver._clients[0].outgoing = 700_000
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
 
-    payload = traffic.pending_payload()
+    payload = await traffic.pending_payload()
     assert payload["users"]["uuid-1"] == {
         "core": "xray",
         "uplink": 200_000,
         "downlink": 200_000,
     }
 
-    acked = traffic.ack_pending()
+    acked = await traffic.ack_pending()
     assert acked == 1
-    assert traffic.pending_payload()["users"] == {}
+    assert (await traffic.pending_payload())["users"] == {}
 
     driver._clients[0].incoming = 1_300_000
-    _sample(traffic, registry)
-    payload = traffic.pending_payload()
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
     assert payload["users"]["uuid-1"]["downlink"] == 100_000
 
 
-def test_traffic_service_regression_resets_baseline(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_traffic_service_regression_resets_baseline(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-2", email="reset@example.com", incoming=900, outgoing=100)
     driver = FakeDriver([client])
     registry = FakeRegistry(["xray"], driver)
 
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
     client.incoming = 1_500
     client.outgoing = 200
-    _sample(traffic, registry)
-    assert traffic.pending_payload()["users"]["uuid-2"]["downlink"] == 600
+    await _sample(traffic, registry)
+    assert (await traffic.pending_payload())["users"]["uuid-2"]["downlink"] == 600
 
-    traffic.ack_pending()
+    await traffic.ack_pending()
     client.incoming = 200
     client.outgoing = 50
-    stats = _sample(traffic, registry)
+    stats = await _sample(traffic, registry)
     assert stats["regressed"] == 1
-    assert traffic.pending_payload()["users"] == {}
+    assert (await traffic.pending_payload())["users"] == {}
 
 
-def test_traffic_service_migrates_legacy_email_rows_to_client_id(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_traffic_service_migrates_legacy_email_rows_to_client_id(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(
         id="uuid-new",
@@ -112,31 +105,32 @@ def test_traffic_service_migrates_legacy_email_rows_to_client_id(tmp_path):
     driver = FakeDriver([client])
     registry = FakeRegistry(["xray"], driver)
 
-    store.set_traffic_ack("xray", "legacy@example.com", 800, 400)
-    store.upsert_traffic_pending("xray", "legacy@example.com", 200, 100, 1_000, 500)
+    await store.set_traffic_ack("xray", "legacy@example.com", 800, 400)
+    await store.upsert_traffic_pending("xray", "legacy@example.com", 200, 100, 1_000, 500)
 
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
 
-    assert traffic.pending_payload()["users"]["uuid-new"] == {
+    assert (await traffic.pending_payload())["users"]["uuid-new"] == {
         "core": "xray",
         "uplink": 100,
         "downlink": 200,
     }
-    assert traffic.pending_payload()["users"]["legacy@example.com"] == {
+    assert (await traffic.pending_payload())["users"]["legacy@example.com"] == {
         "core": "xray",
         "uplink": 100,
         "downlink": 200,
     }
-    assert store.get_traffic_pending("xray", "legacy@example.com") is None
-    assert store.get_traffic_ack("xray", "legacy@example.com") is None
-    assert store.get_traffic_ack("xray", "uuid-new") == {
+    assert await store.get_traffic_pending("xray", "legacy@example.com") is None
+    assert await store.get_traffic_ack("xray", "legacy@example.com") is None
+    assert await store.get_traffic_ack("xray", "uuid-new") == {
         "incoming": 800,
         "outgoing": 400,
     }
 
 
-def test_wireguard_stale_handshake_still_tracks_pending(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_wireguard_stale_handshake_still_tracks_pending(store):
+    import time
+
     traffic = TrafficService(store)
     stale = int(time.time()) - 300
     client = ClientUsageModel(
@@ -149,53 +143,83 @@ def test_wireguard_stale_handshake_still_tracks_pending(tmp_path):
     driver = FakeDriver([client])
     registry = FakeRegistry(["wireguard"], driver)
 
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
     client.incoming = 1_148
-    stats = _sample(traffic, registry)
+    stats = await _sample(traffic, registry)
 
     assert stats["pending"] == 1
-    assert traffic.pending_payload()["users"]["peer-1"]["downlink"] == 148
-    assert traffic.pending_payload()["users"]["wg@example.com"]["downlink"] == 148
+    payload = await traffic.pending_payload()
+    assert payload["users"]["peer-1"]["downlink"] == 148
+    assert payload["users"]["wg@example.com"]["downlink"] == 148
 
 
-def test_ack_clients_accepts_email_alias(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_ack_clients_accepts_email_alias(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-mail", email="alias@example.com", incoming=100, outgoing=0)
     driver = FakeDriver([client])
     registry = FakeRegistry(["xray"], driver)
 
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
     client.incoming = 400
-    _sample(traffic, registry)
-    traffic.pending_payload()
+    await _sample(traffic, registry)
+    await traffic.pending_payload()
 
-    acked, not_found = traffic.ack_clients(["alias@example.com"])
+    acked, not_found = await traffic.ack_clients(["alias@example.com"])
     assert acked == ["alias@example.com"]
     assert not_found == []
-    assert traffic.pending_payload()["users"] == {}
+    assert (await traffic.pending_payload())["users"] == {}
 
 
-def test_ack_uses_get_snapshot_so_later_growth_stays_queued(tmp_path):
-    store = Store(tmp_path / "agent.db")
+async def test_traffic_sample_writes_many_clients_in_one_plan(store):
+    plans: list[dict] = []
+    real_write = store._write_traffic_plan
+
+    async def wrapped_write(conn, writes):
+        plans.append(writes)
+        return await real_write(conn, writes)
+
+    store._write_traffic_plan = wrapped_write
+    clients = [
+        ClientUsageModel(id=f"id-{index}", email=f"user{index}@example.com", incoming=10, outgoing=1)
+        for index in range(40)
+    ]
+    traffic = TrafficService(store)
+    driver = FakeDriver(clients)
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    assert len(plans) == 1
+    assert len(plans[0]["ack_upserts"]) == 40
+    assert plans[0]["pending_deletes"] == []
+
+    await _sample(traffic, registry)
+    assert len(plans) == 2
+    assert plans[1]["ack_upserts"] == []
+    assert plans[1]["ack_deletes"] == []
+    assert plans[1]["pending_upserts"] == []
+    assert plans[1]["pending_deletes"] == []
+    assert (await traffic.pending_payload())["users"] == {}
+
+
+async def test_ack_uses_get_snapshot_so_later_growth_stays_queued(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-snap", email="snap@example.com", incoming=1_000, outgoing=0)
     driver = FakeDriver([client])
     registry = FakeRegistry(["xray"], driver)
 
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
     client.incoming = 1_100
-    _sample(traffic, registry)
-    payload = traffic.pending_payload()
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
     assert payload["users"]["uuid-snap"]["downlink"] == 100
 
     client.incoming = 1_250
-    _sample(traffic, registry)
+    await _sample(traffic, registry)
 
-    acked, not_found = traffic.ack_clients(["uuid-snap"])
+    acked, not_found = await traffic.ack_clients(["uuid-snap"])
     assert acked == ["uuid-snap"]
     assert not_found == []
 
-    _sample(traffic, registry)
-    leftover = traffic.pending_payload()["users"]["uuid-snap"]
+    await _sample(traffic, registry)
+    leftover = (await traffic.pending_payload())["users"]["uuid-snap"]
     assert leftover["downlink"] == 150

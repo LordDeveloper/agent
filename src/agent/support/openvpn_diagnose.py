@@ -33,13 +33,13 @@ _SYSTEM_SERVER_ROOT = Path('/etc/openvpn/server')
 _RUNTIME_STATUS_ROOT = Path('/run/openvpn-server')
 
 
-def find_users_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
+async def find_users_by_address(store: Store, core: str, address: str) -> list[dict[str, Any]]:
     host = normalize_peer_host(address)
     if not host:
         return []
 
     rows: list[dict[str, Any]] = []
-    for server in store.list_docs(core, _SERVER_KIND):
+    for server in await store.list_docs(core, _SERVER_KIND):
         for user in server.get('users') or []:
             if not isinstance(user, dict):
                 continue
@@ -365,7 +365,7 @@ async def diagnose_user_address(
     if not host:
         raise ValueError('address is required')
 
-    rows = find_users_by_address(store, core, host)
+    rows = await find_users_by_address(store, core, host)
     if not rows:
         issue = _issue('error', 'USER_NOT_FOUND', f'No OpenVPN user with address [{host}] in store')
         return {
