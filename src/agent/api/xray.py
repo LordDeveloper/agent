@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -294,7 +295,7 @@ async def import_geodata_route(body: dict[str, Any], xray: XrayDriver = Depends(
 async def get_raw_config(xray: XrayDriver = Depends(get_xray)):
     """Full on-disk config, including secrets. Used to move a server onto a new agent."""
     try:
-        config = xray.read_config()
+        config = await xray._read_config()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config, "config_path": xray.settings.xray.config}
@@ -303,7 +304,7 @@ async def get_raw_config(xray: XrayDriver = Depends(get_xray)):
 @router.get("/config")
 async def get_config(xray: XrayDriver = Depends(get_xray)):
     try:
-        config = xray.dumped_config()
+        config = await asyncio.to_thread(xray.dumped_config)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "config": config, "config_path": xray.settings.xray.config}
@@ -332,7 +333,7 @@ async def ensure_traffic_stats(xray: XrayDriver = Depends(get_xray)):
 
         path = Path(xray.settings.xray.config)
         changed = ensure_xray_traffic_stats_config(path)
-        config = xray.read_config()
+        config = await xray._read_config()
         # Hot-reload into running core when possible (keeps connections if import works).
         try:
             api = await xray._api()

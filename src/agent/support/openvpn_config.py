@@ -217,6 +217,7 @@ def render_server_conf(
     *,
     server_dir: str | Path,
     auth_script: str | Path,
+    dns_servers: list[str] | None = None,
 ) -> str:
     """Render server .conf for Debian/Ubuntu openvpn-server@ units.
 
@@ -234,13 +235,15 @@ def render_server_conf(
     root = Path(server_dir)
     script = Path(auth_script)
 
-    try:
-        from agent.asyncutil import run_sync
-        from agent.dns_leak import preferred_client_dns
+    if dns_servers is None:
+        # Only safe off the server loop. Callers on the loop pass dns_servers.
+        try:
+            from agent.asyncutil import run_sync
+            from agent.dns_leak import preferred_client_dns
 
-        dns_servers = run_sync(preferred_client_dns())
-    except Exception:
-        dns_servers = ['1.1.1.1', '8.8.8.8']
+            dns_servers = run_sync(preferred_client_dns())
+        except Exception:
+            dns_servers = ['1.1.1.1', '8.8.8.8']
     if not dns_servers:
         dns_servers = ['1.1.1.1', '8.8.8.8']
 

@@ -1,7 +1,12 @@
 """Sync entry points must consume coroutines, and bulk baselines stay one-shot."""
 
+import asyncio
 import json
 from types import SimpleNamespace
+
+import pytest
+
+from agent.asyncutil import run_sync
 
 from agent.cli import cmd_peer_diagnose
 from agent.drivers.xray import XrayDriver
@@ -35,6 +40,17 @@ def test_peer_diagnose_awaits_driver(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["found"] is True
     assert payload["summary"]["healthy"] is True
+
+
+def test_run_sync_does_not_block_a_running_loop():
+    async def sample() -> str:
+        return "ok"
+
+    async def on_loop() -> None:
+        run_sync(sample())
+
+    with pytest.raises(RuntimeError, match="running event loop"):
+        asyncio.run(on_loop())
 
 
 def test_stamp_live_baseline_uses_grouped_counters():

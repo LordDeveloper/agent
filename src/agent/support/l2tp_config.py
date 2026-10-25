@@ -237,14 +237,23 @@ def render_xl2tpd_conf(
     return '\n'.join(lines).rstrip() + '\n'
 
 
-def render_ppp_options(*, templates: dict[str, Any] | None = None) -> str:
+def render_ppp_options(
+    *,
+    templates: dict[str, Any] | None = None,
+    dns_servers: list[str] | None = None,
+) -> str:
     tpl = normalize_templates(templates) if templates is not None else default_templates()
     text = str(tpl['ppp_options']).replace('\r\n', '\n').strip() + '\n'
     try:
-        from agent.asyncutil import run_sync
-        from agent.dns_leak import preferred_client_dns, rewrite_ms_dns_options
+        from agent.dns_leak import rewrite_ms_dns_options
 
-        text = rewrite_ms_dns_options(text, run_sync(preferred_client_dns()))
+        if dns_servers is None:
+            # Only safe off the server loop. The async apply path passes servers.
+            from agent.asyncutil import run_sync
+            from agent.dns_leak import preferred_client_dns
+
+            dns_servers = run_sync(preferred_client_dns())
+        text = rewrite_ms_dns_options(text, list(dns_servers))
     except Exception:
         pass
     return text

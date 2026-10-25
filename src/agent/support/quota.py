@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any
 
 from agent.asyncutil import gather_independent, maybe_await
@@ -162,7 +164,9 @@ async def _enforce_xray(driver: Any) -> int:
 
     inbound_rows = getattr(driver, "list_quota_inbounds", None)
     if callable(inbound_rows):
-        inbounds = inbound_rows()
+        # Parses the whole on-disk client list. On the loop that stalls every
+        # other request once the inbound is large.
+        inbounds = await asyncio.to_thread(inbound_rows)
     else:
         inbounds = await maybe_await(driver.list_inbounds())
 

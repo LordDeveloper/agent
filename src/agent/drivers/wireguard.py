@@ -1661,13 +1661,14 @@ class WireGuardDriver(CoreDriver):
         iface: dict[str, Any],
         peer: dict[str, Any],
         endpoint_host: str = "127.0.0.1",
+        dns: str = "1.1.1.1",
     ) -> str:
         lines = [
             "[Interface]",
             f"PrivateKey = {peer.get('private_key')}",
             f"Address = {peer.get('address')}/32",
             f"MTU = {self._client_mtu(peer)}",
-            f"DNS = {self._client_dns(iface)}",
+            f"DNS = {dns}",
             "",
             "[Peer]",
             f"PublicKey = {iface.get('public_key')}",
@@ -1697,7 +1698,12 @@ class WireGuardDriver(CoreDriver):
 
         peer = await self._prepare_peer_config_material(iface, peer)
         return {
-            "config": self._format_client_config(iface, peer, endpoint_host),
+            "config": self._format_client_config(
+                iface,
+                peer,
+                endpoint_host,
+                dns=await self._client_dns(iface),
+            ),
             "client_public_key": str(peer.get("public_key") or ""),
         }
 
@@ -1815,7 +1821,7 @@ class WireGuardDriver(CoreDriver):
             if changed:
                 self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
 
-    def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
+    async def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
         """AdGuard gateway when ads-block is on; otherwise a public resolver."""
         try:
             from agent.adguard import ADS_ENABLED_MARKER
@@ -1825,10 +1831,9 @@ class WireGuardDriver(CoreDriver):
                     gateway = _interface_gateway_host(iface)
                     if gateway:
                         return gateway
-                from agent.asyncutil import run_sync
                 from agent.dns_leak import preferred_client_dns
 
-                servers = [item for item in run_sync(preferred_client_dns()) if str(item).strip()]
+                servers = [item for item in await preferred_client_dns() if str(item).strip()]
                 if servers:
                     return ", ".join(servers[:2])
         except Exception:

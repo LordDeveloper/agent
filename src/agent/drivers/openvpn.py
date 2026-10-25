@@ -851,10 +851,17 @@ class OpenVpnDriver(CoreDriver):
                 if content:
                     (ccd_dir / username).write_text(content, encoding='utf-8')
 
+            try:
+                from agent.dns_leak import preferred_client_dns
+
+                dns_servers = await preferred_client_dns()
+            except Exception:
+                dns_servers = ['1.1.1.1', '8.8.8.8']
             conf_text = render_server_conf(
                 server,
                 server_dir=server_dir,
                 auth_script=auth_script,
+                dns_servers=dns_servers,
             )
             conf_path = _SYSTEM_SERVER_ROOT / f'{instance}.conf'
             conf_path.write_text(conf_text, encoding='utf-8')

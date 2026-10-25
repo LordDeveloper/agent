@@ -269,7 +269,8 @@ class XrayDriver(CoreDriver):
         xray = self.settings.xray
         binary = self._binary()
         if not binary or not binary_has_httpapi(binary):
-            install_xray(force=True)
+            # install_xray is sync and used to call run_sync on this loop.
+            await asyncio.to_thread(install_xray, force=True)
 
         # Keep-alive: start only when down; never bounce an already-running unit.
         return await ensure_xray_running(
@@ -434,6 +435,19 @@ class XrayDriver(CoreDriver):
         inbounds = self._disk_inbounds()
         self._overlay_quota(inbounds, include_flags=False)
         return inbounds
+
+    async def _disk_inbounds_async(self) -> list[dict[str, Any]]:
+        """Same rows as _disk_inbounds, parsed off the event loop."""
+        try:
+            config = await self._read_config()
+        except AgentError:
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw in config.get("inbounds") or []:
+            if not isinstance(raw, dict) or self._is_api_inbound(raw):
+                continue
+            rows.append(self._normalize(raw))
+        return rows
 
     async def _inbound_shell(self, inbound_id: int | str) -> dict[str, Any]:
         """Inbound settings from disk (or one live row). Does not list every user."""
@@ -2662,7 +2676,7 @@ class XrayDriver(CoreDriver):
         )
         user_traffic = dict(user_groups.get("user") or {})
         inbound_traffic = dict(inbound_groups.get("inbound") or {})
-        inbounds = self._disk_inbounds()
+        inbounds = await self._disk_inbounds_async()
         seen: set[str] = set()
 
         rows: list[InboundUsageModel] = []

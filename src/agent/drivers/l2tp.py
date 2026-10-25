@@ -786,9 +786,15 @@ class L2tpDriver(CoreDriver):
         servers = self.list_servers()
         templates = resolve_templates(servers)
         staging = self._staging_dir()
+        try:
+            from agent.dns_leak import preferred_client_dns
+
+            dns_servers = await preferred_client_dns()
+        except Exception:
+            dns_servers = None
         files = {
             staging / 'xl2tpd.conf': render_xl2tpd_conf(servers, templates=templates),
-            staging / 'options.xl2tpd': render_ppp_options(templates=templates),
+            staging / 'options.xl2tpd': render_ppp_options(templates=templates, dns_servers=dns_servers),
             staging / 'chap-secrets': render_chap_secrets(servers),
             staging / 'ipsec.conf': render_ipsec_conf(servers, templates=templates),
             staging / 'ipsec.secrets': render_ipsec_secrets(servers),
