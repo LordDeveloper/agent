@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from agent.asyncutil import run_sync
 from agent.errors import AgentError
 
 KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
@@ -40,10 +41,10 @@ def _prepare_xray_service(result: dict) -> dict:
         from agent.xray_service import ensure_xray_running
 
         # Keep-alive semantics: start only when inactive (never bounce a live unit).
-        result["service"] = ensure_xray_running(
+        result["service"] = run_sync(ensure_xray_running(
             binary=str(result.get("binary") or os.environ.get("XRAY_BINARY", "/usr/local/bin/xray")),
             api_base=str(result.get("api_base") or os.environ.get("XRAY_API_BASE", "http://127.0.0.1:8080")),
-        )
+        ))
     except AgentError as exc:
         result["service_error"] = exc.message
     return result
@@ -87,7 +88,7 @@ def install_xray(
 
     if dest.is_file():
         try:
-            stop_xray_service()
+            run_sync(stop_xray_service())
         except AgentError:
             pass
 

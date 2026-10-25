@@ -378,7 +378,13 @@ class L2tpDriver(CoreDriver):
         await self._apply_all_configs()
         return True
 
-    async def add_user(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def add_user(
+        self,
+        server_id: int | str,
+        payload: dict[str, Any],
+        *,
+        apply: bool = True,
+    ) -> dict[str, Any]:
         server = self.get_server(server_id)
         user = normalize_peer(payload)
         user.setdefault('id', str(uuid.uuid4()))
@@ -398,15 +404,28 @@ class L2tpDriver(CoreDriver):
                     used_by_others.discard(existing_addr)
                     if existing_addr and existing_addr in used_by_others:
                         raise AgentError('VALIDATION_ERROR', f'Duplicate L2TP address [{existing_addr}]')
-                    return await self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+                    return await self.update_user(
+                        server_id,
+                        str(existing.get('id') or user['id']),
+                        payload,
+                        apply=apply,
+                    )
                 except AgentError:
                     # Subnet changed or duplicate IP — recreate with a free address.
-                    await self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                    await self.delete_user(
+                        server_id,
+                        str(existing.get('id') or existing.get('email')),
+                        apply=apply,
+                    )
                     server = self.get_server(server_id)
                     break
             if same_email:
                 # Peer identity rotate: drop the stale user so username/password/address can change.
-                await self.delete_user(server_id, str(existing.get('id') or existing.get('email')))
+                await self.delete_user(
+                    server_id,
+                    str(existing.get('id') or existing.get('email')),
+                    apply=apply,
+                )
                 server = self.get_server(server_id)
                 break
 
@@ -430,12 +449,18 @@ class L2tpDriver(CoreDriver):
         server.setdefault('users', []).append(user)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self.audit.record('create', f'{self.key}/user/{user.get("id")}')
-        await self._apply_all_configs()
-        await self._sync_peer_egress()
-        await self._ensure_services(start=True)
+        if apply:
+            await self._commit_user_runtime()
         return user
 
-    async def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_user(
+        self,
+        server_id: int | str,
+        user_id: str,
+        payload: dict[str, Any],
+        *,
+        apply: bool = True,
+    ) -> dict[str, Any]:
         server = self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
@@ -455,17 +480,13 @@ class L2tpDriver(CoreDriver):
                 self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                if any(k in payload for k in ('username', 'password', 'address', 'is_enabled', 'exit_interface')):
-                    await self._apply_all_configs()
+                if apply:
                     # Soft ensure — never restart xl2tpd/ipsec (keeps existing PPP sessions).
-                    await self._ensure_services(start=True)
-                else:
-                    await self._apply_all_configs()
-                await self._sync_peer_egress()
+                    await self._commit_user_runtime()
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
-    async def delete_user(self, server_id: int | str, user_id: str) -> bool:
+    async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
         server = self.get_server(server_id)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
@@ -473,12 +494,17 @@ class L2tpDriver(CoreDriver):
             raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
         server['users'] = filtered
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        await self._apply_all_configs()
-        await self._sync_peer_egress()
-        # chap-secrets update only — do not bounce live tunnels.
-        await self._ensure_services(start=True)
+        if apply:
+            # chap-secrets update only — do not bounce live tunnels.
+            await self._commit_user_runtime()
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
+
+    async def _commit_user_runtime(self) -> None:
+        """Write chap/ipsec once and ensure services without bouncing live tunnels."""
+        await self._apply_all_configs()
+        await self._sync_peer_egress()
+        await self._ensure_services(start=True)
 
     async def batch_users(
         self,
@@ -506,15 +532,20 @@ class L2tpDriver(CoreDriver):
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    await self.add_user(server_id, row)
+                    await self.add_user(server_id, row, apply=False)
                 else:
-                    await self.update_user(server_id, uid, row)
+                    await self.update_user(server_id, uid, row, apply=False)
                 applied += 1
             except AgentError as exc:
                 failed += 1
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
+                    if applied:
+                        await self._commit_user_runtime()
                     raise
+
+        if applied:
+            await self._commit_user_runtime()
 
         return {'applied': applied, 'failed': failed, 'errors': errors}
 

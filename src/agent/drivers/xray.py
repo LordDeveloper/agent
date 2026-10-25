@@ -47,7 +47,7 @@ from agent.support.proxy_protocol_forwarder import (
     stop_forwarders,
     sync_forwarders_from_inbounds,
 )
-from agent.asyncutil import bounded_gather, gather_independent, maybe_await
+from agent.asyncutil import bounded_gather, gather_independent, invoke, maybe_await
 from agent.xray_service import api_base_from_config, describe_httpapi_guard, xray_auth_from_config
 
 _TAG_RE = re.compile(r"^inbound-(.+)$")
@@ -232,7 +232,8 @@ class XrayDriver(CoreDriver):
 
     async def _api_call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         api = await self._api()
-        return await maybe_await(getattr(api, name)(*args, **kwargs))
+        # Sync clients (tests, older hooks) must not block the loop inside gather.
+        return await invoke(getattr(api, name), *args, **kwargs)
 
     async def running(self) -> bool:
         if not self.installed():
@@ -1335,6 +1336,9 @@ class XrayDriver(CoreDriver):
             live_email, live_id = await self._lookup_clients_for_batch(tag, clients)
             by_email.update(live_email)
             by_id.update(live_id)
+            traffic_index = await self._user_traffic_index()
+            if not traffic_index:
+                await self._prefetch_zero_baselines(clients)
 
             to_add: list[dict[str, Any]] = []
             to_edit: list[dict[str, Any]] = []
@@ -1386,7 +1390,11 @@ class XrayDriver(CoreDriver):
                         if existing is not None:
                             remove_email = str(existing.get("email") or email).strip()
                         else:
-                            remove_email = await self._live_user_email(tag, cid, email)
+                            live_row = (by_id.get(cid) if cid else None) or (by_email.get(email) if email else None)
+                            if isinstance(live_row, dict):
+                                remove_email = str(live_row.get("email") or email).strip()
+                            else:
+                                remove_email = await self._live_user_email(tag, cid, email)
                         prior = self._find_disabled_client(cid or email)
                         if existing is None and prior is None and not remove_email:
                             succeeded += 1
@@ -1401,7 +1409,7 @@ class XrayDriver(CoreDriver):
                             applied.append(client)
                         continue
 
-                    await self._raise_zero_baseline_to_live(client)
+                    self._stamp_live_baseline(client, traffic_index)
                     client["is_enabled"] = True
                     native = xray_protocol_user(
                         protocol,
@@ -1852,6 +1860,49 @@ class XrayDriver(CoreDriver):
             return {}
         users = groups.get("user") or {}
         return dict(users) if isinstance(users, dict) else {}
+
+    @staticmethod
+    def _stamp_live_baseline(client: dict[str, Any], index: dict[str, dict[str, int]]) -> None:
+        """Copy live counters onto a zero baseline without a per-client stats query."""
+        if int(client.get("_incoming") or 0) != 0 or int(client.get("_outgoing") or 0) != 0:
+            return
+        email = str(client.get("email") or "").strip()
+        cid = str(client.get("id") or "").strip()
+        traffic = index.get(email) if email else None
+        if not isinstance(traffic, dict) and cid:
+            traffic = index.get(cid)
+        if not isinstance(traffic, dict):
+            return
+        live_in = int(traffic.get("downlink") or 0)
+        live_out = int(traffic.get("uplink") or 0)
+        if live_in <= 0 and live_out <= 0:
+            return
+        client["_incoming"] = live_in
+        client["_outgoing"] = live_out
+
+    async def _prefetch_zero_baselines(self, clients: list[dict[str, Any]]) -> None:
+        """Parallel per-user stats only when the grouped traffic index is unavailable."""
+        pending = [
+            raw
+            for raw in clients
+            if isinstance(raw, dict)
+            and record_is_enabled(raw)
+            and int(raw.get("_incoming") or 0) == 0
+            and int(raw.get("_outgoing") or 0) == 0
+        ]
+        if not pending:
+            return
+
+        async def fill(raw: dict[str, Any]) -> None:
+            client = normalize_xray_client(raw)
+            await self._raise_zero_baseline_to_live(client)
+            raw["_incoming"] = int(client.get("_incoming") or 0)
+            raw["_outgoing"] = int(client.get("_outgoing") or 0)
+
+        await bounded_gather(
+            [lambda raw=raw: fill(raw) for raw in pending],
+            limit=_CLIENT_PARALLELISM,
+        )
 
     async def _raise_zero_baseline_to_live(self, client: dict[str, Any]) -> None:
         """A renewed client is pushed with a zero baseline while Xray still has old counters.
@@ -2444,10 +2495,19 @@ class XrayDriver(CoreDriver):
         return self.httpapi_guard()
 
     async def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {"updated": 0}
-        for rule in rules:
-            result = await self._api_call("edit_rule", rule)
-        return result
+        if not rules:
+            return {"updated": 0}
+        results = await bounded_gather(
+            [lambda rule=rule: self._api_call("edit_rule", rule) for rule in rules],
+            limit=_CLIENT_PARALLELISM,
+            return_exceptions=True,
+        )
+        for item in results:
+            if isinstance(item, AgentError):
+                raise item
+            if isinstance(item, Exception):
+                raise AgentError("EXEC_ERROR", f"{type(item).__name__}: {item}", 500)
+        return {"updated": len(rules)}
 
     async def remove_rules(self, tags: list[str]) -> dict[str, Any]:
         return await self._api_call("remove_rules", tags)

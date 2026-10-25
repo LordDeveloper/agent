@@ -300,7 +300,13 @@ class OpenVpnDriver(CoreDriver):
         await self._sync_peer_egress()
         return True
 
-    async def add_user(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def add_user(
+        self,
+        server_id: int | str,
+        payload: dict[str, Any],
+        *,
+        apply: bool = True,
+    ) -> dict[str, Any]:
         server = self.get_server(server_id)
         user = normalize_peer(payload)
         user.setdefault('id', str(uuid.uuid4()))
@@ -310,7 +316,12 @@ class OpenVpnDriver(CoreDriver):
             same_id = str(existing.get('id')) == str(user['id'])
             same_email = str(existing.get('email') or '') == str(user.get('email') or '')
             if same_id or same_email:
-                return await self.update_user(server_id, str(existing.get('id') or user['id']), payload)
+                return await self.update_user(
+                    server_id,
+                    str(existing.get('id') or user['id']),
+                    payload,
+                    apply=apply,
+                )
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
@@ -331,11 +342,18 @@ class OpenVpnDriver(CoreDriver):
         server.setdefault('users', []).append(user)
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         self.audit.record('create', f'{self.key}/user/{user.get("id")}')
-        await self._apply_server_auth_files(server)
-        await self._sync_peer_egress()
+        if apply:
+            await self._commit_user_runtime(server)
         return user
 
-    async def update_user(self, server_id: int | str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_user(
+        self,
+        server_id: int | str,
+        user_id: str,
+        payload: dict[str, Any],
+        *,
+        apply: bool = True,
+    ) -> dict[str, Any]:
         server = self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
@@ -355,12 +373,12 @@ class OpenVpnDriver(CoreDriver):
                 self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
                 self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                await self._apply_server_auth_files(server)
-                await self._sync_peer_egress()
+                if apply:
+                    await self._commit_user_runtime(server)
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
-    async def delete_user(self, server_id: int | str, user_id: str) -> bool:
+    async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
         server = self.get_server(server_id)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
@@ -368,10 +386,15 @@ class OpenVpnDriver(CoreDriver):
             raise AgentError('CLIENT_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
         server['users'] = filtered
         self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        await self._apply_server_auth_files(server)
-        await self._sync_peer_egress()
+        if apply:
+            await self._commit_user_runtime(server)
         self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
+
+    async def _commit_user_runtime(self, server: dict[str, Any]) -> None:
+        """Refresh passwd/CCD and egress once for the whole user set."""
+        await self._apply_server_auth_files(server)
+        await self._sync_peer_egress()
 
     async def batch_users(
         self,
@@ -398,15 +421,19 @@ class OpenVpnDriver(CoreDriver):
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    await self.add_user(server_id, row)
+                    await self.add_user(server_id, row, apply=False)
                 else:
-                    await self.update_user(server_id, uid, row)
+                    await self.update_user(server_id, uid, row, apply=False)
                 applied += 1
             except AgentError as exc:
                 failed += 1
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
+                    if applied:
+                        await self._commit_user_runtime(self.get_server(server_id))
                     raise
+        if applied:
+            await self._commit_user_runtime(self.get_server(server_id))
         return {'applied': applied, 'failed': failed, 'errors': errors}
 
     def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:

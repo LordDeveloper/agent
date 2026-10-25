@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -35,15 +36,20 @@ def _settings(tmp_path: Path):
     )
 
 
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
 def _driver(tmp_path: Path) -> OpenVpnDriver:
     store = Store(tmp_path / "agent.db")
     settings = _settings(tmp_path)
     audit = AuditLog(store)
     drv = OpenVpnDriver(settings, audit, store)
 
-    drv._apply_all_configs = lambda: None  # type: ignore[method-assign]
-    drv._ensure_services = lambda **_k: None  # type: ignore[method-assign]
-    drv._sync_peer_egress = lambda: None  # type: ignore[method-assign]
+    drv._apply_all_configs = _async_none  # type: ignore[method-assign]
+    drv._ensure_services = _async_none  # type: ignore[method-assign]
+    drv._sync_peer_egress = _async_none  # type: ignore[method-assign]
+    drv._apply_server_auth_files = _async_none  # type: ignore[method-assign]
     return drv
 
 
@@ -94,9 +100,9 @@ def test_render_server_conf_and_ovpn():
     assert "remote vpn.example.com 1194" in ovpn
     assert "<ca>" in ovpn
     assert "<tls-crypt>" in ovpn
-    assert "<auth-user-pass>" in ovpn
-    assert "alice" in ovpn
-    assert "pw" in ovpn
+    assert "\nauth-user-pass\n" in ovpn
+    assert "# username: alice" in ovpn
+    assert "# password: pw" in ovpn
 
 
 def test_parse_status_v2():
@@ -132,30 +138,61 @@ def test_openvpn_crud_users(tmp_path: Path):
         "ca_crt": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
         "tls_crypt": "STATICKEY",
     }
-    server = drv.create_server({"name": "main", "subnet": "10.8.1.0/24", "public_host": "1.2.3.4"})
+    async def scenario():
+        server = await drv.create_server({"name": "main", "subnet": "10.8.1.0/24", "public_host": "1.2.3.4"})
+        user = await drv.add_user(1, {"email": "u1@test", "exit_interface": "us"})
+        updated = await drv.update_user(1, user["id"], {"exit_interface": "de", "is_enabled": True})
+        bundle = drv.user_config_bundle(1, user["id"], endpoint_host="vpn.test")
+        deleted = await drv.delete_user(1, user["id"])
+        return server, user, updated, bundle, deleted
+
+    server, user, updated, bundle, deleted = asyncio.run(scenario())
     assert server["id"] == 1
     assert server["gateway"] == "10.8.1.1"
-
-    user = drv.add_user(1, {"email": "u1@test", "exit_interface": "us"})
     assert user["username"]
     assert user["address"].startswith("10.8.1.")
     assert user["exit_interface"] == "us"
 
     listed = drv.list_servers()
     assert len(listed) == 1
-    assert len(listed[0]["users"]) == 1
+    assert listed[0]["users"] == []
 
-    updated = drv.update_user(1, user["id"], {"exit_interface": "de", "is_enabled": True})
     assert updated["exit_interface"] == "de"
     assert updated["address"] == user["address"]
-
-    bundle = drv.user_config_bundle(1, user["id"], endpoint_host="vpn.test")
     assert bundle["type"] == "OpenVPN"
     assert "remote vpn.test" in bundle["ovpn"]
     assert "TEST" in bundle["ovpn"]
-
-    assert drv.delete_user(1, user["id"]) is True
+    assert deleted is True
     assert drv.get_server(1)["users"] == []
+
+
+def test_openvpn_batch_users_commits_runtime_once(tmp_path: Path):
+    drv = _driver(tmp_path)
+    calls = {"auth": 0, "egress": 0}
+
+    async def _count_auth(_server):
+        calls["auth"] += 1
+
+    async def _count_egress(drop_keys=None):
+        calls["egress"] += 1
+
+    drv._apply_server_auth_files = _count_auth  # type: ignore[method-assign]
+    drv._sync_peer_egress = _count_egress  # type: ignore[method-assign]
+
+    async def scenario():
+        server = await drv.create_server({"name": "main", "subnet": "10.8.1.0/24"})
+        before = dict(calls)
+        result = await drv.batch_users(
+            server["id"],
+            [{"email": f"u{i}@test"} for i in range(6)],
+        )
+        return before, result
+
+    before, result = asyncio.run(scenario())
+    assert result["applied"] == 6
+    assert result["failed"] == 0
+    assert calls["auth"] == before["auth"] + 1
+    assert calls["egress"] == before["egress"] + 1
 
 
 def test_openvpn_servers_as_interfaces_for_egress():
@@ -184,8 +221,12 @@ def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
         "dh_pem": "",
     }
     drv = _driver(tmp_path)
-    drv.create_server({"name": "main"})
-    user = drv.add_user(1, {"email": "a@b"})
+
+    async def scenario():
+        await drv.create_server({"name": "main"})
+        return await drv.add_user(1, {"email": "a@b"})
+
+    user = asyncio.run(scenario())
     # Re-enable real bundle path without apply
     bundle = OpenVpnDriver.user_config_bundle(drv, 1, user["id"], endpoint_host="h")
     assert "CA" in bundle["ovpn"]

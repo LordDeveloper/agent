@@ -1,3 +1,5 @@
+import asyncio
+
 from agent.db import Store
 from agent.support.openvpn_diagnose import diagnose_user_address
 
@@ -11,7 +13,7 @@ class _Result:
 
 def test_diagnose_reports_missing_user(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    report = diagnose_user_address(store, 'openvpn', '10.8.0.5', runner=lambda *a, **k: _Result())
+    report = asyncio.run(diagnose_user_address(store, 'openvpn', '10.8.0.5', runner=lambda *a, **k: _Result()))
     assert report['found'] is False
     assert report['summary']['healthy'] is False
     assert report['issues'][0]['code'] == 'USER_NOT_FOUND'
@@ -52,13 +54,13 @@ def test_diagnose_finds_user_and_flags_down_unit(tmp_path):
             return _Result()
         return _Result()
 
-    report = diagnose_user_address(
+    report = asyncio.run(diagnose_user_address(
         store,
         'openvpn',
         '10.8.0.5',
         runner=runner,
         sessions={},
-    )
+    ))
     assert report['found'] is True
     assert report['summary']['match_count'] == 1
     codes = {issue['code'] for match in report['matches'] for issue in match['issues']}

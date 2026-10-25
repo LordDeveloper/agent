@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from agent.audit import AuditLog
@@ -6,14 +7,22 @@ from agent.db import Store
 from agent.drivers.l2tp import L2tpDriver
 
 
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
 def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
     monkeypatch.setattr(
         'agent.drivers.l2tp.L2tpDriver._apply_all_configs',
-        lambda self: None,
+        _async_none,
     )
     monkeypatch.setattr(
         'agent.drivers.l2tp.L2tpDriver._ensure_services',
-        lambda self, **kwargs: None,
+        _async_none,
+    )
+    monkeypatch.setattr(
+        'agent.drivers.l2tp.L2tpDriver._sync_peer_egress',
+        _async_none,
     )
 
     settings = AgentSettings(
@@ -24,11 +33,11 @@ def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
     audit = AuditLog(store)
     driver = L2tpDriver(settings, audit, store)
 
-    server = driver.create_server({'subnet': '10.90.0.0/16', 'name': 'l2tp-test'})
+    server = asyncio.run(driver.create_server({'subnet': '10.90.0.0/16', 'name': 'l2tp-test'}))
     assert server['subnet'] == '10.90.0.0/16'
     assert server['gateway'] == '10.90.128.1'
 
-    user = driver.add_user(server['id'], {'id': 'peer-1', 'email': 'peer@test'})
+    user = asyncio.run(driver.add_user(server['id'], {'id': 'peer-1', 'email': 'peer@test'}))
     assert user['address'].startswith('10.90.128.')
     assert user['username']
     assert user['password']
@@ -40,6 +49,44 @@ def test_create_server_and_user_allocates_l2tp_range(tmp_path, monkeypatch):
 
     staging = Path(settings.l2tp.config_dir)
     assert staging.exists() is False  # apply was monkeypatched
+
+
+def test_batch_users_commits_runtime_once(tmp_path, monkeypatch):
+    calls = {'apply': 0, 'ensure': 0, 'egress': 0}
+
+    async def _count_apply(self):
+        calls['apply'] += 1
+
+    async def _count_ensure(self, **_kwargs):
+        calls['ensure'] += 1
+
+    async def _count_egress(self, drop_keys=None):
+        calls['egress'] += 1
+
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _count_apply)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _count_ensure)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._sync_peer_egress', _count_egress)
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = Store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        server = await driver.create_server({'subnet': '10.90.0.0/16', 'name': 'batch'})
+        before = dict(calls)
+        result = await driver.batch_users(
+            server['id'],
+            [{'id': f'u{i}', 'email': f'u{i}@test'} for i in range(8)],
+        )
+        return before, result, server['id']
+
+    before, result, server_id = asyncio.run(scenario())
+    assert result['applied'] == 8
+    assert result['failed'] == 0
+    assert calls['apply'] == before['apply'] + 1
+    assert calls['ensure'] == before['ensure'] + 1
+    assert calls['egress'] == before['egress'] + 1
+    assert len(driver.get_server(server_id)['users']) == 8
 
 
 def test_normalize_templates_upgrades_windows_slow_defaults():

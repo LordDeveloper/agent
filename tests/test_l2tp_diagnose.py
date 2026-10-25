@@ -1,3 +1,5 @@
+import asyncio
+
 from agent.db import Store
 from agent.support.l2tp_diagnose import diagnose_user_address
 
@@ -11,7 +13,7 @@ class _Result:
 
 def test_diagnose_reports_missing_user(tmp_path):
     store = Store(tmp_path / 'agent.db')
-    report = diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=lambda *a, **k: _Result())
+    report = asyncio.run(diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=lambda *a, **k: _Result()))
     assert report['found'] is False
     assert report['summary']['healthy'] is False
 
@@ -50,7 +52,7 @@ def test_diagnose_finds_user(tmp_path):
             return _Result(stdout='[]')
         return _Result()
 
-    report = diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=runner)
+    report = asyncio.run(diagnose_user_address(store, 'l2tp', '10.90.128.50', runner=runner))
     assert report['found'] is True
     assert report['summary']['match_count'] == 1
     codes = {issue['code'] for match in report['matches'] for issue in match['issues']}

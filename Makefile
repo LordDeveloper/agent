@@ -1,4 +1,4 @@
-.PHONY: install dev test smoke build
+.PHONY: install dev test smoke build release
 
 install:
 	pip install -e .
@@ -20,3 +20,7 @@ build:
 # All targets: gnu/musl × amd64/arm64
 build-all:
 	bash scripts/build.sh --all
+
+# Next patch tag from origin, then push. Actions publishes the binaries.
+release:
+	python scripts/release.py

@@ -106,6 +106,23 @@ async def run(
         return result
 
 
+def _call_runner(runner: Callable[..., Any], args: list[str], kwargs: dict[str, Any]) -> Any:
+    """Pass only the kwargs the runner actually accepts.
+
+    Test doubles often take ``(args,)`` or ``(args, timeout=)``. Production
+    ``run()`` also takes ``check``. Filtering keeps both working.
+    """
+    try:
+        signature = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return runner(args, **kwargs)
+    parameters = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return runner(args, **kwargs)
+    accepted = {key: value for key, value in kwargs.items() if key in parameters}
+    return runner(args, **accepted)
+
+
 async def execute(
     runner: Callable[..., Any] | None,
     args: list[str],
@@ -114,7 +131,7 @@ async def execute(
     """Native async subprocess, or an injected sync/async test runner."""
     if runner is None:
         return await run(args, **kwargs)
-    result = runner(args, **kwargs)
+    result = _call_runner(runner, args, kwargs)
     if inspect.isawaitable(result):
         return await result
     return result

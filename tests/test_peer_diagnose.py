@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -67,7 +68,9 @@ def test_find_peers_by_address(tmp_path):
 
 def test_diagnose_reports_missing_peer(tmp_path):
     store = Store(tmp_path / "empty.db")
-    report = diagnose_peer_address(store, "wireguard", "10.80.0.99", runner=lambda *a, **k: _Result())
+    report = asyncio.run(
+        diagnose_peer_address(store, "wireguard", "10.80.0.99", runner=lambda *a, **k: _Result())
+    )
     assert report["found"] is False
     assert report["issues"][0]["code"] == "PEER_NOT_FOUND"
 
@@ -112,14 +115,14 @@ def test_diagnose_detects_routing_and_live_peer(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.peer_diagnose._read_sysctl", lambda path: "1" if "ip_forward" in path else None)
     monkeypatch.setattr("agent.support.peer_diagnose.shutil.which", lambda cmd: "/usr/bin/nft" if cmd == "nft" else None)
 
-    report = diagnose_peer_address(
+    report = asyncio.run(diagnose_peer_address(
         store,
         "wireguard",
         "10.80.0.5",
         runner=fake_runner,
         peer_dump_fn=fake_dump,
         interface_is_up_fn=lambda name: name == "wg1",
-    )
+    ))
 
     assert report["found"] is True
     assert report["summary"]["match_count"] == 1
@@ -138,14 +141,14 @@ def test_diagnose_flags_missing_exit_and_live_peer(tmp_path, monkeypatch):
 
     monkeypatch.setattr("agent.support.peer_diagnose._read_sysctl", lambda path: "1")
 
-    report = diagnose_peer_address(
+    report = asyncio.run(diagnose_peer_address(
         store,
         "wireguard",
         "10.80.0.5",
         runner=lambda *a, **k: _Result(),
         peer_dump_fn=lambda _n: {},
         interface_is_up_fn=lambda _n: True,
-    )
+    ))
 
     codes = {row["code"] for row in report["matches"][0]["issues"]}
     assert "PEER_NOT_IN_LIVE_WG" in codes

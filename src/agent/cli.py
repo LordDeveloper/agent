@@ -122,7 +122,7 @@ def cmd_core_list(args: argparse.Namespace) -> int:
                         "enabled": True,
                         "installed": info.installed(),
                         "running": run_sync(info.running()),
-                        "version": info.version(),
+                        "version": run_sync(info.version()),
                         "capabilities": info.capabilities(),
                     }
                 )
@@ -294,35 +294,35 @@ def cmd_tls_status(_: argparse.Namespace) -> int:
 
 def cmd_tls_install_acme(args: argparse.Namespace) -> int:
     from agent.tls import ensure_acme
-    result = ensure_acme(email=args.email or '')
+    result = run_sync(ensure_acme(email=args.email or ''))
     _print_json({'success': True, **result})
     return 0
 
 
 def cmd_tls_install_certbot(_: argparse.Namespace) -> int:
     from agent.tls import ensure_certbot
-    result = ensure_certbot()
+    result = run_sync(ensure_certbot())
     _print_json({'success': True, **result})
     return 0
 
 
 def cmd_tls_issue(args: argparse.Namespace) -> int:
     from agent.tls import issue_cert
-    result = issue_cert(
+    result = run_sync(issue_cert(
         domain=args.domain,
         method=args.method,
         cf_token=args.cf_token,
         email=args.email or '',
         force=bool(args.force),
         tool=args.tool,
-    )
+    ))
     _print_json(result)
     return 0
 
 
 def cmd_tls_renew(args: argparse.Namespace) -> int:
     from agent.tls import renew_cert
-    result = renew_cert(domain=args.domain, force=bool(args.force), tool=args.tool)
+    result = run_sync(renew_cert(domain=args.domain, force=bool(args.force), tool=args.tool))
     _print_json(result)
     return 0
 
@@ -335,7 +335,7 @@ def cmd_tls_list(_: argparse.Namespace) -> int:
 
 def cmd_tls_revoke(args: argparse.Namespace) -> int:
     from agent.tls import revoke_cert
-    result = revoke_cert(domain=args.domain)
+    result = run_sync(revoke_cert(domain=args.domain))
     _print_json(result)
     return 0
 
@@ -440,7 +440,7 @@ def cmd_peer_diagnose(args: argparse.Namespace) -> int:
         driver = runtime.registry.get(core)
         if not hasattr(driver, "diagnose_address"):
             raise AgentError("UNSUPPORTED_CAPABILITY", f"Core [{core}] does not support peer diagnose")
-        report = driver.diagnose_address(args.address)
+        report = run_sync(driver.diagnose_address(args.address))
         _emit_diagnose_report(report, args)
         healthy = bool((report.get("summary") or {}).get("healthy"))
         if report.get("found") is False:
@@ -481,7 +481,7 @@ def _mullvad_service(args: argparse.Namespace):
 def cmd_mullvad_status(args: argparse.Namespace) -> int:
     runtime, service = _mullvad_service(args)
     try:
-        _print_json({"success": True, **service.status(probe=bool(getattr(args, "probe", False)))})
+        _print_json({"success": True, **run_sync(service.status(probe=bool(getattr(args, "probe", False))))})
     finally:
         runtime.close()
     return 0
@@ -512,7 +512,7 @@ def cmd_mullvad_settings_set(args: argparse.Namespace) -> int:
             kwargs["auto_fallback"] = bool(args.auto_fallback)
         if not kwargs:
             raise AgentError("VALIDATION_ERROR", "Provide --private-key, --address, --metric, and/or --auto-fallback")
-        saved = service.save_settings(**kwargs)
+        saved = run_sync(service.save_settings(**kwargs))
         public = {k: v for k, v in saved.items() if k != "private_key"}
         _print_json({"success": True, "settings": public})
     finally:
@@ -537,7 +537,7 @@ def cmd_mullvad_auto_fallback(args: argparse.Namespace) -> int:
             raise AgentError("VALIDATION_ERROR", "Use: agent mullvad auto-fallback on|off|status")
         if action in {"off", "disable", "disabled", "false", "0"}:
             enabled = False
-        saved = service.save_settings(auto_fallback=enabled)
+        saved = run_sync(service.save_settings(auto_fallback=enabled))
         _print_json({
             "success": True,
             "auto_fallback": bool(saved.get("auto_fallback")),
@@ -554,9 +554,9 @@ def cmd_mullvad_service(args: argparse.Namespace) -> int:
         action = str(getattr(args, "service_action", "") or "").strip().lower()
         iface = str(getattr(args, "iface", "") or "").strip()
         if iface:
-            payload = service.control_tunnel(iface, action)
+            payload = run_sync(service.control_tunnel(iface, action))
         else:
-            payload = service.control_tunnels(action)
+            payload = run_sync(service.control_tunnels(action))
         _print_json({"success": True, **payload})
     finally:
         runtime.close()
@@ -567,7 +567,7 @@ def cmd_mullvad_fallback(args: argparse.Namespace) -> int:
     runtime, service = _mullvad_service(args)
     try:
         country = str(getattr(args, "country", "") or "").strip() or None
-        payload = service.fallback(country, optimize=bool(getattr(args, "optimize", False)))
+        payload = run_sync(service.fallback(country, optimize=bool(getattr(args, "optimize", False))))
         _print_json({"success": True, **payload})
     finally:
         runtime.close()
@@ -577,7 +577,7 @@ def cmd_mullvad_fallback(args: argparse.Namespace) -> int:
 def cmd_mullvad_restore(args: argparse.Namespace) -> int:
     runtime, service = _mullvad_service(args)
     try:
-        _print_json({"success": True, **service.restore_interfaces()})
+        _print_json({"success": True, **run_sync(service.restore_interfaces())})
     finally:
         runtime.close()
     return 0
@@ -586,7 +586,7 @@ def cmd_mullvad_restore(args: argparse.Namespace) -> int:
 def cmd_mullvad_ensure(args: argparse.Namespace) -> int:
     runtime, service = _mullvad_service(args)
     try:
-        _print_json({"success": True, **service.ensure(str(args.country))})
+        _print_json({"success": True, **run_sync(service.ensure(str(args.country)))})
     finally:
         runtime.close()
     return 0

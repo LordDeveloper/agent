@@ -235,9 +235,10 @@ def render_server_conf(
     script = Path(auth_script)
 
     try:
+        from agent.asyncutil import run_sync
         from agent.dns_leak import preferred_client_dns
 
-        dns_servers = preferred_client_dns()
+        dns_servers = run_sync(preferred_client_dns())
     except Exception:
         dns_servers = ['1.1.1.1', '8.8.8.8']
     if not dns_servers:
@@ -315,10 +316,11 @@ def render_client_ovpn(
     # client profile (server push alone is easy to miss after an early ensure).
     try:
         from agent.adguard import ADS_ENABLED_MARKER
+        from agent.asyncutil import run_sync
         from agent.dns_leak import preferred_client_dns
 
         if ADS_ENABLED_MARKER.is_file():
-            for dns in preferred_client_dns()[:1]:
+            for dns in run_sync(preferred_client_dns())[:1]:
                 dns = str(dns).strip()
                 if dns:
                     blocks.append(f'dhcp-option DNS {dns}')

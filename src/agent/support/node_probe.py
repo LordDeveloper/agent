@@ -301,33 +301,37 @@ def _url_host(url: str) -> str | None:
 
 
 async def _resolve_ipv4_hosts(hosts: list[str]) -> list[str]:
-    resolved: list[str] = []
-    seen: set[str] = set()
     loop = asyncio.get_running_loop()
-    for host in hosts:
-        text = str(host or '').strip()
-        if not text:
-            continue
+    ordered = [str(host or '').strip() for host in hosts if str(host or '').strip()]
+
+    async def lookup(text: str) -> list[str]:
         try:
             ip = str(ipaddress.ip_address(text))
-            if ':' in ip:
-                continue
-            if ip not in seen:
-                seen.add(ip)
-                resolved.append(ip)
-            continue
         except ValueError:
-            pass
+            ip = ''
+        if ip:
+            return [] if ':' in ip else [ip]
         try:
             infos = await loop.getaddrinfo(text, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
         except OSError:
-            continue
+            return []
+        found: list[str] = []
         for info in infos:
             addr = str(info[4][0] if info and info[4] else '').strip()
-            if not addr or addr in seen:
-                continue
-            seen.add(addr)
-            resolved.append(addr)
+            if addr:
+                found.append(addr)
+        return found
+
+    parts = await gather_independent(*(lookup(text) for text in ordered), return_exceptions=True)
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if not isinstance(part, list):
+            continue
+        for addr in part:
+            if addr not in seen:
+                seen.add(addr)
+                resolved.append(addr)
     return resolved
 
 

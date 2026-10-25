@@ -313,7 +313,7 @@ def _show_core_runtime_status(name: str) -> None:
 
         installed = bool(driver.installed())
         running = bool(run_sync(driver.running()))
-        version = driver.version() or "-"
+        version = run_sync(driver.version()) or "-"
         _print(kv("Installed", "yes" if installed else "no", GREEN if installed else RED))
         _print(kv("Running", "yes" if running else "no", GREEN if running else RED))
         _print(kv("Version", version, WHITE))
@@ -336,7 +336,7 @@ def _show_core_start(name: str) -> None:
         if not driver.installed():
             _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
             return
-        result = driver.enable()
+        result = run_sync(driver.enable())
         _print(paint(f"  {label} started.", GREEN))
         if isinstance(result, dict) and result:
             for key, value in result.items():
@@ -362,7 +362,7 @@ def _show_core_restart(name: str) -> None:
         if not driver.installed():
             _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
             return
-        result = driver.restart()
+        result = run_sync(driver.restart())
         _print(paint(f"  {label} restarted.", GREEN))
         if isinstance(result, dict) and result:
             for key, value in result.items():
@@ -707,14 +707,14 @@ def _show_tls_status() -> None:
 def _show_tls_install_acme() -> None:
     from agent.tls import ensure_acme
     email = prompt_text("Email (optional)", "")
-    result = ensure_acme(email=email)
+    result = run_sync(ensure_acme(email=email))
     _print(kv("Path", str(result.get('path', '-')), GREEN))
     _print(kv("Downloaded", "yes" if result.get('downloaded') else "already present", CYAN))
 
 
 def _show_tls_install_certbot() -> None:
     from agent.tls import ensure_certbot
-    result = ensure_certbot()
+    result = run_sync(ensure_certbot())
     _print(kv("Path", str(result.get('path', '-')), GREEN))
     _print(kv("Downloaded", "yes" if result.get('downloaded') else "already present", CYAN))
 
@@ -749,7 +749,7 @@ def _tls_issue_flow() -> None:
 
     def _do():
         from agent.tls import issue_cert
-        result = issue_cert(domain=domain, method=method, cf_token=cf_token, force=force, tool=tool)
+        result = run_sync(issue_cert(domain=domain, method=method, cf_token=cf_token, force=force, tool=tool))
         _print(kv("Domain", result.get('domain', '-'), CYAN))
         _print(kv("Tool", result.get('tool', '-'), WHITE))
         _print(kv("Issued", "yes" if result.get('issued') else "cached", GREEN))
@@ -778,7 +778,7 @@ def _tls_renew_flow() -> None:
 
     def _do():
         from agent.tls import renew_cert
-        result = renew_cert(domain=domain, force=force, tool=tool)
+        result = run_sync(renew_cert(domain=domain, force=force, tool=tool))
         _print(kv("Domain", result.get('domain', '-'), CYAN))
         _print(kv("Renewed", "yes" if result.get('renewed') else "no", GREEN))
 
@@ -810,7 +810,7 @@ def _tls_revoke_flow() -> None:
 
     def _do():
         from agent.tls import revoke_cert
-        result = revoke_cert(domain=domain)
+        result = run_sync(revoke_cert(domain=domain))
         _print(kv("Revoked", "yes" if result.get('revoked') else "no", GREEN if result.get('revoked') else RED))
         _print(kv("Files removed", "yes" if result.get('removed') else "no", DIM))
 
@@ -1196,7 +1196,7 @@ def _show_mullvad_set_account() -> None:
         if not kwargs:
             _print(paint("  Nothing changed.", YELLOW))
             return
-        saved = service.save_settings(**kwargs)
+        saved = run_sync(service.save_settings(**kwargs))
         prop = saved.get("propagated") or {}
         _print(paint("  Account saved.", GREEN))
         _print(kv("Key", mask_key(saved.get("private_key") or ""), WHITE))
@@ -1210,7 +1210,7 @@ def _show_mullvad_set_account() -> None:
 def _show_mullvad_status() -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        payload = service.status()
+        payload = run_sync(service.status())
         settings = payload.get("settings") or {}
         _print(kv("Private key", "set" if settings.get("has_private_key") else "missing", GREEN if settings.get("has_private_key") else YELLOW))
         _print(kv("Address", settings.get("address") or "-", WHITE))
@@ -1260,7 +1260,7 @@ def _mullvad_service_menu() -> None:
 def _show_mullvad_service_bulk(action: str) -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        result = service.control_tunnels(action)
+        result = run_sync(service.control_tunnels(action))
         _print(kv("Action", action, CYAN))
         _print(kv("OK", str(result.get("count") or 0), GREEN))
         _print(kv("Failed", str(result.get("failed_count") or 0), RED if result.get("failed_count") else WHITE))
@@ -1275,7 +1275,7 @@ def _show_mullvad_service_bulk(action: str) -> None:
 def _show_mullvad_service_one() -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        tunnels = (service.status().get("tunnels") or [])
+        tunnels = (run_sync(service.status()).get("tunnels") or [])
         if not tunnels:
             _print(paint("  No Mullvad tunnels.", YELLOW))
             return
@@ -1300,7 +1300,7 @@ def _show_mullvad_service_one() -> None:
         if action in {None, "back"}:
             _print(paint("  Cancelled.", YELLOW))
             return
-        result = service.control_tunnel(iface, action)
+        result = run_sync(service.control_tunnel(iface, action))
         _print(paint(f"  {result.get('message')}", GREEN if result.get("ok") else RED))
     finally:
         runtime.close()
@@ -1321,7 +1321,7 @@ def _show_mullvad_auto_fallback() -> None:
         if picked in {None, "back"}:
             _print(paint("  Cancelled.", YELLOW))
             return
-        saved = service.save_settings(auto_fallback=(picked == "on"))
+        saved = run_sync(service.save_settings(auto_fallback=(picked == "on")))
         enabled = bool(saved.get("auto_fallback"))
         _print(paint(
             "  Auto fallback enabled — worker may switch unhealthy relays."
@@ -1348,7 +1348,7 @@ def _show_mullvad_relay_metric() -> None:
         if picked in {None, "back"}:
             _print(paint("  Cancelled.", YELLOW))
             return
-        saved = service.save_settings(relay_metric=picked)
+        saved = run_sync(service.save_settings(relay_metric=picked))
         _print(paint(f"  Relay metric set to {saved.get('relay_metric')}.", GREEN))
         if picked == "speed":
             _print(paint("  Speed ranking uses curl --interface <iface> (shared tunnel IP is ignored).", CYAN))
@@ -1359,7 +1359,7 @@ def _show_mullvad_relay_metric() -> None:
 def _show_mullvad_fallback(optimize: bool = False) -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        result = service.fallback(optimize=optimize)
+        result = run_sync(service.fallback(optimize=optimize))
         changed = result.get("changed") or []
         failed = result.get("failed") or []
         skipped = result.get("skipped") or []
@@ -1378,7 +1378,7 @@ def _show_mullvad_fallback(optimize: bool = False) -> None:
 def _show_mullvad_switch_relay() -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        tunnels = (service.status().get("tunnels") or [])
+        tunnels = (run_sync(service.status()).get("tunnels") or [])
         if not tunnels:
             _print(paint("  No Mullvad tunnels bound yet.", YELLOW))
             return
@@ -1389,7 +1389,7 @@ def _show_mullvad_switch_relay() -> None:
         if not country:
             _print(paint("  Cancelled.", YELLOW))
             return
-        payload = service.country_relays(country, ping=True)
+        payload = run_sync(service.country_relays(country, ping=True))
         relays = payload.get("relays") or []
         if not relays:
             _print(paint("  No relays found.", YELLOW))
@@ -1413,7 +1413,7 @@ def _show_mullvad_switch_relay() -> None:
         if picked in {None, "back"}:
             _print(paint("  Cancelled.", YELLOW))
             return
-        result = service.switch_relay(country, picked)
+        result = run_sync(service.switch_relay(country, picked))
         tone = GREEN if result.get("status") == "changed" else WHITE
         _print(paint(f"  {result.get('message')}", tone))
         _print(kv("Hostname", result.get("hostname") or "-", WHITE))
@@ -1425,7 +1425,7 @@ def _show_mullvad_switch_relay() -> None:
 def _show_mullvad_refresh() -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        payload = service.locations(force=True)
+        payload = run_sync(service.locations(force=True))
         locations = payload.get("locations") or []
         bound = [row for row in locations if row.get("bound")]
         _print(kv("Countries", str(len(locations)), WHITE))

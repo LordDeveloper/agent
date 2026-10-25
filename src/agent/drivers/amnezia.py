@@ -104,4 +104,4 @@ class AmneziaDriver(WireGuardDriver):
         return bundle
 
     async def peer_config(self, interface_id: int | str, peer_id: str, endpoint_host: str = "127.0.0.1") -> str:
-        return await self.peer_config_bundle(interface_id, peer_id, endpoint_host)["config"]
+        return (await self.peer_config_bundle(interface_id, peer_id, endpoint_host))["config"]

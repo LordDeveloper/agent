@@ -19,7 +19,7 @@ from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
-from agent.asyncutil import gather_independent
+from agent.asyncutil import bounded_gather, gather_independent
 from agent.support.process import run
 from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
@@ -197,7 +197,16 @@ async def _materialize_peer_keypair(peer: dict[str, Any], cli: str) -> None:
 
     generated_private, generated_public = await _wg_keypair(cli)
     peer["private_key"] = generated_private
-    peer["public_key"] = await _require_wg_pubkey(cli, generated_private) or generated_public
+    peer["public_key"] = generated_public
+
+
+async def _keypair_for_payload(payload: dict[str, Any], cli: str) -> tuple[str, str]:
+    stub = {
+        "private_key": payload.get("private_key"),
+        "public_key": payload.get("public_key"),
+    }
+    await _materialize_peer_keypair(stub, cli)
+    return str(stub.get("private_key") or ""), str(stub.get("public_key") or "")
 
 
 def _server_address(subnet: str) -> str:
@@ -890,7 +899,12 @@ class WireGuardDriver(CoreDriver):
         iface = deepcopy(self.get_interface(interface_id))
         rows = list(iface.get("peers") or [])
         used_ips = {str(peer.get("address") or "") for peer in rows if peer.get("address")}
+        await self._prefetch_create_keypairs(peers, {}, {}, "add")
         for raw in peers:
+            if isinstance(raw, dict):
+                key_error = raw.pop("_keypair_error", None)
+                if key_error:
+                    raise AgentError("VALIDATION_ERROR", str(key_error), 500)
             rows.append(await self._spawn_peer(iface, raw, used_ips))
         iface["peers"] = rows
         _ensure_interface_address(iface)
@@ -1144,6 +1158,43 @@ class WireGuardDriver(CoreDriver):
             return by_email[email]
         return None
 
+    async def _prefetch_create_keypairs(
+        self,
+        peers: list[dict[str, Any]],
+        by_id: dict[str, dict[str, Any]],
+        by_email: dict[str, dict[str, Any]],
+        mode_key: str,
+    ) -> None:
+        """Mint missing WireGuard keypairs concurrently before the serial IP assign."""
+        if mode_key == "update":
+            return
+        pending: list[dict[str, Any]] = []
+        for raw in peers:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("private_key") or "").strip() and str(raw.get("public_key") or "").strip():
+                continue
+            probe = normalize_peer(raw)
+            probe.setdefault("id", str(raw.get("id") or uuid.uuid4()))
+            if not probe.get("email"):
+                probe["email"] = probe.get("name") or str(probe["id"])[:8]
+            if self._find_existing_peer(by_id, by_email, probe) is not None:
+                continue
+            pending.append(raw)
+        if not pending:
+            return
+        cli = self._cli_bin() or "wg"
+        minted = await bounded_gather(
+            [lambda raw=raw: _keypair_for_payload(raw, cli) for raw in pending],
+            limit=32,
+            return_exceptions=True,
+        )
+        for raw, keys in zip(pending, minted):
+            if isinstance(keys, tuple):
+                raw["private_key"], raw["public_key"] = keys
+            elif isinstance(keys, BaseException):
+                raw["_keypair_error"] = f"{type(keys).__name__}: {keys}"
+
     async def _spawn_peer(self, iface: dict[str, Any], payload: dict[str, Any], used_ips: set[str]) -> dict[str, Any]:
         peer = normalize_peer(payload)
         peer.setdefault("id", str(uuid.uuid4()))
@@ -1239,6 +1290,7 @@ class WireGuardDriver(CoreDriver):
         by_id, by_email = self._peer_index(iface)
         rows: list[dict[str, Any]] = list(iface.get("peers", []))
         used_ips = {str(p.get("address") or "") for p in rows if p.get("address")}
+        await self._prefetch_create_keypairs(peers, by_id, by_email, mode_key)
 
         succeeded = 0
         failed = 0
@@ -1289,6 +1341,9 @@ class WireGuardDriver(CoreDriver):
                         by_email[merged_email] = merged
                     applied.append(merged)
                 else:
+                    key_error = raw.pop("_keypair_error", None)
+                    if key_error:
+                        raise AgentError("VALIDATION_ERROR", str(key_error), 500)
                     created = await self._spawn_peer(iface, raw, used_ips)
                     rows.append(created)
                     by_id[str(created.get("id") or "")] = created
@@ -1770,9 +1825,10 @@ class WireGuardDriver(CoreDriver):
                     gateway = _interface_gateway_host(iface)
                     if gateway:
                         return gateway
+                from agent.asyncutil import run_sync
                 from agent.dns_leak import preferred_client_dns
 
-                servers = [item for item in preferred_client_dns() if str(item).strip()]
+                servers = [item for item in run_sync(preferred_client_dns()) if str(item).strip()]
                 if servers:
                     return ", ".join(servers[:2])
         except Exception:

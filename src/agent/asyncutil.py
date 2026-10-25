@@ -15,10 +15,23 @@ async def maybe_await(value: T | Awaitable[T]) -> T:
 
 
 def run_sync(value: T | Awaitable[T]) -> T:
-    """Run an awaitable from sync CLI/menu code."""
-    if inspect.isawaitable(value):
+    """Run an awaitable from sync CLI/menu code.
+
+    Sync entry points (argparse, the text menu, config renderers) must use this
+    instead of touching a coroutine. Inside a running loop the awaitable is
+    finished on a worker thread so ``asyncio.run`` is not nested.
+    """
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
         return asyncio.run(value)
-    return value
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, value).result()
 
 
 async def invoke(fn: Callable[..., T | Awaitable[T]], /, *args: Any, **kwargs: Any) -> T:
