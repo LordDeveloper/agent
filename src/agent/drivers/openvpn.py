@@ -457,12 +457,22 @@ class OpenVpnDriver(CoreDriver):
 
         host = endpoint_host or server.get('public_host') or '127.0.0.1'
         pki = await self._pki_texts(server)
+        dns_servers: list[str] | None = None
+        try:
+            from agent.adguard import ADS_ENABLED_MARKER
+            from agent.dns_leak import preferred_client_dns
+
+            if ADS_ENABLED_MARKER.is_file():
+                dns_servers = await preferred_client_dns()
+        except Exception:
+            dns_servers = []
         ovpn = render_client_ovpn(
             server,
             user,
             endpoint_host=str(host),
             ca_crt=pki.get('ca_crt') or '',
             tls_crypt=pki.get('tls_crypt') or '',
+            dns_servers=dns_servers,
         )
         return {
             'type': 'OpenVPN',

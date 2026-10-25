@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from agent.update import (
     check_for_update,
     detect_arch,
+    detect_libc,
     fetch_latest_release,
     normalize_version,
     parse_version_tuple,
@@ -28,6 +30,21 @@ def test_version_compare():
 def test_detect_arch():
     assert detect_arch("x86_64") == "amd64"
     assert detect_arch("aarch64") == "arm64"
+
+
+def test_detect_libc_runs_inside_a_live_loop(monkeypatch):
+    monkeypatch.delenv("AGENT_LIBC", raising=False)
+
+    def fake_run(args, **kwargs):
+        assert args == ["ldd", "--version"]
+        return subprocess.CompletedProcess(args, 0, "", "musl libc\nVersion 1.2.5\n")
+
+    monkeypatch.setattr("agent.update.subprocess.run", fake_run)
+
+    async def on_loop() -> str:
+        return detect_libc()
+
+    assert asyncio.run(on_loop()) == "musl"
 
 
 def test_pick_release_asset_fallback():
@@ -90,6 +107,51 @@ def test_fetch_latest_release(monkeypatch):
     )
     assert release.version == "0.2.0"
     assert release.asset_id == 42
+
+
+def test_fetch_latest_release_detects_platform_on_the_loop(monkeypatch):
+    """Menu update enters the loop, then resolves the asset. That must not nest run_sync."""
+    payload = {
+        "tag_name": "v0.4.119",
+        "html_url": "https://github.com/LordDeveloper/agent/releases/tag/v0.4.119",
+        "assets": [{"id": 7, "name": "agent-linux-musl-amd64"}],
+    }
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return payload
+
+        @property
+        def text(self):
+            return json.dumps(payload)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None):
+            return FakeResponse()
+
+    monkeypatch.delenv("AGENT_LIBC", raising=False)
+    monkeypatch.setattr("agent.update.platform.system", lambda: "Linux")
+    monkeypatch.setattr("agent.update.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        "agent.update.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", "musl libc\n"),
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    release = asyncio.run(fetch_latest_release(repo="LordDeveloper/agent", token="secret-token"))
+    assert release.asset_name == "agent-linux-musl-amd64"
+    assert release.version == "0.4.119"
 
 
 def test_check_for_update(monkeypatch):

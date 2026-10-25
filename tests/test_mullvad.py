@@ -135,33 +135,33 @@ def test_pick_best_relay_by_catalog_speed():
 def test_save_settings_relay_metric(tmp_path: Path):
     svc = _service(tmp_path)
     run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="speed"))
-    assert svc.relay_metric() == "speed"
+    assert run_sync(svc.relay_metric()) == "speed"
     run_sync(svc.save_settings(relay_metric="ping"))
-    assert svc.relay_metric() == "ping"
+    assert run_sync(svc.relay_metric()) == "ping"
 
 
 def test_save_settings_auto_fallback(tmp_path: Path):
     svc = _service(tmp_path)
     run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32"))
-    assert svc.auto_fallback_enabled() is True
+    assert run_sync(svc.auto_fallback_enabled()) is True
     saved = run_sync(svc.save_settings(auto_fallback=False))
     assert saved["auto_fallback"] is False
-    assert svc.auto_fallback_enabled() is False
+    assert run_sync(svc.auto_fallback_enabled()) is False
     # Lightweight flag flip must keep account fields.
     assert saved["address"] == "10.64.0.2/32"
     saved = run_sync(svc.save_settings(auto_fallback=True))
     assert saved["auto_fallback"] is True
-    assert svc.auto_fallback_enabled() is True
+    assert run_sync(svc.auto_fallback_enabled()) is True
 
 
 def test_save_settings_relay_mode_fixed(tmp_path: Path):
     svc = _service(tmp_path)
     run_sync(svc.save_settings(private_key=PRIV, address="10.64.0.2/32", relay_metric="ping"))
-    assert svc.relay_mode() == "auto"
+    assert run_sync(svc.relay_mode()) == "auto"
     saved = run_sync(svc.save_settings(relay_mode="fixed"))
     assert saved["relay_mode"] == "fixed"
     assert saved["selection_mode"] == "fixed"
-    assert svc.relay_mode() == "fixed"
+    assert run_sync(svc.relay_mode()) == "fixed"
     saved = run_sync(svc.save_settings(relay_metric="speed", relay_mode="auto"))
     assert saved["relay_metric"] == "speed"
     assert saved["relay_mode"] == "auto"
@@ -171,7 +171,7 @@ def test_save_settings_metric_only_keeps_dual_stack_address(tmp_path: Path):
     svc = _service(tmp_path)
     dual = "10.64.0.2/32,fc00:bbbb:bbbb:bb01::2/128"
     run_sync(svc.save_settings(private_key=PRIV, address=dual, relay_metric="ping"))
-    assert svc.settings()["address"] == dual
+    assert run_sync(svc.settings())["address"] == dual
     saved = run_sync(svc.save_settings(relay_metric="speed"))
     assert saved["relay_metric"] == "speed"
     assert saved["relay_mode"] == "auto"
@@ -329,8 +329,8 @@ def test_adopts_existing_de_conf(tmp_path: Path):
     )
     bindings = run_sync(svc.refresh_bindings())
     assert any(row["country_code"] == "de" and row["iface"] == "de" and row["adopted"] for row in bindings)
-    assert svc.settings()["private_key"] == PRIV
-    assert svc.settings()["address"] == "10.64.9.9/32"
+    assert run_sync(svc.settings())["private_key"] == PRIV
+    assert run_sync(svc.settings())["address"] == "10.64.9.9/32"
 
     payload = run_sync(svc.locations())
     de = next(row for row in payload["locations"] if row["country_code"] == "de")
@@ -366,7 +366,7 @@ def test_fallback_rewrites_peer_keeps_iface_name(tmp_path: Path, monkeypatch):
     parsed = parse_wg_conf(path.read_text(encoding="utf-8"))
     assert parsed["peers"][0]["PublicKey"] == PUB_BER
     assert parsed["interface"]["PostUp"] == "keep-me"
-    assert svc.binding_for("de")["iface"] == "de"
+    assert run_sync(svc.binding_for("de"))["iface"] == "de"
 
 
 def test_fallback_switches_when_relay_tcp_probe_fails(tmp_path: Path, monkeypatch):
@@ -616,7 +616,7 @@ def test_switch_relay_fixed_is_per_node_and_skips_fallback(tmp_path: Path, monke
     assert result["status"] == "changed"
     assert result["fixed"] is True
     # Global metric mode stays auto — fixed is per binding.
-    assert svc.relay_mode() == "auto"
+    assert run_sync(svc.relay_mode()) == "auto"
     listed = run_sync(svc.country_relays("de", ping=False))
     assert listed["current_fixed"] is True
     assert listed["current_hostname"] == "de-ber-wg-001"
@@ -629,9 +629,9 @@ def test_switch_relay_fixed_is_per_node_and_skips_fallback(tmp_path: Path, monke
     assert fallback["skipped"]
     assert "fixed" in str(fallback["skipped"][0].get("message") or "").lower()
 
-    unfixed = svc.set_relay_fixed("de", False)
+    unfixed = run_sync(svc.set_relay_fixed("de", False))
     assert unfixed["fixed"] is False
-    assert svc.binding_for("de")["fixed"] is False
+    assert run_sync(svc.binding_for("de"))["fixed"] is False
 
 
 def test_persist_unit_enables_systemd_watchdog(tmp_path: Path, monkeypatch):

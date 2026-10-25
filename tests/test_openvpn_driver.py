@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from agent.audit import AuditLog
 from tests.conftest import open_store
@@ -141,10 +141,13 @@ def test_openvpn_crud_users(tmp_path: Path, monkeypatch):
         _noop_egress,
     )
     drv = _driver(tmp_path)
-    drv._pki_texts = lambda _server: {  # type: ignore[method-assign]
-        "ca_crt": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
-        "tls_crypt": "STATICKEY",
-    }
+    async def _pki_texts(_server):
+        return {
+            "ca_crt": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
+            "tls_crypt": "STATICKEY",
+        }
+
+    drv._pki_texts = _pki_texts  # type: ignore[method-assign]
     async def scenario():
         server = await drv.create_server({"name": "main", "subnet": "10.8.1.0/24", "public_host": "1.2.3.4"})
         user = await drv.add_user(1, {"email": "u1@test", "exit_interface": "us"})
@@ -218,7 +221,7 @@ def test_openvpn_servers_as_interfaces_for_egress():
     assert ifaces[0]["peers"][0]["address"] == "10.8.2.10"
 
 
-@patch("agent.drivers.openvpn.ensure_server_pki", new_callable=lambda: __import__("unittest.mock").mock.AsyncMock)
+@patch("agent.drivers.openvpn.ensure_server_pki", new_callable=AsyncMock)
 def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
     mock_pki.return_value = {
         "ca_crt": "CA",

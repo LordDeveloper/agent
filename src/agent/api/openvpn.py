@@ -151,7 +151,7 @@ async def diagnose_user(address: str, openvpn: OpenVpnDriver = Depends(get_openv
 
 @router.post('/backup')
 async def backup(openvpn: OpenVpnDriver = Depends(get_openvpn)):
-    return {'success': True, 'backup': openvpn.backup()}
+    return {'success': True, 'backup': await openvpn.backup()}
 
 
 @router.post('/restore')

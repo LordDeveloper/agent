@@ -231,12 +231,10 @@ def render_server_conf(
     script = Path(auth_script)
 
     if dns_servers is None:
-        # Only safe off the server loop. Callers on the loop pass dns_servers.
         try:
-            from agent.asyncutil import run_sync
-            from agent.dns_leak import preferred_client_dns
+            from agent.dns_leak import sync_preferred_client_dns
 
-            dns_servers = run_sync(preferred_client_dns())
+            dns_servers = sync_preferred_client_dns()
         except Exception:
             dns_servers = ['1.1.1.1', '8.8.8.8']
     if not dns_servers:
@@ -284,6 +282,7 @@ def render_client_ovpn(
     endpoint_host: str,
     ca_crt: str,
     tls_crypt: str = '',
+    dns_servers: list[str] | None = None,
 ) -> str:
     host = str(endpoint_host or server.get('public_host') or '127.0.0.1').strip()
     port = int(server.get('listen_port') or 1194)
@@ -314,11 +313,11 @@ def render_client_ovpn(
     # client profile (server push alone is easy to miss after an early ensure).
     try:
         from agent.adguard import ADS_ENABLED_MARKER
-        from agent.asyncutil import run_sync
-        from agent.dns_leak import preferred_client_dns
+        from agent.dns_leak import sync_preferred_client_dns
 
         if ADS_ENABLED_MARKER.is_file():
-            for dns in run_sync(preferred_client_dns())[:1]:
+            servers = dns_servers if dns_servers is not None else sync_preferred_client_dns()
+            for dns in servers[:1]:
                 dns = str(dns).strip()
                 if dns:
                     blocks.append(f'dhcp-option DNS {dns}')

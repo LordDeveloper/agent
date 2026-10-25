@@ -87,6 +87,45 @@ def test_get_inbound_can_skip_live_user_dump(client: TestClient, fake_xray: Fake
     assert calls == []
 
 
+def test_format_refresh_does_not_dump_every_user(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(28, 443)).status_code == 200
+    fake_xray.add_users(
+        "inbound-28",
+        [
+            {"id": "00000000-0000-0000-0000-000000000001", "email": "a@x"},
+            {"id": "00000000-0000-0000-0000-000000000002", "email": "b@x"},
+        ],
+        protocol="vless",
+    )
+
+    calls: list[tuple[str, str | None]] = []
+    real = fake_xray.list_users
+
+    def tracked(tag: str, email: str | None = None):
+        calls.append((tag, email))
+        return real(tag, email)
+
+    fake_xray.list_users = tracked  # type: ignore[method-assign]
+
+    body = {
+        "protocol": "vless",
+        "port": 443,
+        "listen": "0.0.0.0",
+        "settings": {"decryption": "none"},
+        "streamSettings": {"network": "tcp", "security": "reality"},
+        "preserve_clients": True,
+        "reset_clients": False,
+    }
+    refreshed = client.post("/api/v1/cores/xray/inbounds/28/refresh", headers=headers, json=body)
+    assert refreshed.status_code == 200, refreshed.text
+    updated = client.put("/api/v1/cores/xray/inbounds/28", headers=headers, json=body)
+    assert updated.status_code == 200, updated.text
+    assert calls == []
+    kept = real("inbound-28")
+    assert {row["email"] for row in kept} == {"a@x", "b@x"}
+
+
 def test_single_client_upsert_looks_up_one_email(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(50, 4450)).status_code == 200

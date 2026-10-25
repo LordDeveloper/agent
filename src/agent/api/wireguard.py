@@ -208,13 +208,13 @@ async def diagnose_peer(address: str, wg: WireGuardDriver = Depends(get_wg)):
 
 @router.delete("/peers/{email}/ips")
 async def clear_peer_ips(email: str, wg: WireGuardDriver = Depends(get_wg)):
-    wg.clear_peer_ips(email)
+    await wg.clear_peer_ips(email)
     return {"success": True}
 
 
 @router.post("/backup")
 async def backup(wg: WireGuardDriver = Depends(get_wg)):
-    return {"success": True, "backup": wg.backup()}
+    return {"success": True, "backup": await wg.backup()}
 
 
 @router.post("/restore")

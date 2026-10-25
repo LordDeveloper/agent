@@ -227,13 +227,16 @@ def test_install_xray_skips_customized_binary(tmp_path, monkeypatch):
 
     called = {"download": False}
 
-    def fake_download(dest, token=None, tag=None):
+    async def fake_download(dest, token=None, tag=None):
         called["download"] = True
         return {"core": "xray", "installed": True, "downloaded": True, "binary": str(dest)}
 
+    async def fake_prepare(result):
+        return result
+
     monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
-    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
-    result = install_xray()
+    monkeypatch.setattr("agent.ops._prepare_xray_service", fake_prepare)
+    result = asyncio.run(install_xray())
     assert called["download"] is False
     assert result["downloaded"] is False
     assert result["httpapi_capable"] is True
@@ -249,7 +252,10 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
     monkeypatch.setattr("agent.xray_service.systemctl", lambda *args, **kwargs: {"ok": True})
 
-    def fake_download(dest, token=None, tag=None):
+    async def fake_stop():
+        return None
+
+    async def fake_download(dest, token=None, tag=None):
         dest.write_bytes(b"customized xray httpapi /api/stats/sys")
         return {
             "core": "xray",
@@ -261,9 +267,13 @@ def test_install_xray_replaces_stock_binary(tmp_path, monkeypatch):
             "asset": "Xray-linux-64.zip",
         }
 
+    async def fake_prepare(result):
+        return result
+
+    monkeypatch.setattr("agent.xray_service.stop_xray_service", fake_stop)
     monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
-    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
-    result = install_xray()
+    monkeypatch.setattr("agent.ops._prepare_xray_service", fake_prepare)
+    result = asyncio.run(install_xray())
     assert result["downloaded"] is True
     assert result["replaced_stock"] is True
     assert result["httpapi_capable"] is True
@@ -298,17 +308,17 @@ def test_install_xray_binary_from_release_zip(tmp_path, monkeypatch):
         lambda: type("H", (), {"arch": "amd64", "libc": "gnu"})(),
     )
     monkeypatch.setattr("agent.xray_release.detect_arch", lambda: "amd64")
-    monkeypatch.setattr(
-        "agent.xray_release.fetch_xray_release",
-        lambda **kwargs: ReleaseInfo(
+    async def fake_fetch(**kwargs):
+        return ReleaseInfo(
             tag="v1.0.7",
             version="1.0.7",
             asset_name="Xray-linux-64.zip",
             asset_id=1,
             asset_url="https://example.invalid/asset",
             html_url="https://github.com/LordDeveloper/xray/releases/tag/v1.0.7",
-        ),
-    )
+        )
+
+    monkeypatch.setattr("agent.xray_release.fetch_xray_release", fake_fetch)
 
     def fake_download(release, dest_path, token=None, timeout=300.0):
         with zipfile.ZipFile(dest_path, "w") as zf:
@@ -346,9 +356,12 @@ def test_install_xray_custom_tag_forces_download(tmp_path, monkeypatch):
     monkeypatch.setenv("XRAY_BINARY", str(binary))
     monkeypatch.setattr("agent.ops.which", lambda cmd: None)
     monkeypatch.setattr("agent.xray_service.which", lambda cmd: None)
-    monkeypatch.setattr("agent.xray_service.stop_xray_service", lambda: None)
+    async def fake_stop():
+        return None
 
-    def fake_download(dest, token=None, tag=None):
+    monkeypatch.setattr("agent.xray_service.stop_xray_service", fake_stop)
+
+    async def fake_download(dest, token=None, tag=None):
         dest.write_bytes(b"customized xray httpapi /api/stats/sys")
         return {
             "core": "xray",
@@ -359,9 +372,12 @@ def test_install_xray_custom_tag_forces_download(tmp_path, monkeypatch):
             "source": "release",
         }
 
+    async def fake_prepare(result):
+        return result
+
     monkeypatch.setattr("agent.xray_release.install_xray_binary", fake_download)
-    monkeypatch.setattr("agent.ops._prepare_xray_service", lambda result: result)
-    result = install_xray(tag="v1.0.7")
+    monkeypatch.setattr("agent.ops._prepare_xray_service", fake_prepare)
+    result = asyncio.run(install_xray(tag="v1.0.7"))
     assert result["downloaded"] is True
     assert result["release_tag"] == "v1.0.7"
 

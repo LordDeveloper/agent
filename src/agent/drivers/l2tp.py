@@ -791,7 +791,7 @@ class L2tpDriver(CoreDriver):
 
             dns_servers = await preferred_client_dns()
         except Exception:
-            dns_servers = None
+            dns_servers = ['1.1.1.1', '8.8.8.8']
         files = {
             staging / 'xl2tpd.conf': render_xl2tpd_conf(servers, templates=templates),
             staging / 'options.xl2tpd': render_ppp_options(templates=templates, dns_servers=dns_servers),

@@ -151,7 +151,7 @@ async def diagnose_user(address: str, l2tp: L2tpDriver = Depends(get_l2tp)):
 
 @router.post('/backup')
 async def backup(l2tp: L2tpDriver = Depends(get_l2tp)):
-    return {'success': True, 'backup': l2tp.backup()}
+    return {'success': True, 'backup': await l2tp.backup()}
 
 
 @router.post('/restore')

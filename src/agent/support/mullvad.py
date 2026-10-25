@@ -611,13 +611,16 @@ class MullvadService:
         }
 
     async def relay_metric(self) -> str:
-        return normalize_relay_metric(await self.settings().get("relay_metric"))
+        settings = await self.settings()
+        return normalize_relay_metric(settings.get("relay_metric"))
 
     async def relay_mode(self) -> str:
-        return normalize_relay_mode(await self.settings().get("relay_mode"))
+        settings = await self.settings()
+        return normalize_relay_mode(settings.get("relay_mode"))
 
     async def auto_fallback_enabled(self) -> bool:
-        return bool(await self.settings().get("auto_fallback", True))
+        settings = await self.settings()
+        return bool(settings.get("auto_fallback", True))
 
     @staticmethod
     def _coerce_auto_fallback(value: Any, *, default: bool = True) -> bool:
@@ -830,8 +833,9 @@ class MullvadService:
             )
         if ping:
             locations = await self._attach_pings(locations, relays)
+        settings = await self.settings()
         return {
-            "settings": {k: v for k, v in await self.settings().items() if k != "private_key"},
+            "settings": {k: v for k, v in settings.items() if k != "private_key"},
             "locations": locations,
         }
 

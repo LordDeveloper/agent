@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.asyncutil import maybe_await
 from agent.config import AgentSettings, load_settings
 from agent.db import Store
 
@@ -57,21 +58,21 @@ async def factory_reset(
     managed = await _managed_configs(cfg)
     try:
         if stop_service and which("systemctl"):
-            _run(execute, ["systemctl", "mask", "agent"])
+            await _run(execute, ["systemctl", "mask", "agent"])
             masked = True
-            _run(execute, ["systemctl", "kill", "-s", "SIGKILL", "agent"])
-            _run(execute, ["systemctl", "reset-failed", "agent"])
-        result = _wipe(cfg, execute, managed, removed)
+            await _run(execute, ["systemctl", "kill", "-s", "SIGKILL", "agent"])
+            await _run(execute, ["systemctl", "reset-failed", "agent"])
+        result = await _wipe(cfg, execute, managed, removed)
         return result
     finally:
         if masked:
-            _run(execute, ["systemctl", "unmask", "agent"])
-            start = _run(execute, ["systemctl", "start", "agent"])
+            await _run(execute, ["systemctl", "unmask", "agent"])
+            start = await _run(execute, ["systemctl", "start", "agent"])
             if result is not None:
                 result["service_restarted"] = getattr(start, "returncode", 1) == 0
 
 
-def _wipe(
+async def _wipe(
     cfg: AgentSettings,
     execute: Runner,
     managed: list[tuple[str, Path, str]],
@@ -80,14 +81,14 @@ def _wipe(
     for quick, conf, name in managed:
         quick_bin = shutil.which(quick)
         if quick_bin and conf.is_file():
-            _run(execute, [quick_bin, "down", str(conf)])
-        _run(execute, ["ip", "link", "delete", "dev", name])
+            await _run(execute, [quick_bin, "down", str(conf)])
+        await _run(execute, ["ip", "link", "delete", "dev", name])
         if conf.is_file() or conf.is_symlink():
             conf.unlink()
             removed.append(str(conf))
 
-    rules_removed = _clear_agent_policy_rules(execute)
-    _run(execute, ["nft", "delete", "table", "inet", "netinja_egress"])
+    rules_removed = await _clear_agent_policy_rules(execute)
+    await _run(execute, ["nft", "delete", "table", "inet", "netinja_egress"])
 
     from agent.support.peer_egress import apply_script_path
 
@@ -105,7 +106,7 @@ def _wipe(
         _remove_path(certs)
         removed.append(str(certs))
 
-    xray_reset = _reset_xray_config(cfg, execute)
+    xray_reset = await _reset_xray_config(cfg, execute)
 
     return {
         "ok": True,
@@ -152,7 +153,7 @@ def _delete_database(db_path: Path) -> list[str]:
     return removed
 
 
-def _reset_xray_config(settings: AgentSettings, runner: Runner) -> bool:
+async def _reset_xray_config(settings: AgentSettings, runner: Runner) -> bool:
     config_path = Path(settings.xray_config)
     if not config_path.is_file():
         return False
@@ -165,12 +166,12 @@ def _reset_xray_config(settings: AgentSettings, runner: Runner) -> bool:
         config_path=str(config_path),
     )
     config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    _run(runner, ["systemctl", "restart", "xray"])
+    await _run(runner, ["systemctl", "restart", "xray"])
     return True
 
 
-def _clear_agent_policy_rules(runner: Runner) -> list[int]:
-    proc = _run(runner, ["ip", "-4", "rule", "show"])
+async def _clear_agent_policy_rules(runner: Runner) -> list[int]:
+    proc = await _run(runner, ["ip", "-4", "rule", "show"])
     text = str(getattr(proc, "stdout", "") or "")
     prefs: list[int] = []
     for line in text.splitlines():
@@ -182,7 +183,7 @@ def _clear_agent_policy_rules(runner: Runner) -> list[int]:
             prefs.append(pref)
     removed: list[int] = []
     for pref in prefs:
-        _run(runner, ["ip", "rule", "del", "pref", str(pref)])
+        await _run(runner, ["ip", "rule", "del", "pref", str(pref)])
         removed.append(pref)
     return removed
 
@@ -203,8 +204,8 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _run(runner: Runner, args: list[str]) -> Any:
+async def _run(runner: Runner, args: list[str]) -> Any:
     try:
-        return runner(args, check=False, timeout=30)
+        return await maybe_await(runner(args, check=False, timeout=30))
     except (OSError, subprocess.TimeoutExpired):
         return None

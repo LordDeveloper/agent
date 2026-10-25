@@ -193,6 +193,23 @@ def _wg_conf_is_exit(text: str) -> bool:
     return has_endpoint and not has_listen
 
 
+def _mullvad_bound_names(bound: set[str] | None) -> set[str]:
+    """Store bindings for exit detection.
+
+    Async callers pass the snapshot they already awaited. A sync caller may
+    load it with run_sync. Never start a second loop from inside the server.
+    """
+    if bound is not None:
+        return set(bound)
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return set(run_sync(_mullvad_bound_ifaces()))
+    return set()
+
+
 def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> bool:
     """Mullvad / region exits must never get client DNS DNAT/AdGuard.
 
@@ -203,7 +220,7 @@ def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> b
     lowered = str(name or '').strip().lower()
     if not lowered:
         return False
-    bound_names = run_sync(_mullvad_bound_ifaces()) if bound is None else bound
+    bound_names = _mullvad_bound_names(bound)
     if lowered in bound_names:
         return True
 
@@ -216,7 +233,7 @@ def _is_mullvad_exit_interface(name: str, *, bound: set[str] | None = None) -> b
 def _mullvad_exit_gateway_ips(*, bound: set[str] | None = None) -> set[str]:
     """Tunnel Address IPs used by Mullvad exits — never bind AdGuard here."""
     ips: set[str] = set()
-    bound_names = run_sync(_mullvad_bound_ifaces()) if bound is None else bound
+    bound_names = _mullvad_bound_names(bound)
     names = set(bound_names)
     for directory in _wg_conf_dirs():
         if not directory.is_dir():
@@ -656,6 +673,21 @@ async def _dns_leak_active(*, runner: Runner | None = None) -> bool:
     if UNIT_PATH.is_file() or apply_script_path().is_file():
         return True
     return await _nft_table_exists(runner=runner)
+
+
+def sync_preferred_client_dns() -> list[str]:
+    """DNS list for synchronous config renderers.
+
+    Async apply paths should await preferred_client_dns() and pass the list in.
+    This must not call run_sync while the server loop is already running.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return list(run_sync(preferred_client_dns()))
+    return list(DEFAULT_UPSTREAM_DNS)
 
 
 async def preferred_client_dns(*, runner: Runner | None = None) -> list[str]:

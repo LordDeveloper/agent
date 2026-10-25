@@ -69,7 +69,7 @@ async def install_amnezia_bundle(
             "bin_dir": str(dest_dir),
         }
 
-    release = fetch_release_for_asset(
+    release = await fetch_release_for_asset(
         repo=resolve_repo(repo),
         asset_name=resolve_amnezia_asset_name(asset_name),
         prefix="amneziawg",
@@ -87,7 +87,7 @@ async def install_amnezia_bundle(
     installed: list[str] = []
     with tempfile.TemporaryDirectory(prefix="amneziawg-install-") as tmp:
         archive = Path(tmp) / release.asset_name
-        download_release_asset(release, archive, token=resolve_token(token), timeout=timeout)
+        await download_release_asset(release, archive, token=resolve_token(token), timeout=timeout)
 
         with tarfile.open(archive, "r:gz") as tar:
             names = {member.name for member in tar.getmembers() if member.isfile()}

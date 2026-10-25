@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from agent import dns_leak
 
 
@@ -53,7 +55,7 @@ def test_discover_includes_configured_l2tp_and_openvpn(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(dns_leak, '_is_mullvad_exit_interface', lambda name, **k: False)
 
-    rows = dns_leak.discover_vpn_interfaces()
+    rows = asyncio.run(dns_leak.discover_vpn_interfaces())
     by_name = {row['name']: row['gateway'] for row in rows}
     assert by_name['wg0'] == '10.77.0.1'
     assert by_name['ppp+'] == '10.77.128.1'

@@ -46,7 +46,7 @@ async def mullvad_worker_loop(
             changed = 0
             auto_fallback = True
             try:
-                auto_fallback = bool(service.auto_fallback_enabled())
+                auto_fallback = bool(await service.auto_fallback_enabled())
             except Exception:
                 log.exception("mullvad auto_fallback flag read failed; assuming enabled")
 

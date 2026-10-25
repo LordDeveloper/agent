@@ -220,13 +220,13 @@ async def diagnose_peer(address: str, amnezia: AmneziaDriver = Depends(get_amnez
 
 @router.delete("/peers/{email}/ips")
 async def clear_peer_ips(email: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
-    amnezia.clear_peer_ips(email)
+    await amnezia.clear_peer_ips(email)
     return {"success": True}
 
 
 @router.post("/backup")
 async def backup(amnezia: AmneziaDriver = Depends(get_amnezia)):
-    return {"success": True, "backup": amnezia.backup()}
+    return {"success": True, "backup": await amnezia.backup()}
 
 
 @router.post("/restore")

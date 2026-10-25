@@ -248,11 +248,9 @@ def render_ppp_options(
         from agent.dns_leak import rewrite_ms_dns_options
 
         if dns_servers is None:
-            # Only safe off the server loop. The async apply path passes servers.
-            from agent.asyncutil import run_sync
-            from agent.dns_leak import preferred_client_dns
+            from agent.dns_leak import sync_preferred_client_dns
 
-            dns_servers = run_sync(preferred_client_dns())
+            dns_servers = sync_preferred_client_dns()
         text = rewrite_ms_dns_options(text, list(dns_servers))
     except Exception:
         pass

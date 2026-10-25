@@ -81,7 +81,7 @@ def resolve_xray_asset_name(explicit: str | None = None) -> str:
     return asset
 
 
-def fetch_xray_release(
+async def fetch_xray_release(
     *,
     repo: str | None = None,
     token: str | None = None,
@@ -92,7 +92,7 @@ def fetch_xray_release(
     wanted = resolve_xray_asset_name(asset_name)
     repo_id = resolve_xray_repo(repo)
     release_tag = resolve_xray_tag(tag)
-    return fetch_release_for_asset(
+    return await fetch_release_for_asset(
         repo=repo_id,
         asset_name=wanted,
         prefix="Xray",
@@ -199,7 +199,7 @@ async def install_xray_binary(
     """
     detect_host_platform()
     dest = Path(dest)
-    release = fetch_xray_release(
+    release = await fetch_xray_release(
         repo=repo,
         token=token,
         tag=tag,

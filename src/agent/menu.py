@@ -931,7 +931,7 @@ def _bbr_menu() -> None:
 def _show_bbr_status() -> None:
     from agent.bbr import bbr_status
 
-    payload = bbr_status()
+    payload = run_sync(bbr_status())
     supported = bool(payload.get("supported"))
     enabled = bool(payload.get("enabled"))
     _print(kv("Supported", "yes" if supported else "no", GREEN if supported else RED))
@@ -945,7 +945,7 @@ def _show_bbr_status() -> None:
 def _show_bbr_install(*, apply: bool) -> None:
     from agent.bbr import bbr_install
 
-    result = bbr_install(apply=apply)
+    result = run_sync(bbr_install(apply=apply))
     _print(kv("Installed", "yes", GREEN))
     if result.get("applied"):
         _print(kv("Applied", "yes", GREEN))
@@ -956,14 +956,14 @@ def _show_bbr_install(*, apply: bool) -> None:
 def _show_bbr_enable() -> None:
     from agent.bbr import bbr_enable
 
-    result = bbr_enable()
+    result = run_sync(bbr_enable())
     _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
 
 
 def _show_bbr_disable(*, remove_persistence: bool) -> None:
     from agent.bbr import bbr_disable
 
-    result = bbr_disable(remove_persistence=remove_persistence)
+    result = run_sync(bbr_disable(remove_persistence=remove_persistence))
     _print(kv("Enabled", "yes" if result.get("enabled") else "no", GREEN if result.get("enabled") else YELLOW))
     _print(kv("Congestion control", str(result.get("tcp_congestion_control") or "-"), WHITE))
 
@@ -1419,7 +1419,7 @@ def _show_mullvad_auto_fallback() -> None:
 def _show_mullvad_relay_metric() -> None:
     runtime, service = _mullvad_runtime_service()
     try:
-        current = service.relay_metric()
+        current = run_sync(service.relay_metric())
         _print(kv("Current", current, CYAN))
         picked = select(
             [

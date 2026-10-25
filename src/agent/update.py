@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -62,12 +63,21 @@ def detect_libc() -> str:
     if forced in {"gnu", "musl"}:
         return forced
 
+    # Synchronous on purpose. fetch_latest_release and the core installers call
+    # this while an event loop is already running; run_sync() would raise and
+    # abort the update.
     try:
-        proc = run_sync(run_cmd(["ldd", "--version"], check=False))
+        proc = subprocess.run(
+            ["ldd", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
         if "musl" in blob:
             return "musl"
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         pass
 
     # Alpine / musl loader paths
@@ -434,7 +444,9 @@ def check_for_update(
     current: str | None = None,
 ) -> dict:
     host = detect_host_platform()
-    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=asset_name))
+    # Resolve the asset before entering the loop so libc detection stays synchronous.
+    wanted = resolve_asset_name(asset_name)
+    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=wanted))
     current_version = normalize_version(current or __version__)
     newer = version_is_newer(release.version, current_version)
     return {
@@ -459,7 +471,8 @@ def perform_update(
 ) -> dict:
     host = _assert_supported_host()
     binary = current_binary_path()
-    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=asset_name))
+    wanted = resolve_asset_name(asset_name)
+    release = run_sync(fetch_latest_release(repo=repo, token=token, asset_name=wanted))
     current_version = normalize_version(__version__)
     newer = version_is_newer(release.version, current_version)
 

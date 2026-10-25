@@ -104,12 +104,12 @@ def test_install_amnezia_bundle_extracts_binaries(tmp_path, monkeypatch):
         asset_url = "https://example.invalid/asset"
         html_url = "https://example.invalid/release"
 
-    monkeypatch.setattr(
-        "agent.amnezia_release.fetch_release_for_asset",
-        lambda **kwargs: FakeRelease(),
-    )
+    async def fake_fetch(**kwargs):
+        return FakeRelease()
 
-    def fake_download(release, dest, **kwargs):
+    monkeypatch.setattr("agent.amnezia_release.fetch_release_for_asset", fake_fetch)
+
+    async def fake_download(release, dest, **kwargs):
         dest.write_bytes(archive)
         return dest
 

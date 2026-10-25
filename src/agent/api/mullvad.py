@@ -132,7 +132,7 @@ async def mullvad_switch_relay(country_code: str, body: dict[str, Any], request:
 async def mullvad_set_relay_fixed(country_code: str, body: dict[str, Any], request: Request):
     try:
         fixed = bool(body.get("fixed") if "fixed" in body else (body.get("pin") or body.get("pinned")))
-        payload = _service(request).set_relay_fixed(country_code, fixed)
+        payload = await _service(request).set_relay_fixed(country_code, fixed)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

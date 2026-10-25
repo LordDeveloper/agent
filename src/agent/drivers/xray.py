@@ -678,21 +678,22 @@ class XrayDriver(CoreDriver):
         self._pause_proxy_forwarders()
         try:
             api_payload = self._wire_inbound(inbound)
+            if preserve_clients:
+                # Xray-core preserve_clients merges runtime/disk users. Keep those
+                # rows out of xray run -test too, or the test sits past the panel timeout.
+                settings = dict(api_payload.get("settings") or {})
+                settings.pop("clients", None)
+                settings.pop("users", None)
+                api_payload["settings"] = settings
             await self._validate_config_mutation(
                 lambda cfg: self._replace_inbound_in_config(cfg, api_payload),
                 inbound=api_payload,
             )
-            if preserve_clients:
-                # Xray-core preserve_clients merges runtime/disk users; omit client lists so
-                # format updates stay fast even with thousands of clients.
-                slim = deepcopy(api_payload)
-                settings = dict(slim.get("settings") or {})
-                settings.pop("clients", None)
-                settings.pop("users", None)
-                slim["settings"] = settings
-                await self._api_call("edit_inbounds", [slim], preserve_clients=True)
-                return
-            await self._api_call("edit_inbounds", [api_payload], preserve_clients=False)
+            await self._api_call(
+                "edit_inbounds",
+                [api_payload],
+                preserve_clients=preserve_clients,
+            )
         finally:
             await self._resume_proxy_forwarders()
 
@@ -849,16 +850,39 @@ class XrayDriver(CoreDriver):
         await self.audit.record("create", f"xray/inbound/{inbound_id}")
         return await self.get_inbound(inbound_id)
 
+    async def _inbound_for_settings_edit(
+        self,
+        inbound_id: int | str,
+        *,
+        preserve_clients: bool,
+    ) -> dict[str, Any]:
+        """Port/stream edits must not list every user. That dump returns no bytes until it finishes."""
+        if preserve_clients:
+            return await self._inbound_shell(inbound_id, include_clients=False)
+        return await self.get_inbound(inbound_id)
+
+    async def _inbound_after_settings_edit(
+        self,
+        inbound_id: int | str,
+        *,
+        preserve_clients: bool,
+    ) -> dict[str, Any]:
+        """Disk copy of the inbound. Skip the live user dump; that call is what times out."""
+        if preserve_clients:
+            return await self._inbound_shell(inbound_id, include_clients=True)
+        return await self.get_inbound(inbound_id)
+
     async def update_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        existing = await self.get_inbound(inbound_id)
-        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         preserve_clients = bool(payload.get("preserve_clients", True))
         reset_clients = bool(payload.get("reset_clients", False))
         if reset_clients:
             preserve_clients = False
 
+        existing = await self._inbound_for_settings_edit(inbound_id, preserve_clients=preserve_clients)
+        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
+
         async with self._inbound_lock(tag):
-            existing = await self.get_inbound(inbound_id)
+            existing = await self._inbound_for_settings_edit(inbound_id, preserve_clients=preserve_clients)
             inbound = self._apply_inbound_patch(
                 existing,
                 payload,
@@ -867,19 +891,19 @@ class XrayDriver(CoreDriver):
             )
             await self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             await self.audit.record("update", f"xray/inbound/{inbound_id}")
-            return await self.get_inbound(inbound_id)
+            return await self._inbound_after_settings_edit(inbound_id, preserve_clients=preserve_clients)
 
     async def refresh_inbound(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Rebuild protocol/stream for an inbound without delete+create when possible."""
-        existing = await self.get_inbound(inbound_id)
-        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         reset_clients = bool(payload.pop("reset_clients", False))
         preserve_clients = not reset_clients
+        existing = await self._inbound_for_settings_edit(inbound_id, preserve_clients=preserve_clients)
+        tag = str(existing.get("tag") or self.inbound_tag(inbound_id))
         payload = {k: v for k, v in payload.items() if k != "format"}
         payload.setdefault("port", existing.get("port"))
 
         async with self._inbound_lock(tag):
-            existing = await self.get_inbound(inbound_id)
+            existing = await self._inbound_for_settings_edit(inbound_id, preserve_clients=preserve_clients)
             inbound = self._apply_inbound_patch(
                 existing,
                 payload,
@@ -889,7 +913,7 @@ class XrayDriver(CoreDriver):
             # Prefer in-place edit so clients stay attached and we avoid remove+add churn.
             await self._edit_inbound_preserving(inbound, preserve_clients=preserve_clients)
             await self.audit.record("update", f"xray/inbound/{inbound_id}/refresh")
-            return await self.get_inbound(inbound_id)
+            return await self._inbound_after_settings_edit(inbound_id, preserve_clients=preserve_clients)
 
     async def patch_inbound_settings(self, inbound_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         """Update port/stream/sniffing/settings without rewriting client lists."""

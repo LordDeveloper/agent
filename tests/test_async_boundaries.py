@@ -43,6 +43,20 @@ def test_peer_diagnose_awaits_driver(monkeypatch, capsys):
     assert payload["summary"]["healthy"] is True
 
 
+def test_sync_preferred_client_dns_does_not_nest_run_sync(monkeypatch):
+    from agent.dns_leak import sync_preferred_client_dns
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("run_sync must not run while the event loop is active")
+
+    monkeypatch.setattr("agent.dns_leak.run_sync", explode)
+
+    async def on_loop() -> list[str]:
+        return sync_preferred_client_dns()
+
+    assert asyncio.run(on_loop())
+
+
 def test_run_sync_does_not_block_a_running_loop():
     async def sample() -> str:
         return "ok"

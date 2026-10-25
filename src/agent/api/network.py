@@ -59,7 +59,7 @@ async def _run_probe_fallbacks(*, store: Store, settings: Any) -> None:
 
     service = MullvadService(store, config_dir=settings.wireguard_config_dir)
     try:
-        if not service.auto_fallback_enabled():
+        if not await service.auto_fallback_enabled():
             log.debug("mullvad probe fallback skipped — auto_fallback disabled")
             _probe_fallback_pending.clear()
             _probe_fallback_running = False
