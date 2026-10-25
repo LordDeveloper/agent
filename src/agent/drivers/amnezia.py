@@ -31,7 +31,7 @@ class AmneziaDriver(WireGuardDriver):
 
     async def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         body = deepcopy(payload)
-        current = super().get_interface(interface_id)
+        current = await super().get_interface(interface_id)
         incoming = body.get("obfuscation") if isinstance(body.get("obfuscation"), dict) else None
         if incoming:
             merged = {**(current.get("obfuscation") or {}), **incoming}
@@ -78,7 +78,7 @@ class AmneziaDriver(WireGuardDriver):
         peer_id: str,
         endpoint_host: str = "127.0.0.1",
     ) -> dict[str, str]:
-        iface = self.get_interface(interface_id)
+        iface = await self.get_interface(interface_id)
         incomplete = not obfuscation_is_complete(iface.get("obfuscation"))
         await self._ensure_obfuscation(iface, apply=incomplete)
         bundle = await super().peer_config_bundle(interface_id, peer_id, endpoint_host)

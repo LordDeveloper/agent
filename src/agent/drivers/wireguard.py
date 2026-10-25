@@ -755,7 +755,9 @@ class WireGuardDriver(CoreDriver):
     async def install(self) -> dict[str, Any]:
         from agent.ops import install_amnezia, install_wireguard
 
-        return install_amnezia() if self.key == "amnezia" else await install_wireguard()
+        if self.key == "amnezia":
+            return await install_amnezia()
+        return await install_wireguard()
 
     async def enable(self) -> dict[str, Any]:
         ifaces = await self.list_interfaces()

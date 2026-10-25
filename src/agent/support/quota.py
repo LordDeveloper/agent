@@ -124,14 +124,14 @@ async def enforce_driver_quotas(driver: Any) -> int:
     return 0
 
 
-def _disabled_client_index(driver: Any) -> dict[str, dict[str, Any]]:
+async def _disabled_client_index(driver: Any) -> dict[str, dict[str, Any]]:
     """Clients the panel or a previous enforce already marked disabled."""
     docs = getattr(driver, "_disabled_docs", None)
     if not callable(docs):
         return {}
     index: dict[str, dict[str, Any]] = {}
     try:
-        rows = docs()
+        rows = await maybe_await(docs())
     except Exception:
         return {}
     for row in rows or []:
@@ -165,7 +165,7 @@ async def _enforce_xray(driver: Any) -> int:
             if client.id:
                 traffic_by_id[str(client.id)] = (int(client.incoming), int(client.outgoing))
 
-    disabled_index = _disabled_client_index(driver)
+    disabled_index = await _disabled_client_index(driver)
 
     inbound_rows = getattr(driver, "list_quota_inbounds", None)
     if callable(inbound_rows):
@@ -287,7 +287,8 @@ async def _enforce_wireguard(driver: Any) -> int:
         await maybe_await(driver.batch_peers(interface_id, peers=to_disable, mode="update"))
         return len(to_disable)
 
-    counts = await gather_independent(*(handle(iface) for iface in driver.list_interfaces()))
+    interfaces = await maybe_await(driver.list_interfaces())
+    counts = await gather_independent(*(handle(iface) for iface in interfaces or []))
     return sum(int(count) for count in counts if isinstance(count, int))
 
 
@@ -349,7 +350,8 @@ async def _enforce_l2tp(driver: Any) -> int:
         await maybe_await(driver.batch_users(server_id, users=to_disable, mode='update'))
         return len(to_disable)
 
-    counts = await gather_independent(*(handle(server) for server in driver.list_servers()))
+    servers = await maybe_await(driver.list_servers())
+    counts = await gather_independent(*(handle(server) for server in servers or []))
     return sum(int(count) for count in counts if isinstance(count, int))
 
 

@@ -48,7 +48,7 @@ async def xray_status(xray: XrayDriver = Depends(get_xray)):
 @router.get("/inbounds")
 async def list_inbounds(xray: XrayDriver = Depends(get_xray)):
     try:
-        inbounds = xray.present_inbounds(await xray.list_inbounds())
+        inbounds = await xray.present_inbounds(await xray.list_inbounds())
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "inbounds": inbounds}
@@ -63,7 +63,8 @@ async def get_inbound(
     try:
         inbound = await xray.get_inbound(inbound_id, include_clients=include_clients)
         if include_clients:
-            inbound = (xray.present_inbounds([inbound]))[0]
+            presented = await xray.present_inbounds([inbound])
+            inbound = presented[0]
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "inbound": inbound}

@@ -4,6 +4,7 @@ import asyncio
 import io
 import tarfile
 
+from agent.drivers.amnezia import AmneziaDriver
 from agent.amnezia_release import (
     amnezia_bundle_present,
     install_amnezia_bundle,
@@ -119,8 +120,39 @@ def test_install_amnezia_bundle_extracts_binaries(tmp_path, monkeypatch):
         lambda: type("Host", (), {"arch": "amd64", "libc": "gnu"})(),
     )
 
-    result = install_amnezia_bundle(force=True)
+    result = asyncio.run(install_amnezia_bundle(force=True))
 
     assert result["downloaded"] is True
     for name in ("awg", "awg-quick", "amneziawg-go"):
         assert (bin_dir / name).is_file()
+
+
+def test_update_interface_awaits_current_interface(monkeypatch):
+    async def fake_get(self, interface_id):
+        return {
+            "id": interface_id,
+            "obfuscation": {
+                "Jc": 4,
+                "Jmin": 40,
+                "Jmax": 70,
+                "S1": 15,
+                "S2": 16,
+                "H1": 11,
+                "H2": 12,
+                "H3": 13,
+                "H4": 14,
+            },
+        }
+
+    async def fake_update(self, interface_id, body):
+        return {"id": interface_id, **body}
+
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver.get_interface", fake_get)
+    monkeypatch.setattr("agent.drivers.wireguard.WireGuardDriver.update_interface", fake_update)
+
+    driver = object.__new__(AmneziaDriver)
+    result = asyncio.run(driver.update_interface(3, {"obfuscation": {"Jc": 9}}))
+
+    assert result["id"] == 3
+    assert result["obfuscation"]["Jc"] == 9
+    assert result["obfuscation"]["H1"] == 11

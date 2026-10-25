@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.api.xray import get_inbound, list_inbounds
 from agent.asyncutil import run_sync
 
 from agent.cli import cmd_peer_diagnose
@@ -71,3 +72,25 @@ def test_stamp_live_baseline_keeps_nonzero_history():
     )
     assert client["_incoming"] == 9
     assert client["_outgoing"] == 3
+
+
+class _PresentingXray:
+    async def list_inbounds(self) -> list[dict]:
+        return [{"id": 3, "tag": "inbound-3"}]
+
+    async def get_inbound(self, inbound_id: str, *, include_clients: bool = True) -> dict:
+        return {"id": inbound_id, "tag": f"inbound-{inbound_id}"}
+
+    async def present_inbounds(self, inbounds: list[dict]) -> list[dict]:
+        for row in inbounds:
+            row["presented"] = True
+        return inbounds
+
+
+async def test_inbound_gets_await_present_inbounds():
+    listed = await list_inbounds(_PresentingXray())
+    assert listed["inbounds"][0]["presented"] is True
+
+    one = await get_inbound("9", include_clients=True, xray=_PresentingXray())
+    assert one["inbound"]["id"] == "9"
+    assert one["inbound"]["presented"] is True

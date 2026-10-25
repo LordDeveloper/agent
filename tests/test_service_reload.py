@@ -70,6 +70,31 @@ def test_down_tunnel_is_brought_up_and_live_tunnel_is_synced():
     assert driver.up == ["wg0"]
 
 
+def test_reload_awaits_async_list_interfaces():
+    class Driver:
+        def __init__(self):
+            self.up: list[str] = []
+
+        async def list_interfaces(self):
+            return [{"name": "awg0"}]
+
+        async def _interface_is_up(self, name):
+            return False
+
+        async def _bring_up(self, iface):
+            self.up.append(iface["name"])
+            return {"name": iface["name"], "ok": True}
+
+        async def _apply_live(self, iface):
+            raise AssertionError("down interface should be brought up")
+
+    driver = Driver()
+    result = asyncio.run(_reload_tunnel_core(driver))
+    assert result["ok"] is True
+    assert result["brought_up"] == ["awg0"]
+    assert driver.up == ["awg0"]
+
+
 def test_reload_reports_disabled_cores_and_a_failed_one(monkeypatch):
     async def core(key, driver):
         if key == "wireguard":

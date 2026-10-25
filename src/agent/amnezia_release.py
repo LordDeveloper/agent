@@ -47,7 +47,7 @@ def amnezia_bundle_present(bin_dir: Path | None = None) -> bool:
     return all(_bin_path(name, target) is not None for name in BIN_NAMES)
 
 
-def install_amnezia_bundle(
+async def install_amnezia_bundle(
     *,
     repo: str | None = None,
     token: str | None = None,
@@ -119,7 +119,7 @@ def install_amnezia_bundle(
     awg = dest_dir / "awg"
     if awg.is_file():
         try:
-            proc = run_cmd([str(awg), "--version"], check=False)
+            proc = await run_cmd([str(awg), "--version"], check=False)
             version = (proc.stdout or proc.stderr or "").strip().split("\n")[0] or None
         except OSError:
             version = None

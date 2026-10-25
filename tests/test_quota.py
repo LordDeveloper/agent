@@ -1,5 +1,8 @@
 import asyncio
+import logging
+import warnings
 
+from agent.quota_enforcer import enforce_all
 from agent.support.quota import (
     apply_quota_meta,
     enforce_driver_quotas,
@@ -311,3 +314,264 @@ def test_enforcer_leaves_a_client_with_remaining_quota():
 
     assert asyncio.run(enforce_driver_quotas(driver)) == 0
     assert driver.batches == []
+
+
+class _AsyncDisabledXray(_LiveXray):
+    """Real Xray methods are async. A sync call iterates the coroutine."""
+
+    async def running(self) -> bool:
+        return True
+
+    async def usage_snapshot(self) -> _UsageSnapshot:
+        return super().usage_snapshot()
+
+    async def list_inbounds(self) -> list[dict]:
+        return super().list_inbounds()
+
+    async def _disabled_docs(self) -> list[dict]:
+        return super()._disabled_docs()
+
+    async def batch_clients(self, inbound_id, clients=None, *, mode="update"):
+        return super().batch_clients(inbound_id, clients=clients, mode=mode)
+
+
+def test_xray_enforcer_awaits_async_disabled_docs():
+    driver = _AsyncDisabledXray(
+        clients=[{
+            "id": "node-1",
+            "email": "spent@x",
+            "is_enabled": True,
+            "volume": 1,
+            "_incoming": 500,
+            "_outgoing": 500,
+        }],
+        disabled=[{
+            "id": "node-1",
+            "email": "spent@x",
+            "is_enabled": False,
+            "disabled_reason": "quota_exceeded",
+        }],
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert asyncio.run(enforce_driver_quotas(driver)) == 1
+
+    assert not any("never awaited" in str(item.message) for item in caught)
+    assert driver.batches[0][0]["is_enabled"] is False
+    assert driver.batches[0][0]["disabled_reason"] == "quota_exceeded"
+
+
+class _AsyncTunnel:
+    def __init__(self, key: str, interfaces: list[dict], live: dict[str, tuple[int, int]]):
+        self.key = key
+        self.interfaces = interfaces
+        self.live = live
+        self.calls: list[str] = []
+        self.batches: list[tuple] = []
+        self.release = asyncio.Event()
+
+    async def sync_peer_stats(self) -> None:
+        self.calls.append("sync_peer_stats")
+
+    async def usage_snapshot(self) -> _UsageSnapshot:
+        self.calls.append("usage_snapshot")
+        rows = []
+        for iface in self.interfaces:
+            for peer in iface.get("peers") or []:
+                email = str(peer.get("email") or "")
+                incoming, outgoing = self.live.get(email, (0, 0))
+                rows.append(_UsageClient(email, incoming, outgoing, str(peer.get("id") or "")))
+        return _UsageSnapshot([_UsageInbound(rows)])
+
+    async def list_interfaces(self) -> list[dict]:
+        self.calls.append("list_interfaces")
+        return self.interfaces
+
+    async def batch_peers(self, interface_id, peers=None, *, mode="update"):
+        self.calls.append(f"batch_peers:{interface_id}")
+        self.batches.append((interface_id, list(peers or []), mode))
+        if len(self.batches) == 1 and len(self.interfaces) > 1:
+            await self.release.wait()
+        else:
+            self.release.set()
+        return {"ok": True, "succeeded": len(peers or [])}
+
+
+def _tunnel_interfaces() -> tuple[list[dict], dict[str, tuple[int, int]]]:
+    interfaces = [
+        {
+            "id": "wg0",
+            "peers": [
+                {
+                    "id": "spent",
+                    "email": "spent@wg",
+                    "is_enabled": True,
+                    "volume": 1_000,
+                    "_incoming": 100,
+                    "_outgoing": 0,
+                },
+                {
+                    "id": "ok",
+                    "email": "ok@wg",
+                    "is_enabled": True,
+                    "volume": 5_000,
+                    "_incoming": 100,
+                    "_outgoing": 0,
+                },
+            ],
+        },
+        {
+            "id": "wg1",
+            "peers": [{
+                "id": "spent-2",
+                "email": "spent2@wg",
+                "is_enabled": True,
+                "volume": 500,
+                "_incoming": 0,
+                "_outgoing": 0,
+            }],
+        },
+    ]
+    live = {
+        "spent@wg": (1_100, 0),
+        "ok@wg": (200, 0),
+        "spent2@wg": (500, 0),
+    }
+    return interfaces, live
+
+
+def _assert_tunnel_quota(driver: _AsyncTunnel) -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        count = asyncio.run(asyncio.wait_for(enforce_driver_quotas(driver), timeout=2))
+
+    assert not any("never awaited" in str(item.message) for item in caught)
+    assert count == 2
+    assert driver.calls[:3] == ["sync_peer_stats", "usage_snapshot", "list_interfaces"]
+    by_iface = {iface_id: peers for iface_id, peers, _mode in driver.batches}
+    assert set(by_iface) == {"wg0", "wg1"}
+    disabled = by_iface["wg0"][0]
+    assert disabled["email"] == "spent@wg"
+    assert disabled["is_enabled"] is False
+    assert disabled["disabled_reason"] == "quota_exceeded"
+    assert disabled["disabled_detail"]["remaining_bytes"] == 1_000
+    assert disabled["disabled_detail"]["delta_bytes"] == 1_000
+    assert disabled["disabled_detail"]["live_incoming"] == 1_100
+    assert disabled["disabled_detail"]["baseline_incoming"] == 100
+    assert all(peer["email"] != "ok@wg" for peer in by_iface["wg0"])
+    assert by_iface["wg1"][0]["email"] == "spent2@wg"
+    assert by_iface["wg1"][0]["disabled_detail"]["delta_bytes"] == 500
+
+
+def test_wireguard_enforcer_awaits_async_list_interfaces():
+    interfaces, live = _tunnel_interfaces()
+    _assert_tunnel_quota(_AsyncTunnel("wireguard", interfaces, live))
+
+
+def test_amnezia_enforcer_awaits_async_list_interfaces():
+    interfaces, live = _tunnel_interfaces()
+    _assert_tunnel_quota(_AsyncTunnel("amnezia", interfaces, live))
+
+
+class _AsyncL2tp:
+    key = "l2tp"
+
+    def __init__(self):
+        self.calls: list[str] = []
+        self.batches: list[tuple] = []
+
+    async def sync_user_stats(self) -> None:
+        self.calls.append("sync_user_stats")
+
+    async def usage_snapshot(self) -> _UsageSnapshot:
+        self.calls.append("usage_snapshot")
+        rows = [
+            _UsageClient("spent@l2", 500, 0, "u1"),
+            _UsageClient("companion@l2", 500, 0, "u2"),
+        ]
+        return _UsageSnapshot([_UsageInbound(rows)])
+
+    async def list_servers(self) -> list[dict]:
+        self.calls.append("list_servers")
+        return [{
+            "id": "l2tp-1",
+            "users": [
+                {
+                    "id": "u1",
+                    "email": "spent@l2",
+                    "is_enabled": True,
+                    "volume": 100,
+                    "_incoming": 0,
+                    "_outgoing": 0,
+                },
+                {
+                    "id": "u2",
+                    "email": "companion@l2",
+                    "is_enabled": True,
+                    "volume": 100,
+                    "_incoming": 0,
+                    "_outgoing": 0,
+                    "linked_peer_id": "peer-1",
+                },
+            ],
+        }]
+
+    async def batch_users(self, server_id, users=None, *, mode="update"):
+        self.calls.append("batch_users")
+        self.batches.append((server_id, list(users or []), mode))
+        return {"ok": True}
+
+
+def test_l2tp_enforcer_awaits_async_list_servers():
+    driver = _AsyncL2tp()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert asyncio.run(enforce_driver_quotas(driver)) == 1
+
+    assert not any("never awaited" in str(item.message) for item in caught)
+    assert driver.calls == ["sync_user_stats", "usage_snapshot", "list_servers", "batch_users"]
+    _server_id, users, mode = driver.batches[0]
+    assert mode == "update"
+    assert [user["email"] for user in users] == ["spent@l2"]
+    assert users[0]["disabled_reason"] == "quota_exceeded"
+    assert users[0]["disabled_detail"]["delta_bytes"] == 500
+
+
+class _Cores:
+    def __init__(self, keys: list[str]):
+        self._keys = keys
+
+    def cores(self) -> list[str]:
+        return list(self._keys)
+
+
+class _Registry:
+    def __init__(self, drivers: dict):
+        self.settings = _Cores(list(drivers))
+        self._drivers = drivers
+
+    def get(self, key: str):
+        return self._drivers[key]
+
+
+def test_one_driver_failure_is_logged_and_does_not_block_the_other(caplog):
+    interfaces, live = _tunnel_interfaces()
+    amnezia = _AsyncTunnel("amnezia", interfaces, live)
+
+    class _BrokenWireGuard(_AsyncTunnel):
+        async def list_interfaces(self) -> list[dict]:
+            self.calls.append("list_interfaces")
+            raise RuntimeError("store locked")
+
+    wireguard = _BrokenWireGuard("wireguard", interfaces, live)
+    registry = _Registry({"wireguard": wireguard, "amnezia": amnezia})
+
+    with caplog.at_level(logging.ERROR, logger="agent.quota"):
+        count = asyncio.run(asyncio.wait_for(enforce_all(registry), timeout=2))
+
+    assert count == 2
+    assert "quota enforce failed core=wireguard" in caplog.text
+    assert "store locked" in caplog.text
+    assert {iface_id for iface_id, _peers, _mode in amnezia.batches} == {"wg0", "wg1"}

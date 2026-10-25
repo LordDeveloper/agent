@@ -313,7 +313,7 @@ async def install_openvpn() -> dict:
     }
 
 
-def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:
+async def install_amnezia(*, github_token: str | None = None, force: bool = False) -> dict:
     from agent.amnezia_release import amnezia_bundle_present, install_amnezia_bundle
 
     if amnezia_bundle_present() and not force:
@@ -324,7 +324,7 @@ def install_amnezia(*, github_token: str | None = None, force: bool = False) -> 
             "message": "amneziawg bundle present",
         }
 
-    return install_amnezia_bundle(token=github_token, force=force)
+    return await install_amnezia_bundle(token=github_token, force=force)
 
 
 INSTALLERS = {
@@ -350,7 +350,7 @@ async def install_core(
     if key == "xray":
         return await installer(github_token=github_token, force=force, tag=tag)
     if key == "amnezia":
-        return installer(github_token=github_token, force=force)
+        return await installer(github_token=github_token, force=force)
     return await installer()
 
 

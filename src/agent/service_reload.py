@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent.asyncutil import gather_independent
+from agent.asyncutil import gather_independent, maybe_await
 from agent.errors import AgentError
 from agent.logutil import get_logger
 
@@ -186,7 +186,11 @@ async def _recover_xray_file(driver: Any, path: Path) -> dict[str, Any]:
 
 async def _reload_tunnel_core(driver: Any) -> dict[str, Any]:
     """Rewrite WireGuard/Amnezia confs from sqlite and bring down interfaces up."""
-    ifaces = [row for row in (driver.list_interfaces() or []) if isinstance(row, dict)]
+    ifaces = [
+        row
+        for row in (await maybe_await(driver.list_interfaces()) or [])
+        if isinstance(row, dict)
+    ]
     if not ifaces:
         return {"ok": True, "skipped": True, "reason": "no interfaces in store"}
 
@@ -217,7 +221,7 @@ async def _reload_tunnel_core(driver: Any) -> dict[str, Any]:
 
 
 async def _reload_l2tp(driver: Any) -> dict[str, Any]:
-    servers = list(driver.list_servers() or [])
+    servers = list(await maybe_await(driver.list_servers()) or [])
     if not servers:
         return {"ok": True, "skipped": True, "reason": "no servers in store"}
     result = await driver.enable()
@@ -231,7 +235,11 @@ async def _reload_openvpn(driver: Any) -> dict[str, Any]:
     """Rewrite server configs. Start units that are down; leave active ones up."""
     from agent.support.process import run
 
-    servers = [row for row in (driver.list_servers() or []) if isinstance(row, dict)]
+    servers = [
+        row
+        for row in (await maybe_await(driver.list_servers()) or [])
+        if isinstance(row, dict)
+    ]
     if not servers:
         return {"ok": True, "skipped": True, "reason": "no servers in store"}
 
