@@ -469,6 +469,18 @@ def conf_path(config_dir: str | Path, iface: str) -> Path:
     return Path(config_dir) / f"{iface}.conf"
 
 
+def _endpoint_host(endpoint: str) -> str:
+    text = str(endpoint or "").strip()
+    if not text:
+        return ""
+    if text.startswith("["):
+        end = text.find("]")
+        return text[1:end] if end > 1 else ""
+    if text.count(":") == 1:
+        return text.split(":", 1)[0].strip()
+    return text
+
+
 def render_persist_hold_script(config_dir: str | Path) -> str:
     root = str(Path(config_dir)).replace("'", "'\"'\"'")
     return f"""#!/bin/sh
@@ -1862,6 +1874,87 @@ class MullvadService:
                 seeded["relay_mode"] = mode
                 seeded["selection_mode"] = mode
             self.store.put_doc(CORE, KIND_SETTINGS, SETTINGS_ID, seeded)
+
+    async def reload_bindings(self) -> dict[str, Any]:
+        """Recreate missing Mullvad confs from stored bindings and bring tunnels up.
+
+        A live interface with a conf file on disk is left up. A deleted conf is
+        rewritten from the account private key plus the binding pubkey/endpoint.
+        """
+        rebuilt: list[str] = []
+        restored: list[str] = []
+        persisted: list[str] = []
+        failed: list[dict[str, str]] = []
+        binds = self.bindings()
+        if not binds:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "no mullvad bindings",
+                "rebuilt": rebuilt,
+                "restored": restored,
+                "persisted": persisted,
+                "failed": failed,
+            }
+
+        account = self.settings()
+        for bind in binds:
+            iface = normalize_exit_interface(str(bind.get("iface") or ""))
+            if not iface:
+                continue
+            path = conf_path(self.config_dir, iface)
+            try:
+                parsed = read_conf(path) if path.is_file() else None
+                if parsed is None:
+                    await self._rewrite_conf_from_binding(iface, bind, account)
+                    rebuilt.append(iface)
+                elif not self._iface_up(iface):
+                    await maybe_await(self._sync_iface(iface, path))
+                    restored.append(iface)
+                unit = await self._ensure_persist_unit(iface)
+                if unit.get("ok"):
+                    persisted.append(iface)
+                elif not unit.get("skipped"):
+                    failed.append({"iface": iface, "error": str(unit.get("reason") or "persist unit failed")})
+            except Exception as exc:
+                message = getattr(exc, "message", None) or str(exc)
+                log.warning("mullvad reload failed iface=%s: %s", iface, message)
+                failed.append({"iface": iface, "error": message})
+        return {
+            "ok": not failed,
+            "skipped": False,
+            "rebuilt": rebuilt,
+            "restored": restored,
+            "persisted": persisted,
+            "failed": failed,
+        }
+
+    async def _rewrite_conf_from_binding(
+        self,
+        iface: str,
+        bind: dict[str, Any],
+        account: dict[str, Any],
+    ) -> None:
+        private_key = str(account.get("private_key") or "").strip()
+        address = str(account.get("address") or "").strip()
+        pubkey = str(bind.get("pubkey") or "").strip()
+        host = _endpoint_host(str(bind.get("endpoint") or ""))
+        missing: list[str] = []
+        if not private_key:
+            missing.append("private key")
+        if not address:
+            missing.append("address")
+        if not pubkey:
+            missing.append("relay public key")
+        if not host:
+            missing.append("endpoint")
+        if missing:
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"Cannot rebuild {iface}: stored Mullvad data is missing {', '.join(missing)}",
+                422,
+            )
+        await self._apply_relay(iface, {"pubkey": pubkey, "ipv4_addr_in": host})
 
     async def restore_interfaces(self) -> dict[str, Any]:
         restored: list[str] = []

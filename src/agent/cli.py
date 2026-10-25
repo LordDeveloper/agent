@@ -195,9 +195,24 @@ def cmd_xray_status(_: argparse.Namespace) -> int:
 def cmd_service(args: argparse.Namespace) -> int:
     if args.action == "reset":
         return cmd_service_reset()
+    if args.action == "reload":
+        return cmd_service_reload()
     result = service_action(args.action)
     _print_json({"success": bool(result.get("ok", True)), **result})
     return 0 if result.get("ok", True) else 1
+
+
+def cmd_service_reload() -> int:
+    """Rewrite VPN runtime from stored data and start anything that is down."""
+    from agent.service_reload import reload_stored_services
+
+    runtime = open_runtime()
+    try:
+        report = run_sync(reload_stored_services(runtime.settings, runtime.store, runtime.registry))
+    finally:
+        runtime.close()
+    _print_json({"success": bool(report.get("ok")), **report})
+    return 0 if report.get("ok") else 1
 
 
 def cmd_service_reset() -> int:
@@ -698,10 +713,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_xray_status = xray_sub.add_parser("status", help="Show installed Xray binary status")
     p_xray_status.set_defaults(func=cmd_xray_status)
 
-    p_service = sub.add_parser("service", help="Manage systemd service")
+    p_service = sub.add_parser("service", help="Manage the agent unit, or reload VPN cores from stored data")
     p_service.add_argument(
         "action",
-        choices=["install", "uninstall", "start", "stop", "restart", "status", "enable", "disable", "reset"],
+        choices=["install", "uninstall", "start", "stop", "restart", "status", "enable", "disable", "reset", "reload"],
     )
     p_service.set_defaults(func=cmd_service)
 

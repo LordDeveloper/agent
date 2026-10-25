@@ -235,6 +235,74 @@ def _factory_reset_action() -> None:
     _run_action("Factory reset", _run)
 
 
+def _show_service_reload() -> None:
+    from agent.runtime import open_runtime
+    from agent.service_reload import reload_stored_services
+
+    runtime = open_runtime()
+    try:
+        report = run_sync(reload_stored_services(runtime.settings, runtime.store, runtime.registry))
+    finally:
+        runtime.close()
+    _print_reload_report(report)
+
+
+def _print_reload_report(report: dict) -> None:
+    ok = bool(report.get("ok"))
+    _print(kv("Result", "ok" if ok else "failed", GREEN if ok else RED))
+    for name, row in (report.get("cores") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        if row.get("skipped"):
+            color = DIM
+            state = "skipped"
+        elif row.get("ok"):
+            color = GREEN
+            state = "ok"
+        else:
+            color = RED
+            state = "failed"
+        detail = _reload_detail(row)
+        line = f"  {name:<12} {state}"
+        if detail:
+            line += f"  {detail}"
+        _print(paint(line, color))
+        error = str(row.get("error") or row.get("detail") or "").strip()
+        if error and not row.get("ok"):
+            _print(paint(f"    {error}", RED))
+        for item in row.get("failed") or []:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("name") or item.get("iface") or item.get("unit") or "item"
+            _print(paint(f"    {label}: {item.get('error') or 'failed'}", RED))
+
+
+def _reload_detail(row: dict) -> str:
+    parts: list[str] = []
+    if row.get("skipped"):
+        reason = str(row.get("reason") or "").strip()
+        return reason
+    for key in ("brought_up", "synced", "started", "kept", "rebuilt", "restored", "persisted"):
+        value = row.get(key)
+        if isinstance(value, list) and value:
+            parts.append(f"{key}={','.join(str(item) for item in value)}")
+        elif key == "started" and value is True:
+            parts.append("started")
+    if row.get("already_running"):
+        parts.append("already running")
+    if row.get("recovered_from_runtime"):
+        parts.append("config recovered from running xray")
+    if row.get("imported"):
+        parts.append("config imported")
+    servers = row.get("servers")
+    if isinstance(servers, int) and servers:
+        parts.append(f"servers={servers}")
+    rules = row.get("rules")
+    if isinstance(rules, int):
+        parts.append(f"rules={rules}")
+    return "  ".join(parts)
+
+
 def _show_service_action(action: str) -> None:
     if action == "status":
         active = service_is_active()
@@ -603,16 +671,25 @@ def _service_menu() -> None:
                 Choice("start", "Start", GREEN, "3"),
                 Choice("stop", "Stop", RED, "4"),
                 Choice("restart", "Restart", YELLOW, "5"),
-                Choice("enable", "Enable on boot", WHITE, "6"),
-                Choice("disable", "Disable on boot", WHITE, "7"),
-                Choice("uninstall", "Remove unit", RED, "8"),
-                Choice("serve", "Start API (foreground)", BLUE, "9"),
+                Choice("reload", "Reload", YELLOW, "6"),
+                Choice("enable", "Enable on boot", WHITE, "7"),
+                Choice("disable", "Disable on boot", WHITE, "8"),
+                Choice("uninstall", "Remove unit", RED, "9"),
+                Choice("serve", "Start API (foreground)", BLUE, "s"),
                 Choice("reset", "Factory reset", RED, "r"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
+        if picked == "reload":
+            if not confirm(
+                "Reload services from stored data? Missing configs are recreated and stopped services are started.",
+                default=True,
+            ):
+                continue
+            _run_action("Service reload", _show_service_reload)
+            continue
         if picked == "serve":
             from agent.cli import cmd_serve
 
