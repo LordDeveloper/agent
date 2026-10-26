@@ -81,6 +81,35 @@ def test_export_import_rewrites_only_crt_files(tmp_path, monkeypatch):
     assert imported["written"] >= 2
 
 
+def test_transfer_install_writes_matching_private_key(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.support.openvpn_certificates.certificate_roots", _only_tmp_roots)
+    from agent.support.openvpn_certificates import install_certificates
+
+    settings = AgentSettings(
+        data_dir=str(tmp_path / "data"),
+        db_path=str(tmp_path / "agent.db"),
+        enabled_cores="openvpn",
+        openvpn_config_dir=str(tmp_path),
+    )
+    pki = tmp_path / "pki" / "openvpn-9"
+    pki.mkdir(parents=True)
+    (pki / "server.crt").write_text(_cert("NEW-SRV"), encoding="utf-8")
+    (pki / "server.key").write_text("NEW-KEY\n", encoding="utf-8")
+    documents = [{
+        "core": "openvpn",
+        "kind": "server",
+        "data": {
+            "id": 9,
+            "name": "openvpn-9",
+            "server_crt": _cert("OLD-SRV"),
+            "server_key": "OLD-KEY",
+        },
+    }]
+    install_certificates(documents, settings, rewrite=True, with_keys=True)
+    assert "OLD-SRV" in (pki / "server.crt").read_text(encoding="utf-8")
+    assert (pki / "server.key").read_text(encoding="utf-8") == "OLD-KEY\n"
+
+
 def test_import_without_rewrite_keeps_existing_crt(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.openvpn_certificates.certificate_roots", _only_tmp_roots)
     bundle = tmp_path / "openvpn-certificates.json"

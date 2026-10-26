@@ -460,7 +460,7 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
 
     from agent.support.openvpn_certificates import install_certificates
 
-    openvpn_certificates = install_certificates(documents, settings, rewrite=True)
+    openvpn_certificates = install_certificates(documents, settings, rewrite=True, with_keys=True)
 
     log.info(
         "transfer snapshot imported documents=%s meta=%s tls=%s deps=%s geodata=%s xray=%s",

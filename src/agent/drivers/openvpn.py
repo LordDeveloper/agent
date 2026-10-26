@@ -1228,10 +1228,15 @@ class OpenVpnDriver(CoreDriver):
         live = self._read_live_pki(server)
         stored = self._stored_pki(server)
         overlay = {**stored, **live}
-        for key in ('ca_crt', 'server_crt'):
-            stored_cert = str(stored.get(key) or '').strip()
-            if stored_cert:
-                overlay[key] = stored_cert
+        for cert_key, key_key in (('ca_crt', 'ca_key'), ('server_crt', 'server_key')):
+            stored_cert = str(stored.get(cert_key) or '').strip()
+            stored_key = str(stored.get(key_key) or '').strip()
+            if stored_cert and stored_key:
+                overlay[cert_key] = stored_cert
+                overlay[key_key] = stored_key
+        stored_tls = normalize_tls_crypt(stored.get('tls_crypt'))
+        if stored_tls:
+            overlay['tls_crypt'] = stored_tls
         missing = [key for key in _PKI_KEYS if not str(overlay.get(key) or '').strip()]
         if missing:
             staging = self._pki_dir(server)

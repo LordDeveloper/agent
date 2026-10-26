@@ -180,19 +180,45 @@ def _write_cert(path: Path, content: str, *, rewrite: bool) -> bool:
     return True
 
 
+_KEY_FILES = (
+    ("ca.key", "ca_key"),
+    ("server.key", "server_key"),
+    ("tc.key", "tls_crypt"),
+)
+
+
+def _private_material(server: dict[str, Any]) -> dict[str, str]:
+    from agent.support.openvpn_config import normalize_tls_crypt
+
+    files: dict[str, str] = {}
+    for name, key in _KEY_FILES:
+        raw = str(server.get(key) or "").strip()
+        if key == "tls_crypt":
+            raw = normalize_tls_crypt(raw)
+        if raw:
+            files[name] = raw if raw.endswith("\n") else raw + "\n"
+    return files
+
+
 def install_certificates(
     documents: list[dict[str, Any]],
     settings: Any,
     *,
     rewrite: bool,
+    with_keys: bool = False,
 ) -> dict[str, int]:
-    """Write ca.crt and server.crt into each OpenVPN instance directory."""
+    """Write ca.crt and server.crt into each OpenVPN instance directory.
+
+    Server transfer also writes the matching private key and tls-crypt material
+    so the certificate is not paired with a key generated on the new host.
+    """
     discovered = _instance_dirs(settings)
     written = 0
     skipped = 0
     for server in _openvpn_documents(documents):
         targets = _dirs_for_server(settings, server, discovered)
         files = _server_files(server, targets, prefer_disk=False)
+        secrets = _private_material(server) if with_keys else {}
         for directory in targets:
             for name, _key in _CERT_FILES:
                 content = _pem_certificate(files.get(name))
@@ -201,6 +227,16 @@ def install_certificates(
                 if _write_cert(directory / name, content, rewrite=rewrite):
                     written += 1
                 elif (directory / name).is_file():
+                    skipped += 1
+            for name, content in secrets.items():
+                path = directory / name
+                if _write_cert(path, content, rewrite=rewrite):
+                    try:
+                        path.chmod(0o600)
+                    except OSError:
+                        pass
+                    written += 1
+                elif path.is_file():
                     skipped += 1
         for name, key in _CERT_FILES:
             text = _pem_certificate(files.get(name))
