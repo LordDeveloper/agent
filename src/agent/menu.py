@@ -514,6 +514,79 @@ def _show_openvpn_create_server() -> None:
         run_sync(runtime.close())
 
 
+def _openvpn_certificates_menu() -> None:
+    while True:
+        render_header("OpenVPN / Certificates")
+        picked = select(
+            [
+                Choice("export", "Export", GREEN, "1"),
+                Choice("import", "Import", CYAN, "2"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "export":
+            _openvpn_export_certificates()
+            continue
+        if picked == "import":
+            _openvpn_import_certificates()
+
+
+def _openvpn_export_certificates() -> None:
+    from agent.support.openvpn_certificates import export_bundle, resolve_export_path
+
+    raw = prompt_text("Export path", default="~")
+    path = resolve_export_path(raw)
+    rewrite = False
+    if path.exists():
+        rewrite = confirm(f"Rewrite {path}?", default=False)
+        if not rewrite:
+            _print(paint("  Export cancelled.", YELLOW))
+            pause()
+            return
+
+    def _run() -> None:
+        from agent.runtime import open_runtime
+
+        runtime = open_runtime()
+        try:
+            result = export_bundle(runtime.store, runtime.settings, raw, rewrite=rewrite or not path.exists())
+        finally:
+            run_sync(runtime.close())
+        _print(paint(f"  Wrote {result['servers']} server certificate set(s).", GREEN))
+        _print(kv("Path", str(result["path"]), CYAN))
+
+    _run_action("Export OpenVPN certificates", _run)
+
+
+def _openvpn_import_certificates() -> None:
+    raw = prompt_text("Bundle path", default="")
+    if not str(raw or "").strip():
+        _print(paint("  Path is required.", YELLOW))
+        pause()
+        return
+    rewrite = confirm("Rewrite existing certificates?", default=True)
+
+    def _run() -> None:
+        from agent.runtime import open_runtime
+        from agent.support.openvpn_certificates import import_bundle
+
+        runtime = open_runtime()
+        try:
+            result = import_bundle(runtime.store, runtime.settings, raw, rewrite=rewrite)
+        finally:
+            run_sync(runtime.close())
+        _print(paint(f"  Imported {result['servers']} server certificate set(s).", GREEN))
+        _print(kv("Written", str(result["written"]), CYAN))
+        _print(kv("Skipped", str(result["skipped"]), DIM))
+        restarted = result.get("restarted") or []
+        if restarted:
+            _print(kv("Restarted", ", ".join(restarted), GREEN))
+
+    _run_action("Import OpenVPN certificates", _run)
+
+
 def _core_ops_menu(name: str) -> None:
     label = _core_label(name)
     while True:
@@ -539,6 +612,7 @@ def _core_ops_menu(name: str) -> None:
                     Choice("restart", "Restart", YELLOW, "4"),
                     Choice("status", "Status", WHITE, "5"),
                     Choice("reset", "Reset (wipe PKI + resync from scratch)", RED, "r"),
+                    Choice("certificates", "Certificates", CYAN, "c"),
                     Choice("back", "Back", WHITE, "0"),
                 ]
             )
@@ -584,6 +658,10 @@ def _core_ops_menu(name: str) -> None:
 
         if picked == "reset":
             _openvpn_reset_action()
+            continue
+
+        if picked == "certificates":
+            _openvpn_certificates_menu()
             continue
 
         if picked == "install":

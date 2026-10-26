@@ -359,6 +359,9 @@ async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
     documents = await store.dump_documents()
     meta = await store.dump_meta()
     _absorb_openvpn_pki(documents, settings)
+    from agent.support.openvpn_certificates import attach_document_certificates
+
+    attach_document_certificates(documents, settings)
 
     report_progress(1, _STEPS, "Reading Xray config")
     config = _read_xray_config(settings)
@@ -455,6 +458,10 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
     if isinstance(config, dict) and config:
         config_path = _write_xray_config(settings, config)
 
+    from agent.support.openvpn_certificates import install_certificates
+
+    openvpn_certificates = install_certificates(documents, settings, rewrite=True)
+
     log.info(
         "transfer snapshot imported documents=%s meta=%s tls=%s deps=%s geodata=%s xray=%s",
         document_count,
@@ -472,6 +479,7 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
         "acme_files": acme_written,
         "geodata": geodata_written,
         "xray_config": config_path,
+        "openvpn_certificates": openvpn_certificates["written"],
         "tls_missing": [str(item) for item in (snapshot.get("tls_missing") or []) if str(item).strip()],
         "cores": cores_to_enable(snapshot),
     }
