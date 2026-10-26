@@ -207,6 +207,34 @@ def worktree_status() -> str:
     return git("status", "--porcelain").stdout.strip()
 
 
+def dirty_paths() -> list[str]:
+    names: list[str] = []
+    for line in worktree_status().splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        names.append(path.replace("\\", "/"))
+    return names
+
+
+def payload_paths(names: list[str] | None = None) -> list[str]:
+    version = {item.replace("\\", "/") for item in VERSION_FILES}
+    return [name for name in (names if names is not None else dirty_paths()) if name not in version]
+
+
+def ensure_payload_changes() -> list[str]:
+    payload = payload_paths()
+    if payload:
+        return payload
+    die(
+        "No edited files to release.\n"
+        "The worktree is clean (or only version files changed). "
+        "Make a real code change before cutting a tag."
+    )
+
+
 def stage_release() -> list[str]:
     git("add", "-A")
     names = staged_names()
@@ -217,15 +245,19 @@ def stage_release() -> list[str]:
     return names
 
 
-def commit_release(subject: str) -> bool:
+def commit_release(subject: str) -> None:
     names = stage_release()
-    if not names:
-        return False
+    if not payload_paths(names):
+        git("reset", "-q", "HEAD")
+        git("checkout", "--", *VERSION_FILES)
+        die(
+            "No edited files to release.\n"
+            "Refusing to tag a version-only commit. Change source files first."
+        )
     print("Committing:")
     for name in names:
         print(f"  {name}")
     git("commit", "-m", subject)
-    return True
 
 
 def release_page(tag: str) -> str:
@@ -318,14 +350,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Branch:             {branch}")
     print(f"Commit:             {subject}")
 
+    if not payload_paths():
+        if args.dry_run:
+            print("Dry run. No edited files — a real release would abort.")
+            return 1
+        ensure_payload_changes()
+
     if args.dry_run:
         print("Dry run. Version files and git are unchanged.")
         status = worktree_status()
         if status:
             print("Worktree that would be included:")
             print(status)
-        else:
-            print("Worktree is clean. The commit would only update the version files.")
         return 0
 
     on_origin = any(item.tag == tag for item in published)
