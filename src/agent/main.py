@@ -23,6 +23,7 @@ from agent.api.openvpn import router as openvpn_router
 from agent.api.tls import router as tls_router
 from agent.api.network import router as network_router
 from agent.api.mullvad import router as mullvad_router
+from agent.api.transfer import router as transfer_router
 from agent.mullvad_worker import mullvad_worker_loop
 from agent.errorlog import CoreErrorCaptureMiddleware, CoreErrorLog
 from agent.logutil import get_logger, resolve_log_path, setup_logging
@@ -193,6 +194,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     app.include_router(tls_router, prefix="/api/v1", dependencies=auth)
     app.include_router(network_router, prefix="/api/v1", dependencies=auth)
     app.include_router(mullvad_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(transfer_router, prefix="/api/v1", dependencies=auth)
 
     @app.get("/health")
     async def root_health(request: Request):

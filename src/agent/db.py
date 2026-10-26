@@ -209,6 +209,102 @@ class Store:
             )
             await self._connection().commit()
 
+    async def dump_documents(self) -> list[dict[str, Any]]:
+        """Every stored document. Traffic and audit tables are not included."""
+        async with self._lock:
+            cursor = await self._connection().execute(
+                "SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id"
+            )
+            rows = await cursor.fetchall()
+        dumped: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            dumped.append({
+                "core": str(row["core"]),
+                "kind": str(row["kind"]),
+                "doc_id": str(row["doc_id"]),
+                "data": data,
+            })
+        return dumped
+
+    async def replace_all_documents(self, rows: list[dict[str, Any]]) -> int:
+        """Replace the document table with a transferred snapshot."""
+        async with self._lock:
+            conn = self._connection()
+            await conn.execute("DELETE FROM documents")
+            count = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                core = str(row.get("core") or "").strip()
+                kind = str(row.get("kind") or "").strip()
+                doc_id = str(row.get("doc_id") or "").strip()
+                data = row.get("data")
+                if (
+                    not core
+                    or not kind
+                    or not doc_id
+                    or not isinstance(data, dict)
+                    or len(core) > 64
+                    or len(kind) > 64
+                    or len(doc_id) > 512
+                ):
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO documents (core, kind, doc_id, data, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    """,
+                    (core, kind, doc_id, json.dumps(data, ensure_ascii=False)),
+                )
+                count += 1
+            await conn.commit()
+            return count
+
+    async def dump_meta(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._connection().execute(
+                "SELECT core, key, value FROM meta ORDER BY core, key"
+            )
+            rows = await cursor.fetchall()
+        dumped: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                value = json.loads(row["value"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            dumped.append({
+                "core": str(row["core"]),
+                "key": str(row["key"]),
+                "value": value,
+            })
+        return dumped
+
+    async def replace_all_meta(self, rows: list[dict[str, Any]]) -> int:
+        async with self._lock:
+            conn = self._connection()
+            await conn.execute("DELETE FROM meta")
+            count = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                core = str(row.get("core") or "").strip()
+                key = str(row.get("key") or "").strip()
+                if not core or not key or len(core) > 64 or len(key) > 128 or "value" not in row:
+                    continue
+                await conn.execute(
+                    "INSERT INTO meta (core, key, value) VALUES (?, ?, ?)",
+                    (core, key, json.dumps(row.get("value"), ensure_ascii=False)),
+                )
+                count += 1
+            await conn.commit()
+            return count
+
     async def get_traffic_ack(self, core: str, client_key: str) -> dict[str, int] | None:
         async with self._lock:
             cursor = await self._connection().execute(
