@@ -1,4 +1,5 @@
 import json
+import tarfile
 from pathlib import Path
 
 from agent.asyncutil import run_sync
@@ -15,14 +16,18 @@ def _cert(body: str) -> str:
     return f"-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n"
 
 
+def _key(body: str) -> str:
+    return f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"
+
+
 def test_export_import_rewrites_only_crt_files(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.support.openvpn_certificates.certificate_roots", _only_tmp_roots)
     source_pki = tmp_path / "src" / "pki" / "openvpn-7"
     source_pki.mkdir(parents=True)
     (source_pki / "ca.crt").write_text(_cert("OLD-CA"), encoding="utf-8")
     (source_pki / "server.crt").write_text(_cert("OLD-SRV"), encoding="utf-8")
-    (source_pki / "ca.key").write_text("SECRET-KEY", encoding="utf-8")
-    (source_pki / "tc.key").write_text("SECRET-TLS", encoding="utf-8")
+    (source_pki / "ca.key").write_text(_key("SECRET-KEY"), encoding="utf-8")
+    (source_pki / "server.key").write_text(_key("SECRET-SRV"), encoding="utf-8")
 
     source_db = tmp_path / "source.db"
     source = Store(source_db)
@@ -39,19 +44,22 @@ def test_export_import_rewrites_only_crt_files(tmp_path, monkeypatch):
     finally:
         run_sync(source.close())
 
-    payload = json.loads((tmp_path / "out" / "openvpn-certificates.json").read_text(encoding="utf-8"))
-    files = payload["servers"][0]["files"]
-    assert "OLD-CA" in files["ca.crt"]
-    assert "OLD-SRV" in files["server.crt"]
-    assert "ca.key" not in files
-    assert "tc.key" not in files
+    archive = tmp_path / "out" / "openvpn-certificates.tar.gz"
+    with tarfile.open(archive, "r:gz") as tar:
+        names = set(tar.getnames())
+    assert "openvpn-7/ca.crt" in names
+    assert "openvpn-7/server.crt" in names
+    assert "openvpn-7/ca.key" in names
+    assert "openvpn-7/server.key" in names
+    assert exported["path"] == str(archive)
     assert exported["servers"] == 1
 
     dest_pki = tmp_path / "dst" / "pki" / "openvpn-7"
     dest_pki.mkdir(parents=True)
     (dest_pki / "ca.crt").write_text(_cert("NEW-CA"), encoding="utf-8")
     (dest_pki / "server.crt").write_text(_cert("NEW-SRV"), encoding="utf-8")
-    (dest_pki / "ca.key").write_text("KEEP-KEY", encoding="utf-8")
+    (dest_pki / "ca.key").write_text(_key("KEEP-KEY"), encoding="utf-8")
+    (dest_pki / "server.key").write_text(_key("KEEP-SRV"), encoding="utf-8")
 
     dest_db = tmp_path / "dest.db"
     dest = Store(dest_db)
@@ -76,8 +84,10 @@ def test_export_import_rewrites_only_crt_files(tmp_path, monkeypatch):
 
     assert "OLD-CA" in (dest_pki / "ca.crt").read_text(encoding="utf-8")
     assert "OLD-SRV" in (dest_pki / "server.crt").read_text(encoding="utf-8")
-    assert (dest_pki / "ca.key").read_text(encoding="utf-8") == "KEEP-KEY"
+    assert "SECRET-KEY" in (dest_pki / "ca.key").read_text(encoding="utf-8")
+    assert "SECRET-SRV" in (dest_pki / "server.key").read_text(encoding="utf-8")
     assert "OLD-CA" in saved["ca_crt"]
+    assert "SECRET-SRV" in saved["server_key"]
     assert imported["written"] >= 2
 
 

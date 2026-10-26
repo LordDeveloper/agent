@@ -1,11 +1,13 @@
-"""Export and import OpenVPN certificate files (ca.crt, server.crt) only."""
+"""Export and import the OpenVPN certificate set as one gzip archive."""
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +16,19 @@ from agent.support.openvpn_config import instance_name_for_server
 
 BUNDLE_VERSION = 1
 BUNDLE_KIND = "openvpn-certificates"
-EXPORT_NAME = "openvpn-certificates.json"
+EXPORT_NAME = "openvpn-certificates.tar.gz"
 _CERT_FILES = (
     ("ca.crt", "ca_crt"),
     ("server.crt", "server_crt"),
 )
+_KEY_FILES = (
+    ("ca.key", "ca_key"),
+    ("server.key", "server_key"),
+    ("tc.key", "tls_crypt"),
+)
+_MATERIAL_FILES = _CERT_FILES + _KEY_FILES
 _MAX_BYTES = 512_000
+_MAX_ARCHIVE_BYTES = 8_000_000
 
 
 def certificate_roots(settings: Any) -> list[Path]:
@@ -71,10 +80,36 @@ def _instance_dirs(settings: Any) -> dict[str, list[Path]]:
     return found
 
 
-def _certs_in_dir(directory: Path) -> dict[str, str]:
+def _material_text(value: Any, field: str) -> str:
+    if field in {"ca_crt", "server_crt"}:
+        return _pem_certificate(value)
+    raw = str(value or "").strip()
+    if not raw or len(raw.encode("utf-8")) > _MAX_BYTES:
+        return ""
+    if field == "tls_crypt":
+        from agent.support.openvpn_config import normalize_tls_crypt
+
+        raw = normalize_tls_crypt(raw).strip()
+        if not raw:
+            return ""
+    elif "PRIVATE KEY" not in raw:
+        return ""
+    return raw if raw.endswith("\n") else raw + "\n"
+
+
+def _read_material(path: Path, field: str) -> str:
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > _MAX_BYTES:
+            return ""
+        return _material_text(path.read_text(encoding="utf-8"), field)
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _material_in_dir(directory: Path) -> dict[str, str]:
     files: dict[str, str] = {}
-    for name, _key in _CERT_FILES:
-        text = _read_cert(directory / name)
+    for name, field in _MATERIAL_FILES:
+        text = _read_material(directory / name, field)
         if text:
             files[name] = text
     return files
@@ -115,13 +150,13 @@ def _dirs_for_server(settings: Any, server: dict[str, Any], discovered: dict[str
 
 def _server_files(server: dict[str, Any], directories: list[Path], *, prefer_disk: bool) -> dict[str, str]:
     from_doc: dict[str, str] = {}
-    for name, key in _CERT_FILES:
-        text = _pem_certificate(server.get(key))
+    for name, field in _MATERIAL_FILES:
+        text = _material_text(server.get(field), field)
         if text:
             from_doc[name] = text
     from_disk: dict[str, str] = {}
     for directory in directories:
-        for name, text in _certs_in_dir(directory).items():
+        for name, text in _material_in_dir(directory).items():
             from_disk.setdefault(name, text)
     if prefer_disk:
         return {**from_doc, **from_disk}
@@ -178,13 +213,6 @@ def _write_cert(path: Path, content: str, *, rewrite: bool) -> bool:
     except OSError:
         return False
     return True
-
-
-_KEY_FILES = (
-    ("ca.key", "ca_key"),
-    ("server.key", "server_key"),
-    ("tc.key", "tls_crypt"),
-)
 
 
 def _private_material(server: dict[str, Any]) -> dict[str, str]:
@@ -281,6 +309,99 @@ def _restart_instances(instances: list[str]) -> list[str]:
     return restarted
 
 
+def _archive_add(tar: tarfile.TarFile, name: str, content: str) -> None:
+    payload = content.encode("utf-8")
+    info = tarfile.TarInfo(name)
+    info.size = len(payload)
+    info.mode = 0o600 if name.endswith((".key",)) else 0o644
+    tar.addfile(info, io.BytesIO(payload))
+
+
+def _write_archive(path: Path, bundle: dict[str, Any]) -> None:
+    allowed = {name for name, _field in _MATERIAL_FILES}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz") as tar:
+        manifest = {
+            "version": BUNDLE_VERSION,
+            "kind": BUNDLE_KIND,
+            "servers": [
+                {"id": server.get("id"), "instance": server.get("instance")}
+                for server in bundle["servers"]
+            ],
+        }
+        _archive_add(tar, "manifest.json", json.dumps(manifest) + "\n")
+        for server in bundle["servers"]:
+            instance = str(server.get("instance") or "").strip()
+            files = server.get("files") if isinstance(server.get("files"), dict) else {}
+            for name, content in files.items():
+                if name not in allowed or not str(content or "").strip():
+                    continue
+                _archive_add(tar, f"{instance}/{name}", str(content))
+    path.chmod(0o600)
+
+
+def _member_parts(name: str) -> tuple[str, str] | None:
+    text = str(name or "").replace("\\", "/").lstrip("./")
+    if not text or text.startswith("/") or ".." in text.split("/"):
+        return None
+    parts = [part for part in text.split("/") if part]
+    if len(parts) != 2:
+        return None
+    instance, filename = parts
+    allowed = {item for item, _field in _MATERIAL_FILES}
+    if filename not in allowed:
+        return None
+    return instance, filename
+
+
+def _read_archive(path: Path) -> dict[str, Any]:
+    grouped: dict[str, dict[str, str]] = {}
+    manifest: dict[str, Any] | None = None
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            for member in tar.getmembers():
+                if not member.isfile() or member.size > _MAX_BYTES:
+                    continue
+                handle = tar.extractfile(member)
+                if handle is None:
+                    continue
+                raw = handle.read(_MAX_BYTES + 1)
+                if len(raw) > _MAX_BYTES:
+                    continue
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if member.name.replace("\\", "/").endswith("manifest.json") and "/" not in member.name.replace("\\", "/").strip("/"):
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        manifest = parsed
+                    continue
+                parts = _member_parts(member.name)
+                if parts is None:
+                    continue
+                instance, filename = parts
+                grouped.setdefault(instance, {})[filename] = text
+    except (OSError, tarfile.TarError, json.JSONDecodeError) as exc:
+        raise AgentError("VALIDATION_ERROR", f"Certificate archive could not be read: {exc}", 422) from exc
+    if path.stat().st_size > _MAX_ARCHIVE_BYTES:
+        raise AgentError("VALIDATION_ERROR", "Certificate archive is too large", 422)
+    servers = []
+    listed = manifest.get("servers") if isinstance(manifest, dict) else None
+    if isinstance(listed, list) and listed:
+        for item in listed:
+            if not isinstance(item, dict):
+                continue
+            instance = str(item.get("instance") or "").strip()
+            row = dict(item)
+            row["files"] = grouped.get(instance, {})
+            servers.append(row)
+    else:
+        for instance, files in grouped.items():
+            servers.append({"instance": instance, "files": files})
+    return {"version": BUNDLE_VERSION, "kind": BUNDLE_KIND, "servers": servers}
+
+
 def export_bundle(store: Any, settings: Any, raw_path: str | None, *, rewrite: bool) -> dict[str, Any]:
     from agent.asyncutil import run_sync
 
@@ -295,9 +416,7 @@ def export_bundle(store: Any, settings: Any, raw_path: str | None, *, rewrite: b
     if path.exists() and not rewrite:
         raise AgentError("VALIDATION_ERROR", f"Refusing to overwrite {path}", 422)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
-        path.chmod(0o600)
+        _write_archive(path, bundle)
     except OSError as exc:
         raise AgentError("EXEC_ERROR", f"Could not write {path}: {exc}", 500) from exc
     return {"path": str(path), "servers": len(bundle["servers"])}
@@ -321,9 +440,12 @@ def _bundle_documents(payload: dict[str, Any], existing: list[dict[str, Any]]) -
         if not isinstance(item, dict):
             continue
         files = item.get("files") if isinstance(item.get("files"), dict) else {}
-        certs = {name: _pem_certificate(files.get(name)) for name, _key in _CERT_FILES}
-        certs = {name: text for name, text in certs.items() if text}
-        if not certs:
+        material = {
+            name: _material_text(files.get(name), field)
+            for name, field in _MATERIAL_FILES
+        }
+        material = {name: text for name, text in material.items() if text}
+        if not any(name.endswith(".crt") for name in material):
             continue
         sid = item.get("id")
         instance = str(item.get("instance") or "").strip()
@@ -336,10 +458,10 @@ def _bundle_documents(payload: dict[str, Any], existing: list[dict[str, Any]]) -
         data = row["data"]
         if instance and not data.get("instance"):
             data["instance"] = instance
-        for name, key in _CERT_FILES:
-            text = certs.get(name)
+        for name, field in _MATERIAL_FILES:
+            text = material.get(name)
             if text:
-                data[key] = text.strip()
+                data[field] = text.strip()
         if row not in documents and row not in existing:
             documents.append(row)
         elif row not in documents:
@@ -355,10 +477,13 @@ def import_bundle(store: Any, settings: Any, raw_path: str, *, rewrite: bool) ->
     path = Path(str(raw_path or "").strip()).expanduser()
     if not path.is_file():
         raise AgentError("CONFIG_NOT_FOUND", f"Certificate bundle not found: {path}", 404)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AgentError("VALIDATION_ERROR", f"Certificate bundle could not be read: {exc}", 422) from exc
+    if path.name.endswith(".json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AgentError("VALIDATION_ERROR", f"Certificate bundle could not be read: {exc}", 422) from exc
+    else:
+        payload = _read_archive(path)
     if not isinstance(payload, dict) or payload.get("kind") != BUNDLE_KIND:
         raise AgentError("VALIDATION_ERROR", "File is not an OpenVPN certificate bundle", 422)
     try:
@@ -372,7 +497,7 @@ def import_bundle(store: Any, settings: Any, raw_path: str, *, rewrite: bool) ->
     if not isinstance(existing, list):
         existing = []
     documents = _bundle_documents(payload, existing)
-    result = install_certificates(documents, settings, rewrite=rewrite)
+    result = install_certificates(documents, settings, rewrite=rewrite, with_keys=True)
     _remember_store(store, documents)
     instances = []
     for row in documents:
