@@ -377,16 +377,24 @@ def _reserved_peer_addresses(subnet: str) -> set[str]:
     return reserved
 
 
-def _next_ip(subnet: str, used: set[str]) -> str:
+def _next_ip(subnet: str, used: set[str], *, start_after: str | None = None) -> str:
+    """Next free host. ``start_after`` skips every address at or below that host.
+
+    A tunnel IP that was already issued must not be handed out again. Callers
+    pass the interface high-water mark so holes under it stay unused.
+    """
     from agent.support.l2tp_ip import wireguard_skips_host
 
-    reserved = _reserved_peer_addresses(subnet)
+    reserved = {_host_ip(item) for item in _reserved_peer_addresses(subnet)}
+    blocked = {_host_ip(item) for item in used} | reserved
+    blocked.discard("")
     network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+    floor = _ip_or_none(_host_ip(start_after))
     for host in network.hosts():
-        ip = str(host)
-        if ip in reserved or ip in used:
+        if floor is not None and int(host) <= int(floor):
             continue
-        if wireguard_skips_host(ip):
+        ip = str(host)
+        if ip in blocked or wireguard_skips_host(ip):
             continue
         return ip
     raise AgentError("VALIDATION_ERROR", "No free IPs in subnet")
@@ -467,6 +475,117 @@ def _host_ip(value: Any) -> str:
     return str(value or "").split("/", 1)[0].strip()
 
 
+def _ip_or_none(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not value:
+        return None
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def _widen_subnet_for_host(iface: dict[str, Any], host: str) -> bool:
+    """Grow a narrow pool (often /24) to its /16 when the database IP sits in that /16.
+
+    10.90.68.5 is inside 10.90.0.0/16 and outside 10.90.0.0/24. Leaving the
+    prefix unchanged makes sync keep the first auto host (10.90.0.2).
+    """
+    subnet = str(iface.get("subnet") or "").strip()
+    host = _host_ip(host)
+    if not subnet or not host:
+        return False
+    ip = _ip_or_none(host)
+    if ip is None:
+        return False
+    try:
+        network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+    except (AgentError, ValueError):
+        return False
+    if ip in network:
+        return False
+    expanded = _slash_16_supernet(subnet)
+    if expanded is None:
+        return False
+    parent = ipaddress.ip_network(expanded, strict=False)
+    if ip not in parent:
+        return False
+    iface["subnet"] = expanded
+    _ensure_interface_address(iface, previous_subnet=subnet)
+    log.info("wireguard widened subnet %s -> %s to fit %s", subnet, expanded, host)
+    return True
+
+
+def _ensure_address_cursor(iface: dict[str, Any], extra: set[str] | None = None) -> None:
+    """Remember the highest tunnel IP ever seen so later allocators cannot go backwards."""
+    best = _ip_or_none(_host_ip(iface.get("address_cursor")))
+    hosts = [_host_ip(peer.get("address")) for peer in iface.get("peers") or []]
+    hosts.extend(_host_ip(item) for item in (extra or set()))
+    for host in hosts:
+        ip = _ip_or_none(host)
+        if ip is None:
+            continue
+        if best is None or int(ip) > int(best):
+            best = ip
+    if best is not None:
+        iface["address_cursor"] = str(best)
+
+
+def _note_issued(iface: dict[str, Any], host: str) -> None:
+    ip = _ip_or_none(_host_ip(host))
+    if ip is None:
+        return
+    current = _ip_or_none(_host_ip(iface.get("address_cursor")))
+    if current is None or int(ip) > int(current):
+        iface["address_cursor"] = str(ip)
+
+
+def _auto_address(iface: dict[str, Any], subnet: str, blocked: set[str]) -> str:
+    _ensure_address_cursor(iface, blocked)
+    addr = _next_ip(
+        subnet,
+        blocked,
+        start_after=_host_ip(iface.get("address_cursor")) or None,
+    )
+    _note_issued(iface, addr)
+    return addr
+
+
+def _displace_peer_address(
+    iface: dict[str, Any],
+    requested: str,
+    *,
+    keep_id: str = "",
+    keep_email: str = "",
+) -> None:
+    """Move any other peer off ``requested`` onto a never-before-issued host."""
+    requested = _host_ip(requested)
+    if not requested:
+        return
+    peers = list(iface.get("peers") or [])
+    subnet = str(iface.get("subnet") or "")
+    for row in peers:
+        row_id = str(row.get("id") or "")
+        row_email = str(row.get("email") or "")
+        if keep_id and row_id == keep_id:
+            continue
+        if not keep_id and keep_email and row_email == keep_email:
+            continue
+        if _host_ip(row.get("address")) != requested:
+            continue
+        blocked = {_host_ip(peer.get("address")) for peer in peers}
+        blocked.add(requested)
+        blocked.discard("")
+        new_addr = _auto_address(iface, subnet, blocked)
+        row["address"] = new_addr
+        row["allowed_ips"] = f"{new_addr}/32"
+        log.info(
+            "wireguard moved peer %s off %s to %s",
+            row_email or row_id or "?",
+            requested,
+            new_addr,
+        )
+
+
 def _place_requested_peer_address(
     iface: dict[str, Any],
     peers: list[dict[str, Any]],
@@ -474,7 +593,7 @@ def _place_requested_peer_address(
     merged: dict[str, Any],
     payload: dict[str, Any],
 ) -> None:
-    """Keep the live tunnel IP unless the payload names the database address."""
+    """Write the database tunnel IP onto the peer, widening the pool when it fits the /16."""
     current = _host_ip(before.get("address"))
     if "address" not in payload or not _host_ip(payload.get("address")):
         merged["address"] = before.get("address")
@@ -487,9 +606,12 @@ def _place_requested_peer_address(
     except ValueError as exc:
         raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is not an IP", 422) from exc
 
+    _widen_subnet_for_host(iface, requested)
+
     if requested == current:
         merged["address"] = current
         merged["allowed_ips"] = before.get("allowed_ips") or f"{requested}/32"
+        _note_issued(iface, requested)
         return
 
     from agent.support.l2tp_ip import wireguard_skips_host
@@ -513,24 +635,24 @@ def _place_requested_peer_address(
                 f"Peer address [{requested}] is outside subnet [{subnet}]",
                 422,
             )
-        reserved = _reserved_peer_addresses(subnet) | _interface_gateway_reserved(iface)
+        reserved = {_host_ip(item) for item in _reserved_peer_addresses(subnet)}
+        reserved |= {_host_ip(item) for item in _interface_gateway_reserved(iface)}
         if requested in reserved:
-            raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is reserved", 422)
+            # A gateway or broadcast must not replace a real client address.
+            merged["address"] = before.get("address")
+            merged["allowed_ips"] = before.get("allowed_ips") or (f"{current}/32" if current else None)
+            return
 
     self_id = str(before.get("id") or "")
     self_email = str(before.get("email") or "")
-    for row in peers:
-        row_id = str(row.get("id") or "")
-        row_email = str(row.get("email") or "")
-        if self_id and row_id == self_id:
-            continue
-        if not self_id and self_email and row_email == self_email:
-            continue
-        if _host_ip(row.get("address")) == requested:
-            raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is already in use", 422)
+    holders = peers if peers else list(iface.get("peers") or [])
+    if holders is not iface.get("peers") and iface.get("peers"):
+        iface["peers"] = holders
+    _displace_peer_address(iface, requested, keep_id=self_id, keep_email=self_email)
 
     merged["address"] = requested
     merged["allowed_ips"] = f"{requested}/32"
+    _note_issued(iface, requested)
 
 
 def _assign_peer_address(
@@ -540,16 +662,68 @@ def _assign_peer_address(
     *,
     iface: dict[str, Any] | None = None,
 ) -> None:
-    """Pick a peer tunnel address; never assign gateway/broadcast/reserved hosts."""
-    reserved = _reserved_peer_addresses(subnet)
+    """Pick a peer tunnel address; a named database IP is never replaced with the first free host."""
     if iface is not None:
-        reserved |= _interface_gateway_reserved(iface)
-    requested = str(peer.get("address") or "").strip()
-    if requested and requested not in reserved and requested not in used_ips:
+        requested_probe = _host_ip(peer.get("address"))
+        if requested_probe and _widen_subnet_for_host(iface, requested_probe):
+            subnet = str(iface.get("subnet") or subnet)
+
+    reserved = {_host_ip(item) for item in _reserved_peer_addresses(subnet)}
+    if iface is not None:
+        reserved |= {_host_ip(item) for item in _interface_gateway_reserved(iface)}
+    reserved.discard("")
+
+    requested = _host_ip(peer.get("address"))
+    used_hosts = {_host_ip(item) for item in used_ips}
+    used_hosts.discard("")
+
+    if requested and requested not in reserved:
+        from agent.support.l2tp_ip import wireguard_skips_host
+
+        if wireguard_skips_host(requested):
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"Peer address [{requested}] is outside the WireGuard range",
+                422,
+            )
+        if subnet:
+            network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+            ip = _ip_or_none(requested)
+            if ip is None:
+                raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is not an IP", 422)
+            if ip not in network:
+                raise AgentError(
+                    "VALIDATION_ERROR",
+                    f"Peer address [{requested}] is outside subnet [{subnet}]",
+                    422,
+                )
+        if requested in used_hosts:
+            if iface is None:
+                raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is already in use", 422)
+            _displace_peer_address(
+                iface,
+                requested,
+                keep_id=str(peer.get("id") or ""),
+                keep_email=str(peer.get("email") or ""),
+            )
+            used_hosts = {_host_ip(row.get("address")) for row in iface.get("peers") or []}
+            used_hosts.discard("")
+            if requested in used_hosts:
+                raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is already in use", 422)
         peer["address"] = requested
-    else:
-        peer["address"] = _next_ip(subnet, used_ips | reserved)
+        peer["allowed_ips"] = f"{requested}/32"
+        if iface is not None:
+            _note_issued(iface, requested)
+        return
+
+    floor = None
+    if iface is not None:
+        _ensure_address_cursor(iface, used_hosts)
+        floor = _host_ip(iface.get("address_cursor")) or None
+    peer["address"] = _next_ip(subnet, used_hosts | reserved, start_after=floor)
     peer["allowed_ips"] = f"{peer['address']}/32"
+    if iface is not None:
+        _note_issued(iface, peer["address"])
 
 
 def _repair_reserved_peer_addresses(iface: dict[str, Any]) -> bool:
@@ -558,20 +732,24 @@ def _repair_reserved_peer_addresses(iface: dict[str, Any]) -> bool:
     if not subnet:
         return False
 
-    reserved = _reserved_peer_addresses(subnet) | _interface_gateway_reserved(iface)
+    reserved = {_host_ip(item) for item in _reserved_peer_addresses(subnet)}
+    reserved |= {_host_ip(item) for item in _interface_gateway_reserved(iface)}
+    reserved.discard("")
+    _ensure_address_cursor(iface)
     used: set[str] = set()
     for row in iface.get("peers", []):
-        addr = str(row.get("address") or "").strip()
+        addr = _host_ip(row.get("address"))
         if addr and addr not in reserved:
             used.add(addr)
 
     changed = False
     for row in iface.get("peers", []):
-        addr = str(row.get("address") or "").strip()
+        addr = _host_ip(row.get("address"))
         if addr and addr not in reserved:
             continue
-        new_addr = _next_ip(subnet, used)
+        new_addr = _next_ip(subnet, used, start_after=_host_ip(iface.get("address_cursor")) or None)
         used.add(new_addr)
+        _note_issued(iface, new_addr)
         row["address"] = new_addr
         row["allowed_ips"] = f"{new_addr}/32"
         changed = True
@@ -1149,7 +1327,9 @@ class WireGuardDriver(CoreDriver):
                     merged[key] = value
                 merged["private_key"] = before.get("private_key")
                 merged["public_key"] = before.get("public_key")
+                subnet_before = str(iface.get("subnet") or "")
                 _place_requested_peer_address(iface, list(iface.get("peers") or []), before, merged, payload)
+                subnet_changed = str(iface.get("subnet") or "") != subnet_before
                 if "exit_interface" in payload:
                     if "exit_interface" in normalized:
                         merged["exit_interface"] = normalized["exit_interface"]
@@ -1169,7 +1349,7 @@ class WireGuardDriver(CoreDriver):
                 iface["peers"][idx] = merged
 
                 # exit_interface / metadata-only updates must not wg syncconf + nft flush.
-                if _peer_change_needs_wg_apply(before, merged):
+                if _peer_change_needs_wg_apply(before, merged) or subnet_changed:
                     await self.update_interface(interface_id, iface)
                     await self._sync_linked_l2tp()
                 else:
@@ -1180,6 +1360,7 @@ class WireGuardDriver(CoreDriver):
 
     async def delete_peer(self, interface_id: int | str, peer_id: str) -> bool:
         iface = await self.get_interface(interface_id)
+        _ensure_address_cursor(iface)
         peers = iface.get("peers", [])
         drop_keys: list[str] = []
         filtered: list[dict[str, Any]] = []
@@ -1358,9 +1539,10 @@ class WireGuardDriver(CoreDriver):
         started = time.perf_counter()
         iface = deepcopy(await self.get_interface(interface_id))
         previous = deepcopy(iface)
+        _ensure_address_cursor(iface)
         by_id, by_email = self._peer_index(iface)
         rows: list[dict[str, Any]] = list(iface.get("peers", []))
-        used_ips = {str(p.get("address") or "") for p in rows if p.get("address")}
+        used_ips = {_host_ip(p.get("address")) for p in rows if _host_ip(p.get("address"))}
         await self._prefetch_create_keypairs(peers, by_id, by_email, mode_key)
 
         succeeded = 0
@@ -1429,6 +1611,12 @@ class WireGuardDriver(CoreDriver):
                     wg_apply = True
                     applied.append(created)
 
+                used_ips.clear()
+                used_ips.update(
+                    host
+                    for host in (_host_ip(row.get("address")) for row in rows)
+                    if host
+                )
                 succeeded += 1
             except Exception as exc:  # noqa: BLE001 — partial success per row
                 failed += 1
@@ -1457,6 +1645,8 @@ class WireGuardDriver(CoreDriver):
 
         iface["peers"] = rows
         _ensure_interface_address(iface, previous_subnet=str(previous.get("subnet") or "") or None)
+        if _subnet_prefix_widened(str(previous.get("subnet") or ""), str(iface.get("subnet") or "")):
+            wg_apply = True
         bring_up = _interface_needs_recycle(previous, iface)
         await self._validate_before_apply(iface)
         await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
@@ -1505,6 +1695,7 @@ class WireGuardDriver(CoreDriver):
         started = time.perf_counter()
         iface = deepcopy(await self.get_interface(interface_id))
         previous = deepcopy(iface)
+        _ensure_address_cursor(iface)
         remove_keys = set(email_keys + id_keys)
         errors: list[dict[str, str]] = []
         succeeded = 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import secrets
 import shutil
@@ -39,11 +40,62 @@ from agent.support.openvpn_ip import (
     normalize_openvpn_subnet,
     openvpn_gateway,
     openvpn_host,
+    widen_openvpn_subnet_for_host,
 )
 from agent.asyncutil import gather_independent
 from agent.support.process import run
 
 log = get_logger('openvpn')
+
+def _note_openvpn_issued(server: dict[str, Any], host: str) -> None:
+    host = openvpn_host(host)
+    if not host:
+        return
+    current = openvpn_host(server.get('address_cursor'))
+    if not current:
+        server['address_cursor'] = host
+        return
+    try:
+        if int(ipaddress.ip_address(host)) > int(ipaddress.ip_address(current)):
+            server['address_cursor'] = host
+    except ValueError:
+        server['address_cursor'] = host
+
+
+def _ensure_openvpn_cursor(server: dict[str, Any], extra: set[str] | None = None) -> None:
+    """Keep the highest issued OpenVPN host so freed addresses are not recycled."""
+    best = openvpn_host(server.get('address_cursor'))
+    hosts = [best]
+    for user in server.get('users') or []:
+        if isinstance(user, dict):
+            hosts.append(openvpn_host(user.get('address')))
+    for item in extra or set():
+        hosts.append(openvpn_host(item))
+    chosen = ''
+    score = -1
+    for host in hosts:
+        if not host:
+            continue
+        try:
+            rank = int(ipaddress.ip_address(host))
+        except ValueError:
+            continue
+        if rank > score:
+            score = rank
+            chosen = host
+    if chosen:
+        server['address_cursor'] = chosen
+
+
+def _fit_openvpn_subnet(server: dict[str, Any], subnet: str, host: str) -> str:
+    widened = widen_openvpn_subnet_for_host(subnet, host)
+    if not widened or widened == subnet:
+        return subnet
+    server['subnet'] = widened
+    server['gateway'] = openvpn_gateway(widened)
+    log.info('openvpn widened subnet %s -> %s to fit %s', subnet, widened, openvpn_host(host))
+    return widened
+
 
 _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
@@ -257,6 +309,8 @@ class OpenVpnDriver(CoreDriver):
 
         A host owned by another server is a real conflict and still fails.
         """
+        subnet = _fit_openvpn_subnet(server, subnet, requested)
+        _ensure_openvpn_cursor(server)
         requested = assert_openvpn_address(subnet, requested)
         if requested in used_elsewhere:
             raise AgentError(
@@ -270,7 +324,11 @@ class OpenVpnDriver(CoreDriver):
             requested,
             used_elsewhere,
             keep_user=keep_user,
+            floor=openvpn_host(server.get('address_cursor')) or None,
         )
+        for _label, _old, new in moved:
+            _note_openvpn_issued(server, new)
+        _note_openvpn_issued(server, requested)
         for label, old, new in moved:
             log.info(
                 'openvpn moved %s from %s to %s so %s can be claimed',
@@ -305,6 +363,7 @@ class OpenVpnDriver(CoreDriver):
         *,
         preferred: str | None = None,
         exclude_user_id: str | None = None,
+        start_after: str | None = None,
     ) -> str:
         used = await self._used_addresses(subnet)
         if exclude_user_id is not None:
@@ -314,13 +373,15 @@ class OpenVpnDriver(CoreDriver):
                         used.discard(str(user.get('address') or '').split('/', 1)[0].strip())
         preferred_host = str(preferred or '').strip()
         if preferred_host:
-            try:
-                preferred_host = assert_openvpn_address(subnet, preferred_host)
-                if preferred_host not in used:
-                    return preferred_host
-            except AgentError:
-                pass
-        return next_openvpn_ip(subnet, used)
+            preferred_host = assert_openvpn_address(subnet, preferred_host)
+            if preferred_host in used:
+                raise AgentError(
+                    'VALIDATION_ERROR',
+                    f'OpenVPN address [{preferred_host}] is already in use',
+                    422,
+                )
+            return preferred_host
+        return next_openvpn_ip(subnet, used, start_after=start_after)
 
     async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = await self.get_server(server_id)
@@ -389,13 +450,20 @@ class OpenVpnDriver(CoreDriver):
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        subnet = str(server.get('subnet') or '')
+        subnet_before = str(server.get('subnet') or '')
+        subnet = subnet_before
         preferred = openvpn_host(user.get('address'))
         if preferred:
+            subnet = _fit_openvpn_subnet(server, subnet, preferred)
             elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
             user['address'] = self._claim_address(server, subnet, preferred, elsewhere)
         else:
-            user['address'] = await self._allocate_address(subnet)
+            _ensure_openvpn_cursor(server)
+            user['address'] = await self._allocate_address(
+                subnet,
+                start_after=openvpn_host(server.get('address_cursor')) or None,
+            )
+            _note_openvpn_issued(server, user['address'])
         user.setdefault('incoming', 0)
         user.setdefault('outgoing', 0)
         user.setdefault('_incoming', 0)
@@ -410,7 +478,7 @@ class OpenVpnDriver(CoreDriver):
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self.audit.record('create', f'{self.key}/user/{user.get("id")}')
         if apply:
-            await self._commit_user_runtime(server)
+            await self._commit_after_user_change(server, subnet_before)
         return user
 
     async def update_user(
@@ -422,6 +490,7 @@ class OpenVpnDriver(CoreDriver):
         apply: bool = True,
     ) -> dict[str, Any]:
         server = await self.get_server(server_id)
+        subnet_before = str(server.get('subnet') or '')
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
                 merged = deepcopy(user)
@@ -435,7 +504,7 @@ class OpenVpnDriver(CoreDriver):
                 requested = openvpn_host(payload.get('address'))
                 current = openvpn_host(user.get('address'))
                 if requested and requested != current:
-                    subnet = str(server.get('subnet') or '')
+                    subnet = _fit_openvpn_subnet(server, str(server.get('subnet') or ''), requested)
                     elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
                     # Database address wins. Another user on this server is moved
                     # to a free host so a batch can swap tunnel IPs without failing.
@@ -456,12 +525,13 @@ class OpenVpnDriver(CoreDriver):
                 server['users'][idx] = merged
                 await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
                 if apply:
-                    await self._commit_user_runtime(server)
+                    await self._commit_after_user_change(server, subnet_before)
                 return merged
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
     async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
         server = await self.get_server(server_id)
+        _ensure_openvpn_cursor(server)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
         if len(filtered) == len(users):
@@ -478,6 +548,14 @@ class OpenVpnDriver(CoreDriver):
         await self._apply_server_auth_files(server)
         await self._sync_peer_egress()
 
+    async def _commit_after_user_change(self, server: dict[str, Any], subnet_before: str) -> None:
+        """Rewrite the server when the pool had to grow so the new tunnel IP is routed."""
+        if str(server.get('subnet') or '') != str(subnet_before or ''):
+            await self._apply_all_configs()
+            await self._ensure_services(start=True, restart=True)
+            return
+        await self._commit_user_runtime(server)
+
     async def batch_users(
         self,
         server_id: int | str,
@@ -492,6 +570,7 @@ class OpenVpnDriver(CoreDriver):
         applied = 0
         failed = 0
         errors: list[dict[str, Any]] = []
+        subnet_before = str((await self.get_server(server_id)).get('subnet') or '')
         # One database address can belong to only one row in this batch.
         # A later row must not steal it back from someone already placed.
         claimed_by: dict[str, str] = {}
@@ -530,10 +609,10 @@ class OpenVpnDriver(CoreDriver):
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
                     if applied:
-                        await self._commit_user_runtime(await self.get_server(server_id))
+                        await self._commit_after_user_change(await self.get_server(server_id), subnet_before)
                     raise
         if applied:
-            await self._commit_user_runtime(await self.get_server(server_id))
+            await self._commit_after_user_change(await self.get_server(server_id), subnet_before)
         return {'applied': applied, 'failed': failed, 'errors': errors}
 
     async def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:

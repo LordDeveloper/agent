@@ -42,7 +42,7 @@ def test_assign_peer_address_with_expand_on_full_slash_24():
     assert _assign_peer_address_with_expand(iface, peer, used) is True
     assert iface["subnet"] == "10.90.0.0/16"
     assert iface["interface_address"] == "10.90.68.1"
-    assert peer["address"] == "10.90.0.2"
+    assert peer["address"] == "10.90.68.255"
 
 
 def test_interface_address_preserved_after_manual_slash_16():
@@ -139,12 +139,12 @@ def test_repair_reserved_peer_addresses():
         ],
     }
     assert _repair_reserved_peer_addresses(iface) is True
-    assert iface["peers"][0]["address"] == "10.90.68.2"
-    assert iface["peers"][0]["allowed_ips"] == "10.90.68.2/32"
+    assert iface["peers"][0]["address"] == "10.90.68.6"
+    assert iface["peers"][0]["allowed_ips"] == "10.90.68.6/32"
     assert iface["peers"][1]["address"] == "10.90.68.5"
 
 
-def test_merge_peer_row_keeps_address_and_allowed_ips():
+def test_merge_peer_row_keeps_reserved_address():
     driver = WireGuardDriver.__new__(WireGuardDriver)
     before = {
         "id": "S66SZo",
@@ -155,6 +155,7 @@ def test_merge_peer_row_keeps_address_and_allowed_ips():
         "public_key": "pub",
         "volume": 10,
     }
+    iface = {"subnet": "10.90.68.0/24", "peers": [before]}
     merged = driver._merge_peer_row(
         before,
         {
@@ -164,12 +165,47 @@ def test_merge_peer_row_keeps_address_and_allowed_ips():
             "private_key": "other",
             "public_key": "other-pub",
         },
+        iface,
+        iface["peers"],
     )
     assert merged["address"] == "10.90.68.5"
     assert merged["allowed_ips"] == "10.90.68.5/32"
     assert merged["volume"] == 999
     assert merged["private_key"] == "priv"
     assert merged["public_key"] == "pub"
+
+
+def test_merge_writes_database_address_and_widens_subnet():
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    before = {
+        "id": "peer-1",
+        "email": "peer-1",
+        "address": "10.90.0.2",
+        "allowed_ips": "10.90.0.2/32",
+        "private_key": "priv",
+        "public_key": "pub",
+    }
+    iface = {"subnet": "10.90.0.0/24", "peers": [before]}
+    merged = driver._merge_peer_row(
+        before,
+        {"address": "10.90.68.5", "allowed_ips": "10.90.0.2/32"},
+        iface,
+        iface["peers"],
+    )
+    assert merged["address"] == "10.90.68.5"
+    assert merged["allowed_ips"] == "10.90.68.5/32"
+    assert iface["subnet"] == "10.90.0.0/16"
+
+
+def test_assign_without_address_does_not_reuse_lower_holes():
+    iface = {
+        "subnet": "10.90.0.0/16",
+        "interface_address": "10.90.0.1",
+        "peers": [{"address": "10.90.68.5"}],
+    }
+    peer: dict = {}
+    _assign_peer_address(peer, "10.90.0.0/16", {"10.90.68.5"}, iface=iface)
+    assert peer["address"] == "10.90.68.6"
 
 
 def test_peer_config_includes_default_mtu(monkeypatch):

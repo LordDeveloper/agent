@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import secrets
 import shutil
 import subprocess
@@ -42,6 +43,50 @@ log = get_logger('l2tp')
 _ONLINE_SECONDS = 180
 _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
+
+
+def _l2tp_host(value: Any) -> str:
+    return str(value or '').split('/', 1)[0].strip()
+
+
+def _note_l2tp_issued(server: dict[str, Any], host: str) -> None:
+    host = _l2tp_host(host)
+    if not host:
+        return
+    current = _l2tp_host(server.get('address_cursor'))
+    if not current:
+        server['address_cursor'] = host
+        return
+    try:
+        if int(ipaddress.ip_address(host)) > int(ipaddress.ip_address(current)):
+            server['address_cursor'] = host
+    except ValueError:
+        server['address_cursor'] = host
+
+
+def _ensure_l2tp_cursor(server: dict[str, Any], extra: set[str] | None = None) -> None:
+    """Highest issued L2TP host. Later auto-allocation starts after it."""
+    best = _l2tp_host(server.get('address_cursor'))
+    hosts = [best]
+    for user in server.get('users') or []:
+        if isinstance(user, dict):
+            hosts.append(_l2tp_host(user.get('address')))
+    for item in extra or set():
+        hosts.append(_l2tp_host(item))
+    chosen = ''
+    score = -1
+    for host in hosts:
+        if not host:
+            continue
+        try:
+            rank = int(ipaddress.ip_address(host))
+        except ValueError:
+            continue
+        if rank > score:
+            score = rank
+            chosen = host
+    if chosen:
+        server['address_cursor'] = chosen
 
 
 def _gen_username(prefix: str = 'u') -> str:
@@ -216,8 +261,13 @@ class L2tpDriver(CoreDriver):
         *,
         preferred: str | None = None,
         exclude_user_id: str | None = None,
+        server: dict[str, Any] | None = None,
     ) -> str:
-        """Pick a free L2TP client IP unique across every server on this /16."""
+        """Pick a free L2TP client IP unique across every server on this /16.
+
+        A preferred (database) address is used as-is. It is never replaced with
+        the first free host when it does not fit or is already taken.
+        """
         used = await self._used_addresses_for_subnet(subnet)
         if exclude_user_id is not None:
             for row in await self.list_servers():
@@ -225,16 +275,27 @@ class L2tpDriver(CoreDriver):
                     if str(user.get('id')) == str(exclude_user_id):
                         used.discard(str(user.get('address') or '').strip())
 
-        preferred_host = str(preferred or '').strip()
+        preferred_host = _l2tp_host(preferred)
         if preferred_host:
-            try:
-                preferred_host = assert_l2tp_address(subnet, preferred_host)
-                if preferred_host not in used:
-                    return preferred_host
-            except AgentError:
-                pass
+            preferred_host = assert_l2tp_address(subnet, preferred_host)
+            if preferred_host in used:
+                raise AgentError(
+                    'VALIDATION_ERROR',
+                    f'L2TP address [{preferred_host}] is already in use',
+                    422,
+                )
+            if server is not None:
+                _note_l2tp_issued(server, preferred_host)
+            return preferred_host
 
-        return next_l2tp_ip(subnet, used)
+        floor = None
+        if server is not None:
+            _ensure_l2tp_cursor(server, used)
+            floor = _l2tp_host(server.get('address_cursor')) or None
+        addr = next_l2tp_ip(subnet, used, start_after=floor)
+        if server is not None:
+            _note_l2tp_issued(server, addr)
+        return addr
 
     async def _repair_duplicate_addresses(self) -> int:
         """Reassign client IPs that collide across companion/pure L2TP servers."""
@@ -434,6 +495,7 @@ class L2tpDriver(CoreDriver):
         user['address'] = await self._allocate_l2tp_address(
             str(server.get('subnet') or ''),
             preferred=str(user.get('address') or '') or None,
+            server=server,
         )
 
         user.setdefault('incoming', 0)
@@ -482,8 +544,10 @@ class L2tpDriver(CoreDriver):
                     if requested in used:
                         raise AgentError('VALIDATION_ERROR', f'L2TP address [{requested}] is already in use', 422)
                     merged['address'] = requested
+                    _note_l2tp_issued(server, requested)
                 else:
                     merged['address'] = user.get('address')
+                    _note_l2tp_issued(server, str(merged.get('address') or ''))
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 
@@ -499,6 +563,7 @@ class L2tpDriver(CoreDriver):
 
     async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
         server = await self.get_server(server_id)
+        _ensure_l2tp_cursor(server)
         users = server.get('users') or []
         filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
         if len(filtered) == len(users):

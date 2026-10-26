@@ -68,6 +68,7 @@ def move_holders_off_address(
     used_elsewhere: Iterable[str] = (),
     *,
     keep_user: dict[str, Any] | None = None,
+    floor: str | None = None,
 ) -> list[tuple[str, str, str]]:
     """Free `requested` on this server by moving other users to a spare host.
 
@@ -92,7 +93,7 @@ def move_holders_off_address(
         current = openvpn_host(user.get('address'))
         if current != requested:
             continue
-        new_addr = next_openvpn_ip(subnet, taken)
+        new_addr = next_openvpn_ip(subnet, taken, start_after=floor)
         user['address'] = new_addr
         taken.add(new_addr)
         label = str(user.get('email') or user.get('id') or '?')
@@ -100,11 +101,39 @@ def move_holders_off_address(
     return moved
 
 
-def next_openvpn_ip(subnet: str, used: Iterable[str]) -> str:
+def widen_openvpn_subnet_for_host(subnet: str, host: str) -> str | None:
+    """Return the containing /16 when ``host`` is outside ``subnet`` but inside that /16."""
+    text = openvpn_host(host)
+    if not text:
+        return None
+    try:
+        ip = ipaddress.ip_address(text)
+        network = ipaddress.ip_network(normalize_openvpn_subnet(subnet), strict=False)
+    except (AgentError, ValueError):
+        return None
+    if ip.version != 4 or ip in network or network.prefixlen <= 16:
+        return None
+    octets = network.network_address.packed
+    parent = ipaddress.ip_network(f'{octets[0]}.{octets[1]}.0.0/16', strict=False)
+    if ip not in parent:
+        return None
+    return str(parent)
+
+
+def next_openvpn_ip(subnet: str, used: Iterable[str], *, start_after: str | None = None) -> str:
     network = ipaddress.ip_network(normalize_openvpn_subnet(subnet), strict=False)
     taken = {str(item).split('/', 1)[0].strip() for item in used if str(item or '').strip()}
     taken.add(openvpn_gateway(str(network)))
+    floor = openvpn_host(start_after)
+    floor_ip = None
+    if floor:
+        try:
+            floor_ip = ipaddress.ip_address(floor)
+        except ValueError:
+            floor_ip = None
     for host in network.hosts():
+        if floor_ip is not None and int(host) <= int(floor_ip):
+            continue
         text = str(host)
         if text not in taken:
             return text

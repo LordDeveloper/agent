@@ -66,17 +66,27 @@ def _l2tp_reserved(subnet: str) -> set[str]:
     return reserved
 
 
-def next_l2tp_ip(subnet: str, used: set[str]) -> str:
+def next_l2tp_ip(subnet: str, used: set[str], *, start_after: str | None = None) -> str:
+    """Next free L2TP host. Addresses at or below ``start_after`` are not reused."""
     reserved = _l2tp_reserved(subnet)
     start, end = l2tp_pool_bounds(subnet)
     start_ip = ipaddress.ip_address(start)
     end_ip = ipaddress.ip_address(end)
+    floor = str(start_after or '').split('/', 1)[0].strip()
+    floor_ip = None
+    if floor:
+        try:
+            floor_ip = ipaddress.ip_address(floor)
+        except ValueError:
+            floor_ip = None
     current = int(start_ip)
     last = int(end_ip)
     while current <= last:
         host = ipaddress.ip_address(current)
         label = str(host)
         current += 1
+        if floor_ip is not None and int(host) <= int(floor_ip):
+            continue
         if label in reserved or label in used:
             continue
         return label
