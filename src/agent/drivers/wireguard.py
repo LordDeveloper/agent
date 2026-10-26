@@ -463,6 +463,76 @@ def _assign_peer_address_with_expand(
 _IMMUTABLE_PEER_KEYS = frozenset({"private_key", "public_key", "address", "allowed_ips"})
 
 
+def _host_ip(value: Any) -> str:
+    return str(value or "").split("/", 1)[0].strip()
+
+
+def _place_requested_peer_address(
+    iface: dict[str, Any],
+    peers: list[dict[str, Any]],
+    before: dict[str, Any],
+    merged: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    """Keep the live tunnel IP unless the payload names the database address."""
+    current = _host_ip(before.get("address"))
+    if "address" not in payload or not _host_ip(payload.get("address")):
+        merged["address"] = before.get("address")
+        merged["allowed_ips"] = before.get("allowed_ips") or (f"{current}/32" if current else None)
+        return
+
+    requested = _host_ip(payload.get("address"))
+    try:
+        ip = ipaddress.ip_address(requested)
+    except ValueError as exc:
+        raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is not an IP", 422) from exc
+
+    if requested == current:
+        merged["address"] = current
+        merged["allowed_ips"] = before.get("allowed_ips") or f"{requested}/32"
+        return
+
+    from agent.support.l2tp_ip import wireguard_skips_host
+
+    if wireguard_skips_host(requested):
+        raise AgentError(
+            "VALIDATION_ERROR",
+            f"Peer address [{requested}] is outside the WireGuard range",
+            422,
+        )
+
+    subnet = str(iface.get("subnet") or "").strip()
+    if subnet:
+        try:
+            network = ipaddress.ip_network(_normalize_subnet(subnet), strict=False)
+        except ValueError as exc:
+            raise AgentError("VALIDATION_ERROR", f"Interface subnet [{subnet}] is invalid", 422) from exc
+        if ip not in network:
+            raise AgentError(
+                "VALIDATION_ERROR",
+                f"Peer address [{requested}] is outside subnet [{subnet}]",
+                422,
+            )
+        reserved = _reserved_peer_addresses(subnet) | _interface_gateway_reserved(iface)
+        if requested in reserved:
+            raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is reserved", 422)
+
+    self_id = str(before.get("id") or "")
+    self_email = str(before.get("email") or "")
+    for row in peers:
+        row_id = str(row.get("id") or "")
+        row_email = str(row.get("email") or "")
+        if self_id and row_id == self_id:
+            continue
+        if not self_id and self_email and row_email == self_email:
+            continue
+        if _host_ip(row.get("address")) == requested:
+            raise AgentError("VALIDATION_ERROR", f"Peer address [{requested}] is already in use", 422)
+
+    merged["address"] = requested
+    merged["allowed_ips"] = f"{requested}/32"
+
+
 def _assign_peer_address(
     peer: dict[str, Any],
     subnet: str,
@@ -1072,18 +1142,14 @@ class WireGuardDriver(CoreDriver):
                 before = deepcopy(peer)
                 merged = deepcopy(peer)
                 normalized = normalize_peer(payload)
-                # Peer keys and tunnel slot (address/allowed_ips) are immutable after create.
+                # Keys stay put. An explicit address is the panel tunnel IP and replaces the live one.
                 for key, value in normalized.items():
                     if key in _IMMUTABLE_PEER_KEYS:
                         continue
                     merged[key] = value
-                # Keep live identity material even if caller sent blank/stale values.
                 merged["private_key"] = before.get("private_key")
                 merged["public_key"] = before.get("public_key")
-                merged["address"] = before.get("address")
-                merged["allowed_ips"] = before.get("allowed_ips") or (
-                    f"{before.get('address')}/32" if before.get("address") else None
-                )
+                _place_requested_peer_address(iface, list(iface.get("peers") or []), before, merged, payload)
                 if "exit_interface" in payload:
                     if "exit_interface" in normalized:
                         merged["exit_interface"] = normalized["exit_interface"]
@@ -1233,7 +1299,13 @@ class WireGuardDriver(CoreDriver):
             if old_val > 0 and new_val < old_val:
                 merged[key] = old_val
 
-    def _merge_peer_row(self, before: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    def _merge_peer_row(
+        self,
+        before: dict[str, Any],
+        payload: dict[str, Any],
+        iface: dict[str, Any] | None = None,
+        peers: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         merged = deepcopy(before)
         normalized = normalize_peer(payload)
         for key, value in normalized.items():
@@ -1245,10 +1317,7 @@ class WireGuardDriver(CoreDriver):
             merged[key] = value
         merged["private_key"] = before.get("private_key")
         merged["public_key"] = before.get("public_key")
-        merged["address"] = before.get("address")
-        merged["allowed_ips"] = before.get("allowed_ips") or (
-            f"{before.get('address')}/32" if before.get("address") else None
-        )
+        _place_requested_peer_address(iface or {}, peers or [], before, merged, payload)
         if "exit_interface" in payload:
             if "exit_interface" in normalized:
                 merged["exit_interface"] = normalized["exit_interface"]
@@ -1326,7 +1395,13 @@ class WireGuardDriver(CoreDriver):
 
                 if existing is not None:
                     before = deepcopy(existing)
-                    merged = self._merge_peer_row(before, raw)
+                    merged = self._merge_peer_row(before, raw, iface, rows)
+                    old_ip = _host_ip(before.get("address"))
+                    new_ip = _host_ip(merged.get("address"))
+                    if old_ip and old_ip != new_ip:
+                        used_ips.discard(old_ip)
+                    if new_ip:
+                        used_ips.add(new_ip)
                     if _peer_change_needs_wg_apply(before, merged):
                         wg_apply = True
                     else:

@@ -369,7 +369,18 @@ class OpenVpnDriver(CoreDriver):
                     merged[key] = value
                 merged['username'] = user.get('username')
                 merged['password'] = user.get('password')
-                merged['address'] = user.get('address')
+                requested = str(payload.get('address') or '').split('/', 1)[0].strip()
+                current = str(user.get('address') or '').split('/', 1)[0].strip()
+                if requested and requested != current:
+                    subnet = str(server.get('subnet') or '')
+                    requested = assert_openvpn_address(subnet, requested)
+                    used = await self._used_addresses(subnet)
+                    used.discard(current)
+                    if requested in used:
+                        raise AgentError('VALIDATION_ERROR', f'OpenVPN address [{requested}] is already in use', 422)
+                    merged['address'] = requested
+                else:
+                    merged['address'] = user.get('address')
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 
