@@ -210,7 +210,7 @@ def _show_agent_status() -> None:
             color = GREEN if info.running else YELLOW
             _print(paint(f"  {info.label:<12} {version}  ({', '.join(bits)})", color))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_core_list() -> None:
@@ -249,7 +249,7 @@ def _show_service_reload() -> None:
     try:
         report = run_sync(reload_stored_services(runtime.settings, runtime.store, runtime.registry))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     _print_reload_report(report)
 
 
@@ -392,7 +392,34 @@ def _show_core_runtime_status(name: str) -> None:
         _print(kv("Running", "yes" if running else "no", GREEN if running else RED))
         _print(kv("Version", version, WHITE))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
+
+
+def _core_waiting_for_server(result: object) -> bool:
+    return (
+        isinstance(result, dict)
+        and result.get("servers") == 0
+        and result.get("running") is False
+    )
+
+
+def _print_core_lifecycle(label: str, verb: str, result: object) -> None:
+    if _core_waiting_for_server(result):
+        _print(paint(
+            f"  {label} is installed. No server is stored yet, so nothing was {verb}.",
+            YELLOW,
+        ))
+        _print(paint(
+            "  The panel writes the server during transfer; reload starts it after that.",
+            DIM,
+        ))
+        return
+    _print(paint(f"  {label} {verb}.", GREEN))
+    if isinstance(result, dict) and result:
+        for key, value in result.items():
+            if key in {"enabled", "restarted"}:
+                continue
+            _print(kv(str(key), str(value), DIM))
 
 
 def _show_core_start(name: str) -> None:
@@ -411,14 +438,9 @@ def _show_core_start(name: str) -> None:
             _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
             return
         result = run_sync(driver.enable())
-        _print(paint(f"  {label} started.", GREEN))
-        if isinstance(result, dict) and result:
-            for key, value in result.items():
-                if key in {"enabled", "restarted"}:
-                    continue
-                _print(kv(str(key), str(value), DIM))
+        _print_core_lifecycle(label, "started", result)
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_core_restart(name: str) -> None:
@@ -437,14 +459,24 @@ def _show_core_restart(name: str) -> None:
             _print(paint(f"  {label} is not installed. Use Install first.", YELLOW))
             return
         result = run_sync(driver.restart())
-        _print(paint(f"  {label} restarted.", GREEN))
-        if isinstance(result, dict) and result:
-            for key, value in result.items():
-                if key in {"enabled", "restarted"}:
-                    continue
-                _print(kv(str(key), str(value), DIM))
+        _print_core_lifecycle(label, "restarted", result)
     finally:
-        runtime.close()
+        run_sync(runtime.close())
+
+
+def _show_openvpn_create_server() -> None:
+    from agent.runtime import open_runtime
+
+    runtime = open_runtime()
+    try:
+        driver = runtime.registry.get("openvpn", require_enabled=False)
+        server = run_sync(driver.create_server({}))
+        _print(paint("  OpenVPN server created.", GREEN))
+        for key in ("id", "name", "listen_port", "proto", "subnet", "tun_dev"):
+            if isinstance(server, dict) and key in server:
+                _print(kv(str(key), str(server[key]), DIM))
+    finally:
+        run_sync(runtime.close())
 
 
 def _core_ops_menu(name: str) -> None:
@@ -457,6 +489,17 @@ def _core_ops_menu(name: str) -> None:
                 [
                     Choice("latest", "Install / update latest release", GREEN, "1"),
                     Choice("tag", "Install custom tag", CYAN, "2"),
+                    Choice("start", "Start", GREEN, "3"),
+                    Choice("restart", "Restart", YELLOW, "4"),
+                    Choice("status", "Status", WHITE, "5"),
+                    Choice("back", "Back", WHITE, "0"),
+                ]
+            )
+        elif name == "openvpn":
+            choices.extend(
+                [
+                    Choice("install", f"Install {label}", GREEN, "1"),
+                    Choice("create", "Create Server", CYAN, "2"),
                     Choice("start", "Start", GREEN, "3"),
                     Choice("restart", "Restart", YELLOW, "4"),
                     Choice("status", "Status", WHITE, "5"),
@@ -495,6 +538,12 @@ def _core_ops_menu(name: str) -> None:
             if not confirm(f"Restart {label} now?", default=True):
                 continue
             _run_action(f"Restart {label}", lambda n=name: _show_core_restart(n))
+            continue
+
+        if picked == "create":
+            if not confirm("Create an OpenVPN server?", default=True):
+                continue
+            _run_action("Create OpenVPN server", _show_openvpn_create_server)
             continue
 
         if picked == "install":
@@ -585,7 +634,7 @@ def _show_stats(*, online_only: bool) -> None:
                 label = client.email or client.id or "-"
                 _print(paint(f"    {label}  in={client.incoming}  out={client.outgoing}", WHITE))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_update(*, check: bool, force: bool) -> None:
@@ -1287,7 +1336,7 @@ def _show_mullvad_set_account() -> None:
         if prop:
             _print(kv("Updated ifaces", str(prop.get("updated_count") or 0), CYAN))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_status() -> None:
@@ -1314,7 +1363,7 @@ def _show_mullvad_status() -> None:
                 tone,
             ))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _mullvad_service_menu() -> None:
@@ -1352,7 +1401,7 @@ def _show_mullvad_service_bulk(action: str) -> None:
         for row in result.get("errors") or []:
             _print(paint(f"  {row.get('iface')}: {row.get('error')}", RED))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_service_one() -> None:
@@ -1386,7 +1435,7 @@ def _show_mullvad_service_one() -> None:
         result = run_sync(service.control_tunnel(iface, action))
         _print(paint(f"  {result.get('message')}", GREEN if result.get("ok") else RED))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_auto_fallback() -> None:
@@ -1413,7 +1462,7 @@ def _show_mullvad_auto_fallback() -> None:
             GREEN if enabled else YELLOW,
         ))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_relay_metric() -> None:
@@ -1436,7 +1485,7 @@ def _show_mullvad_relay_metric() -> None:
         if picked == "speed":
             _print(paint("  Speed ranking uses curl --interface <iface> (shared tunnel IP is ignored).", CYAN))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_fallback(optimize: bool = False) -> None:
@@ -1455,7 +1504,7 @@ def _show_mullvad_fallback(optimize: bool = False) -> None:
         for row in failed:
             _print(paint(f"  {row.get('iface')}: {row.get('message')}", RED))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_switch_relay() -> None:
@@ -1502,7 +1551,7 @@ def _show_mullvad_switch_relay() -> None:
         _print(kv("Hostname", result.get("hostname") or "-", WHITE))
         _print(kv("Iface", result.get("iface") or "-", WHITE))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _show_mullvad_refresh() -> None:
@@ -1520,7 +1569,7 @@ def _show_mullvad_refresh() -> None:
                 CYAN,
             ))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _token_menu() -> None:

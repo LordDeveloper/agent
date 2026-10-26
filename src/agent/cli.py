@@ -55,7 +55,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         host = args.host
     if args.port:
         port = args.port
-    runtime.close()
+    run_sync(runtime.close())
     uvicorn.run(create_app(args.env_file), host=host, port=port, factory=False)
     return 0
 
@@ -86,7 +86,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             }
         )
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -104,7 +104,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
             payload = {"success": True, "users": payload["online"]}
         _print_json(payload)
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -130,7 +130,7 @@ def cmd_core_list(args: argparse.Namespace) -> int:
                 rows.append({"key": key, "enabled": False})
         _print_json({"success": True, "cores": rows})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -216,7 +216,7 @@ def cmd_service_reload() -> int:
     try:
         report = run_sync(reload_stored_services(runtime.settings, runtime.store, runtime.registry))
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     _print_json({"success": bool(report.get("ok")), **report})
     return 0 if report.get("ok") else 1
 
@@ -478,7 +478,7 @@ def cmd_peer_diagnose(args: argparse.Namespace) -> int:
             return 2
         return 0 if healthy else 1
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def cmd_client_diagnose(args: argparse.Namespace) -> int:
@@ -498,7 +498,7 @@ def cmd_client_diagnose(args: argparse.Namespace) -> int:
             return 2
         return 0 if healthy else 1
     finally:
-        runtime.close()
+        run_sync(runtime.close())
 
 
 def _mullvad_service(args: argparse.Namespace):
@@ -514,7 +514,7 @@ def cmd_mullvad_status(args: argparse.Namespace) -> int:
     try:
         _print_json({"success": True, **run_sync(service.status(probe=bool(getattr(args, "probe", False))))})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -525,7 +525,7 @@ def cmd_mullvad_settings_get(args: argparse.Namespace) -> int:
         public = {k: v for k, v in settings.items() if k != "private_key"}
         _print_json({"success": True, "settings": public})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -547,7 +547,7 @@ def cmd_mullvad_settings_set(args: argparse.Namespace) -> int:
         public = {k: v for k, v in saved.items() if k != "private_key"}
         _print_json({"success": True, "settings": public})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -575,7 +575,7 @@ def cmd_mullvad_auto_fallback(args: argparse.Namespace) -> int:
             "message": "auto fallback enabled" if enabled else "auto fallback disabled",
         })
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -590,7 +590,7 @@ def cmd_mullvad_service(args: argparse.Namespace) -> int:
             payload = run_sync(service.control_tunnels(action))
         _print_json({"success": True, **payload})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -601,7 +601,7 @@ def cmd_mullvad_fallback(args: argparse.Namespace) -> int:
         payload = run_sync(service.fallback(country, optimize=bool(getattr(args, "optimize", False))))
         _print_json({"success": True, **payload})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -610,7 +610,7 @@ def cmd_mullvad_restore(args: argparse.Namespace) -> int:
     try:
         _print_json({"success": True, **run_sync(service.restore_interfaces())})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 
@@ -619,7 +619,7 @@ def cmd_mullvad_ensure(args: argparse.Namespace) -> int:
     try:
         _print_json({"success": True, **run_sync(service.ensure(str(args.country)))})
     finally:
-        runtime.close()
+        run_sync(runtime.close())
     return 0
 
 

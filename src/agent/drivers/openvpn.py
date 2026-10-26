@@ -117,12 +117,15 @@ class OpenVpnDriver(CoreDriver):
 
     async def enable(self) -> dict[str, Any]:
         servers = await self.list_servers()
+        # Transfer enables the core before the snapshot lands. An empty store
+        # is not a failure; reload starts the units once servers exist.
         if not servers:
-            raise AgentError(
-                'VALIDATION_ERROR',
-                'No OpenVPN server configured — create a server from the panel (or API) first, then Start',
-                400,
-            )
+            return {
+                'enabled': True,
+                'servers': 0,
+                'units': [],
+                'running': False,
+            }
         await self._apply_all_configs()
         units = await self._ensure_services(start=True)
         await self._sync_peer_egress()
@@ -143,11 +146,12 @@ class OpenVpnDriver(CoreDriver):
     async def restart(self) -> dict[str, Any]:
         servers = await self.list_servers()
         if not servers:
-            raise AgentError(
-                'VALIDATION_ERROR',
-                'No OpenVPN server configured — create a server from the panel (or API) first, then Restart',
-                400,
-            )
+            return {
+                'restarted': True,
+                'servers': 0,
+                'units': [],
+                'running': False,
+            }
         await self._apply_all_configs()
         units = await self._ensure_services(start=True, restart=True)
         return {'restarted': True, 'units': units, 'running': await self.running()}

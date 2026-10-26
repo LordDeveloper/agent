@@ -242,3 +242,16 @@ def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
     bundle = asyncio.run(scenario())
     assert "CA" in bundle["ovpn"]
     assert "TC" in bundle["ovpn"]
+
+
+def test_enable_and_restart_with_no_servers(tmp_path: Path):
+    drv = _driver(tmp_path)
+
+    async def scenario():
+        enabled = await drv.enable()
+        restarted = await drv.restart()
+        return enabled, restarted
+
+    enabled, restarted = asyncio.run(scenario())
+    assert enabled == {"enabled": True, "servers": 0, "units": [], "running": False}
+    assert restarted == {"restarted": True, "servers": 0, "units": [], "running": False}
