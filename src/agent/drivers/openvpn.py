@@ -278,7 +278,7 @@ class OpenVpnDriver(CoreDriver):
         await self.store.put_doc(self.key, self._kind, str(server_id), server)
         await self.audit.record('create', f'{self.key}/server/{server_id}')
         await self._apply_all_configs()
-        await self._ensure_services(start=True)
+        await self._ensure_services(start=True, only_ids=[server_id])
         return await self.get_server(server_id)
 
     async def _default_subnet(self, server_id: int | str) -> str:
@@ -408,20 +408,69 @@ class OpenVpnDriver(CoreDriver):
             return preferred_host
         return next_openvpn_ip(subnet, used, start_after=start_after)
 
+    def _conf_listen_port(self, text: str) -> int | None:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('port '):
+                try:
+                    port = int(stripped.split()[1])
+                except (IndexError, ValueError):
+                    return None
+                return port if 1 <= port <= 65535 else None
+        return None
+
+    def _with_conf_listen_port(self, text: str, port: int) -> str:
+        lines: list[str] = []
+        replaced = False
+        for line in text.splitlines():
+            if line.strip().startswith('port '):
+                lines.append(f'port {int(port)}')
+                replaced = True
+            else:
+                lines.append(line)
+        if not replaced:
+            lines.insert(0, f'port {int(port)}')
+        return '\n'.join(lines) + '\n'
+
+    def _disk_listen_bindings(
+        self,
+        *,
+        exclude_instance: str | None = None,
+        proto: str = 'udp',
+    ) -> set[tuple[str, int]]:
+        used: set[tuple[str, int]] = set()
+        proto = proto if proto in {'udp', 'tcp'} else 'udp'
+        if not _SYSTEM_SERVER_ROOT.is_dir():
+            return used
+        for conf in _SYSTEM_SERVER_ROOT.glob('*.conf'):
+            if exclude_instance and conf.stem == exclude_instance:
+                continue
+            try:
+                port = self._conf_listen_port(conf.read_text(encoding='utf-8'))
+            except OSError:
+                continue
+            if port:
+                used.add((proto, port))
+        return used
+
     async def _listen_bindings(self, *, exclude_id: int | str | None = None) -> set[tuple[str, int]]:
         used: set[tuple[str, int]] = set()
+        exclude_instance = None
         for row in await self.list_servers():
-            if exclude_id is not None and str(row.get('id')) == str(exclude_id):
-                continue
             proto = str(row.get('proto') or 'udp').strip().lower()
             if proto not in {'udp', 'tcp'}:
                 proto = 'udp'
+            instance = instance_name_for_server(row)
+            if exclude_id is not None and str(row.get('id')) == str(exclude_id):
+                exclude_instance = instance
+                continue
             try:
                 port = int(row.get('listen_port') or 0)
             except (TypeError, ValueError):
-                continue
+                port = 0
             if 1 <= port <= 65535:
                 used.add((proto, port))
+        used |= self._disk_listen_bindings(exclude_instance=exclude_instance)
         return used
 
     async def _allocate_listen_port(
@@ -529,7 +578,7 @@ class OpenVpnDriver(CoreDriver):
         )
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self._apply_all_configs()
-        await self._ensure_services(start=True, restart=True)
+        await self._ensure_services(start=True, restart=True, only_ids=[server.get('id')])
         return await self.get_server(server.get('id'))
 
     async def delete_server(self, server_id: int | str) -> bool:
@@ -662,7 +711,7 @@ class OpenVpnDriver(CoreDriver):
         """Rewrite the server when the pool had to grow so the new tunnel IP is routed."""
         if str(server.get('subnet') or '') != str(subnet_before or ''):
             await self._apply_all_configs()
-            await self._ensure_services(start=True, restart=True)
+            await self._ensure_services(start=True, restart=True, only_ids=[server.get('id')])
             return
         await self._commit_user_runtime(server)
 
@@ -1226,6 +1275,11 @@ class OpenVpnDriver(CoreDriver):
                 auth_script=auth_script,
                 dns_servers=dns_servers,
             )
+            try:
+                port = int(server.get('listen_port') or 1194)
+            except (TypeError, ValueError):
+                port = 1194
+            conf_text = self._with_conf_listen_port(conf_text, port)
             conf_path = _SYSTEM_SERVER_ROOT / f'{instance}.conf'
             conf_path.write_text(conf_text, encoding='utf-8')
             # Staging copy for debugging / backup.
@@ -1233,8 +1287,14 @@ class OpenVpnDriver(CoreDriver):
 
         await self._sync_peer_egress()
 
-    async def _ensure_services(self, *, start: bool, restart: bool = False) -> list[dict[str, Any]]:
-        """Enable+start each openvpn-server@ unit and fail loudly if not active."""
+    async def _ensure_services(
+        self,
+        *,
+        start: bool,
+        restart: bool = False,
+        only_ids: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Enable+start OpenVPN units. Fail only for the requested set."""
         if not start:
             return []
 
@@ -1242,6 +1302,9 @@ class OpenVpnDriver(CoreDriver):
         await run(['systemctl', 'daemon-reload'], check=False, timeout=30)
 
         servers = await self.list_servers()
+        if only_ids is not None:
+            wanted = {str(item) for item in only_ids if item is not None}
+            servers = [row for row in servers if str(row.get('id')) in wanted]
         if not servers:
             return []
 
