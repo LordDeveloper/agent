@@ -102,6 +102,14 @@ _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
 # Lifetime counters are owned by sync_user_stats. A panel push must not rewrite them.
 _USAGE_COUNTER_KEYS = frozenset({'incoming', 'outgoing', '_incoming', '_outgoing'})
 _SYSTEM_SERVER_ROOT = Path('/etc/openvpn/server')
+_PKI_FILE_MAP = (
+    ('ca.crt', 'ca_crt'),
+    ('server.crt', 'server_crt'),
+    ('server.key', 'server_key'),
+    ('tc.key', 'tls_crypt'),
+    ('dh.pem', 'dh_pem'),
+)
+_PKI_KEYS = tuple(key for _, key in _PKI_FILE_MAP)
 _RUNTIME_STATUS_ROOT = Path('/run/openvpn-server')
 _UNIT_DROPIN_DIR = Path('/etc/systemd/system/openvpn-server@.service.d')
 _UNIT_DROPIN = _UNIT_DROPIN_DIR / 'netinja.conf'
@@ -216,10 +224,10 @@ class OpenVpnDriver(CoreDriver):
     async def get_server(self, server_id: int | str) -> dict[str, Any]:
         doc = await self.store.get_doc(self.key, self._kind, str(server_id))
         if doc:
-            return doc
+            return self._with_live_pki(doc)
         for row in await self.list_servers():
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
-                return row
+                return self._with_live_pki(row)
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN server [{server_id}] not found', 404)
 
     async def create_server(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -250,11 +258,12 @@ class OpenVpnDriver(CoreDriver):
             'public_host': str(payload.get('public_host') or ''),
             'users': list(payload.get('users') or []),
         }
+        self._ingest_payload_pki(server, payload)
         await self.store.put_doc(self.key, self._kind, str(server_id), server)
         await self.audit.record('create', f'{self.key}/server/{server_id}')
         await self._apply_all_configs()
         await self._ensure_services(start=True)
-        return server
+        return await self.get_server(server_id)
 
     async def _default_subnet(self, server_id: int | str) -> str:
         used = set()
@@ -396,13 +405,14 @@ class OpenVpnDriver(CoreDriver):
             updates['instance'] = instance_name_for_server(
                 {'name': updates['name'], 'id': server.get('id')}
             )
+        self._ingest_payload_pki(updates, payload)
         server.update(updates)
         if not server.get('tun_dev'):
             server['tun_dev'] = tun_dev_for_server(server)
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
-        return server
+        return await self.get_server(server.get('id'))
 
     async def delete_server(self, server_id: int | str) -> bool:
         server = await self.get_server(server_id)
@@ -848,11 +858,84 @@ class OpenVpnDriver(CoreDriver):
     def _pki_dir(self, server: dict[str, Any]) -> Path:
         return self._staging_dir() / 'pki' / instance_name_for_server(server)
 
+    def _read_pki_dir(self, directory: Path) -> dict[str, str]:
+        texts: dict[str, str] = {}
+        for name, key in _PKI_FILE_MAP:
+            path = directory / name
+            if path.is_file():
+                try:
+                    value = path.read_text(encoding='utf-8').strip()
+                except OSError:
+                    continue
+                if value:
+                    texts[key] = value
+        return texts
+
+    def _write_pki_dir(self, directory: Path, pki: dict[str, str]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, key in _PKI_FILE_MAP:
+            value = str(pki.get(key) or '').strip()
+            if not value:
+                continue
+            path = directory / name
+            path.write_text(value + ('\n' if not value.endswith('\n') else ''), encoding='utf-8')
+            if name.endswith('.key'):
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+
+    def _stored_pki(self, server: dict[str, Any]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for key in _PKI_KEYS:
+            value = str(server.get(key) or '').strip()
+            if value:
+                out[key] = value
+        return out
+
+    def _ingest_payload_pki(self, target: dict[str, Any], payload: dict[str, Any]) -> None:
+        for key in _PKI_KEYS:
+            value = str(payload.get(key) or '').strip()
+            if value:
+                target[key] = value
+
+    def _with_live_pki(self, server: dict[str, Any]) -> dict[str, Any]:
+        live = self._read_pki_dir(self._server_dir(server))
+        for key in _PKI_KEYS:
+            value = str(live.get(key) or '').strip()
+            if value:
+                server[key] = value
+        return server
+
+    def _remember_pki(self, server: dict[str, Any], pki: dict[str, str]) -> bool:
+        dirty = False
+        for key in _PKI_KEYS:
+            value = str(pki.get(key) or '').strip()
+            if value and str(server.get(key) or '').strip() != value:
+                server[key] = value
+                dirty = True
+        return dirty
+
+    async def _resolved_pki(self, server: dict[str, Any]) -> dict[str, str]:
+        live = self._read_pki_dir(self._server_dir(server))
+        stored = self._stored_pki(server)
+        overlay = {**live, **stored}
+        missing = [key for key in _PKI_KEYS if not str(overlay.get(key) or '').strip()]
+        if missing:
+            staging = self._pki_dir(server)
+            self._write_pki_dir(staging, overlay)
+            generated = await ensure_server_pki(
+                staging,
+                common_name=instance_name_for_server(server),
+            )
+            overlay = {
+                **{key: str(generated.get(key) or '') for key in _PKI_KEYS},
+                **overlay,
+            }
+        return overlay
+
     async def _pki_texts(self, server: dict[str, Any]) -> dict[str, str]:
-        return await ensure_server_pki(
-            self._pki_dir(server),
-            common_name=instance_name_for_server(server),
-        )
+        return await self._resolved_pki(server)
 
     def _unit_name(self, server: dict[str, Any]) -> str:
         return f"openvpn-server@{instance_name_for_server(server)}.service"
@@ -974,21 +1057,11 @@ class OpenVpnDriver(CoreDriver):
             server_dir.mkdir(parents=True, exist_ok=True)
             ccd_dir.mkdir(parents=True, exist_ok=True)
 
-            pki = await ensure_server_pki(self._pki_dir(server), common_name=instance)
-            for name, key in (
-                ('ca.crt', 'ca_crt'),
-                ('server.crt', 'server_crt'),
-                ('server.key', 'server_key'),
-                ('tc.key', 'tls_crypt'),
-                ('dh.pem', 'dh_pem'),
-            ):
-                path = server_dir / name
-                path.write_text(pki.get(key) or '', encoding='utf-8')
-                if name.endswith('.key'):
-                    try:
-                        path.chmod(0o600)
-                    except OSError:
-                        pass
+            pki = await self._resolved_pki(server)
+            self._write_pki_dir(server_dir, pki)
+            self._write_pki_dir(self._pki_dir(server), pki)
+            if self._remember_pki(server, pki):
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
 
             auth_script = server_dir / 'auth-verify.sh'
             auth_script.write_text(AUTH_SCRIPT, encoding='utf-8')
