@@ -277,8 +277,15 @@ class OpenVpnDriver(CoreDriver):
         self._ingest_payload_pki(server, payload)
         await self.store.put_doc(self.key, self._kind, str(server_id), server)
         await self.audit.record('create', f'{self.key}/server/{server_id}')
+        await self._stop_orphan_units()
+        server['listen_port'] = await self._allocate_listen_port(
+            int(server.get('listen_port') or 1194),
+            proto,
+            exclude_id=server_id,
+        )
+        await self.store.put_doc(self.key, self._kind, str(server_id), server)
         await self._apply_all_configs()
-        await self._ensure_services(start=True, only_ids=[server_id])
+        await self._ensure_services(start=True, restart=True, only_ids=[server_id])
         return await self.get_server(server_id)
 
     async def _default_subnet(self, server_id: int | str) -> str:
@@ -407,6 +414,47 @@ class OpenVpnDriver(CoreDriver):
                 )
             return preferred_host
         return next_openvpn_ip(subnet, used, start_after=start_after)
+
+    def _live_listen_port(self, server: dict[str, Any]) -> int | None:
+        conf = _SYSTEM_SERVER_ROOT / f"{instance_name_for_server(server)}.conf"
+        if not conf.is_file():
+            return None
+        try:
+            return self._conf_listen_port(conf.read_text(encoding='utf-8'))
+        except OSError:
+            return None
+
+    async def _listed_openvpn_units(self) -> set[str]:
+        units: set[str] = set()
+        for args in (
+            ['systemctl', 'list-units', '--all', '--type=service', '--no-legend', '--plain', 'openvpn-server@*'],
+            ['systemctl', 'list-unit-files', '--type=service', '--no-legend', '--plain', 'openvpn-server@*'],
+        ):
+            result = await run(args, check=False, timeout=20)
+            for line in (result.stdout or '').splitlines():
+                name = line.strip().split()[0] if line.strip() else ''
+                if name.startswith('openvpn-server@') and name.endswith('.service'):
+                    units.add(name)
+        if _SYSTEM_SERVER_ROOT.is_dir():
+            for conf in _SYSTEM_SERVER_ROOT.glob('*.conf'):
+                units.add(f'openvpn-server@{conf.stem}.service')
+        return units
+
+    async def _stop_orphan_units(self) -> None:
+        wanted = {instance_name_for_server(row) for row in await self.list_servers()}
+        for unit in await self._listed_openvpn_units():
+            instance = unit[len('openvpn-server@'):-len('.service')]
+            if instance in wanted:
+                continue
+            log.info('openvpn stopping orphan unit %s', unit)
+            await run(['systemctl', 'stop', unit], check=False, timeout=30)
+            await run(['systemctl', 'disable', unit], check=False, timeout=30)
+            conf = _SYSTEM_SERVER_ROOT / f'{instance}.conf'
+            if conf.is_file():
+                try:
+                    conf.unlink()
+                except OSError as exc:
+                    log.warning('openvpn orphan conf remove failed: %s', exc)
 
     def _conf_listen_port(self, text: str) -> int | None:
         for line in text.splitlines():
@@ -571,6 +619,8 @@ class OpenVpnDriver(CoreDriver):
         if not server.get('tun_dev'):
             server['tun_dev'] = tun_dev_for_server(server)
         proto = str(server.get('proto') or 'udp')
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        await self._stop_orphan_units()
         server['listen_port'] = await self._allocate_listen_port(
             int(server.get('listen_port') or 1194),
             proto,
@@ -794,6 +844,10 @@ class OpenVpnDriver(CoreDriver):
             raise AgentError('CLIENT_NOT_FOUND', f'OpenVPN user [{user_id}] not found', 404)
 
         host = endpoint_host or server.get('public_host') or '127.0.0.1'
+        server = dict(server)
+        live_port = self._live_listen_port(server)
+        if live_port:
+            server['listen_port'] = live_port
         pki = await self._pki_texts(server)
         dns_servers: list[str] | None = None
         try:
@@ -1241,6 +1295,7 @@ class OpenVpnDriver(CoreDriver):
         staging = self._staging_dir()
         staging.mkdir(parents=True, exist_ok=True)
         _SYSTEM_SERVER_ROOT.mkdir(parents=True, exist_ok=True)
+        await self._stop_orphan_units()
         await self._dedupe_listen_ports()
 
         for server in await self.list_servers():
