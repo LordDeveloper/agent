@@ -1020,13 +1020,53 @@ class OpenVpnDriver(CoreDriver):
                     texts[key] = value
         return texts
 
-    def _write_pki_dir(self, directory: Path, pki: dict[str, str]) -> None:
+    def _read_live_pki(self, server: dict[str, Any]) -> dict[str, str]:
+        texts = self._read_pki_dir(self._server_dir(server))
+        conf = _SYSTEM_SERVER_ROOT / f"{instance_name_for_server(server)}.conf"
+        if not conf.is_file():
+            return texts
+        prefixes = (
+            ('tls-crypt ', 'tls_crypt'),
+            ('ca ', 'ca_crt'),
+            ('cert ', 'server_crt'),
+            ('key ', 'server_key'),
+            ('dh ', 'dh_pem'),
+        )
+        try:
+            body = conf.read_text(encoding='utf-8')
+        except OSError:
+            return texts
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('<') or stripped.startswith('#'):
+                continue
+            for prefix, key in prefixes:
+                if not stripped.startswith(prefix):
+                    continue
+                parts = stripped.split(None, 1)
+                if len(parts) < 2:
+                    break
+                path = Path(parts[1].strip())
+                if not path.is_file():
+                    break
+                try:
+                    value = path.read_text(encoding='utf-8').strip()
+                except OSError:
+                    break
+                if value:
+                    texts[key] = value
+                break
+        return texts
+
+    def _write_pki_dir(self, directory: Path, pki: dict[str, str], *, overwrite: bool = True) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         for name, key in _PKI_FILE_MAP:
             value = str(pki.get(key) or '').strip()
             if not value:
                 continue
             path = directory / name
+            if path.is_file() and not overwrite:
+                continue
             path.write_text(value + ('\n' if not value.endswith('\n') else ''), encoding='utf-8')
             if name.endswith('.key'):
                 try:
@@ -1049,7 +1089,7 @@ class OpenVpnDriver(CoreDriver):
                 target[key] = value
 
     def _with_live_pki(self, server: dict[str, Any]) -> dict[str, Any]:
-        live = self._read_pki_dir(self._server_dir(server))
+        live = self._read_live_pki(server)
         for key in _PKI_KEYS:
             value = str(live.get(key) or '').strip()
             if value:
@@ -1066,13 +1106,13 @@ class OpenVpnDriver(CoreDriver):
         return dirty
 
     async def _resolved_pki(self, server: dict[str, Any]) -> dict[str, str]:
-        live = self._read_pki_dir(self._server_dir(server))
+        live = self._read_live_pki(server)
         stored = self._stored_pki(server)
-        overlay = {**live, **stored}
+        overlay = {**stored, **live}
         missing = [key for key in _PKI_KEYS if not str(overlay.get(key) or '').strip()]
         if missing:
             staging = self._pki_dir(server)
-            self._write_pki_dir(staging, overlay)
+            self._write_pki_dir(staging, overlay, overwrite=False)
             generated = await ensure_server_pki(
                 staging,
                 common_name=instance_name_for_server(server),
@@ -1084,6 +1124,9 @@ class OpenVpnDriver(CoreDriver):
         return overlay
 
     async def _pki_texts(self, server: dict[str, Any]) -> dict[str, str]:
+        live = self._read_live_pki(server)
+        if str(live.get('ca_crt') or '').strip() and str(live.get('tls_crypt') or '').strip():
+            return live
         return await self._resolved_pki(server)
 
     def _unit_name(self, server: dict[str, Any]) -> str:
@@ -1208,8 +1251,8 @@ class OpenVpnDriver(CoreDriver):
             ccd_dir.mkdir(parents=True, exist_ok=True)
 
             pki = await self._resolved_pki(server)
-            self._write_pki_dir(server_dir, pki)
-            self._write_pki_dir(self._pki_dir(server), pki)
+            self._write_pki_dir(server_dir, pki, overwrite=False)
+            self._write_pki_dir(self._pki_dir(server), pki, overwrite=False)
             if self._remember_pki(server, pki):
                 await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
 
