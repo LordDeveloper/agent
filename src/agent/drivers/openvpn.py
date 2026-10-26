@@ -97,6 +97,18 @@ def _fit_openvpn_subnet(server: dict[str, Any], subnet: str, host: str) -> str:
     return widened
 
 
+def _host_in_subnet(subnet: str, host: str) -> bool:
+    text = openvpn_host(host)
+    if not text:
+        return False
+    try:
+        ip = ipaddress.ip_address(text)
+        network = ipaddress.ip_network(normalize_openvpn_subnet(subnet), strict=False)
+    except (AgentError, ValueError):
+        return False
+    return ip in network
+
+
 _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
 # Lifetime counters are owned by sync_user_stats. A panel push must not rewrite them.
@@ -250,7 +262,11 @@ class OpenVpnDriver(CoreDriver):
             'id': server_id,
             'name': name,
             'instance': instance_name_for_server({'name': name, 'id': server_id}),
-            'listen_port': int(payload.get('listen_port') or 1194),
+            'listen_port': await self._allocate_listen_port(
+                int(payload.get('listen_port') or 1194),
+                proto,
+                exclude_id=server_id,
+            ),
             'proto': proto,
             'subnet': subnet,
             'gateway': openvpn_gateway(subnet),
@@ -392,6 +408,102 @@ class OpenVpnDriver(CoreDriver):
             return preferred_host
         return next_openvpn_ip(subnet, used, start_after=start_after)
 
+    async def _listen_bindings(self, *, exclude_id: int | str | None = None) -> set[tuple[str, int]]:
+        used: set[tuple[str, int]] = set()
+        for row in await self.list_servers():
+            if exclude_id is not None and str(row.get('id')) == str(exclude_id):
+                continue
+            proto = str(row.get('proto') or 'udp').strip().lower()
+            if proto not in {'udp', 'tcp'}:
+                proto = 'udp'
+            try:
+                port = int(row.get('listen_port') or 0)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                used.add((proto, port))
+        return used
+
+    async def _allocate_listen_port(
+        self,
+        preferred: int,
+        proto: str,
+        *,
+        exclude_id: int | str | None = None,
+    ) -> int:
+        proto = proto if proto in {'udp', 'tcp'} else 'udp'
+        try:
+            port = int(preferred or 1194)
+        except (TypeError, ValueError):
+            port = 1194
+        if port < 1 or port > 65535:
+            port = 1194
+        used = await self._listen_bindings(exclude_id=exclude_id)
+        if (proto, port) not in used:
+            return port
+        for candidate in list(range(1194, 1300)) + list(range(20000, 20100)):
+            if (proto, candidate) not in used:
+                log.info('openvpn moved listen port %s/%s -> %s', proto, port, candidate)
+                return candidate
+        raise AgentError('VALIDATION_ERROR', 'No free OpenVPN listen port', 422)
+
+    async def _dedupe_listen_ports(self) -> None:
+        seen: set[tuple[str, int]] = set()
+        for server in await self.list_servers():
+            proto = str(server.get('proto') or 'udp').strip().lower()
+            if proto not in {'udp', 'tcp'}:
+                proto = 'udp'
+            try:
+                port = int(server.get('listen_port') or 1194)
+            except (TypeError, ValueError):
+                port = 1194
+            if (proto, port) in seen:
+                port = await self._allocate_listen_port(port, proto, exclude_id=server.get('id'))
+                server['listen_port'] = port
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+            seen.add((proto, port))
+
+    async def _bind_user_address(
+        self,
+        server: dict[str, Any],
+        preferred: Any,
+        *,
+        keep_user: dict[str, Any] | None = None,
+    ) -> str:
+        subnet = str(server.get('subnet') or '')
+        host = openvpn_host(preferred)
+        if host:
+            fitted = _fit_openvpn_subnet(server, subnet, host)
+            if _host_in_subnet(fitted, host):
+                elsewhere = await self._addresses_on_other_servers(fitted, server.get('id'))
+                try:
+                    return self._claim_address(
+                        server,
+                        fitted,
+                        host,
+                        elsewhere,
+                        keep_user=keep_user,
+                    )
+                except AgentError as exc:
+                    message = str(exc.message or '').lower()
+                    if 'outside subnet' not in message and 'already in use' not in message:
+                        raise
+            else:
+                log.info(
+                    'openvpn ignored address %s outside subnet %s',
+                    host,
+                    fitted,
+                )
+        _ensure_openvpn_cursor(server)
+        exclude = str(keep_user.get('id')) if keep_user and keep_user.get('id') is not None else None
+        address = await self._allocate_address(
+            str(server.get('subnet') or subnet),
+            exclude_user_id=exclude,
+            start_after=openvpn_host(server.get('address_cursor')) or None,
+        )
+        _note_openvpn_issued(server, address)
+        return address
+
     async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         server = await self.get_server(server_id)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
@@ -409,6 +521,12 @@ class OpenVpnDriver(CoreDriver):
         server.update(updates)
         if not server.get('tun_dev'):
             server['tun_dev'] = tun_dev_for_server(server)
+        proto = str(server.get('proto') or 'udp')
+        server['listen_port'] = await self._allocate_listen_port(
+            int(server.get('listen_port') or 1194),
+            proto,
+            exclude_id=server.get('id'),
+        )
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self._apply_all_configs()
         await self._ensure_services(start=True, restart=True)
@@ -461,19 +579,7 @@ class OpenVpnDriver(CoreDriver):
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
         subnet_before = str(server.get('subnet') or '')
-        subnet = subnet_before
-        preferred = openvpn_host(user.get('address'))
-        if preferred:
-            subnet = _fit_openvpn_subnet(server, subnet, preferred)
-            elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
-            user['address'] = self._claim_address(server, subnet, preferred, elsewhere)
-        else:
-            _ensure_openvpn_cursor(server)
-            user['address'] = await self._allocate_address(
-                subnet,
-                start_after=openvpn_host(server.get('address_cursor')) or None,
-            )
-            _note_openvpn_issued(server, user['address'])
+        user['address'] = await self._bind_user_address(server, user.get('address'))
         user.setdefault('incoming', 0)
         user.setdefault('outgoing', 0)
         user.setdefault('_incoming', 0)
@@ -514,15 +620,9 @@ class OpenVpnDriver(CoreDriver):
                 requested = openvpn_host(payload.get('address'))
                 current = openvpn_host(user.get('address'))
                 if requested and requested != current:
-                    subnet = _fit_openvpn_subnet(server, str(server.get('subnet') or ''), requested)
-                    elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
-                    # Database address wins. Another user on this server is moved
-                    # to a free host so a batch can swap tunnel IPs without failing.
-                    merged['address'] = self._claim_address(
+                    merged['address'] = await self._bind_user_address(
                         server,
-                        subnet,
                         requested,
-                        elsewhere,
                         keep_user=user,
                     )
                 else:
@@ -1049,6 +1149,7 @@ class OpenVpnDriver(CoreDriver):
         staging = self._staging_dir()
         staging.mkdir(parents=True, exist_ok=True)
         _SYSTEM_SERVER_ROOT.mkdir(parents=True, exist_ok=True)
+        await self._dedupe_listen_ports()
 
         for server in await self.list_servers():
             instance = instance_name_for_server(server)
