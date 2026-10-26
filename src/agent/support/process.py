@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from typing import Any
 
@@ -74,6 +75,64 @@ async def run(
             int(proc.returncode or 0),
             stdout=(stdout_b or b"").decode(errors="replace"),
             stderr=(stderr_b or b"").decode(errors="replace"),
+        )
+        if check and result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
+
+
+async def run_exit(
+    args: list[str],
+    *,
+    check: bool = False,
+    timeout: float = 30,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Wait until the direct child exits, even if it daemonizes a grandchild.
+
+    ``run()`` uses ``communicate()``, which waits for every writer of the
+    stdout/stderr pipes to close. ``awg-quick up`` starts ``amneziawg-go`` and
+    that daemon inherits the pipes, so a successful up never reaches EOF and
+    the agent reports ``TimeoutExpired`` after 30 seconds. Temp files are not
+    pipes: ``wait()`` returns when ``awg-quick`` / ``wg-quick`` itself exits.
+    """
+    with RuntimeTrace.span(command_span_name(args)):
+        stdout_file = tempfile.TemporaryFile()
+        stderr_file = tempfile.TemporaryFile()
+        try:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=env,
+                )
+            except FileNotFoundError:
+                raise
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                await _stop_process(proc)
+                raise subprocess.TimeoutExpired(args, timeout) from exc
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(errors="replace")
+            stderr = stderr_file.read().decode(errors="replace")
+        finally:
+            stdout_file.close()
+            stderr_file.close()
+
+        result = subprocess.CompletedProcess(
+            args,
+            int(proc.returncode or 0),
+            stdout=stdout,
+            stderr=stderr,
         )
         if check and result.returncode != 0:
             raise subprocess.CalledProcessError(

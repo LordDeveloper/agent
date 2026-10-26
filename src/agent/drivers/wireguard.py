@@ -20,7 +20,7 @@ from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.asyncutil import bounded_gather, gather_independent
-from agent.support.process import run
+from agent.support.process import run, run_exit
 from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
 
@@ -2004,8 +2004,18 @@ class WireGuardDriver(CoreDriver):
         conf = str(self._conf_file(name))
         if not quick:
             return {"name": name, "ok": False, "message": "wg-quick not found"}
-        down = await run([quick, "down", conf], check=False)
-        up = await run([quick, "up", conf], check=False)
+        # PostUp reapplies every peer rule. A few hundred peers on a fresh
+        # host (exit NICs still missing) can take longer than the default 30s,
+        # and killing awg-quick mid-up leaves the userspace daemon half-started.
+        try:
+            down = await run_exit([quick, "down", conf], check=False, timeout=45)
+            up = await run_exit([quick, "up", conf], check=False, timeout=120)
+        except subprocess.TimeoutExpired:
+            return {
+                "name": name,
+                "ok": False,
+                "message": f"{Path(quick).name} timed out while bringing {name} up",
+            }
         result = {
             "name": name,
             "ok": up.returncode == 0,
@@ -2026,7 +2036,10 @@ class WireGuardDriver(CoreDriver):
         name = iface["name"]
         if not quick:
             return {"name": name, "ok": False, "message": "wg-quick not found"}
-        result = await run([quick, "down", str(self._conf_file(name))], check=False)
+        try:
+            result = await run_exit([quick, "down", str(self._conf_file(name))], check=False, timeout=45)
+        except subprocess.TimeoutExpired:
+            return {"name": name, "ok": False, "stderr": f"{Path(quick).name} down timed out"}
         return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
 
     async def _apply_live(self, iface: dict[str, Any], *, force_bring_up: bool = False) -> None:

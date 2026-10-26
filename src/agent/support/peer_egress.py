@@ -425,6 +425,7 @@ def render_apply_script(
     ]
 
     masq: set[str] = set()
+    lookup_rows: list[tuple[str, str, int, str, int]] = []
     for row in rules:
         addr = str(row["addr"])
         cidr = str(row.get("cidr") or f"{addr}/32")
@@ -439,13 +440,32 @@ def render_apply_script(
         iface = str(row["iface"])
         if iface:
             masq.add(iface)
+        lookup_rows.append((addr, cidr, pref, iface, table))
+
+    # Probe each exit once. PostUp runs this script while awg-quick/wg-quick is
+    # still in the foreground. A transferred host can point hundreds of peers at
+    # the same missing NIC (nl, tr, de); probing inside every peer blows the
+    # bring-up timeout and the agent kills the userspace daemon.
+    probed: set[tuple[str, int]] = set()
+    for _addr, _cidr, _pref, iface, table in lookup_rows:
+        key = (iface, table)
+        if key in probed:
+            continue
+        probed.add(key)
+        lines.append(f'if _default_for_iface "{iface}" {table}; then')
+        lines.append(f"  _ready_{table}=1")
+        lines.append("else")
+        lines.append(f"  _ready_{table}=0")
+        lines.append("fi")
+    if lookup_rows:
+        lines.append("")
+
+    for _addr, cidr, pref, iface, table in lookup_rows:
         # Install the table, then the rule, at a stable preference.
-        # Do not sleep when the exit interface is missing. A transferred server
-        # can have hundreds of peers aimed at interfaces that will never appear
-        # here; a per-peer sleep inside PostUp / ExecStartPost wedges boot.
+        # Do not sleep when the exit interface is missing.
         # NEVER delete the lookup rule on failure — that dumps traffic onto the
         # region primary IP via the main routing table.
-        lines.append(f'if _default_for_iface "{iface}" {table}; then')
+        lines.append(f'if [ "${{_ready_{table}:-0}}" = 1 ]; then')
         lines.append(f'  ip rule del from "{cidr}" lookup {table} 2>/dev/null || true')
         lines.append(f'  ip rule del from "{cidr}" prohibit 2>/dev/null || true')
         lines.append(

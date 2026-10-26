@@ -527,12 +527,25 @@ def test_render_apply_script_is_idempotent_shell():
     assert "_soften_rp_filter" in script
     assert "netinja-egress-eth1" in script
     assert f'if _default_for_iface "eth1" {table}; then' in script
+    assert script.count(f'_default_for_iface "eth1" {table}') == 1
     assert "keeping existing rule" in script
     assert "sleep" not in script
     assert "flock -n 9" in script
     # Failure path must not tear down the lookup rule (region IP leak).
     else_idx = script.index("keeping existing rule")
     assert f'ip rule del from "10.80.0.2/32" lookup {table}' not in script[else_idx:]
+
+    crowded = render_apply_script(
+        [
+            {"addr": "10.80.0.2", "cidr": "10.80.0.2/32", "iface": "nl", "table": table},
+            {"addr": "10.80.0.3", "cidr": "10.80.0.3/32", "iface": "nl", "table": table},
+            {"addr": "10.80.0.4", "cidr": "10.80.0.4/32", "iface": "uk", "table": table + 1},
+        ]
+    )
+    assert crowded.count(f'_default_for_iface "nl" {table}') == 1
+    assert crowded.count(f'_default_for_iface "uk" {table + 1}') == 1
+    assert 'from "10.80.0.2/32" lookup' in crowded
+    assert 'from "10.80.0.3/32" lookup' in crowded
 
 
 @pytest.mark.asyncio
