@@ -34,9 +34,11 @@ from agent.support.openvpn_config import (
 )
 from agent.support.openvpn_ip import (
     assert_openvpn_address,
+    move_holders_off_address,
     next_openvpn_ip,
     normalize_openvpn_subnet,
     openvpn_gateway,
+    openvpn_host,
 )
 from agent.asyncutil import gather_independent
 from agent.support.process import run
@@ -221,6 +223,64 @@ class OpenVpnDriver(CoreDriver):
                 return normalized
         raise AgentError('VALIDATION_ERROR', 'No free /24 subnet for OpenVPN server')
 
+    async def _addresses_on_other_servers(self, subnet: str, server_id: int | str) -> set[str]:
+        """Hosts already issued by a different OpenVPN server on this subnet."""
+        try:
+            target = normalize_openvpn_subnet(subnet)
+        except AgentError:
+            return set()
+        used: set[str] = set()
+        for row in await self.list_servers():
+            if str(row.get('id')) == str(server_id):
+                continue
+            try:
+                if normalize_openvpn_subnet(str(row.get('subnet') or '')) != target:
+                    continue
+            except AgentError:
+                continue
+            for user in row.get('users') or []:
+                addr = openvpn_host(user.get('address'))
+                if addr:
+                    used.add(addr)
+        return used
+
+    def _claim_address(
+        self,
+        server: dict[str, Any],
+        subnet: str,
+        requested: str,
+        used_elsewhere: set[str],
+        *,
+        keep_user: dict[str, Any] | None = None,
+    ) -> str:
+        """Place `requested` on this server, moving same-server holders aside.
+
+        A host owned by another server is a real conflict and still fails.
+        """
+        requested = assert_openvpn_address(subnet, requested)
+        if requested in used_elsewhere:
+            raise AgentError(
+                'VALIDATION_ERROR',
+                f'OpenVPN address [{requested}] is already in use',
+                422,
+            )
+        moved = move_holders_off_address(
+            list(server.get('users') or []),
+            subnet,
+            requested,
+            used_elsewhere,
+            keep_user=keep_user,
+        )
+        for label, old, new in moved:
+            log.info(
+                'openvpn moved %s from %s to %s so %s can be claimed',
+                label,
+                old,
+                new,
+                requested,
+            )
+        return requested
+
     async def _used_addresses(self, subnet: str) -> set[str]:
         try:
             target = normalize_openvpn_subnet(subnet)
@@ -329,10 +389,13 @@ class OpenVpnDriver(CoreDriver):
 
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
-        user['address'] = await self._allocate_address(
-            str(server.get('subnet') or ''),
-            preferred=str(user.get('address') or '') or None,
-        )
+        subnet = str(server.get('subnet') or '')
+        preferred = openvpn_host(user.get('address'))
+        if preferred:
+            elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
+            user['address'] = self._claim_address(server, subnet, preferred, elsewhere)
+        else:
+            user['address'] = await self._allocate_address(subnet)
         user.setdefault('incoming', 0)
         user.setdefault('outgoing', 0)
         user.setdefault('_incoming', 0)
@@ -369,16 +432,20 @@ class OpenVpnDriver(CoreDriver):
                     merged[key] = value
                 merged['username'] = user.get('username')
                 merged['password'] = user.get('password')
-                requested = str(payload.get('address') or '').split('/', 1)[0].strip()
-                current = str(user.get('address') or '').split('/', 1)[0].strip()
+                requested = openvpn_host(payload.get('address'))
+                current = openvpn_host(user.get('address'))
                 if requested and requested != current:
                     subnet = str(server.get('subnet') or '')
-                    requested = assert_openvpn_address(subnet, requested)
-                    used = await self._used_addresses(subnet)
-                    used.discard(current)
-                    if requested in used:
-                        raise AgentError('VALIDATION_ERROR', f'OpenVPN address [{requested}] is already in use', 422)
-                    merged['address'] = requested
+                    elsewhere = await self._addresses_on_other_servers(subnet, server.get('id'))
+                    # Database address wins. Another user on this server is moved
+                    # to a free host so a batch can swap tunnel IPs without failing.
+                    merged['address'] = self._claim_address(
+                        server,
+                        subnet,
+                        requested,
+                        elsewhere,
+                        keep_user=user,
+                    )
                 else:
                     merged['address'] = user.get('address')
                 if record_is_enabled(merged):
@@ -425,11 +492,27 @@ class OpenVpnDriver(CoreDriver):
         applied = 0
         failed = 0
         errors: list[dict[str, Any]] = []
+        # One database address can belong to only one row in this batch.
+        # A later row must not steal it back from someone already placed.
+        claimed_by: dict[str, str] = {}
         for row in users:
             if not isinstance(row, dict):
                 failed += 1
                 errors.append({'message': 'invalid row'})
                 continue
+            requested = openvpn_host(row.get('address'))
+            owner = str(row.get('id') or row.get('email') or '')
+            if requested:
+                previous = claimed_by.get(requested)
+                if previous is not None and previous != owner:
+                    failed += 1
+                    errors.append({
+                        'id': row.get('id'),
+                        'email': row.get('email'),
+                        'message': f'OpenVPN address [{requested}] is already in use',
+                    })
+                    continue
+                claimed_by[requested] = owner
             try:
                 uid = str(row.get('id') or row.get('email') or '')
                 existing = await self._find_user(server_id, uid) if uid else None
@@ -442,6 +525,8 @@ class OpenVpnDriver(CoreDriver):
                 applied += 1
             except AgentError as exc:
                 failed += 1
+                if requested and claimed_by.get(requested) == owner:
+                    claimed_by.pop(requested, None)
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
                     if applied:

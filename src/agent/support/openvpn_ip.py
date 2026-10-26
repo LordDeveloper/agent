@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Iterable
+from typing import Any, Iterable
 
 from agent.errors import AgentError
 
@@ -49,6 +49,55 @@ def assert_openvpn_address(subnet: str, address: str) -> str:
     if str(ip) == gateway or str(ip) == str(network.network_address) or str(ip) == str(network.broadcast_address):
         raise AgentError('VALIDATION_ERROR', f'Address [{host}] is reserved in [{network}]', 422)
     return str(ip)
+
+
+def openvpn_host(value: Any) -> str:
+    text = str(value or '').split('/', 1)[0].strip()
+    if not text:
+        return ''
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text
+
+
+def move_holders_off_address(
+    users: list[dict[str, Any]],
+    subnet: str,
+    requested: str,
+    used_elsewhere: Iterable[str] = (),
+    *,
+    keep_user: dict[str, Any] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Free `requested` on this server by moving other users to a spare host.
+
+    The caller is about to leave `keep_user`'s current address, so that host
+    may be reused. Addresses owned by a different server stay in `used_elsewhere`
+    and are never taken. Returns ``(label, old, new)`` for each user moved.
+    """
+    requested = openvpn_host(requested)
+    taken = {openvpn_host(item) for item in used_elsewhere if openvpn_host(item)}
+    taken.add(requested)
+    for user in users:
+        if keep_user is not None and user is keep_user:
+            continue
+        addr = openvpn_host(user.get('address'))
+        if addr and addr != requested:
+            taken.add(addr)
+
+    moved: list[tuple[str, str, str]] = []
+    for user in users:
+        if keep_user is not None and user is keep_user:
+            continue
+        current = openvpn_host(user.get('address'))
+        if current != requested:
+            continue
+        new_addr = next_openvpn_ip(subnet, taken)
+        user['address'] = new_addr
+        taken.add(new_addr)
+        label = str(user.get('email') or user.get('id') or '?')
+        moved.append((label, current, new_addr))
+    return moved
 
 
 def next_openvpn_ip(subnet: str, used: Iterable[str]) -> str:
