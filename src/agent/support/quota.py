@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent.asyncutil import gather_independent, maybe_await
+from agent.logutil import get_logger
 from agent.support import record_is_enabled
 from agent.support.disable_reason import baseline_looks_like_raw_kernel, mark_quota_disabled
+
+log = get_logger("quota")
+
+# xray, wireguard, and l2tp each reject a single write above 200 rows.
+# A larger quota pass used to raise PAYLOAD_TOO_LARGE and abort the cycle,
+# so no client on that inbound was reseeded or disabled.
+_QUOTA_WRITE_BATCH = 200
 
 
 def has_volume_quota(client: dict[str, Any]) -> bool:
@@ -112,6 +121,18 @@ def reseed_baseline_if_stale(
         live_incoming,
         live_outgoing,
     )
+
+
+async def _write_quota_rows(
+    write: Callable[[list[dict[str, Any]]], Awaitable[Any]],
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    if len(rows) > _QUOTA_WRITE_BATCH:
+        log.info("quota write split rows=%s batch=%s", len(rows), _QUOTA_WRITE_BATCH)
+    for offset in range(0, len(rows), _QUOTA_WRITE_BATCH):
+        await maybe_await(write(rows[offset : offset + _QUOTA_WRITE_BATCH]))
 
 
 async def enforce_driver_quotas(driver: Any) -> int:
@@ -223,10 +244,16 @@ async def _enforce_xray(driver: Any) -> int:
 
         # Reseed then disable on the same inbound stay sequential.
         if to_reseed:
-            await maybe_await(driver.batch_clients(inbound_id, clients=to_reseed, mode="update"))
+            await _write_quota_rows(
+                lambda chunk: driver.batch_clients(inbound_id, clients=chunk, mode="update"),
+                to_reseed,
+            )
         if not to_disable:
             return 0
-        await maybe_await(driver.batch_clients(inbound_id, clients=to_disable, mode="update"))
+        await _write_quota_rows(
+            lambda chunk: driver.batch_clients(inbound_id, clients=chunk, mode="update"),
+            to_disable,
+        )
         return len(to_disable)
 
     counts = await gather_independent(*(handle(inbound) for inbound in inbounds))
@@ -281,10 +308,16 @@ async def _enforce_wireguard(driver: Any) -> int:
             to_disable.append(row)
 
         if to_reseed:
-            await maybe_await(driver.batch_peers(interface_id, peers=to_reseed, mode="update"))
+            await _write_quota_rows(
+                lambda chunk: driver.batch_peers(interface_id, peers=chunk, mode="update"),
+                to_reseed,
+            )
         if not to_disable:
             return 0
-        await maybe_await(driver.batch_peers(interface_id, peers=to_disable, mode="update"))
+        await _write_quota_rows(
+            lambda chunk: driver.batch_peers(interface_id, peers=chunk, mode="update"),
+            to_disable,
+        )
         return len(to_disable)
 
     interfaces = await maybe_await(driver.list_interfaces())
@@ -344,10 +377,16 @@ async def _enforce_l2tp(driver: Any) -> int:
             to_disable.append(row)
 
         if to_reseed:
-            await maybe_await(driver.batch_users(server_id, users=to_reseed, mode='update'))
+            await _write_quota_rows(
+                lambda chunk: driver.batch_users(server_id, users=chunk, mode="update"),
+                to_reseed,
+            )
         if not to_disable:
             return 0
-        await maybe_await(driver.batch_users(server_id, users=to_disable, mode='update'))
+        await _write_quota_rows(
+            lambda chunk: driver.batch_users(server_id, users=chunk, mode="update"),
+            to_disable,
+        )
         return len(to_disable)
 
     servers = await maybe_await(driver.list_servers())
