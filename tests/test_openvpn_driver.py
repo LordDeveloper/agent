@@ -12,6 +12,7 @@ from agent.support.openvpn_config import (
     render_client_ovpn,
     render_passwd,
     render_server_conf,
+    render_tls_crypt_key,
 )
 from agent.support.openvpn_ip import (
     assert_openvpn_address,
@@ -95,11 +96,12 @@ def test_render_server_conf_and_ovpn():
         {"username": "alice", "password": "pw", "address": "10.8.0.2"},
         endpoint_host="vpn.example.com",
         ca_crt="-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----",
-        tls_crypt="STATIC",
+        tls_crypt=render_tls_crypt_key(),
     )
     assert "remote vpn.example.com 1194" in ovpn
     assert "<ca>" in ovpn
     assert "<tls-crypt>" in ovpn
+    assert "BEGIN OpenVPN Static key V1" in ovpn
     assert "\nauth-user-pass\n" in ovpn
     assert "# username: alice" in ovpn
     assert "# password: pw" in ovpn
@@ -144,7 +146,7 @@ def test_openvpn_crud_users(tmp_path: Path, monkeypatch):
     async def _pki_texts(_server):
         return {
             "ca_crt": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
-            "tls_crypt": "STATICKEY",
+            "tls_crypt": render_tls_crypt_key(),
         }
 
     drv._pki_texts = _pki_texts  # type: ignore[method-assign]
@@ -225,7 +227,7 @@ def test_openvpn_servers_as_interfaces_for_egress():
 def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
     mock_pki.return_value = {
         "ca_crt": "CA",
-        "tls_crypt": "TC",
+        "tls_crypt": render_tls_crypt_key(),
         "ca_key": "",
         "server_crt": "",
         "server_key": "",
@@ -241,7 +243,7 @@ def test_user_config_bundle_uses_pki(mock_pki, tmp_path: Path):
 
     bundle = asyncio.run(scenario())
     assert "CA" in bundle["ovpn"]
-    assert "TC" in bundle["ovpn"]
+    assert "BEGIN OpenVPN Static key V1" in bundle["ovpn"]
 
 
 def test_enable_and_restart_with_no_servers(tmp_path: Path):

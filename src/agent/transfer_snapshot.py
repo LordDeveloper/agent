@@ -19,7 +19,27 @@ log = get_logger("transfer")
 
 SNAPSHOT_VERSION = 1
 _KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
-_CERT_KEYS = {"certificateFile", "keyFile"}
+_CERT_KEYS = {
+    "certificateFile",
+    "keyFile",
+    "certFile",
+    "certPath",
+    "keyPath",
+    "caFile",
+    "dhFile",
+}
+_OPENVPN_PKI_FILES = (
+    ("ca.crt", "ca_crt"),
+    ("ca.key", "ca_key"),
+    ("server.crt", "server_crt"),
+    ("server.key", "server_key"),
+    ("tc.key", "tls_crypt"),
+    ("dh.pem", "dh_pem"),
+)
+_MATERIAL_SUFFIXES = {".pem", ".crt", ".cer", ".key", ".csr"}
+_MATERIAL_NAMES = {"tc.key", "dh.pem", "ca.srl"}
+_MAX_MATERIAL_BYTES = 512_000
+_MAX_MATERIAL_FILES = 2000
 _STEPS = 6
 
 ReloadFn = Callable[..., Awaitable[dict[str, Any]]]
@@ -34,12 +54,116 @@ def _cert_paths(node: Any, found: list[str]) -> None:
         return
     for key, value in node.items():
         if key in _CERT_KEYS and isinstance(value, str):
-            path = value.strip()
-            if path.startswith("/") and ".." not in path:
-                found.append(path)
+            candidate = Path(value.strip())
+            if candidate.is_absolute() and ".." not in candidate.parts:
+                found.append(str(candidate))
             continue
         if isinstance(value, (dict, list)):
             _cert_paths(value, found)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        if not path.is_file() or path.is_symlink():
+            return ""
+        if path.stat().st_size > _MAX_MATERIAL_BYTES:
+            return ""
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _openvpn_roots(settings: Any) -> list[Path]:
+    configured = str(getattr(getattr(settings, "openvpn", None), "config_dir", "") or "/etc/agent/bin/openvpn")
+    return [Path("/etc/openvpn/server"), Path(configured) / "pki"]
+
+
+def _material_roots(settings: Any) -> list[Path]:
+    roots = [
+        Path("/etc/openvpn"),
+        Path("/etc/letsencrypt/live"),
+        Path("/etc/letsencrypt/archive"),
+        Path("/var/lib/agent/certs"),
+        Path("/usr/local/etc/xray"),
+        Path("/etc/xray"),
+        Path("/etc/ipsec.d"),
+        *_openvpn_roots(settings),
+    ]
+    raw = str(getattr(getattr(settings, "xray", None), "config", "") or getattr(settings, "xray_config", "") or "")
+    if raw.strip():
+        roots.append(Path(raw).parent)
+    l2tp = str(getattr(getattr(settings, "l2tp", None), "config_dir", "") or "")
+    if l2tp.strip():
+        roots.append(Path(l2tp))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def _under_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _safe_material_path(raw: str, settings: Any) -> Path | None:
+    text = str(raw or "").strip()
+    if text == "" or "\x00" in text:
+        return None
+    path = Path(text)
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    if not any(_under_root(path, root) for root in _material_roots(settings)):
+        return None
+    return path
+
+
+def _material_file(path: Path) -> bool:
+    name = path.name.lower()
+    return name in _MATERIAL_NAMES or path.suffix.lower() in _MATERIAL_SUFFIXES
+
+
+def _walk_material(settings: Any) -> list[str]:
+    found: list[str] = []
+    for root in _material_roots(settings):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if len(found) >= _MAX_MATERIAL_FILES:
+                return found
+            if not path.is_file() or path.is_symlink() or not _material_file(path):
+                continue
+            safe = _safe_material_path(str(path), settings)
+            if safe is not None:
+                found.append(str(safe))
+    return found
+
+
+def _absorb_openvpn_pki(documents: list[dict[str, Any]], settings: Any) -> None:
+    from agent.support.openvpn_config import instance_name_for_server, normalize_tls_crypt
+
+    for row in documents:
+        if str(row.get("core") or "") != "openvpn" or str(row.get("kind") or "") != "server":
+            continue
+        data = row.get("data")
+        if not isinstance(data, dict):
+            continue
+        instance = instance_name_for_server(data)
+        for root in _openvpn_roots(settings):
+            for filename, key in _OPENVPN_PKI_FILES:
+                text = _read_text(root / instance / filename)
+                if key == "tls_crypt":
+                    text = normalize_tls_crypt(text)
+                if text:
+                    data[key] = text
 
 
 def _read_xray_config(settings: Any) -> dict[str, Any] | None:
@@ -135,6 +259,97 @@ def _require_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _split_material_paths(paths: list[str], settings: Any) -> tuple[list[str], list[str], list[str]]:
+    from agent.tls import _allowed_cert_path
+
+    tls_paths: list[str] = []
+    dependency_paths: list[str] = []
+    rejected: list[str] = []
+    for raw in paths:
+        text = str(raw or "").strip()
+        if text == "":
+            continue
+        try:
+            _allowed_cert_path(text)
+        except AgentError:
+            safe = _safe_material_path(text, settings)
+            if safe is None:
+                rejected.append(text)
+            else:
+                dependency_paths.append(str(safe))
+            continue
+        tls_paths.append(text)
+    return (
+        list(dict.fromkeys(tls_paths)),
+        list(dict.fromkeys(dependency_paths)),
+        list(dict.fromkeys(rejected)),
+    )
+
+
+def _material_content_ok(content: str) -> bool:
+    if content.strip() == "" or "\x00" in content:
+        return False
+    if "-----BEGIN " in content:
+        return True
+    return len(content) <= 8192 and all(ch in "\r\n\t" or 32 <= ord(ch) < 127 for ch in content)
+
+
+def _read_dependency_files(paths: list[str], settings: Any) -> dict[str, list[Any]]:
+    files: list[dict[str, str]] = []
+    missing: list[str] = []
+    for raw in paths:
+        path = _safe_material_path(raw, settings)
+        if path is None:
+            missing.append(str(raw))
+            continue
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            missing.append(str(path))
+            continue
+        if size > _MAX_MATERIAL_BYTES:
+            missing.append(str(path))
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            missing.append(str(path))
+            continue
+        if not _material_content_ok(content):
+            missing.append(str(path))
+            continue
+        files.append({"path": str(path), "content": content})
+    return {"files": files, "missing": missing}
+
+
+def _write_dependency_files(files: list[dict[str, Any]], settings: Any) -> int:
+    written = 0
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        path = _safe_material_path(str(item.get("path") or ""), settings)
+        content = item.get("content")
+        if path is None or not isinstance(content, str) or not _material_content_ok(content):
+            continue
+        if len(content.encode("utf-8")) > _MAX_MATERIAL_BYTES:
+            continue
+        if path.is_symlink():
+            path.unlink()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content if content.endswith("\n") else content + "\n", encoding="utf-8")
+        name = path.name.lower()
+        if name.endswith(".key") or "privkey" in name or "private" in name:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+        written += 1
+    return written
+
+
 async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
     """Full copy of agent state. Traffic counters and the audit log stay behind."""
     from agent.tls import acme_installed, export_acme_store, export_files, list_certs
@@ -143,12 +358,14 @@ async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
     report_progress(0, _STEPS, "Reading agent database")
     documents = await store.dump_documents()
     meta = await store.dump_meta()
+    _absorb_openvpn_pki(documents, settings)
 
     report_progress(1, _STEPS, "Reading Xray config")
     config = _read_xray_config(settings)
 
     paths: list[str] = []
     _cert_paths(config, paths)
+    _cert_paths(documents, paths)
     for row in list_certs():
         if not isinstance(row, dict):
             continue
@@ -156,15 +373,24 @@ async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
             value = str(row.get(key) or "").strip()
             if value:
                 paths.append(value)
+                parent = Path(value).parent
+                for extra in ("fullchain.pem", "cert.pem", "chain.pem", "privkey.pem"):
+                    sibling = parent / extra
+                    if sibling.is_file():
+                        paths.append(str(sibling))
+    paths.extend(_walk_material(settings))
     unique_paths = list(dict.fromkeys(paths))
+    tls_paths, dependency_paths, rejected = _split_material_paths(unique_paths, settings)
 
     report_progress(2, _STEPS, "Reading TLS files")
     tls_files: list[dict[str, str]] = []
-    tls_missing: list[str] = []
-    if unique_paths:
-        exported = export_files(unique_paths)
+    tls_missing: list[str] = list(rejected)
+    if tls_paths:
+        exported = export_files(tls_paths)
         tls_files = list(exported.get("files") or [])
-        tls_missing = [str(item) for item in (exported.get("missing") or [])]
+        tls_missing.extend(str(item) for item in (exported.get("missing") or []))
+    dependency_files = _read_dependency_files(dependency_paths, settings)
+    tls_missing.extend(str(item) for item in dependency_files["missing"])
 
     report_progress(3, _STEPS, "Reading acme store")
     acme_files: list[dict[str, str]] = []
@@ -176,9 +402,10 @@ async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
 
     report_progress(_STEPS, _STEPS, "Snapshot ready")
     log.info(
-        "transfer snapshot exported documents=%s tls=%s acme=%s geodata=%s xray=%s",
+        "transfer snapshot exported documents=%s tls=%s deps=%s acme=%s geodata=%s xray=%s",
         len(documents),
         len(tls_files),
+        len(dependency_files["files"]),
         len(acme_files),
         len(geodata),
         config is not None,
@@ -190,6 +417,7 @@ async def export_snapshot(settings: Any, store: Any) -> dict[str, Any]:
         "xray_config": config,
         "tls_files": tls_files,
         "tls_missing": tls_missing,
+        "dependency_files": dependency_files["files"],
         "acme_files": acme_files,
         "geodata": geodata,
     }
@@ -202,6 +430,8 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
 
     snapshot = _require_snapshot(payload)
     report_progress(0, _STEPS, "Writing TLS files")
+    dependency_files = [row for row in (snapshot.get("dependency_files") or []) if isinstance(row, dict)]
+    dependency_written = _write_dependency_files(dependency_files, settings)
     tls_files = [row for row in (snapshot.get("tls_files") or []) if isinstance(row, dict)]
     tls_written = import_files(tls_files)["count"] if tls_files else 0
 
@@ -226,10 +456,11 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
         config_path = _write_xray_config(settings, config)
 
     log.info(
-        "transfer snapshot imported documents=%s meta=%s tls=%s geodata=%s xray=%s",
+        "transfer snapshot imported documents=%s meta=%s tls=%s deps=%s geodata=%s xray=%s",
         document_count,
         meta_count,
         tls_written,
+        dependency_written,
         geodata_written,
         config_path or "-",
     )
@@ -237,11 +468,28 @@ async def import_snapshot(settings: Any, store: Any, payload: dict[str, Any]) ->
         "documents": document_count,
         "meta": meta_count,
         "tls_files": tls_written,
+        "dependency_files": dependency_written,
         "acme_files": acme_written,
         "geodata": geodata_written,
         "xray_config": config_path,
         "tls_missing": [str(item) for item in (snapshot.get("tls_missing") or []) if str(item).strip()],
         "cores": cores_to_enable(snapshot),
+    }
+
+
+async def import_dependencies(settings: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Write certificate and core dependency files without replacing the database."""
+    from agent.tls import import_acme_store, import_files
+
+    if not isinstance(payload, dict):
+        raise AgentError("VALIDATION_ERROR", "dependency payload must be an object", 422)
+    dependency_files = [row for row in (payload.get("dependency_files") or []) if isinstance(row, dict)]
+    tls_files = [row for row in (payload.get("tls_files") or []) if isinstance(row, dict)]
+    acme_files = [row for row in (payload.get("acme_files") or []) if isinstance(row, dict)]
+    return {
+        "dependency_files": _write_dependency_files(dependency_files, settings),
+        "tls_files": import_files(tls_files)["count"] if tls_files else 0,
+        "acme_files": import_acme_store(acme_files)["count"] if acme_files else 0,
     }
 
 

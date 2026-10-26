@@ -102,6 +102,86 @@ def test_snapshot_apply_reloads_once_and_keeps_traffic(tmp_path, monkeypatch):
     assert note == {"keep": True}
 
 
+def test_snapshot_keeps_openvpn_and_xray_material(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.tls.list_certs", lambda: [])
+    monkeypatch.setattr("agent.tls.acme_installed", lambda: False)
+    monkeypatch.setattr("agent.xray_release.export_geodata", lambda: {"files": []})
+
+    pki = tmp_path / "pki" / "edge"
+    pki.mkdir(parents=True)
+    (pki / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    (pki / "ca.key").write_text("-----BEGIN PRIVATE KEY-----\nCAKEY\n-----END PRIVATE KEY-----\n", encoding="utf-8")
+    (pki / "server.crt").write_text("-----BEGIN CERTIFICATE-----\nSRV\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    (pki / "server.key").write_text("-----BEGIN PRIVATE KEY-----\nSRVKEY\n-----END PRIVATE KEY-----\n", encoding="utf-8")
+    (pki / "tc.key").write_text(
+        "-----BEGIN OpenVPN Static key V1-----\n" + ("A" * 32 + "\n") * 16 + "-----END OpenVPN Static key V1-----\n",
+        encoding="utf-8",
+    )
+
+    source_db = tmp_path / "source.db"
+    source = Store(source_db)
+    run_sync(source.open())
+    run_sync(source.put_doc("openvpn", "server", "7", {"id": 7, "name": "edge", "users": []}))
+    config_path = tmp_path / "xray" / "config.json"
+    config_path.parent.mkdir()
+    cert = config_path.parent / "fullchain.pem"
+    key = config_path.parent / "privkey.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    key.write_text("-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n", encoding="utf-8")
+    config_path.write_text(json.dumps({
+        "inbounds": [{
+            "streamSettings": {
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificateFile": str(cert),
+                        "keyFile": str(key),
+                    }],
+                },
+            },
+        }],
+    }), encoding="utf-8")
+
+    settings = AgentSettings(
+        data_dir=str(tmp_path),
+        db_path=str(source_db),
+        enabled_cores="xray,openvpn",
+        xray_config=str(config_path),
+        openvpn_config_dir=str(tmp_path),
+    )
+    try:
+        snapshot = run_sync(export_snapshot(settings, source))
+    finally:
+        run_sync(source.close())
+
+    saved = next(row["data"] for row in snapshot["documents"] if row["core"] == "openvpn")
+    assert "BEGIN CERTIFICATE" in saved["ca_crt"]
+    assert "BEGIN PRIVATE KEY" in saved["ca_key"]
+    assert "BEGIN OpenVPN Static key V1" in saved["tls_crypt"]
+    carried = [row["path"] for row in [*snapshot["dependency_files"], *snapshot["tls_files"]]]
+    assert str(pki / "ca.key") in carried
+    assert str(cert) in carried
+    assert str(key) in carried
+
+    dest_db = tmp_path / "dest.db"
+    dest_store = Store(dest_db)
+    run_sync(dest_store.open())
+    dest_settings = AgentSettings(
+        data_dir=str(tmp_path / "dest-data"),
+        db_path=str(dest_db),
+        enabled_cores="openvpn",
+        xray_config=str(config_path),
+        openvpn_config_dir=str(tmp_path),
+    )
+    from agent.transfer_snapshot import import_snapshot
+
+    try:
+        run_sync(import_snapshot(dest_settings, dest_store, snapshot))
+    finally:
+        run_sync(dest_store.close())
+    assert "CAKEY" in (pki / "ca.key").read_text(encoding="utf-8")
+    assert "BEGIN PRIVATE KEY" in key.read_text(encoding="utf-8")
+
+
 def test_apply_reports_reload_failure(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.tls.list_certs", lambda: [])
     monkeypatch.setattr("agent.tls.acme_installed", lambda: False)

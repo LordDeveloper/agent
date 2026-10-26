@@ -464,6 +464,41 @@ def _show_core_restart(name: str) -> None:
         run_sync(runtime.close())
 
 
+def _openvpn_reset_action() -> None:
+    _print()
+    _print(paint("  This stops every OpenVPN unit, deletes /etc/openvpn/server,", YELLOW))
+    _print(paint("  staging PKI, and stored servers. The panel then syncs from scratch.", YELLOW))
+    if not confirm("Wipe OpenVPN on this node?", default=False):
+        return
+    typed = prompt_text("Type CONFIRM to continue")
+    if str(typed or "").strip() != "CONFIRM":
+        _print(paint("  Reset cancelled.", DIM))
+        pause()
+        return
+    _run_action("Reset OpenVPN", _show_openvpn_reset)
+
+
+def _show_openvpn_reset() -> None:
+    from agent.runtime import open_runtime
+
+    runtime = open_runtime()
+    try:
+        driver = runtime.registry.get("openvpn", require_enabled=False)
+        result = run_sync(driver.reset_runtime())
+        _print(kv("Result", "ok" if result.get("ok") else "failed", GREEN if result.get("ok") else RED))
+        removed = result.get("servers_removed") or []
+        _print(kv("Servers removed", str(len(removed)), CYAN))
+        for sid in removed[:12]:
+            _print(paint(f"  server {sid}", DIM))
+        files = result.get("removed") or []
+        _print(kv("Files removed", str(len(files)), CYAN))
+        for path in files[:12]:
+            _print(paint(f"  {path}", DIM))
+        _print(paint("  Re-run panel server sync to recreate OpenVPN from zero.", WHITE))
+    finally:
+        run_sync(runtime.close())
+
+
 def _show_openvpn_create_server() -> None:
     from agent.runtime import open_runtime
 
@@ -503,6 +538,7 @@ def _core_ops_menu(name: str) -> None:
                     Choice("start", "Start", GREEN, "3"),
                     Choice("restart", "Restart", YELLOW, "4"),
                     Choice("status", "Status", WHITE, "5"),
+                    Choice("reset", "Reset (wipe PKI + resync from scratch)", RED, "r"),
                     Choice("back", "Back", WHITE, "0"),
                 ]
             )
@@ -544,6 +580,10 @@ def _core_ops_menu(name: str) -> None:
             if not confirm("Create an OpenVPN server?", default=True):
                 continue
             _run_action("Create OpenVPN server", _show_openvpn_create_server)
+            continue
+
+        if picked == "reset":
+            _openvpn_reset_action()
             continue
 
         if picked == "install":

@@ -12,6 +12,40 @@ from agent.support import record_is_enabled
 from agent.support.openvpn_ip import openvpn_gateway, openvpn_netmask, normalize_openvpn_subnet
 
 _SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
+_TLS_CRYPT_BEGIN = '-----BEGIN OpenVPN Static key V1-----'
+_TLS_CRYPT_END = '-----END OpenVPN Static key V1-----'
+_TLS_CRYPT_BLOCK = re.compile(
+    r'-----BEGIN OpenVPN Static key V1-----(.*?)-----END OpenVPN Static key V1-----',
+    re.IGNORECASE | re.DOTALL,
+)
+_TLS_CRYPT_HEX_LEN = 512  # 2048-bit OpenVPN static key
+
+
+def tls_crypt_hex(value: Any) -> str:
+    text = str(value or '')
+    match = _TLS_CRYPT_BLOCK.search(text)
+    body = match.group(1) if match else text
+    return re.sub(r'[^0-9A-Fa-f]', '', body)
+
+
+def normalize_tls_crypt(value: Any) -> str:
+    """PEM-only tls-crypt (no comments). Hex body hashes then match client.ovpn and tc.key."""
+    hexed = tls_crypt_hex(value)
+    if len(hexed) < _TLS_CRYPT_HEX_LEN:
+        return ''
+    lines = [hexed[i : i + 32] for i in range(0, len(hexed), 32)]
+    return _TLS_CRYPT_BEGIN + '\n' + '\n'.join(lines) + '\n' + _TLS_CRYPT_END
+
+
+def render_tls_crypt_key() -> str:
+    return normalize_tls_crypt(secrets.token_bytes(256).hex())
+
+
+def _read_utf8(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return ''
 
 
 def sanitize_instance_name(value: Any, *, fallback: str = 'ovpn') -> str:
@@ -63,8 +97,13 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
     tls_crypt = pki_dir / 'tc.key'
     # dh.pem unused: server conf uses `dh none` (ECDH). Never run openssl dhparam.
 
-    if not ca_key.is_file() or not ca_crt.is_file():
-        await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
+    if not ca_crt.is_file():
+        if not ca_key.is_file():
+            await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
+            try:
+                ca_key.chmod(0o600)
+            except OSError:
+                pass
         await _run_openssl(
             [
                 'req',
@@ -80,14 +119,23 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
                 f'/CN={common_name}-ca',
             ]
         )
-        try:
-            ca_key.chmod(0o600)
-        except OSError:
-            pass
 
-    if not server_key.is_file() or not server_crt.is_file():
+    if not server_crt.is_file() or not server_key.is_file():
+        if server_crt.is_file() and not server_key.is_file():
+            raise AgentError(
+                'VALIDATION_ERROR',
+                f'OpenVPN server certificate exists without its key in {pki_dir}',
+                422,
+            )
+        if not ca_key.is_file() or not ca_crt.is_file():
+            raise AgentError(
+                'VALIDATION_ERROR',
+                f'OpenVPN CA material is incomplete in {pki_dir}',
+                422,
+            )
         req = pki_dir / 'server.csr'
-        await _run_openssl(['genrsa', '-out', str(server_key), '2048'])
+        if not server_key.is_file():
+            await _run_openssl(['genrsa', '-out', str(server_key), '2048'])
         await _run_openssl(
             [
                 'req',
@@ -123,16 +171,12 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
         except OSError:
             pass
 
-    if not tls_crypt.is_file():
-        # Prefer openvpn --genkey; fall back to openssl rand.
-        try:
-            from agent.support.process import run
-
-            proc = await run(['openvpn', '--genkey', 'secret', str(tls_crypt)], check=False, timeout=30)
-            if proc.returncode != 0 or not tls_crypt.is_file():
-                raise FileNotFoundError('openvpn genkey failed')
-        except FileNotFoundError:
-            tls_crypt.write_bytes(secrets.token_bytes(256))
+    existing_tls = normalize_tls_crypt(_read_utf8(tls_crypt) if tls_crypt.is_file() else '')
+    if not existing_tls:
+        generated = await _generate_tls_crypt_file(tls_crypt)
+        existing_tls = generated
+    elif existing_tls != _read_utf8(tls_crypt).strip():
+        tls_crypt.write_text(existing_tls + '\n', encoding='utf-8')
         try:
             tls_crypt.chmod(0o600)
         except OSError:
@@ -141,13 +185,44 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
     # dh.pem is unused: server conf uses `dh none` (ECDH). Skip openssl dhparam.
 
     return {
-        'ca_crt': ca_crt.read_text(encoding='utf-8'),
-        'ca_key': ca_key.read_text(encoding='utf-8'),
-        'server_crt': server_crt.read_text(encoding='utf-8'),
-        'server_key': server_key.read_text(encoding='utf-8'),
-        'tls_crypt': tls_crypt.read_text(encoding='utf-8') if tls_crypt.is_file() else '',
+        'ca_crt': _read_utf8(ca_crt),
+        'ca_key': _read_utf8(ca_key),
+        'server_crt': _read_utf8(server_crt),
+        'server_key': _read_utf8(server_key),
+        'tls_crypt': existing_tls,
         'dh_pem': '',
     }
+
+
+async def _generate_tls_crypt_file(path: Path) -> str:
+    from agent.support.process import run
+
+    attempts = (
+        ['openvpn', '--genkey', 'secret', str(path)],
+        ['openvpn', '--genkey', '--secret', str(path)],
+    )
+    for args in attempts:
+        try:
+            proc = await run(args, check=False, timeout=30)
+        except FileNotFoundError:
+            break
+        if proc.returncode == 0:
+            normalized = normalize_tls_crypt(_read_utf8(path))
+            if normalized:
+                path.write_text(normalized + '\n', encoding='utf-8')
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+                return normalized
+
+    pem = render_tls_crypt_key()
+    path.write_text(pem + '\n', encoding='utf-8')
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return pem
 
 
 AUTH_SCRIPT = r'''#!/bin/sh
@@ -307,8 +382,9 @@ def render_client_ovpn(
         ca_crt.strip(),
         '</ca>',
     ]
-    if tls_crypt.strip():
-        blocks.extend(['<tls-crypt>', tls_crypt.strip(), '</tls-crypt>'])
+    tls_block = normalize_tls_crypt(tls_crypt)
+    if tls_block:
+        blocks.extend(['<tls-crypt>', tls_block, '</tls-crypt>'])
     # When ads-block / DNS leak is active, embed AdGuard gateway DNS in the
     # client profile (server push alone is easy to miss after an early ensure).
     try:

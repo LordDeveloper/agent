@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from agent.errors import AgentError, raise_agent_error
-from agent.transfer_snapshot import apply_snapshot, export_snapshot
+from agent.transfer_snapshot import apply_snapshot, export_snapshot, import_dependencies
 
 router = APIRouter(prefix="/transfer", tags=["transfer"])
 
@@ -19,6 +19,15 @@ async def export_transfer_snapshot(request: Request):
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, "snapshot": snapshot}
+
+
+@router.post("/dependencies")
+async def apply_transfer_dependencies(body: dict[str, Any], request: Request):
+    try:
+        result = await import_dependencies(request.app.state.settings, body)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
+    return {"success": True, "result": result}
 
 
 @router.post("/apply")

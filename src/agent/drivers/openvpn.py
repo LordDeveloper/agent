@@ -26,6 +26,7 @@ from agent.support.openvpn_config import (
     AUTH_SCRIPT,
     ensure_server_pki,
     instance_name_for_server,
+    normalize_tls_crypt,
     parse_status_v2,
     render_ccd_file,
     render_client_ovpn,
@@ -116,6 +117,7 @@ _USAGE_COUNTER_KEYS = frozenset({'incoming', 'outgoing', '_incoming', '_outgoing
 _SYSTEM_SERVER_ROOT = Path('/etc/openvpn/server')
 _PKI_FILE_MAP = (
     ('ca.crt', 'ca_crt'),
+    ('ca.key', 'ca_key'),
     ('server.crt', 'server_crt'),
     ('server.key', 'server_key'),
     ('tc.key', 'tls_crypt'),
@@ -231,7 +233,8 @@ class OpenVpnDriver(CoreDriver):
         return {'restarted': True, 'units': units, 'running': await self.running()}
 
     async def list_servers(self) -> list[dict[str, Any]]:
-        return await self.store.list_docs(self.key, self._kind)
+        rows = await self.store.list_docs(self.key, self._kind)
+        return [self._with_live_pki(row) for row in rows]
 
     async def get_server(self, server_id: int | str) -> dict[str, Any]:
         doc = await self.store.get_doc(self.key, self._kind, str(server_id))
@@ -652,6 +655,54 @@ class OpenVpnDriver(CoreDriver):
         await self._sync_peer_egress()
         return True
 
+    async def reset_runtime(self) -> dict[str, Any]:
+        """Stop units, drop PKI/config, and clear stored servers so sync starts empty."""
+        removed_ids: list[Any] = []
+        for row in list(await self.store.list_docs(self.key, self._kind)):
+            sid = row.get('id')
+            if sid is None:
+                continue
+            try:
+                await self.delete_server(sid)
+            except AgentError as exc:
+                log.warning('openvpn reset delete %s failed: %s', sid, exc.message)
+                await self.store.delete_doc(self.key, self._kind, str(sid))
+            removed_ids.append(sid)
+
+        await self._stop_orphan_units()
+        wiped = self._wipe_runtime_files()
+        await self.audit.record('reset', f'{self.key}/runtime')
+        try:
+            await self._sync_peer_egress()
+        except Exception:
+            log.exception('openvpn peer egress reconcile failed after reset')
+        return {
+            'ok': True,
+            'servers_removed': removed_ids,
+            'removed': wiped,
+        }
+
+    def _wipe_runtime_files(self) -> list[str]:
+        removed: list[str] = []
+        for root in (_SYSTEM_SERVER_ROOT, self._config_dir(), _RUNTIME_STATUS_ROOT):
+            if not root.exists():
+                continue
+            try:
+                entries = list(root.iterdir())
+            except OSError as exc:
+                log.warning('openvpn wipe list %s failed: %s', root, exc)
+                continue
+            for path in entries:
+                try:
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink(missing_ok=True)
+                    removed.append(str(path))
+                except OSError as exc:
+                    log.warning('openvpn wipe %s failed: %s', path, exc)
+        return removed
+
     async def add_user(
         self,
         server_id: int | str,
@@ -1068,8 +1119,10 @@ class OpenVpnDriver(CoreDriver):
             if path.is_file():
                 try:
                     value = path.read_text(encoding='utf-8').strip()
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     continue
+                if key == 'tls_crypt':
+                    value = normalize_tls_crypt(value)
                 if value:
                     texts[key] = value
         return texts
@@ -1105,8 +1158,10 @@ class OpenVpnDriver(CoreDriver):
                     break
                 try:
                     value = path.read_text(encoding='utf-8').strip()
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     break
+                if key == 'tls_crypt':
+                    value = normalize_tls_crypt(value)
                 if value:
                     texts[key] = value
                 break
@@ -1116,6 +1171,8 @@ class OpenVpnDriver(CoreDriver):
         directory.mkdir(parents=True, exist_ok=True)
         for name, key in _PKI_FILE_MAP:
             value = str(pki.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
             if not value:
                 continue
             path = directory / name
@@ -1132,6 +1189,8 @@ class OpenVpnDriver(CoreDriver):
         out: dict[str, str] = {}
         for key in _PKI_KEYS:
             value = str(server.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
             if value:
                 out[key] = value
         return out
@@ -1139,6 +1198,8 @@ class OpenVpnDriver(CoreDriver):
     def _ingest_payload_pki(self, target: dict[str, Any], payload: dict[str, Any]) -> None:
         for key in _PKI_KEYS:
             value = str(payload.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
             if value:
                 target[key] = value
 
@@ -1146,6 +1207,8 @@ class OpenVpnDriver(CoreDriver):
         live = self._read_live_pki(server)
         for key in _PKI_KEYS:
             value = str(live.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
             if value:
                 server[key] = value
         return server
@@ -1154,6 +1217,8 @@ class OpenVpnDriver(CoreDriver):
         dirty = False
         for key in _PKI_KEYS:
             value = str(pki.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
             if value and str(server.get(key) or '').strip() != value:
                 server[key] = value
                 dirty = True
@@ -1175,6 +1240,9 @@ class OpenVpnDriver(CoreDriver):
                 **{key: str(generated.get(key) or '') for key in _PKI_KEYS},
                 **overlay,
             }
+        tls = normalize_tls_crypt(overlay.get('tls_crypt'))
+        if tls:
+            overlay['tls_crypt'] = tls
         return overlay
 
     async def _pki_texts(self, server: dict[str, Any]) -> dict[str, str]:
@@ -1306,8 +1374,8 @@ class OpenVpnDriver(CoreDriver):
             ccd_dir.mkdir(parents=True, exist_ok=True)
 
             pki = await self._resolved_pki(server)
-            self._write_pki_dir(server_dir, pki, overwrite=False)
-            self._write_pki_dir(self._pki_dir(server), pki, overwrite=False)
+            self._write_pki_dir(server_dir, pki, overwrite=True)
+            self._write_pki_dir(self._pki_dir(server), pki, overwrite=True)
             if self._remember_pki(server, pki):
                 await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
 

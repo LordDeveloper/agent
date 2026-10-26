@@ -134,6 +134,35 @@ def cmd_core_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_core_reset(args: argparse.Namespace) -> int:
+    from agent.factory_reset import confirmation_accepted
+
+    if args.name != "openvpn":
+        _print_json({"success": False, "error": {"code": "VALIDATION_ERROR", "message": "Only openvpn reset is supported"}})
+        return 2
+    if not bool(getattr(args, "yes", False)):
+        print(
+            "This stops OpenVPN units and deletes servers, PKI, and /etc/openvpn/server "
+            "so the panel can sync from scratch.\nType CONFIRM to continue."
+        )
+        try:
+            typed = input("Type CONFIRM to wipe OpenVPN: ")
+        except EOFError:
+            typed = ""
+        if not confirmation_accepted(typed):
+            print("Reset cancelled.")
+            return 1
+
+    runtime = open_runtime(args.env_file)
+    try:
+        driver = runtime.registry.get("openvpn", require_enabled=False)
+        result = run_sync(driver.reset_runtime())
+    finally:
+        run_sync(runtime.close())
+    _print_json({"success": bool(result.get("ok")), **result})
+    return 0 if result.get("ok") else 1
+
+
 def cmd_core_install(args: argparse.Namespace) -> int:
     tag = getattr(args, "tag", None)
     result = run_sync(
@@ -713,6 +742,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Xray release tag (e.g. v1.0.7). Default: latest. Ignored for other cores.",
     )
     p_core_install.set_defaults(func=cmd_core_install)
+
+    p_core_reset = core_sub.add_parser(
+        "reset",
+        help="Wipe a core's runtime so the panel can sync from scratch",
+    )
+    _env_flag(p_core_reset)
+    p_core_reset.add_argument("name", choices=["openvpn"], help="Core to wipe")
+    p_core_reset.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip CONFIRM prompt",
+    )
+    p_core_reset.set_defaults(func=cmd_core_reset)
 
     p_xray = sub.add_parser("xray", help="Install / update Xray from LordDeveloper/xray Releases")
     xray_sub = p_xray.add_subparsers(dest="xray_command", required=True)
