@@ -105,6 +105,26 @@ async def validate_wg_conf_stripped(
         Path(temp_path).unlink(missing_ok=True)
 
 
+def prepare_shadowsocks_for_config_test(settings: dict[str, Any]) -> None:
+    """Keep AEAD multi-user inbounds loadable by ``xray run -test``.
+
+    Xray 1.0.7 treats a missing ``clients``/``users`` key as single-user mode
+    and then requires ``settings.password`` ("Shadowsocks password is not
+    specified."). AEAD multi-user stores the password on each client and omits
+    the server password. ``preserve_clients`` drops that list before the test
+    so a large user dump cannot stall the panel. An empty list stays in
+    multi-user mode and still builds.
+    """
+    method = str(settings.get("method") or "").strip()
+    if method.startswith("2022-"):
+        return
+    if str(settings.get("password") or "").strip():
+        return
+    if isinstance(settings.get("clients"), list) or isinstance(settings.get("users"), list):
+        return
+    settings["clients"] = []
+
+
 def validate_xray_inbound(inbound: dict[str, Any]) -> None:
     protocol = str(inbound.get("protocol") or "").strip()
     if not protocol:
@@ -191,6 +211,7 @@ async def validate_xray_config(binary: str, config: dict[str, Any]) -> None:
         from agent.support import repair_shadowsocks_settings
 
         repair_shadowsocks_settings(settings)
+        prepare_shadowsocks_for_config_test(settings)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
         json.dump(config, handle)
