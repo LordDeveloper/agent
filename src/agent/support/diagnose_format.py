@@ -349,7 +349,67 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
     return lines
 
 
+def format_trace_report(report: dict[str, Any], *, use_color: bool = True) -> str:
+    core = str(report.get('core') or 'unknown')
+    title = f'Agent trace — {core}'
+    lines = [paint(title, WHITE) if use_color else title, '']
+    if report.get('key') or report.get('email'):
+        lines.append(f'Key:     {report.get("key") or "-"}')
+        lines.append(f'Email:   {report.get("email") or "-"}')
+    else:
+        lines.append(f'Address: {report.get("address") or "-"}')
+    lines.append('')
+    lines.append('Configured hops are intended routes. Observed hops were read from the live host. Kernel lookups are not captured packets.')
+    lines.append('')
+
+    matches = [row for row in (report.get('matches') or []) if isinstance(row, dict)]
+    if report.get('found') is False or not matches:
+        lines.append('Found: no')
+        for item in list(report.get('limitations') or [])[:8]:
+            lines.append(f'  - {item}')
+        for issue in list(report.get('issues') or [])[:6]:
+            if isinstance(issue, dict) and issue.get('message'):
+                lines.append(f'  - {issue.get("message")}')
+        return '\n'.join(lines).rstrip() + '\n'
+
+    total = len(matches)
+    for index, match in enumerate(matches, start=1):
+        inbound = match.get('inbound') if isinstance(match.get('inbound'), dict) else {}
+        label = str(inbound.get('tag') or match.get('address') or match.get('email') or '-')
+        lines.extend([f'── Match {index}/{total} · {label} ──', ''])
+        for hop in list(match.get('hops') or [])[:12]:
+            if not isinstance(hop, dict):
+                continue
+            lines.append(
+                f'  {hop.get("step") or "-"}. {hop.get("role") or "hop"}'
+                f'  [{hop.get("basis") or "unknown"}]'
+            )
+            lines.append(f'     {hop.get("summary") or "-"}')
+        exit_info = match.get('public_exit') if isinstance(match.get('public_exit'), dict) else {}
+        lines.extend(['', 'Public exit'])
+        shown_ip = exit_info.get('ip') or exit_info.get('interface_global')
+        if exit_info.get('ip'):
+            lines.append(f'  IP:     {exit_info.get("ip")}  [{exit_info.get("basis") or "observed"}]')
+        elif shown_ip:
+            lines.append(f'  IP:     {shown_ip}  [interface address, not a verified exit IP]')
+        else:
+            lines.append('  IP:     unavailable')
+        if exit_info.get('detail'):
+            lines.append(f'  Note:   {exit_info.get("detail")}')
+        limits = list(match.get('limitations') or [])
+        if limits:
+            lines.extend(['', 'Limitations'])
+            for item in limits[:8]:
+                lines.append(f'  - {item}')
+        lines.append('')
+
+    return '\n'.join(lines).rstrip() + '\n'
+
+
 def format_diagnose_report(report: dict[str, Any], *, use_color: bool = True) -> str:
+    if str(report.get('kind') or '') == 'trace':
+        return format_trace_report(report, use_color=use_color)
+
     core = str(report.get('core') or 'unknown')
     matches = list(report.get('matches') or [])
     top_issues = list(report.get('issues') or [])

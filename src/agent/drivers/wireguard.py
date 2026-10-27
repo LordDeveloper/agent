@@ -1042,6 +1042,18 @@ class WireGuardDriver(CoreDriver):
             interface_is_up_fn=self._interface_is_up,
         )
 
+    async def trace_address(self, address: str) -> dict[str, Any]:
+        """Read-only forwarding path for a peer address. Does not sync or apply routes."""
+        from agent.support.traffic_trace import trace_stored_peer
+
+        return await trace_stored_peer(
+            self.store,
+            self.key,
+            address,
+            peer_dump_fn=self._peer_dump,
+            interface_is_up_fn=self._interface_is_up,
+        )
+
     async def clear_peer_ips(self, email: str) -> bool:
         changed = False
         for iface in await self.list_interfaces():

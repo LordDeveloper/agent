@@ -149,6 +149,15 @@ async def diagnose_user(address: str, l2tp: L2tpDriver = Depends(get_l2tp)):
     return report
 
 
+@router.get('/trace')
+async def trace_user(address: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+    try:
+        report = await l2tp.trace_address(address)
+    except ValueError as exc:
+        raise_agent_error('VALIDATION_ERROR', str(exc), 422)
+    return report
+
+
 @router.post('/backup')
 async def backup(l2tp: L2tpDriver = Depends(get_l2tp)):
     return {'success': True, 'backup': await l2tp.backup()}

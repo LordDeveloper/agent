@@ -226,6 +226,24 @@ async def diagnose_client(
     return report
 
 
+@router.get("/trace")
+async def trace_client(
+    key: str | None = None,
+    email: str | None = None,
+    client_id: str | None = None,
+    inbound_id: str | None = None,
+    xray: XrayDriver = Depends(get_xray),
+):
+    client_key = str(key or email or client_id or "").strip()
+    if not client_key:
+        raise_agent_error("VALIDATION_ERROR", "key, email, or client_id is required", 422)
+    try:
+        report = await xray.trace_client(client_key, inbound_id=inbound_id)
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return report
+
+
 @router.get("/clients/{email}/ips")
 async def client_ips(email: str, xray: XrayDriver = Depends(get_xray)):
     try:

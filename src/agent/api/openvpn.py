@@ -149,6 +149,15 @@ async def diagnose_user(address: str, openvpn: OpenVpnDriver = Depends(get_openv
     return report
 
 
+@router.get('/trace')
+async def trace_user(address: str, openvpn: OpenVpnDriver = Depends(get_openvpn)):
+    try:
+        report = await openvpn.trace_address(address)
+    except ValueError as exc:
+        raise_agent_error('VALIDATION_ERROR', str(exc), 422)
+    return report
+
+
 @router.post('/backup')
 async def backup(openvpn: OpenVpnDriver = Depends(get_openvpn)):
     return {'success': True, 'backup': await openvpn.backup()}

@@ -218,6 +218,15 @@ async def diagnose_peer(address: str, amnezia: AmneziaDriver = Depends(get_amnez
     return report
 
 
+@router.get("/trace")
+async def trace_peer(address: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
+    try:
+        report = await amnezia.trace_address(address)
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return report
+
+
 @router.delete("/peers/{email}/ips")
 async def clear_peer_ips(email: str, amnezia: AmneziaDriver = Depends(get_amnezia)):
     await amnezia.clear_peer_ips(email)

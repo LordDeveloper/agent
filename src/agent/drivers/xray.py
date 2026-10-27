@@ -1048,6 +1048,14 @@ class XrayDriver(CoreDriver):
 
         return await diagnose_xray_clients_by_key(self, key)
 
+    async def trace_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
+        from agent.support.traffic_trace import trace_xray_client
+
+        key = str(client_key or "").strip()
+        if not key:
+            raise ValueError("client key is required")
+        return await trace_xray_client(self, key, inbound_id=inbound_id)
+
     def _index_clients(self, inbound: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         by_email: dict[str, dict[str, Any]] = {}
         by_id: dict[str, dict[str, Any]] = {}

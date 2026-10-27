@@ -937,6 +937,11 @@ class OpenVpnDriver(CoreDriver):
         await self.sync_user_stats()
         return await diagnose_user_address(self.store, self.key, address)
 
+    async def trace_address(self, address: str) -> dict[str, Any]:
+        from agent.support.traffic_trace import trace_stored_peer
+
+        return await trace_stored_peer(self.store, self.key, address)
+
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
         rows: list[InboundUsageModel] = []

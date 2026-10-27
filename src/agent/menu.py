@@ -1321,25 +1321,46 @@ def _peer_diagnose_menu() -> None:
         )
         if picked in {None, "back"}:
             return
+        action = select(
+            [
+                Choice("diagnose", "Diagnose", CYAN, "1"),
+                Choice("trace", "Trace", GREEN, "2"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if action in {None, "back"}:
+            continue
         if picked == "xray":
             email = prompt_text("Client email (searches all inbounds)")
             if not str(email or "").strip():
                 continue
             inbound_id = prompt_text("Inbound id (optional, Enter = all inbounds)", default="")
             inbound_id = str(inbound_id or "").strip() or None
-            _run_action(
-                "Diagnose Xray client",
-                lambda addr=str(email).strip(), scope=inbound_id: _show_client_diagnose(addr, scope),
-            )
+            if action == "trace":
+                _run_action(
+                    "Trace Xray client",
+                    lambda addr=str(email).strip(), scope=inbound_id: _show_client_trace(addr, scope),
+                )
+            else:
+                _run_action(
+                    "Diagnose Xray client",
+                    lambda addr=str(email).strip(), scope=inbound_id: _show_client_diagnose(addr, scope),
+                )
             continue
         address = prompt_text("Peer address (e.g. 10.80.0.5)")
         if not str(address or "").strip():
             continue
         core = picked if picked in {"wireguard", "amnezia", "l2tp", "openvpn"} else "wireguard"
-        _run_action(
-            f"Diagnose {core} peer",
-            lambda addr=str(address).strip(), selected_core=core: _show_peer_diagnose(selected_core, addr),
-        )
+        if action == "trace":
+            _run_action(
+                f"Trace {core} peer",
+                lambda addr=str(address).strip(), selected_core=core: _show_peer_trace(selected_core, addr),
+            )
+        else:
+            _run_action(
+                f"Diagnose {core} peer",
+                lambda addr=str(address).strip(), selected_core=core: _show_peer_diagnose(selected_core, addr),
+            )
 
 
 def _show_client_diagnose(email: str, inbound_id: str | None) -> None:
@@ -1361,6 +1382,35 @@ def _show_client_diagnose(email: str, inbound_id: str | None) -> None:
         _print(paint("  ✗ client not found", YELLOW))
     else:
         _print(paint("  ✗ issues detected — see table above", RED))
+
+
+def _show_client_trace(email: str, inbound_id: str | None) -> None:
+    from agent.cli import cmd_client_trace
+
+    code = cmd_client_trace(
+        SimpleNamespace(
+            env_file=None,
+            email=email,
+            key=None,
+            client_id=None,
+            inbound_id=inbound_id,
+            json=False,
+        )
+    )
+    if code == 2:
+        _print(paint("  ✗ client not found", YELLOW))
+    elif code != 0:
+        _print(paint("  ✗ trace failed", RED))
+
+
+def _show_peer_trace(core: str, address: str) -> None:
+    from agent.cli import cmd_peer_trace
+
+    code = cmd_peer_trace(SimpleNamespace(env_file=None, core=core, address=address, json=False))
+    if code == 2:
+        _print(paint("  ✗ peer not found", YELLOW))
+    elif code != 0:
+        _print(paint("  ✗ trace failed", RED))
 
 
 def _show_peer_diagnose(core: str, address: str) -> None:

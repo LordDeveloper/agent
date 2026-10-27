@@ -530,6 +530,41 @@ def cmd_client_diagnose(args: argparse.Namespace) -> int:
         run_sync(runtime.close())
 
 
+def cmd_peer_trace(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        core = (args.core or "wireguard").strip().lower()
+        driver = runtime.registry.get(core)
+        if not hasattr(driver, "trace_address"):
+            raise AgentError("UNSUPPORTED_CAPABILITY", f"Core [{core}] does not support trace")
+        report = run_sync(driver.trace_address(args.address))
+        _emit_diagnose_report(report, args)
+        if report.get("found") is False:
+            return 2
+        return 0
+    finally:
+        run_sync(runtime.close())
+
+
+def cmd_client_trace(args: argparse.Namespace) -> int:
+    runtime = open_runtime(args.env_file)
+    try:
+        driver = runtime.registry.get("xray")
+        if not hasattr(driver, "trace_client"):
+            raise AgentError("UNSUPPORTED_CAPABILITY", "Xray core does not support trace")
+        client_key = str(args.email or args.key or args.client_id or "").strip()
+        if not client_key:
+            raise AgentError("VALIDATION_ERROR", "email, key, or client_id is required")
+        inbound_id = str(getattr(args, "inbound_id", "") or "").strip() or None
+        report = run_sync(driver.trace_client(client_key, inbound_id=inbound_id))
+        _emit_diagnose_report(report, args)
+        if report.get("found") is False:
+            return 2
+        return 0
+    finally:
+        run_sync(runtime.close())
+
+
 def _mullvad_service(args: argparse.Namespace):
     from agent.support.mullvad import MullvadService
 
@@ -1016,6 +1051,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_peer_diag.set_defaults(func=cmd_peer_diagnose)
 
+    p_peer_trace = peer_sub.add_parser(
+        "trace",
+        help="Read-only traffic path for a peer address",
+    )
+    _env_flag(p_peer_trace)
+    p_peer_trace.add_argument("address", help="Peer address (e.g. 10.80.0.5 or 10.80.0.5/32)")
+    p_peer_trace.add_argument(
+        "--core",
+        default="wireguard",
+        choices=["wireguard", "amnezia", "l2tp", "openvpn"],
+        help="VPN core to inspect (default: wireguard)",
+    )
+    p_peer_trace.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_peer_trace.set_defaults(func=cmd_peer_trace)
+
     p_client = sub.add_parser("client", help="Xray client diagnostics")
     client_sub = p_client.add_subparsers(dest="client_command", required=True)
 
@@ -1040,6 +1090,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output raw JSON instead of a human-readable table",
     )
     p_client_diag.set_defaults(func=cmd_client_diagnose)
+
+    p_client_trace = client_sub.add_parser(
+        "trace",
+        help="Read-only traffic path for an Xray client (including Shadowsocks)",
+    )
+    _env_flag(p_client_trace)
+    p_client_trace.add_argument("--email", help="Client email / remark")
+    p_client_trace.add_argument("--key", help="Alias for email or client UUID")
+    p_client_trace.add_argument("--client-id", help="Client UUID")
+    p_client_trace.add_argument("--inbound-id", help="Optional inbound id/tag scope")
+    p_client_trace.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_client_trace.set_defaults(func=cmd_client_trace)
 
     p_update = sub.add_parser("update", help="Update agent binary from GitHub Releases")
     _env_flag(p_update)
