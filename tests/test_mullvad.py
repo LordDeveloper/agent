@@ -12,6 +12,7 @@ from agent.support.mullvad import (
     parse_wg_conf,
     pick_best_relay,
     preferred_iface,
+    canonical_country_code,
     country_for_iface_name,
     render_persist_hold_script,
     render_persist_unit,
@@ -73,6 +74,11 @@ def test_iface_aliases():
     assert country_for_iface_name("sw") == "se"
     assert country_for_iface_name("mx") == "mx"
     assert country_for_iface_name("de") == "de"
+    assert canonical_country_code("sw") == "se"
+    assert canonical_country_code("se") == "se"
+    assert canonical_country_code("uk") == "gb"
+    assert canonical_country_code("usa") == "us"
+    assert preferred_iface("sw") == "sw"
 
 
 def test_parse_roundtrip_keeps_table_off():

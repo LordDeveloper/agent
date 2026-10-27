@@ -63,8 +63,23 @@ IFACE_FOR_COUNTRY: dict[str, str] = {
 COUNTRY_FOR_IFACE: dict[str, str] = {iface: code for code, iface in IFACE_FOR_COUNTRY.items()}
 
 
+def canonical_country_code(value: str) -> str:
+    """ISO country for a Mullvad code or a legacy iface alias (sw → se)."""
+    code = str(value or "").strip().lower()
+    if not code:
+        return ""
+    return COUNTRY_FOR_IFACE.get(code, code)
+
+
+def require_country_code(value: str) -> str:
+    code = canonical_country_code(value)
+    if not re.fullmatch(r"[a-z]{2}", code or ""):
+        raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+    return code
+
+
 def preferred_iface(country_code: str) -> str:
-    code = str(country_code or "").strip().lower()
+    code = canonical_country_code(country_code)
     return IFACE_FOR_COUNTRY.get(code, code)
 
 
@@ -801,16 +816,45 @@ class MullvadService:
         return rows
 
     async def binding_for(self, country_code: str) -> dict[str, Any] | None:
-        code = str(country_code or "").strip().lower()
+        code = canonical_country_code(country_code)
         if not code:
             return None
         row = await self.store.get_doc(CORE, KIND_LOCATION, code)
+        preferred = preferred_iface(code)
+        legacy: dict[str, Any] | None = None
+        for alias, iso in COUNTRY_FOR_IFACE.items():
+            if iso != code or alias == code:
+                continue
+            found = await self.store.get_doc(CORE, KIND_LOCATION, alias)
+            if isinstance(found, dict):
+                legacy = found
+                break
+        if isinstance(legacy, dict) and (
+            not isinstance(row, dict)
+            or (
+                str(legacy.get("iface") or "").strip() == preferred
+                and str(row.get("iface") or "").strip() != preferred
+            )
+        ):
+            return {**legacy, "country_code": code}
         return row if isinstance(row, dict) else None
 
     async def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
         relays = await maybe_await(fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch())
         await self.refresh_bindings(relays)
-        bound = {str(row.get("country_code") or "").lower(): row for row in await self.bindings()}
+        bound: dict[str, dict[str, Any]] = {}
+        for row in await self.bindings():
+            code = canonical_country_code(str(row.get("country_code") or ""))
+            if not code:
+                continue
+            current = bound.get(code)
+            preferred = preferred_iface(code)
+            row_iface = str(row.get("iface") or "").strip()
+            if current is not None and not (
+                row_iface == preferred and str(current.get("iface") or "").strip() != preferred
+            ):
+                continue
+            bound[code] = {**row, "country_code": code}
         locations = []
         for item in group_locations(relays):
             code = item["country_code"]
@@ -911,7 +955,31 @@ class MullvadService:
                 item["ping_via"] = None
         return locations
 
+    async def _canonicalize_stored_bindings(self) -> None:
+        """Move location docs keyed by a legacy iface (sw) onto the ISO code (se)."""
+        for row in await self.bindings():
+            stored = str(row.get("country_code") or "").strip().lower()
+            canonical = canonical_country_code(stored)
+            if not canonical or canonical == stored:
+                continue
+            payload = {**row, "country_code": canonical}
+            existing = await self.store.get_doc(CORE, KIND_LOCATION, canonical)
+            alias_iface = str(row.get("iface") or "").strip()
+            if isinstance(existing, dict):
+                existing_iface = str(existing.get("iface") or "").strip()
+                if existing_iface and alias_iface and existing_iface != alias_iface:
+                    log.warning(
+                        "mullvad binding alias %s left in place; %s already uses iface %s",
+                        stored,
+                        canonical,
+                        existing_iface,
+                    )
+                    continue
+            await self.store.put_doc(CORE, KIND_LOCATION, canonical, payload)
+            await self.store.delete_doc(CORE, KIND_LOCATION, stored)
+
     async def refresh_bindings(self, relays: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        await self._canonicalize_stored_bindings()
         catalog = relays if relays is not None else await maybe_await(self.fetch())
         claimed_ifaces = {
             str(row.get("iface") or "").strip()
@@ -919,9 +987,9 @@ class MullvadService:
             if str(row.get("iface") or "").strip()
         }
         claimed_countries = {
-            str(row.get("country_code") or "").strip().lower()
+            canonical_country_code(str(row.get("country_code") or ""))
             for row in await self.bindings()
-            if str(row.get("country_code") or "").strip()
+            if canonical_country_code(str(row.get("country_code") or ""))
         }
 
         for iface, parsed, live in await self._scan_interfaces():
@@ -957,9 +1025,7 @@ class MullvadService:
         return await self.bindings()
 
     async def ensure(self, country_code: str) -> dict[str, Any]:
-        code = str(country_code or "").strip().lower()
-        if not re.fullmatch(r"[a-z]{2}", code or ""):
-            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+        code = require_country_code(country_code)
 
         relays = await maybe_await(self.fetch())
         await self.refresh_bindings(relays)
@@ -1036,8 +1102,12 @@ class MullvadService:
         await self.refresh_bindings(relays)
         targets = await self.bindings()
         if country_code:
-            code = str(country_code).strip().lower()
-            targets = [row for row in targets if str(row.get("country_code") or "").lower() == code]
+            code = require_country_code(country_code)
+            targets = [
+                row
+                for row in targets
+                if canonical_country_code(str(row.get("country_code") or "")) == code
+            ]
             if not targets:
                 raise AgentError("NOT_FOUND", f"No Mullvad binding for {code}", 404)
 
@@ -1060,9 +1130,7 @@ class MullvadService:
         return {"changed": changed, "skipped": skipped, "failed": failed, "optimize": bool(optimize)}
 
     async def country_relays(self, country_code: str, *, ping: bool = True) -> dict[str, Any]:
-        code = str(country_code or "").strip().lower()
-        if not re.fullmatch(r"[a-z]{2}", code or ""):
-            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+        code = require_country_code(country_code)
 
         relays = await maybe_await(self.fetch())
         await self.refresh_bindings(relays)
@@ -1128,10 +1196,8 @@ class MullvadService:
         fixed: bool = False,
         pin: bool | None = None,
     ) -> dict[str, Any]:
-        code = str(country_code or "").strip().lower()
+        code = require_country_code(country_code)
         host = str(hostname or "").strip()
-        if not re.fullmatch(r"[a-z]{2}", code or ""):
-            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
         if not host:
             raise AgentError("VALIDATION_ERROR", "hostname is required", 422)
 
@@ -1189,9 +1255,7 @@ class MullvadService:
 
     async def set_relay_fixed(self, country_code: str, fixed: bool) -> dict[str, Any]:
         """Pin/unpin current relay for one country without changing the peer."""
-        code = str(country_code or "").strip().lower()
-        if not re.fullmatch(r"[a-z]{2}", code or ""):
-            raise AgentError("VALIDATION_ERROR", "country_code must be ISO 3166-1 alpha-2", 422)
+        code = require_country_code(country_code)
 
         bind = await self.binding_for(code)
         if not bind:
@@ -1429,7 +1493,9 @@ class MullvadService:
         *,
         optimize: bool = False,
     ) -> dict[str, Any]:
-        code = str(bind.get("country_code") or "").strip().lower()
+        code = canonical_country_code(str(bind.get("country_code") or ""))
+        if code:
+            bind = {**bind, "country_code": code}
         iface = str(bind.get("iface") or "").strip()
         hostname = str(bind.get("hostname") or "")
         presented = self._present_binding(bind)
@@ -2199,6 +2265,7 @@ class MullvadService:
         adopted: bool,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        country_code = canonical_country_code(country_code)
         current = await self.binding_for(country_code) or {}
         payload = {
             "country_code": country_code,
@@ -2218,6 +2285,17 @@ class MullvadService:
         if extra:
             payload.update(extra)
         await self.store.put_doc(CORE, KIND_LOCATION, country_code, payload)
+        iface_name = str(payload.get("iface") or "").strip()
+        for alias, iso in COUNTRY_FOR_IFACE.items():
+            if iso != country_code or alias == country_code:
+                continue
+            legacy = await self.store.get_doc(CORE, KIND_LOCATION, alias)
+            if not isinstance(legacy, dict):
+                continue
+            legacy_iface = str(legacy.get("iface") or "").strip()
+            if legacy_iface and iface_name and legacy_iface != iface_name:
+                continue
+            await self.store.delete_doc(CORE, KIND_LOCATION, alias)
 
     def _present_binding(self, bind: dict[str, Any]) -> dict[str, Any]:
         fixed = bool(bind.get("fixed") or bind.get("pinned"))
