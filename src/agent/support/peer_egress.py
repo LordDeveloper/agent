@@ -84,6 +84,46 @@ _L2TP_KIND = "server"
 _OPENVPN_KIND = "server"
 
 
+def _peer_egress_wants_link(unit_path: Path) -> Path:
+    return unit_path.parent / "multi-user.target.wants" / unit_path.name
+
+
+def _wants_target_is_unit(link: Path, raw_target: str, unit_path: Path) -> bool:
+    """True when a wants-link target names this unit file.
+
+    ``systemctl enable`` stores either an absolute path or a relative one
+    such as ``../agent-peer-egress.service``. A missing link, a regular file,
+    or a link to another path means the unit is not enabled.
+    """
+    raw = str(raw_target or "").strip()
+    if raw == "":
+        return False
+    target = Path(raw)
+    if not target.is_absolute():
+        target = link.parent / target
+    try:
+        return os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(unit_path))
+    except OSError:
+        return False
+
+
+def _peer_egress_unit_enabled(unit_path: Path) -> bool:
+    """True when the WantedBy symlink already points at this unit.
+
+    Checking the symlink avoids ``systemctl enable`` and ``systemctl is-enabled``
+    on every reconcile. A changed unit file still daemon-reloads; the existing
+    symlink keeps the unit enabled.
+    """
+    link = _peer_egress_wants_link(unit_path)
+    try:
+        if not link.is_symlink():
+            return False
+        raw = os.readlink(link)
+    except OSError:
+        return False
+    return _wants_target_is_unit(link, raw, unit_path)
+
+
 def _egress_comment_label(iface: str) -> str:
     """Make iface names safe for nft/iptables comment tokens (no '+' / '*')."""
     return str(iface or "").strip().replace("+", "x").replace("*", "x")
@@ -679,14 +719,20 @@ async def ensure_peer_egress_unit(
         log.warning("peer egress unit write failed: %s", exc)
         return {"ok": False, "skipped": False, "reason": str(exc)}
 
-    enable = await execute(runner, ["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
+    already_enabled = _peer_egress_unit_enabled(_UNIT_PATH)
+    if already_enabled:
+        enable_ok = True
+    else:
+        enable = await execute(runner, ["systemctl", "enable", _UNIT_NAME], check=False, timeout=30)
+        enable_ok = getattr(enable, "returncode", 1) == 0
     started = False
     if start:
         start_result = await execute(runner, ["systemctl", "start", _UNIT_NAME], check=False, timeout=60)
         started = getattr(start_result, "returncode", 1) == 0
     return {
-        "ok": getattr(enable, "returncode", 1) == 0,
+        "ok": enable_ok,
         "started": started,
+        "already_enabled": already_enabled,
         "unit": str(_UNIT_PATH),
         "script": str(script_path),
     }
@@ -796,6 +842,7 @@ async def reconcile_core_egress(
     if not shutil.which("ip"):
         return {"ok": False, "skipped": True, "reason": "ip not found"}
 
+    cache = _EgressCache()
     desired = desired_rules_from_interfaces(interfaces)
     previous = await store.get_doc(core, _STATE_KIND, _STATE_ID) or {}
     prev_rules = [row for row in (previous.get("rules") or []) if isinstance(row, dict)]
@@ -810,7 +857,7 @@ async def reconcile_core_egress(
         if str(row.get("addr") or "").strip()
     }
 
-    await _ensure_ip_forward(runner)
+    await _ensure_ip_forward(runner, cache)
 
     applied: list[dict[str, str | int]] = []
     switched: list[str] = []
@@ -831,12 +878,12 @@ async def reconcile_core_egress(
         key = (iface, table)
         if key in warmed:
             continue
-        if not iface or iface in absent or not await _iface_exists(runner, iface):
+        if not iface or iface in absent or not await _iface_exists(runner, iface, cache):
             if iface:
                 absent.add(iface)
             continue
-        await _soften_rp_filter(runner, iface)
-        if await _install_default_route(runner, iface=iface, table=table):
+        await _soften_rp_filter(runner, iface, cache)
+        if await _install_default_route(runner, iface=iface, table=table, cache=cache):
             warmed.add(key)
 
     # 2) Install desired rules BEFORE removing stale ones (atomic switch).
@@ -850,14 +897,14 @@ async def reconcile_core_egress(
         old = prev_by_addr.get(addr)
         old_action = str((old or {}).get("action") or "lookup")
         if action == "prohibit":
-            if not await _has_from_prohibit_rule(runner, cidr=cidr):
-                if not await _ip(runner, ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"]):
+            if not await _has_from_prohibit_rule(runner, cidr=cidr, cache=cache):
+                if not await _mutate_rule(runner, ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"], cache):
                     log.warning("peer egress skipped %s: failed to add prohibit rule", cidr)
                     continue
             if old and old_action != "prohibit":
                 old_table = int(old.get("table") or 0)
                 if old_table > 0:
-                    await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                    await _mutate_rule(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)], cache)
                 switched.append(addr)
             applied.append(row)
             continue
@@ -889,14 +936,15 @@ async def reconcile_core_egress(
             continue
 
         switching = bool(old and (int(old["table"]) != table or str(old["iface"]) != iface or old_action != "lookup"))
-        already = await _has_from_lookup_rule(runner, cidr=cidr, table=table)
+        already = await _has_from_lookup_rule(runner, cidr=cidr, table=table, cache=cache)
 
         if switching and not already:
             # Cutover pref beats any lingering old rule briefly.
             cutover = max(100, pref - 1)
-            if not await _ip(
+            if not await _mutate_rule(
                 runner,
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(cutover)],
+                cache,
             ):
                 log.warning("peer egress skipped %s: failed to add cutover rule → %s", cidr, iface)
                 if old and int(old.get("table") or 0) > 0 and str(old.get("iface") or ""):
@@ -913,15 +961,16 @@ async def reconcile_core_egress(
                 continue
             old_table = int(old["table"])
             if old_table > 0:
-                await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                await _mutate_rule(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)], cache)
             # Normalize to stable preference.
-            await _ip(runner, ["rule", "del", "from", cidr, "lookup", str(table), "pref", str(cutover)])
-            await _ip(runner, ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)])
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(table), "pref", str(cutover)], cache)
+            await _mutate_rule(runner, ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)], cache)
             switched.append(addr)
         elif not already:
-            if not await _ip(
+            if not await _mutate_rule(
                 runner,
                 ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)],
+                cache,
             ):
                 log.warning("peer egress skipped %s: failed to add rule → %s", cidr, iface)
                 if old and int(old.get("table") or 0) > 0 and str(old.get("iface") or ""):
@@ -939,11 +988,11 @@ async def reconcile_core_egress(
         elif switching:
             old_table = int(old["table"])
             if old_table > 0:
-                await _ip(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)])
+                await _mutate_rule(runner, ["rule", "del", "from", str(old["cidr"]), "lookup", str(old_table)], cache)
             switched.append(addr)
 
         if old_action == "prohibit":
-            await _ip(runner, ["rule", "del", "from", cidr, "prohibit"])
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "prohibit"], cache)
             switched.append(addr)
 
         applied.append(row)
@@ -968,10 +1017,10 @@ async def reconcile_core_egress(
         cidr = peer_source_cidr(addr) or f"{addr}/32"
         prev_action = str(row.get("action") or "lookup")
         if prev_action == "prohibit":
-            await _ip(runner, ["rule", "del", "from", cidr, "prohibit"])
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "prohibit"], cache)
             switched.append(addr)
         elif table:
-            await _ip(runner, ["rule", "del", "from", cidr, "lookup", str(table)])
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(table)], cache)
             switched.append(addr)
 
     # 4) Flush conntrack so old NAT paths do not stick after exit change/removal.
@@ -994,7 +1043,7 @@ async def reconcile_core_egress(
     # briefly leave the new exit without SNAT if apply races).
     for iface in previous.get("masq") or []:
         name = str(iface or "").strip()
-        if name and await _iface_exists(runner, name):
+        if name and await _iface_exists(runner, name, cache):
             masq_ifaces = sorted(set(masq_ifaces) | {name})
     # Merge masq with other cores so we don't drop shared exits while reconciling one core.
     other_masq: set[str] = set()
@@ -1042,6 +1091,15 @@ async def reconcile_core_egress(
     }
     await store.put_doc(core, _STATE_KIND, _STATE_ID, state)
 
+    log.debug(
+        "peer egress probes core=%s rule_show=%s link_show=%s route_show=%s route_replace=%s sysctl_write=%s",
+        core,
+        cache.counts["rule_show"],
+        cache.counts["link_show"],
+        cache.counts["route_show"],
+        cache.counts["route_replace"],
+        cache.counts["sysctl_write"],
+    )
     persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
     return {
         "ok": True,
@@ -1054,7 +1112,222 @@ async def reconcile_core_egress(
         "nat_rebuilt": nat_rebuilt,
         "forced": force,
         "persist": persist,
+        "probes": dict(cache.counts),
     }
+
+
+class _EgressCache:
+    """Kernel reads reused for one reconcile_core_egress call. Not kept afterward."""
+
+    def __init__(self) -> None:
+        self.ifaces: dict[str, bool] = {}
+        self.rules_loaded = False
+        self.rules_failed = False
+        self.lookups: set[tuple[str, int]] = set()
+        self.prohibits: set[str] = set()
+        # None until a main-table query succeeds. A failure stays None so it is
+        # retried and is never stored as an empty route list.
+        self.main_defaults: list[tuple[str, str | None]] | None = None
+        self.table_defaults: dict[int, list[tuple[str, str | None]] | None] = {}
+        self.counts = {
+            "rule_show": 0,
+            "link_show": 0,
+            "route_show": 0,
+            "route_replace": 0,
+            "sysctl_write": 0,
+        }
+
+    async def ensure_rules(self, runner: Runner) -> None:
+        if self.rules_loaded:
+            return
+        self.rules_loaded = True
+        parsed = await _load_policy_rules(runner, self)
+        if parsed is None:
+            self.rules_failed = True
+            self.lookups.clear()
+            self.prohibits.clear()
+            return
+        self.lookups, self.prohibits = parsed
+
+    def invalidate_rules(self) -> None:
+        self.rules_loaded = False
+        self.rules_failed = False
+        self.lookups.clear()
+        self.prohibits.clear()
+
+    def has_lookup(self, cidr: str, table: int) -> bool:
+        if self.rules_failed:
+            return False
+        return (_rule_host(cidr), int(table)) in self.lookups
+
+    def has_prohibit(self, cidr: str) -> bool:
+        if self.rules_failed:
+            return False
+        return _rule_host(cidr) in self.prohibits
+
+    def note_rule(self, args: list[str]) -> None:
+        if "from" not in args:
+            self.invalidate_rules()
+            return
+        cidr = str(args[args.index("from") + 1])
+        host = _rule_host(cidr)
+        if "lookup" in args:
+            try:
+                table = int(args[args.index("lookup") + 1])
+            except (TypeError, ValueError, IndexError):
+                self.invalidate_rules()
+                return
+            if "del" in args:
+                self.lookups.discard((host, table))
+            else:
+                self.lookups.add((host, table))
+            return
+        if "prohibit" in args:
+            if "del" in args:
+                self.prohibits.discard(host)
+            else:
+                self.prohibits.add(host)
+            return
+        self.invalidate_rules()
+
+
+def _rule_host(cidr: str) -> str:
+    return str(cidr or "").split("/", 1)[0].strip()
+
+
+def _table_number(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.startswith("table") and text[5:].isdigit():
+        return int(text[5:])
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+def _parse_rule_rows(rows: list[Any]) -> tuple[set[tuple[str, int]], set[str]]:
+    lookups: set[tuple[str, int]] = set()
+    prohibits: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        src = str(row.get("src") or "").strip()
+        if src in ("", "all"):
+            continue
+        host = _rule_host(src)
+        kind = str(row.get("type") or row.get("action") or "").lower()
+        if kind == "prohibit":
+            prohibits.add(host)
+            continue
+        table = _table_number(row.get("table"))
+        if table is None:
+            continue
+        lookups.add((host, table))
+    return lookups, prohibits
+
+
+def _parse_rule_text(text: str) -> tuple[set[tuple[str, int]], set[str]]:
+    lookups: set[tuple[str, int]] = set()
+    prohibits: set[str] = set()
+    for line in text.splitlines():
+        match = re.search(r"\bfrom\s+(\S+)\s+(.*)$", line.strip())
+        if not match:
+            continue
+        src = match.group(1)
+        if src == "all":
+            continue
+        rest = match.group(2)
+        host = _rule_host(src)
+        if re.search(r"\bprohibit\b", rest):
+            prohibits.add(host)
+            continue
+        found = re.search(r"\b(?:lookup|table)\s+(\d+)\b", rest)
+        if not found:
+            continue
+        lookups.add((host, int(found.group(1))))
+    return lookups, prohibits
+
+
+async def _load_policy_rules(
+    runner: Runner,
+    cache: _EgressCache | None = None,
+) -> tuple[set[tuple[str, int]], set[str]] | None:
+    def _count() -> None:
+        if cache is not None:
+            cache.counts["rule_show"] += 1
+
+    _count()
+    try:
+        result = await execute(runner, ["ip", "-j", "rule", "show"], check=False, timeout=5)
+    except Exception:
+        result = None
+    if result is not None and getattr(result, "returncode", 1) == 0:
+        raw = str(getattr(result, "stdout", "") or "").strip()
+        if raw:
+            try:
+                rows = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                rows = None
+            if isinstance(rows, list):
+                return _parse_rule_rows(rows)
+    _count()
+    try:
+        result = await execute(runner, ["ip", "rule", "show"], check=False, timeout=5)
+    except Exception:
+        return None
+    if result is None or getattr(result, "returncode", 1) != 0:
+        return None
+    return _parse_rule_text(str(getattr(result, "stdout", "") or ""))
+
+
+def _parse_default_routes(text: str) -> list[tuple[str, str | None]]:
+    found: list[tuple[str, str | None]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "default" or "dev" not in parts:
+            continue
+        try:
+            dev = parts[parts.index("dev") + 1]
+        except IndexError:
+            continue
+        via = None
+        if "via" in parts:
+            try:
+                via = parts[parts.index("via") + 1]
+            except IndexError:
+                via = None
+        found.append((dev, via))
+    return found
+
+
+def _single_default_matches(routes: list[tuple[str, str | None]], iface: str, via: str | None) -> bool:
+    if len(routes) != 1:
+        return False
+    dev, have = routes[0]
+    return dev == iface and have == via
+
+
+def _proc_sys_value(key: str) -> str | None:
+    parts = [part for part in str(key).split(".") if part]
+    if not parts or any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
+        return None
+    path = Path("/proc/sys").joinpath(*parts)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _rule_delete_is_absent(result: Any) -> bool:
+    """True only for iproute2's missing-rule replies, not for other failures."""
+    text = " ".join(
+        str(getattr(result, attr, "") or "")
+        for attr in ("stderr", "stdout")
+    ).lower()
+    return "no such file or directory" in text or "no such process" in text
 
 
 async def _ip(runner: Runner, args: list[str]) -> bool:
@@ -1065,19 +1338,46 @@ async def _ip(runner: Runner, args: list[str]) -> bool:
         return False
     if getattr(result, "returncode", 1) != 0:
         stderr = (getattr(result, "stderr", None) or getattr(result, "stdout", None) or "").strip()
-        # delete of missing rule is expected
-        if args[:1] == ["rule"] and "del" in args:
+        # Deleting a rule that is already gone is idempotent. Permission,
+        # netlink, and argument errors must stay failures so the rule map
+        # is reloaded instead of forgetting a rule that is still installed.
+        if args[:1] == ["rule"] and "del" in args and _rule_delete_is_absent(result):
             return True
         log.warning("ip %s rc=%s %s", " ".join(args), getattr(result, "returncode", "?"), stderr)
         return False
     return True
 
 
-async def _iface_exists(runner: Runner, iface: str) -> bool:
-    return await _ip(runner, ["link", "show", iface])
+async def _iface_exists(runner: Runner, iface: str, cache: _EgressCache | None = None) -> bool:
+    if cache is not None and iface in cache.ifaces:
+        return cache.ifaces[iface]
+    if cache is not None:
+        cache.counts["link_show"] += 1
+    ok = await _ip(runner, ["link", "show", iface])
+    if cache is not None:
+        cache.ifaces[iface] = ok
+    return ok
 
 
-async def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> bool:
+async def _mutate_rule(runner: Runner, args: list[str], cache: _EgressCache) -> bool:
+    ok = await _ip(runner, args)
+    if not ok:
+        cache.invalidate_rules()
+        return False
+    cache.note_rule(args)
+    return True
+
+
+async def _has_from_lookup_rule(
+    runner: Runner,
+    *,
+    cidr: str,
+    table: int,
+    cache: _EgressCache | None = None,
+) -> bool:
+    if cache is not None:
+        await cache.ensure_rules(runner)
+        return cache.has_lookup(cidr, table)
     """True when an identical from/lookup policy rule already exists."""
     try:
         result = await execute(runner, ["ip", "-j", "rule", "show"], check=False, timeout=5)
@@ -1122,7 +1422,15 @@ async def _has_from_lookup_rule(runner: Runner, *, cidr: str, table: int) -> boo
     return needle_a in text or needle_b in text
 
 
-async def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
+async def _has_from_prohibit_rule(
+    runner: Runner,
+    *,
+    cidr: str,
+    cache: _EgressCache | None = None,
+) -> bool:
+    if cache is not None:
+        await cache.ensure_rules(runner)
+        return cache.has_prohibit(cidr)
     host = cidr.split("/", 1)[0]
     try:
         result = await execute(runner, ["ip", "-j", "rule", "show"], check=False, timeout=5)
@@ -1154,19 +1462,9 @@ async def _has_from_prohibit_rule(runner: Runner, *, cidr: str) -> bool:
     return "prohibit" in str(getattr(result, "stdout", "") or "").lower()
 
 
-async def _soften_rp_filter(runner: Runner, iface: str) -> None:
+async def _soften_rp_filter(runner: Runner, iface: str, cache: _EgressCache | None = None) -> None:
     """Strict rp_filter breaks multi-exit WG tunnels that share similar addressing."""
-    if not shutil.which("sysctl"):
-        return
-    try:
-        await execute(
-            runner,
-            ["sysctl", "-w", f"net.ipv4.conf.{iface}.rp_filter=0"],
-            check=False,
-            timeout=5,
-        )
-    except Exception:
-        pass
+    await _sysctl_write(runner, f"net.ipv4.conf.{iface}.rp_filter", "0", cache)
 
 
 async def _flush_conntrack(runner: Runner, addr: str) -> None:
@@ -1184,65 +1482,135 @@ async def _flush_conntrack(runner: Runner, addr: str) -> None:
     # nft / iptables cannot easily wipe by IP here; conntrack-tools is preferred.
 
 
-async def _install_default_route(runner: Runner, *, iface: str, table: int) -> bool:
+class _GatewayRead:
+    """Result of one main-table default lookup. ``ok`` is false when the query failed."""
+
+    __slots__ = ("ok", "via")
+
+    def __init__(self, *, ok: bool, via: str | None = None) -> None:
+        self.ok = ok
+        self.via = via
+
+
+async def _install_default_route(
+    runner: Runner,
+    *,
+    iface: str,
+    table: int,
+    cache: _EgressCache | None = None,
+) -> bool:
     """Prefer `default via <gw> dev <iface>` when main table has a gateway on that NIC."""
-    via = await _gateway_for_iface(runner, iface)
+    gateway = await _gateway_for_iface(runner, iface, cache)
+    if not gateway.ok:
+        # A failed main-table read is not "this NIC has no gateway".
+        return False
+    via = gateway.via
+    if cache is not None:
+        current = await _table_default_routes(runner, table, cache)
+        if current is not None and _single_default_matches(current, iface, via):
+            return True
+    args = ["route", "replace", "default", "dev", iface, "table", str(table)]
     if via:
-        return await _ip(runner, ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)])
-    return await _ip(runner, ["route", "replace", "default", "dev", iface, "table", str(table)])
+        args = ["route", "replace", "default", "via", via, "dev", iface, "table", str(table)]
+    if cache is not None:
+        cache.counts["route_replace"] += 1
+    ok = await _ip(runner, args)
+    if cache is not None:
+        if ok:
+            cache.table_defaults[table] = [(iface, via)]
+        else:
+            cache.ifaces.pop(iface, None)
+            cache.table_defaults.pop(table, None)
+    return ok
 
 
-async def _gateway_for_iface(runner: Runner, iface: str) -> str | None:
+async def _table_default_routes(
+    runner: Runner,
+    table: int,
+    cache: _EgressCache,
+) -> list[tuple[str, str | None]] | None:
+    if table in cache.table_defaults:
+        return cache.table_defaults[table]
+    cache.counts["route_show"] += 1
     try:
-        result = await execute(runner, ["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+        result = await execute(
+            runner,
+            ["ip", "-4", "route", "show", "table", str(table)],
+            check=False,
+            timeout=5,
+        )
     except Exception:
+        cache.table_defaults[table] = None
         return None
     if getattr(result, "returncode", 1) != 0:
+        cache.table_defaults[table] = None
         return None
-    stdout = str(getattr(result, "stdout", "") or "")
-    for line in stdout.splitlines():
-        parts = line.split()
-        if "dev" not in parts:
-            continue
+    parsed = _parse_default_routes(str(getattr(result, "stdout", "") or ""))
+    cache.table_defaults[table] = parsed
+    return parsed
+
+
+async def _gateway_for_iface(
+    runner: Runner,
+    iface: str,
+    cache: _EgressCache | None = None,
+) -> _GatewayRead:
+    """Read the main-table gateway for ``iface``.
+
+    A successful query with no default, or with no default on this NIC, returns
+    ``ok`` and ``via is None`` (on-link install). A failed query returns
+    ``ok`` false and is not cached.
+    """
+    routes = cache.main_defaults if cache is not None else None
+    if routes is None:
+        if cache is not None:
+            cache.counts["route_show"] += 1
         try:
-            dev = parts[parts.index("dev") + 1]
-        except (ValueError, IndexError):
-            continue
-        if dev != iface:
-            continue
-        if "via" in parts:
-            try:
-                return parts[parts.index("via") + 1]
-            except (ValueError, IndexError):
-                return None
-        return None
-    return None
+            result = await execute(runner, ["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+        except Exception:
+            result = None
+        if result is None or getattr(result, "returncode", 1) != 0:
+            return _GatewayRead(ok=False)
+        routes = _parse_default_routes(str(getattr(result, "stdout", "") or ""))
+        if cache is not None:
+            cache.main_defaults = routes
+    for dev, via in routes:
+        if dev == iface:
+            return _GatewayRead(ok=True, via=via)
+    return _GatewayRead(ok=True, via=None)
 
 
-async def _ensure_ip_forward(runner: Runner) -> None:
+async def _sysctl_write(
+    runner: Runner,
+    key: str,
+    value: str,
+    cache: _EgressCache | None = None,
+) -> None:
+    current = _proc_sys_value(key)
+    if current is not None and current == value:
+        return
+    if not shutil.which("sysctl"):
+        return
+    if cache is not None:
+        cache.counts["sysctl_write"] += 1
     try:
-        path = "/proc/sys/net/ipv4/ip_forward"
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("1\n")
-    except OSError:
-        if shutil.which("sysctl"):
-            try:
-                await execute(runner, ["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, timeout=5)
-            except Exception:
-                pass
+        await execute(runner, ["sysctl", "-w", f"{key}={value}"], check=False, timeout=5)
+    except Exception:
+        pass
+
+
+async def _ensure_ip_forward(runner: Runner, cache: _EgressCache | None = None) -> None:
+    if _proc_sys_value("net.ipv4.ip_forward") != "1":
+        try:
+            path = "/proc/sys/net/ipv4/ip_forward"
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1\n")
+        except OSError:
+            await _sysctl_write(runner, "net.ipv4.ip_forward", "1", cache)
 
     # Strict all/default rp_filter breaks multi-exit peer egress after region switch.
-    if shutil.which("sysctl"):
-        for key in ("all", "default"):
-            try:
-                await execute(
-                    runner,
-                    ["sysctl", "-w", f"net.ipv4.conf.{key}.rp_filter=0"],
-                    check=False,
-                    timeout=5,
-                )
-            except Exception:
-                pass
+    for key in ("all", "default"):
+        await _sysctl_write(runner, f"net.ipv4.conf.{key}.rp_filter", "0", cache)
 
     await _persist_sysctl_forward()
 

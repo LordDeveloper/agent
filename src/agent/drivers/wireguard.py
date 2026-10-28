@@ -841,6 +841,29 @@ def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -
     return False
 
 
+def _peer_routing_key(peer: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Identity of the policy rule this peer installs. None when it installs none."""
+    from agent.support.peer_egress import normalize_exit_interface, peer_source_cidr
+
+    cidr = peer_source_cidr(peer.get("address"))
+    if not cidr:
+        return None
+    host = cidr.split("/", 1)[0]
+    exit_iface = normalize_exit_interface(peer.get("exit_interface")) or ""
+    linked = str(peer.get("linked_peer_id") or "").strip()
+    enabled = record_is_enabled(peer)
+    if linked and (not enabled or not exit_iface):
+        return (host, "prohibit", "")
+    if not enabled or not exit_iface:
+        return None
+    return (host, "lookup", exit_iface)
+
+
+def _peer_routing_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """True when the peer's desired policy rule changed. Quota and counters do not."""
+    return _peer_routing_key(before) != _peer_routing_key(after)
+
+
 def _migrate_wg_counter_fields(peer: dict[str, Any]) -> None:
     """
     Legacy WireGuard peers stored kernel raw counters in _incoming/_outgoing.
@@ -1258,7 +1281,14 @@ class WireGuardDriver(CoreDriver):
                     return cidr
         raise AgentError("VALIDATION_ERROR", "No free subnet for WireGuard/Amnezia interface")
 
-    async def update_interface(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def update_interface(
+        self,
+        interface_id: int | str,
+        payload: dict[str, Any],
+        *,
+        drop_keys: list[str] | None = None,
+        sync_egress: bool = True,
+    ) -> dict[str, Any]:
         iface = await self.get_interface(interface_id)
         previous = deepcopy(iface)
         updates = {k: v for k, v in payload.items() if k not in ("id",)}
@@ -1268,10 +1298,16 @@ class WireGuardDriver(CoreDriver):
         iface.update(updates)
         _ensure_interface_address(iface, previous_subnet=old_subnet or None)
         bring_up = _interface_needs_recycle(previous, iface)
-        await self._validate_before_apply(iface)
+        stripped = await self._validate_before_apply(iface)
         await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
-            await self._apply_live(iface, force_bring_up=bring_up)
+            await self._apply_live(
+                iface,
+                force_bring_up=bring_up,
+                stripped=stripped,
+                drop_keys=drop_keys,
+                sync_egress=sync_egress,
+            )
         except AgentError:
             await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
@@ -1360,13 +1396,18 @@ class WireGuardDriver(CoreDriver):
                     clear_disabled_metadata(merged)
                 iface["peers"][idx] = merged
 
-                # exit_interface / metadata-only updates must not wg syncconf + nft flush.
-                if _peer_change_needs_wg_apply(before, merged) or subnet_changed:
-                    await self.update_interface(interface_id, iface)
-                    await self._sync_linked_l2tp()
-                else:
+                # Quota, counters, and labels do not change policy routing.
+                # A WireGuard-only change (keepalive, allowed IPs) still syncconfs
+                # without reconciling egress. Exit, address, enable, and link do.
+                needs_wg = _peer_change_needs_wg_apply(before, merged) or subnet_changed
+                needs_route = _peer_routing_changed(before, merged)
+                if needs_wg:
+                    await self.update_interface(interface_id, iface, sync_egress=needs_route)
+                elif needs_route:
                     await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                     await self._sync_peer_egress()
+                else:
+                    await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
                 return merged
         raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
@@ -1387,10 +1428,8 @@ class WireGuardDriver(CoreDriver):
         if len(filtered) == len(peers):
             raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
         iface["peers"] = filtered
-        await self.update_interface(interface_id, iface)
+        await self.update_interface(interface_id, iface, drop_keys=drop_keys or None)
         await self.audit.record("delete", f"{self.key}/peer/{peer_id}")
-        if drop_keys:
-            await self._sync_linked_l2tp(drop_keys=drop_keys)
         return True
 
     def _peer_index(self, iface: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -1562,7 +1601,7 @@ class WireGuardDriver(CoreDriver):
         errors: list[dict[str, str]] = []
         applied: list[dict[str, Any]] = []
         wg_apply = False
-        egress_only = False
+        routing = False
 
         for raw in peers:
             if not isinstance(raw, dict):
@@ -1598,8 +1637,8 @@ class WireGuardDriver(CoreDriver):
                         used_ips.add(new_ip)
                     if _peer_change_needs_wg_apply(before, merged):
                         wg_apply = True
-                    else:
-                        egress_only = True
+                    if _peer_routing_changed(before, merged):
+                        routing = True
                     for idx, row in enumerate(rows):
                         if str(row.get("id")) == str(existing.get("id")) or str(row.get("email")) == str(existing.get("email")):
                             rows[idx] = merged
@@ -1621,6 +1660,8 @@ class WireGuardDriver(CoreDriver):
                     if created.get("email"):
                         by_email[str(created["email"])] = created
                     wg_apply = True
+                    if _peer_routing_changed({}, created):
+                        routing = True
                     applied.append(created)
 
                 used_ips.clear()
@@ -1660,14 +1701,18 @@ class WireGuardDriver(CoreDriver):
         if _subnet_prefix_widened(str(previous.get("subnet") or ""), str(iface.get("subnet") or "")):
             wg_apply = True
         bring_up = _interface_needs_recycle(previous, iface)
-        await self._validate_before_apply(iface)
+        stripped = await self._validate_before_apply(iface) if wg_apply else None
         await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
             if wg_apply:
-                await self._apply_live(iface, force_bring_up=bring_up)
-            elif egress_only:
+                await self._apply_live(
+                    iface,
+                    force_bring_up=bring_up,
+                    stripped=stripped,
+                    sync_egress=routing,
+                )
+            elif routing:
                 await self._sync_peer_egress()
-            await self._sync_linked_l2tp()
         except AgentError:
             await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
@@ -1746,10 +1791,10 @@ class WireGuardDriver(CoreDriver):
             }
 
         iface["peers"] = filtered
-        await self._validate_before_apply(iface)
+        stripped = await self._validate_before_apply(iface)
         await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
         try:
-            await self._apply_live(iface)
+            await self._apply_live(iface, stripped=stripped, drop_keys=drop_keys or None)
         except AgentError:
             await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise
@@ -1760,8 +1805,6 @@ class WireGuardDriver(CoreDriver):
             f"{self.key}/interface/{interface_id}/peers/batch",
             f"removed={succeeded} failed={failed} ms={elapsed_ms}",
         )
-        if drop_keys:
-            await self._sync_linked_l2tp(drop_keys=drop_keys)
         return {
             "ok": failed == 0,
             "succeeded": succeeded,
@@ -2218,14 +2261,15 @@ class WireGuardDriver(CoreDriver):
             lines.extend(_peer_lines_for_conf(peer))
         return "\n".join(lines)
 
-    async def _validate_before_apply(self, iface: dict[str, Any]) -> None:
+    async def _validate_before_apply(self, iface: dict[str, Any]) -> str:
+        """Return wg-quick strip stdout for this interface, or "" when wg-quick is absent."""
         _repair_reserved_peer_addresses(iface)
         validate_wg_iface(iface)
         quick = self._quick_bin()
         if not quick:
-            return
+            return ""
         conf_text = self._render_conf(iface)
-        await validate_wg_conf_stripped(
+        return await validate_wg_conf_stripped(
             conf_text,
             quick_bin=quick,
             config_dir=self._config_dir(),
@@ -2274,8 +2318,16 @@ class WireGuardDriver(CoreDriver):
         self._config_dir().mkdir(parents=True, exist_ok=True)
         self._conf_file(iface["name"]).write_text(self._render_conf(iface), encoding="utf-8")
 
-    async def _bring_up(self, iface: dict[str, Any]) -> dict[str, Any]:
-        await self._validate_before_apply(iface)
+    async def _bring_up(
+        self,
+        iface: dict[str, Any],
+        *,
+        already_valid: bool = False,
+        drop_keys: list[str] | None = None,
+        sync_egress: bool = True,
+    ) -> dict[str, Any]:
+        if not already_valid:
+            await self._validate_before_apply(iface)
         self._sync_conf(iface)
         quick = self._quick_bin()
         name = iface["name"]
@@ -2299,8 +2351,8 @@ class WireGuardDriver(CoreDriver):
             "ok": up.returncode == 0,
             "stderr": (up.stderr or down.stderr or "").strip(),
         }
-        if result["ok"]:
-            await self._sync_peer_egress()
+        if result["ok"] and sync_egress:
+            await self._sync_peer_egress(drop_keys=drop_keys)
         return result
 
     async def _bring_down(self, iface: dict[str, Any]) -> dict[str, Any]:
@@ -2320,8 +2372,17 @@ class WireGuardDriver(CoreDriver):
             return {"name": name, "ok": False, "stderr": f"{Path(quick).name} down timed out"}
         return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
 
-    async def _apply_live(self, iface: dict[str, Any], *, force_bring_up: bool = False) -> None:
-        await self._validate_before_apply(iface)
+    async def _apply_live(
+        self,
+        iface: dict[str, Any],
+        *,
+        force_bring_up: bool = False,
+        stripped: str | None = None,
+        drop_keys: list[str] | None = None,
+        sync_egress: bool = True,
+    ) -> None:
+        if stripped is None:
+            stripped = await self._validate_before_apply(iface)
 
         cli = self._cli_bin()
         quick = self._quick_bin()
@@ -2331,7 +2392,8 @@ class WireGuardDriver(CoreDriver):
 
         if not cli or not quick:
             self._sync_conf(iface)
-            await self._sync_peer_egress()
+            if sync_egress:
+                await self._sync_peer_egress(drop_keys=drop_keys)
             return
 
         if force_bring_up:
@@ -2341,7 +2403,12 @@ class WireGuardDriver(CoreDriver):
                     if not down.get("ok"):
                         detail = (down.get("stderr") or "wg-quick down failed").strip()
                         raise AgentError("VALIDATION_ERROR", f"WireGuard interface recycle failed: {detail}")
-                up = await self._bring_up(iface)
+                up = await self._bring_up(
+                    iface,
+                    already_valid=True,
+                    drop_keys=drop_keys,
+                    sync_egress=sync_egress,
+                )
                 if not up.get("ok"):
                     detail = (up.get("stderr") or up.get("message") or "wg-quick up failed").strip()
                     raise AgentError("VALIDATION_ERROR", f"WireGuard interface recycle failed: {detail}")
@@ -2355,20 +2422,22 @@ class WireGuardDriver(CoreDriver):
 
         if not await self._interface_is_up(name):
             self._sync_conf(iface)
-            await self._sync_peer_egress()
+            if sync_egress:
+                await self._sync_peer_egress(drop_keys=drop_keys)
             return
 
         try:
             self._sync_conf(iface)
-            strip = await run([quick, "strip", str(conf_path)], check=False)
-            if strip.returncode != 0 or not strip.stdout:
-                detail = (strip.stderr or strip.stdout or "wg-quick strip failed").strip()
-                raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
-            sync = await _apply_wg_syncconf(cli, name, strip.stdout, directory=conf_path.parent)
+            # Same render validate_wg_conf_stripped already checked. A second
+            # wg-quick strip of the file just written would repeat that work.
+            if not (stripped or "").strip():
+                raise AgentError("VALIDATION_ERROR", "WireGuard live apply rejected: wg-quick strip failed")
+            sync = await _apply_wg_syncconf(cli, name, stripped, directory=conf_path.parent)
             if sync.returncode != 0:
                 detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
-            await self._sync_peer_egress()
+            if sync_egress:
+                await self._sync_peer_egress(drop_keys=drop_keys)
         except AgentError:
             if backup is not None:
                 conf_path.write_text(backup, encoding="utf-8")
@@ -2376,7 +2445,12 @@ class WireGuardDriver(CoreDriver):
                 conf_path.unlink(missing_ok=True)
             raise
 
-    async def _sync_peer_egress(self, interfaces: list[dict[str, Any]] | None = None) -> None:
+    async def _sync_peer_egress(
+        self,
+        interfaces: list[dict[str, Any]] | None = None,
+        *,
+        drop_keys: list[str] | None = None,
+    ) -> None:
         try:
             from agent.support.peer_egress import reconcile_core_egress
 
@@ -2391,7 +2465,7 @@ class WireGuardDriver(CoreDriver):
             from agent.logutil import get_logger
 
             get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)
-        await self._sync_linked_l2tp()
+        await self._sync_linked_l2tp(drop_keys=drop_keys)
 
     async def _sync_linked_l2tp(self, drop_keys: list[str] | None = None) -> None:
         try:
