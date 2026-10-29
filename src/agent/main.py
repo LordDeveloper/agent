@@ -24,6 +24,7 @@ from agent.api.tls import router as tls_router
 from agent.api.network import router as network_router
 from agent.api.mullvad import router as mullvad_router
 from agent.api.transfer import router as transfer_router
+from agent.api.status import router as status_router
 from agent.mullvad_worker import mullvad_worker_loop
 from agent.errorlog import CoreErrorCaptureMiddleware, CoreErrorLog
 from agent.logutil import get_logger, resolve_log_path, setup_logging
@@ -184,6 +185,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
     auth = [Depends(verify_auth)]
     app.include_router(cores_router, prefix="/api/v1", dependencies=auth)
     app.include_router(stats_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(status_router, prefix="/api/v1", dependencies=auth)
 
     # Core APIs are always mounted; ENABLED_CORES only marks preferred cores in health.
     app.include_router(xray_router, prefix="/api/v1", dependencies=auth)
