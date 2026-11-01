@@ -80,9 +80,11 @@ class AgentSettings(BaseSettings):
     amnezia_config_dir: str = "/etc/amneziawg"
     l2tp_config_dir: str = "/etc/agent/bin/l2tp"
     openvpn_config_dir: str = "/etc/agent/bin/openvpn"
-    # Seconds between local volume-quota checks (0 disables). Cuts clients on the agent
-    # before the Laravel panel polls, so overshoot stays near zero.
+    # Seconds between local volume-quota checks (0 disables the enforcer loop entirely).
     quota_enforce_interval: float = 10.0
+    # When false, positive client `volume` from the panel is stored for sync/diagnose but
+    # quota_exceeded / enforce_driver_quotas never cut traffic locally — Laravel owns caps.
+    enforce_local_volume_quota: bool = True
     # Seconds between traffic delta samples for panel billing (0 disables background worker).
     traffic_sample_interval: float = 30.0
     # Sidecar TCP forwarder injecting PROXY protocol v1 for Xray acceptProxyProtocol inbounds.

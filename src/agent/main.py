@@ -34,6 +34,7 @@ from agent.routing import ROUTE_SLUGS
 from agent.core_supervisor import bootstrap_enabled_cores
 from agent.errors import AgentError
 from agent.quota_enforcer import quota_enforcer_loop
+from agent.support.quota import configure_quota_settings
 from agent.runtime import RuntimeTrace
 from agent.traffic.service import TrafficService
 from agent.traffic_worker import traffic_worker_loop
@@ -111,6 +112,7 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
 def create_app(env_file: str | None = None) -> FastAPI:
     settings = load_settings(env_file or os.environ.get("ENV_FILE"))
+    configure_quota_settings(settings)
     setup_logging(settings)
     app_log = get_logger("app")
 
@@ -125,12 +127,17 @@ def create_app(env_file: str | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         await store.open()
         app_log.info(
-            "agent started version=%s listen=%s cores=%s log=%s",
+            "agent started version=%s listen=%s cores=%s log=%s local_volume_quota=%s",
             __version__,
             settings.listen,
             ",".join(settings.cores()) or "-",
             resolve_log_path(settings),
+            settings.enforce_local_volume_quota,
         )
+        if not settings.enforce_local_volume_quota:
+            app_log.warning(
+                "local volume quota enforcement disabled; panel sync must disable on is_exceeded",
+            )
         await bootstrap_enabled_cores(settings, registry, app_log)
 
         stop_quota = asyncio.Event()

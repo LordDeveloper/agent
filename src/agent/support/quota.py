@@ -4,11 +4,26 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent.asyncutil import gather_independent, maybe_await
+from agent.config import AgentSettings, load_settings
 from agent.logutil import get_logger
 from agent.support import record_is_enabled
 from agent.support.disable_reason import baseline_looks_like_raw_kernel, mark_quota_disabled
 
 log = get_logger("quota")
+
+_quota_settings: AgentSettings | None = None
+
+
+def configure_quota_settings(settings: AgentSettings) -> None:
+    global _quota_settings
+    _quota_settings = settings
+
+
+def local_volume_quota_enforced() -> bool:
+    global _quota_settings
+    if _quota_settings is None:
+        configure_quota_settings(load_settings())
+    return bool(_quota_settings.enforce_local_volume_quota)
 
 # xray, wireguard, and l2tp each reject a single write above 200 rows.
 # A larger quota pass used to raise PAYLOAD_TOO_LARGE and abort the cycle,
@@ -17,7 +32,9 @@ _QUOTA_WRITE_BATCH = 200
 
 
 def has_volume_quota(client: dict[str, Any]) -> bool:
-    """True when the panel tracks a finite byte quota for this client."""
+    """True when the agent should enforce a finite byte quota for this client."""
+    if not local_volume_quota_enforced():
+        return False
     if "volume" not in client:
         return False
 
