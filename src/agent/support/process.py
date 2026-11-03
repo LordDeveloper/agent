@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -16,18 +18,65 @@ def which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
 
-async def _stop_process(proc: asyncio.subprocess.Process) -> None:
-    """Kill a timed-out child. A race with an already-exited pid is not an error."""
+async def _stop_process(proc: asyncio.subprocess.Process, *, kill_group: bool = False) -> None:
+    """Kill a timed-out or cancelled child. A race with an already-exited pid is not an error.
+
+    ``kill_group`` is for ``run_exit`` children started in their own session.
+    ``wg-quick`` / ``awg-quick`` spawn a tunnel daemon; killing only the parent
+    on timeout leaves that daemon half-started. The group is killed only when
+    the child is still the leader (it has not exited). A successful exit does
+    not call this, so a daemon that already detached keeps running.
+    """
     if proc.returncode is not None:
         return
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        return
+    if kill_group and os.name != "nt" and proc.pid:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+    else:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
     try:
         await proc.wait()
     except ProcessLookupError:
         return
+
+
+def _drain_cancellation() -> None:
+    """Allow cleanup awaits after this task has already been cancelled.
+
+    Python 3.11 keeps a cancellation counter. Catching ``CancelledError`` does
+    not always clear it, so the next ``await`` (the kill) is cancelled too and
+    the child keeps running.
+    """
+    current = asyncio.current_task()
+    uncancel = getattr(current, "uncancel", None) if current is not None else None
+    if not callable(uncancel):
+        return
+    while uncancel():
+        pass
+
+
+async def _abort_process(proc: asyncio.subprocess.Process, *, kill_group: bool = False) -> None:
+    """Finish process cleanup even when the awaiting task is already cancelled.
+
+    The inner task is kept alive across ``CancelledError``. A bare
+    ``asyncio.shield(coroutine)`` can be collected before the kill runs.
+    """
+    task = asyncio.create_task(_stop_process(proc, kill_group=kill_group))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 async def _collect_output(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
@@ -49,6 +98,7 @@ async def run(
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess without blocking the event loop."""
     with RuntimeTrace.span(command_span_name(args)):
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -65,8 +115,13 @@ async def run(
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
-            await _stop_process(proc)
+            await _abort_process(proc)
             raise subprocess.TimeoutExpired(args, timeout) from exc
+        except asyncio.CancelledError:
+            _drain_cancellation()
+            if proc is not None and proc.returncode is None:
+                await _abort_process(proc)
+            raise
         except ProcessLookupError:
             stdout_b, stderr_b = await _collect_output(proc)
 
@@ -104,6 +159,7 @@ async def run_exit(
     with RuntimeTrace.span(command_span_name(args)):
         stdout_file = tempfile.TemporaryFile()
         stderr_file = tempfile.TemporaryFile()
+        proc: asyncio.subprocess.Process | None = None
         try:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -112,14 +168,22 @@ async def run_exit(
                     stdout=stdout_file,
                     stderr=stderr_file,
                     env=env,
+                    # Own session so a timeout can kill wg-quick and the tunnel
+                    # process it has not detached yet. Windows has no killpg.
+                    start_new_session=os.name != "nt",
                 )
             except FileNotFoundError:
                 raise
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout)
             except asyncio.TimeoutError as exc:
-                await _stop_process(proc)
+                await _abort_process(proc, kill_group=True)
                 raise subprocess.TimeoutExpired(args, timeout) from exc
+            except asyncio.CancelledError:
+                _drain_cancellation()
+                if proc is not None and proc.returncode is None:
+                    await _abort_process(proc, kill_group=True)
+                raise
             stdout_file.seek(0)
             stderr_file.seek(0)
             stdout = stdout_file.read().decode(errors="replace")

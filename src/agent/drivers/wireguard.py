@@ -21,6 +21,11 @@ from agent.support import normalize_peer, record_is_enabled
 from agent.support.client_identity import apply_panel_identity, panel_client_response
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.asyncutil import bounded_gather, gather_independent
+from agent.support.interface_lifecycle import (
+    InterfaceLockRegistry,
+    lifecycle_limits,
+    run_interface_operations,
+)
 from agent.support.process import run, run_exit
 from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
@@ -33,6 +38,20 @@ _AWG_MTU = 1280
 _PEER_BATCH_MAX = 200
 
 log = get_logger("wireguard")
+
+
+def _wg_quick_already_down(stderr: str) -> bool:
+    text = stderr.lower()
+    return any(
+        needle in text
+        for needle in (
+            "is not a wireguard interface",
+            "is not a wireguard",
+            "does not exist",
+            "cannot find device",
+            "no such device",
+        )
+    )
 
 
 async def _apply_wg_syncconf(cli: str, name: str, stripped: str, *, directory: Path):
@@ -972,6 +991,7 @@ class WireGuardDriver(CoreDriver):
         self.settings = settings
         self.audit = audit
         self.store = store
+        self._iface_locks = InterfaceLockRegistry()
 
     async def _migrate_keepalive_opt_in(self) -> None:
         """
@@ -1032,18 +1052,73 @@ class WireGuardDriver(CoreDriver):
         return await install_wireguard()
 
     async def enable(self) -> dict[str, Any]:
-        ifaces = await self.list_interfaces()
-        results = await gather_independent(*(self._bring_up(iface) for iface in ifaces))
-        return {"enabled": True, "interfaces": [row for row in results if isinstance(row, dict)]}
+        report = await self._run_interface_lifecycle("start")
+        return self._lifecycle_payload(report, enabled=bool(report.get("ok")))
 
     async def disable(self) -> dict[str, Any]:
-        ifaces = await self.list_interfaces()
-        results = await gather_independent(*(self._bring_down(iface) for iface in ifaces))
-        return {"enabled": False, "interfaces": [row for row in results if isinstance(row, dict)]}
+        report = await self._run_interface_lifecycle("stop")
+        return self._lifecycle_payload(report, enabled=False)
 
     async def restart(self) -> dict[str, Any]:
-        await self.disable()
-        return await self.enable()
+        report = await self._run_interface_lifecycle("restart")
+        payload = self._lifecycle_payload(report, enabled=bool(report.get("ok")))
+        payload["restarted"] = bool(report.get("ok"))
+        return payload
+
+    async def _run_interface_lifecycle(self, operation: str) -> dict[str, Any]:
+        """Start, stop, or restart every stored interface without a shared cancel.
+
+        Peer-egress rules are reconciled once after the batch. Doing that inside
+        each parallel ``wg-quick`` call races nftables and lets one slow
+        interface rewrite routes the others still own.
+        """
+        ifaces = list(await self.list_interfaces())
+        by_id = {str(iface.get("id")): iface for iface in ifaces}
+        limit, timeout = lifecycle_limits(self.settings)
+
+        async def worker(interface_id: str, _interface_name: str, op: str) -> dict[str, Any]:
+            iface = by_id[interface_id]
+            if op == "stop":
+                return await self._bring_down(iface, sync_egress=False, hold_lock=False)
+            return await self._bring_up(iface, sync_egress=False, hold_lock=False)
+
+        report = await run_interface_operations(
+            [(str(iface.get("id")), str(iface.get("name") or "")) for iface in ifaces],
+            operation,
+            worker,
+            locks=self._iface_locks,
+            limit=limit,
+            timeout=timeout,
+            logger=log,
+        )
+        await self._reconcile_after_lifecycle(ifaces, list(report.get("results") or []), operation)
+        return report
+
+    async def _reconcile_after_lifecycle(
+        self,
+        ifaces: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        operation: str,
+    ) -> None:
+        if operation == "stop":
+            stopped = {str(row.get("interface_id")) for row in results if row.get("ok")}
+            remaining = [row for row in ifaces if str(row.get("id")) not in stopped]
+            await self._sync_peer_egress(remaining)
+            return
+        await self._sync_peer_egress()
+
+    def _lifecycle_payload(self, report: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+        results = [row for row in (report.get("results") or []) if isinstance(row, dict)]
+        return {
+            "enabled": enabled,
+            "ok": bool(report.get("ok")),
+            "interfaces": results,
+            "summary": dict(report.get("summary") or {}),
+            "action": report.get("action"),
+            "errors": list(report.get("errors") or []),
+            "count": int(report.get("count") or 0),
+            "failed_count": int(report.get("failed_count") or 0),
+        }
 
     async def peer_ips(self, email: str) -> list[str]:
         await self.sync_peer_stats()
@@ -2318,6 +2393,9 @@ class WireGuardDriver(CoreDriver):
         self._config_dir().mkdir(parents=True, exist_ok=True)
         self._conf_file(iface["name"]).write_text(self._render_conf(iface), encoding="utf-8")
 
+    def _iface_lock_key(self, iface: dict[str, Any]) -> str:
+        return str(iface.get("name") or iface.get("id") or "")
+
     async def _bring_up(
         self,
         iface: dict[str, Any],
@@ -2325,7 +2403,17 @@ class WireGuardDriver(CoreDriver):
         already_valid: bool = False,
         drop_keys: list[str] | None = None,
         sync_egress: bool = True,
+        hold_lock: bool = True,
     ) -> dict[str, Any]:
+        if hold_lock:
+            async with self._iface_locks.lock(self._iface_lock_key(iface)):
+                return await self._bring_up(
+                    iface,
+                    already_valid=already_valid,
+                    drop_keys=drop_keys,
+                    sync_egress=sync_egress,
+                    hold_lock=False,
+                )
         if not already_valid:
             await self._validate_before_apply(iface)
         self._sync_conf(iface)
@@ -2341,27 +2429,36 @@ class WireGuardDriver(CoreDriver):
             down = await run_exit([quick, "down", conf], check=False, timeout=45)
             up = await run_exit([quick, "up", conf], check=False, timeout=120)
         except subprocess.TimeoutExpired:
-            return {
-                "name": name,
-                "ok": False,
-                "message": f"{Path(quick).name} timed out while bringing {name} up",
-            }
+            detail = f"{Path(quick).name} timed out while bringing {name} up"
+            return {"name": name, "ok": False, "timed_out": True, "message": detail, "error": detail}
         result = {
             "name": name,
             "ok": up.returncode == 0,
             "stderr": (up.stderr or down.stderr or "").strip(),
         }
+        if not result["ok"] and not result["stderr"]:
+            result["error"] = "wg-quick up failed"
         if result["ok"] and sync_egress:
             await self._sync_peer_egress(drop_keys=drop_keys)
         return result
 
-    async def _bring_down(self, iface: dict[str, Any]) -> dict[str, Any]:
-        remaining = [
-            row
-            for row in await self.list_interfaces()
-            if str(row.get("id")) != str(iface.get("id"))
-        ]
-        await self._sync_peer_egress(remaining)
+    async def _bring_down(
+        self,
+        iface: dict[str, Any],
+        *,
+        sync_egress: bool = True,
+        hold_lock: bool = True,
+    ) -> dict[str, Any]:
+        if hold_lock:
+            async with self._iface_locks.lock(self._iface_lock_key(iface)):
+                return await self._bring_down(iface, sync_egress=sync_egress, hold_lock=False)
+        if sync_egress:
+            remaining = [
+                row
+                for row in await self.list_interfaces()
+                if str(row.get("id")) != str(iface.get("id"))
+            ]
+            await self._sync_peer_egress(remaining)
         quick = self._quick_bin()
         name = iface["name"]
         if not quick:
@@ -2369,8 +2466,16 @@ class WireGuardDriver(CoreDriver):
         try:
             result = await run_exit([quick, "down", str(self._conf_file(name))], check=False, timeout=45)
         except subprocess.TimeoutExpired:
-            return {"name": name, "ok": False, "stderr": f"{Path(quick).name} down timed out"}
-        return {"name": name, "ok": result.returncode == 0, "stderr": (result.stderr or "").strip()}
+            detail = f"{Path(quick).name} down timed out"
+            return {"name": name, "ok": False, "timed_out": True, "stderr": detail, "error": detail}
+        ok = result.returncode == 0
+        stderr = (result.stderr or "").strip()
+        # wg-quick down is non-zero when the interface is already gone. That is
+        # a finished stop, not a failure that should block a following start.
+        if not ok and _wg_quick_already_down(stderr):
+            ok = True
+            stderr = ""
+        return {"name": name, "ok": ok, "stderr": stderr, "error": None if ok else (stderr or "wg-quick down failed")}
 
     async def _apply_live(
         self,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from agent.tui import GREEN, RED, WHITE, YELLOW, paint
@@ -13,6 +15,31 @@ def _yes_no(value: Any) -> str:
     if value is False:
         return 'no'
     return '-'
+
+
+def _online_label(live: dict[str, Any]) -> str:
+    status = str(live.get('online_status') or '').strip().lower()
+    if status == 'online':
+        return 'yes'
+    if status == 'offline':
+        return 'no'
+    if status == 'unknown':
+        return 'unknown'
+    return _yes_no(live.get('online'))
+
+
+def _format_epoch(value: Any) -> str:
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return '-'
+    if stamp > 10_000_000_000:
+        stamp = stamp / 1000.0
+    if stamp <= 0:
+        return '-'
+    rendered = datetime.fromtimestamp(stamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    age = max(0, int(time.time() - stamp))
+    return f'{rendered} ({age}s ago)'
 
 
 def _status_label(healthy: bool) -> str:
@@ -334,10 +361,25 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
         'Live runtime',
         f'  Present:      {_yes_no(match.get("live") is not None)}',
         f'  Enabled:      {_yes_no(live.get("is_enabled"))}',
-        f'  Online:       {_yes_no(live.get("online"))}',
-        f'  IPs:          {_truncate(", ".join(live.get("ips") or []), 56) or "-"}',
-        '',
+        f'  Online:       {_online_label(live)}',
+        f'  IPs:          {_truncate(", ".join(str(ip) for ip in (live.get("ips") or [])), 56) or "-"}',
     ])
+    if live.get('online_source'):
+        lines.append(f'  Source:       {live.get("online_source")}')
+    if live.get('online_window_seconds') not in (None, ''):
+        lines.append(f'  Window:       {live.get("online_window_seconds")}s')
+    if live.get('last_activity') not in (None, ''):
+        lines.append(f'  Last activity: {_format_epoch(live.get("last_activity"))}')
+    traffic = live.get('traffic') if isinstance(live.get('traffic'), dict) else {}
+    if traffic:
+        lines.append(
+            f'  Uplink:       {traffic.get("uplink", "-")}'
+            f'  Downlink: {traffic.get("downlink", "-")}'
+            f'  ({traffic.get("kind") or "cumulative"}, not used as presence)'
+        )
+    if live.get('online_reason'):
+        lines.append(f'  Reason:       {_truncate(str(live.get("online_reason")), 96)}')
+    lines.append('')
 
     checks = list(match.get('checks') or [])
     if checks:

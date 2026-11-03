@@ -9,6 +9,7 @@ iface name — and panel exit_interface — stay unchanged.
 
 import asyncio
 import ipaddress
+import json
 import re
 import shutil
 import socket
@@ -24,6 +25,11 @@ from agent.logutil import get_logger
 from agent.support.node_probe import _curl_probe, curl_speed_mbps
 from agent.support.peer_egress import normalize_exit_interface
 from agent.asyncutil import bounded_gather, gather_independent, maybe_await
+from agent.support.interface_lifecycle import (
+    InterfaceLockRegistry,
+    lifecycle_limits,
+    run_interface_operations,
+)
 from agent.support.process import execute
 
 log = get_logger("mullvad")
@@ -321,6 +327,52 @@ def sample_relays(relays: list[dict[str, Any]], limit: int = 6) -> list[dict[str
     return (owned + rest)[: max(1, limit)]
 
 
+def configured_tunnel_ips(address_field: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """IP addresses listed in a WireGuard Address field. Prefix length is ignored."""
+    found: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for raw in str(address_field or "").split(","):
+        cidr = raw.strip()
+        if not cidr:
+            continue
+        try:
+            found.add(ipaddress.ip_interface(cidr if "/" in cidr else f"{cidr}/32").ip)
+        except ValueError:
+            continue
+    return found
+
+
+def stale_tunnel_cidrs(address_field: str, addr_info: list[Any]) -> list[str]:
+    """Global addresses on the iface that are not in Address.
+
+    Link-local addresses are left alone. An empty or unreadable Address field
+    deletes nothing, so a failed conf read cannot strip the tunnel.
+    """
+    keep = configured_tunnel_ips(address_field)
+    if not keep:
+        return []
+    stale: list[str] = []
+    for row in addr_info:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("scope") or "global").lower() == "link":
+            continue
+        local = str(row.get("local") or "").strip()
+        if not local:
+            continue
+        try:
+            parsed = ipaddress.ip_address(local)
+        except ValueError:
+            continue
+        if parsed in keep:
+            continue
+        try:
+            prefix = int(row.get("prefixlen"))
+        except (TypeError, ValueError):
+            prefix = 128 if ":" in local else 32
+        stale.append(f"{local}/{prefix}")
+    return stale
+
+
 def normalize_tunnel_address(value: Any) -> str:
     """Validate and normalize Address (supports comma-separated IPv4+IPv6)."""
     text = str(value or "").strip()
@@ -590,6 +642,8 @@ class MullvadService:
         egress_probe: Callable[..., tuple[bool, str, int | None]] | None = None,
         persist_script: str | Path | None = None,
         persist_unit_path: str | Path | None = None,
+        lifecycle_concurrency: int | None = None,
+        lifecycle_timeout: float | None = None,
     ) -> None:
         self.store = store
         self.config_dir = Path(config_dir)
@@ -600,6 +654,15 @@ class MullvadService:
         self.handshake_wait = 2.0
         self.persist_script = Path(persist_script) if persist_script else PERSIST_HOLD_SCRIPT
         self.persist_unit_path = Path(persist_unit_path) if persist_unit_path else PERSIST_UNIT_PATH
+        self._persist_lock = asyncio.Lock()
+        self._tunnel_locks = InterfaceLockRegistry()
+        limit, timeout = lifecycle_limits(self)
+        if lifecycle_concurrency is not None:
+            limit = max(1, int(lifecycle_concurrency))
+        if lifecycle_timeout is not None:
+            timeout = max(1.0, float(lifecycle_timeout))
+        self.lifecycle_concurrency = limit
+        self.lifecycle_timeout = timeout
 
     async def _exec(self, args: list[str], **kwargs):
         return await execute(self.runner, args, **kwargs)
@@ -1352,65 +1415,15 @@ class MullvadService:
         verb = str(action or "").strip().lower()
         if verb not in {"start", "stop", "restart"}:
             raise AgentError("VALIDATION_ERROR", "action must be start, stop, or restart", 422)
-
-        bind = next(
-            (
-                row
-                for row in await self.bindings()
-                if normalize_exit_interface(str(row.get("iface") or "")) == name
-            ),
-            None,
-        )
-        path = conf_path(self.config_dir, name)
-        instance = f"agent-mullvad-wg@{name}.service"
-
-        if verb == "stop":
-            await self._exec(["systemctl", "stop", instance], check=False, timeout=30)
-            await self._exec(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
-            unit = await self._unit_status(name)
-            return {
-                "ok": True,
-                "iface": name,
-                "action": "stop",
-                "up": self._iface_up(name),
-                "unit": unit.get("unit"),
-                "unit_active": bool(unit.get("active")),
-                "service_state": unit.get("state"),
-                "message": f"stopped {name}",
-                "binding": self._present_binding(bind) if bind else {"iface": name},
-            }
-
-        if verb == "restart":
-            await self._exec(["systemctl", "stop", instance], check=False, timeout=30)
-            await self._exec(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
-
-        if not path.is_file():
-            raise AgentError("NOT_FOUND", f"Mullvad conf missing for {name}", 404)
-
-        # Never rewrite PrivateKey here — conf on disk is source of truth for start/restart.
-        # Explicit key rotation goes through save_settings → propagate_account only.
-        await self._ensure_persist_unit(name)
-        await maybe_await(self._sync_iface(name, path))
-        start = await self._exec(["systemctl", "start", instance], check=False, timeout=30)
-        unit = await self._unit_status(name)
-        started = bool(unit.get("active")) or self._iface_up(name)
-        if not started and getattr(start, "returncode", 1) != 0:
+        report = await self._run_tunnel_lifecycle(verb, [(name, name)])
+        row = dict((report.get("results") or [{}])[0])
+        if not row.get("ok"):
             raise AgentError(
-                "EXEC_ERROR",
-                self._proc_err(start, f"failed to start {instance}"),
-                500,
+                str(row.get("code") or "EXEC_ERROR"),
+                str(row.get("error") or row.get("message") or f"failed to {verb} {name}"),
+                int(row.get("status") or 500),
             )
-        return {
-            "ok": True,
-            "iface": name,
-            "action": verb,
-            "up": self._iface_up(name),
-            "unit": unit.get("unit"),
-            "unit_active": bool(unit.get("active")),
-            "service_state": unit.get("state"),
-            "message": f"{verb}ed {name}",
-            "binding": self._present_binding(bind) if bind else {"iface": name},
-        }
+        return row
 
     async def control_tunnels(self, action: str, *, ifaces: list[str] | None = None) -> dict[str, Any]:
         verb = str(action or "").strip().lower()
@@ -1421,38 +1434,135 @@ class MullvadService:
             for name in (ifaces or [])
             if normalize_exit_interface(str(name or ""))
         }
-        targets = []
+        targets: list[tuple[str, str]] = []
+        seen: set[str] = set()
         for bind in await self.bindings():
             iface = normalize_exit_interface(str(bind.get("iface") or ""))
-            if not iface:
+            if not iface or iface in seen:
                 continue
             if wanted and iface not in wanted:
                 continue
-            targets.append(iface)
+            seen.add(iface)
+            interface_id = str(bind.get("country_code") or iface)
+            targets.append((interface_id, iface))
         if not targets and wanted:
             raise AgentError("NOT_FOUND", "No matching Mullvad tunnels", 404)
+        return await self._run_tunnel_lifecycle(verb, targets)
 
-        results: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
-        brought = await gather_independent(
-            *(self.control_tunnel(iface, verb) for iface in targets),
-            return_exceptions=True,
+    async def _run_tunnel_lifecycle(self, verb: str, targets: list[tuple[str, str]]) -> dict[str, Any]:
+        return await run_interface_operations(
+            targets,
+            verb,
+            self._apply_tunnel_action,
+            locks=self._tunnel_locks,
+            limit=self.lifecycle_concurrency,
+            timeout=self.lifecycle_timeout,
+            logger=log,
         )
-        for iface, item in zip(targets, brought):
-            if isinstance(item, AgentError):
-                errors.append({"iface": iface, "error": item.message})
-            elif isinstance(item, Exception):
-                errors.append({"iface": iface, "error": str(item)})
-            elif isinstance(item, dict):
-                results.append(item)
+
+    async def _apply_tunnel_action(self, _interface_id: str, iface: str, action: str) -> dict[str, Any]:
+        """One start or stop. Restart's stop-then-start order is owned by the scheduler."""
+        name = normalize_exit_interface(str(iface or ""))
+        if not name:
+            return {
+                "ok": False,
+                "code": "VALIDATION_ERROR",
+                "status": 422,
+                "error": "Invalid Mullvad interface",
+            }
+        verb = str(action or "").strip().lower()
+        try:
+            if verb == "stop":
+                return await self._stop_tunnel(name)
+            if verb == "start":
+                return await self._start_tunnel(name)
+        except AgentError as exc:
+            return {"ok": False, "code": exc.code, "status": exc.status, "error": exc.message, "iface": name}
         return {
-            "ok": errors == [],
-            "action": verb,
-            "results": results,
-            "errors": errors,
-            "count": len(results),
-            "failed_count": len(errors),
+            "ok": False,
+            "code": "VALIDATION_ERROR",
+            "status": 422,
+            "error": "action must be start, stop, or restart",
+            "iface": name,
         }
+
+    async def _binding_for_iface(self, name: str) -> dict[str, Any] | None:
+        return next(
+            (
+                row
+                for row in await self.bindings()
+                if normalize_exit_interface(str(row.get("iface") or "")) == name
+            ),
+            None,
+        )
+
+    def _tunnel_state(
+        self,
+        name: str,
+        verb: str,
+        unit: dict[str, Any],
+        bind: dict[str, Any] | None,
+        *,
+        ok: bool,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "iface": name,
+            "action": verb,
+            "up": self._iface_up(name),
+            "unit": unit.get("unit"),
+            "unit_active": bool(unit.get("active")),
+            "service_state": unit.get("state"),
+            "message": message,
+            "binding": self._present_binding(bind) if bind else {"iface": name},
+        }
+
+    async def _stop_tunnel(self, name: str) -> dict[str, Any]:
+        instance = f"agent-mullvad-wg@{name}.service"
+        stop = await self._exec(["systemctl", "stop", instance], check=False, timeout=30)
+        link = await self._exec(["ip", "link", "set", "dev", name, "down"], check=False, timeout=10)
+        stop_rc = int(getattr(stop, "returncode", 1) or 0)
+        link_rc = int(getattr(link, "returncode", 1) or 0)
+        stop_err = self._proc_err(stop, "")
+        link_err = self._proc_err(link, "")
+        stop_ok = stop_rc in {0, 5} or "not loaded" in stop_err.lower() or "not found" in stop_err.lower()
+        link_ok = link_rc == 0 or any(
+            needle in link_err.lower()
+            for needle in ("cannot find device", "does not exist", "not found")
+        )
+        unit = await self._unit_status(name)
+        bind = await self._binding_for_iface(name)
+        if not stop_ok and not link_ok:
+            detail = stop_err or link_err or f"failed to stop {instance}"
+            return self._tunnel_state(name, "stop", unit, bind, ok=False, message=detail) | {
+                "error": detail,
+                "code": "EXEC_ERROR",
+                "status": 500,
+            }
+        return self._tunnel_state(name, "stop", unit, bind, ok=True, message=f"stopped {name}")
+
+    async def _start_tunnel(self, name: str) -> dict[str, Any]:
+        path = conf_path(self.config_dir, name)
+        instance = f"agent-mullvad-wg@{name}.service"
+        if not path.is_file():
+            raise AgentError("NOT_FOUND", f"Mullvad conf missing for {name}", 404)
+        # Never rewrite PrivateKey here — conf on disk is source of truth for start/restart.
+        # Explicit key rotation goes through save_settings → propagate_account only.
+        await self._ensure_persist_unit(name)
+        await maybe_await(self._sync_iface(name, path))
+        start = await self._exec(["systemctl", "start", instance], check=False, timeout=30)
+        unit = await self._unit_status(name)
+        bind = await self._binding_for_iface(name)
+        started = bool(unit.get("active")) or self._iface_up(name)
+        if not started and int(getattr(start, "returncode", 1) or 0) != 0:
+            detail = self._proc_err(start, f"failed to start {instance}")
+            return self._tunnel_state(name, "start", unit, bind, ok=False, message=detail) | {
+                "error": detail,
+                "code": "EXEC_ERROR",
+                "status": 500,
+            }
+        return self._tunnel_state(name, "start", unit, bind, ok=True, message=f"started {name}")
 
     async def _unit_status(self, iface: str) -> dict[str, Any]:
         name = normalize_exit_interface(str(iface or ""))
@@ -2039,6 +2149,11 @@ class MullvadService:
                 if path.is_file() and not self._iface_up(iface):
                     await maybe_await(self._sync_iface(iface, path))
                     restored.append(iface)
+                elif path.is_file():
+                    # Address changes only add the new IP. A leftover Mullvad
+                    # address stays primary, and Xray's interface bind then
+                    # sources traffic from an address the relay drops.
+                    await maybe_await(self._assign_tunnel_address(iface, path))
                 if (await self._ensure_persist_unit(iface)).get("ok"):
                     persisted.append(iface)
             except Exception as exc:
@@ -2055,22 +2170,26 @@ class MullvadService:
 
         script_text = render_persist_hold_script(self.config_dir)
         unit_text = render_persist_unit(self.persist_script)
+        # The unit template is shared by every exit. Parallel start/restart used
+        # to rewrite it and daemon-reload at the same time, which made systemctl
+        # time out or apply a half-written unit to the other interfaces.
         try:
-            self.persist_script.parent.mkdir(parents=True, exist_ok=True)
-            self.persist_unit_path.parent.mkdir(parents=True, exist_ok=True)
-            previous_script = self.persist_script.read_text(encoding="utf-8") if self.persist_script.is_file() else ""
-            previous_unit = self.persist_unit_path.read_text(encoding="utf-8") if self.persist_unit_path.is_file() else ""
-            changed = previous_script != script_text or previous_unit != unit_text
-            if previous_script != script_text:
-                self.persist_script.write_text(script_text, encoding="utf-8")
-                try:
-                    self.persist_script.chmod(0o755)
-                except OSError:
-                    pass
-            if previous_unit != unit_text:
-                self.persist_unit_path.write_text(unit_text, encoding="utf-8")
-            if changed:
-                await self._exec(["systemctl", "daemon-reload"], check=False, timeout=30)
+            async with self._persist_lock:
+                self.persist_script.parent.mkdir(parents=True, exist_ok=True)
+                self.persist_unit_path.parent.mkdir(parents=True, exist_ok=True)
+                previous_script = self.persist_script.read_text(encoding="utf-8") if self.persist_script.is_file() else ""
+                previous_unit = self.persist_unit_path.read_text(encoding="utf-8") if self.persist_unit_path.is_file() else ""
+                changed = previous_script != script_text or previous_unit != unit_text
+                if previous_script != script_text:
+                    self.persist_script.write_text(script_text, encoding="utf-8")
+                    try:
+                        self.persist_script.chmod(0o755)
+                    except OSError:
+                        pass
+                if previous_unit != unit_text:
+                    self.persist_unit_path.write_text(unit_text, encoding="utf-8")
+                if changed:
+                    await self._exec(["systemctl", "daemon-reload"], check=False, timeout=30)
         except OSError as exc:
             log.warning("mullvad persist unit write failed: %s", exc)
             return {"ok": False, "skipped": False, "reason": str(exc)}
@@ -2151,6 +2270,7 @@ class MullvadService:
         address = str((parsed.get("interface") or {}).get("Address") or "").strip()
         if not address:
             return
+        await self._drop_stale_tunnel_addresses(iface, address)
         for raw in address.split(","):
             cidr = raw.strip()
             if not cidr:
@@ -2169,6 +2289,36 @@ class MullvadService:
             if self._is_exists_err(err):
                 continue
             raise AgentError("EXEC_ERROR", err, 500)
+
+    async def _drop_stale_tunnel_addresses(self, iface: str, address: str) -> None:
+        shown = await self._exec(["ip", "-j", "addr", "show", "dev", iface], check=False, timeout=10)
+        if getattr(shown, "returncode", 1) != 0:
+            return
+        try:
+            payload = json.loads(getattr(shown, "stdout", "") or "[]")
+        except json.JSONDecodeError:
+            return
+        infos: list[Any] = []
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    rows = item.get("addr_info")
+                    if isinstance(rows, list):
+                        infos.extend(rows)
+        for cidr in stale_tunnel_cidrs(address, infos):
+            family = "-6" if ":" in cidr else "-4"
+            deleted = await self._exec(
+                ["ip", family, "addr", "del", cidr, "dev", iface],
+                check=False,
+                timeout=10,
+            )
+            if getattr(deleted, "returncode", 1) == 0:
+                log.info("mullvad dropped stale address iface=%s cidr=%s", iface, cidr)
+                continue
+            err = self._proc_err(deleted, f"ip addr del {cidr} dev {iface} failed")
+            if "cannot find" in err.lower() or "not found" in err.lower():
+                continue
+            log.warning("mullvad stale address delete failed iface=%s cidr=%s: %s", iface, cidr, err)
 
     def _iface_up(self, iface: str) -> bool:
         return Path(f"/sys/class/net/{iface}").is_dir()
@@ -2322,7 +2472,10 @@ class MullvadService:
 
 def service_from_app(request) -> MullvadService:
     settings = request.app.state.settings
+    limit, timeout = lifecycle_limits(settings)
     return MullvadService(
         request.app.state.store,
         config_dir=settings.wireguard_config_dir,
+        lifecycle_concurrency=limit,
+        lifecycle_timeout=timeout,
     )

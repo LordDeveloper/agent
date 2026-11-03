@@ -43,7 +43,12 @@ from agent.support.openvpn_ip import (
     openvpn_host,
     widen_openvpn_subnet_for_host,
 )
-from agent.asyncutil import gather_independent
+from agent.asyncutil import bounded_gather
+from agent.support.interface_lifecycle import (
+    InterfaceLockRegistry,
+    lifecycle_limits,
+    run_interface_operations,
+)
 from agent.support.process import run
 
 log = get_logger('openvpn')
@@ -150,6 +155,7 @@ class OpenVpnDriver(CoreDriver):
         self.settings = settings
         self.audit = audit
         self.store = store
+        self._unit_locks = InterfaceLockRegistry()
 
     def capabilities(self) -> list[str]:
         return [
@@ -213,11 +219,40 @@ class OpenVpnDriver(CoreDriver):
         }
 
     async def disable(self) -> dict[str, Any]:
-        for server in await self.list_servers():
-            unit = self._unit_name(server)
-            await run(['systemctl', 'stop', unit], check=False, timeout=30)
-            await run(['systemctl', 'disable', unit], check=False, timeout=30)
-        return {'enabled': False}
+        servers = await self.list_servers()
+        if not servers:
+            return {'enabled': False, 'ok': True, 'units': [], 'summary': {'total': 0, 'successful': 0, 'failed': 0, 'timed_out': 0}}
+        limit, timeout = lifecycle_limits(self.settings)
+
+        async def worker(_interface_id: str, unit: str, _op: str) -> dict[str, Any]:
+            stop = await run(['systemctl', 'stop', unit], check=False, timeout=30)
+            disabled = await run(['systemctl', 'disable', unit], check=False, timeout=30)
+            stop_rc = int(getattr(stop, 'returncode', 1) or 0)
+            disable_rc = int(getattr(disabled, 'returncode', 1) or 0)
+            # systemctl stop/disable return 5 when the unit is not installed.
+            ok = stop_rc in {0, 5} and disable_rc in {0, 5}
+            detail = ''
+            if not ok:
+                detail = ((getattr(stop, 'stderr', '') or '') + ' ' + (getattr(disabled, 'stderr', '') or '')).strip()
+                detail = detail or f'failed to stop {unit}'
+            return {'ok': ok, 'unit': unit, 'error': detail or None, 'message': detail or f'stopped {unit}'}
+
+        report = await run_interface_operations(
+            [(str(server.get('id')), self._unit_name(server)) for server in servers],
+            'stop',
+            worker,
+            locks=self._unit_locks,
+            limit=limit,
+            timeout=timeout,
+            logger=log,
+        )
+        return {
+            'enabled': False,
+            'ok': bool(report.get('ok')),
+            'units': list(report.get('results') or []),
+            'summary': dict(report.get('summary') or {}),
+            'errors': list(report.get('errors') or []),
+        }
 
     async def restart(self) -> dict[str, Any]:
         servers = await self.list_servers()
@@ -1492,6 +1527,11 @@ class OpenVpnDriver(CoreDriver):
         failures: list[str] = []
 
         async def _bring_up(server: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+            unit = self._unit_name(server)
+            async with self._unit_locks.lock(unit):
+                return await _bring_up_locked(server)
+
+        async def _bring_up_locked(server: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
             instance = instance_name_for_server(server)
             conf_path = _SYSTEM_SERVER_ROOT / f'{instance}.conf'
             unit = self._unit_name(server)
@@ -1526,14 +1566,24 @@ class OpenVpnDriver(CoreDriver):
                 error = f"{unit}: {row['error']}"
             return row, error
 
-        brought = await gather_independent(*(_bring_up(server) for server in servers))
-        for item in brought:
-            if not isinstance(item, tuple):
+        limit, _timeout = lifecycle_limits(self.settings)
+        brought = await bounded_gather(
+            [(lambda server=server: _bring_up(server)) for server in servers],
+            limit=limit,
+            return_exceptions=True,
+        )
+        for server, item in zip(servers, brought):
+            if isinstance(item, tuple):
+                row, error = item
+                results.append(row)
+                if error:
+                    failures.append(error)
                 continue
-            row, error = item
-            results.append(row)
-            if error:
-                failures.append(error)
+            unit = self._unit_name(server)
+            timed_out = isinstance(item, (asyncio.TimeoutError, TimeoutError, subprocess.TimeoutExpired))
+            message = f'{unit} timed out' if timed_out else str(item)
+            results.append({'unit': unit, 'active': False, 'error': message, 'timed_out': timed_out})
+            failures.append(f'{unit}: {message}')
 
         if failures:
             joined = ' | '.join(failures)[:1500]

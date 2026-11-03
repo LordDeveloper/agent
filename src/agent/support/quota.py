@@ -420,6 +420,7 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
     xray_id = str(client.get("id") or "").strip()
     agent_pk = str(client.get("agent_id") or "").strip()
     panel_node_id = str(client.get("node_id") or "").strip()
+    core_id = str(client.get("client_link_uuid") or "").strip()
     email = str(client.get("email") or "").strip()
     volume = client.get("volume") if "volume" in client else None
     try:
@@ -429,8 +430,14 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
     if volume is not None and volume <= 0:
         volume = None
 
-    link_id = panel_node_id or xray_id
-    stored_id = agent_pk or xray_id
+    if core_id:
+        link_id = core_id
+        stored_id = agent_pk or (xray_id if xray_id and xray_id != core_id else panel_node_id)
+        if not stored_id or stored_id == core_id:
+            stored_id = agent_pk or panel_node_id or xray_id
+    else:
+        link_id = panel_node_id or xray_id
+        stored_id = agent_pk or xray_id
     meta: dict[str, Any] = {
         "id": stored_id,
         "node_id": link_id,

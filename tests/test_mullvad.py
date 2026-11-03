@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from agent.asyncutil import run_sync
@@ -14,6 +15,8 @@ from agent.support.mullvad import (
     preferred_iface,
     canonical_country_code,
     country_for_iface_name,
+    configured_tunnel_ips,
+    stale_tunnel_cidrs,
     render_persist_hold_script,
     render_persist_unit,
 )
@@ -541,6 +544,61 @@ def test_sync_iface_creates_link_without_wg_quick_up(tmp_path: Path):
     assert ["ip", "link", "add", "name", "no", "type", "wireguard"] in commands
     assert ["ip", "link", "set", "dev", "no", "up"] in commands
     assert any(cmd[:3] == ["wg", "setconf", "no"] for cmd in commands)
+
+
+def test_stale_tunnel_cidr_is_the_address_missing_from_config():
+    live = [
+        {"family": "inet", "local": "10.75.248.145", "prefixlen": 32, "scope": "global"},
+        {"family": "inet", "local": "10.76.10.66", "prefixlen": 32, "scope": "global"},
+        {"family": "inet6", "local": "fc00:bbbb:bbbb:bb01::d:a41", "prefixlen": 128, "scope": "global"},
+        {"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"},
+    ]
+    configured = "10.76.10.66/32,fc00:bbbb:bbbb:bb01::d:a41/128"
+    assert {str(item) for item in configured_tunnel_ips(configured)} == {
+        "10.76.10.66",
+        "fc00:bbbb:bbbb:bb01::d:a41",
+    }
+    assert stale_tunnel_cidrs(configured, live) == ["10.75.248.145/32"]
+    assert stale_tunnel_cidrs("", live) == []
+
+
+def test_assign_tunnel_address_drops_stale_ipv4(tmp_path: Path):
+    commands = []
+    live = json.dumps([
+        {
+            "addr_info": [
+                {"family": "inet", "local": "10.75.248.145", "prefixlen": 32, "scope": "global"},
+                {"family": "inet", "local": "10.76.10.66", "prefixlen": 32, "scope": "global"},
+                {"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"},
+            ]
+        }
+    ])
+
+    def runner(args, **_k):
+        commands.append(list(args))
+        if args[:4] == ["ip", "-j", "addr", "show"]:
+            return FakeProc(returncode=0, stdout=live, stderr="")
+        if args[:3] == ["ip", "-4", "addr"] and args[3] == "del":
+            return FakeProc(returncode=0, stdout="", stderr="")
+        if args[:3] == ["ip", "-4", "addr"] and args[3] == "add":
+            return FakeProc(returncode=2, stdout="", stderr="Error: ipv4: Address already assigned.")
+        return FakeProc(returncode=1, stdout="", stderr="unexpected " + " ".join(args))
+
+    svc = _service(tmp_path, runner=runner)
+    path = tmp_path / "wg" / "de.conf"
+    path.write_text(
+        dump_wg_conf(
+            {
+                "interface": {"PrivateKey": PRIV, "Address": "10.76.10.66/32", "Table": "off"},
+                "peers": [{"PublicKey": PUB_FRA, "Endpoint": "147.78.240.3:51820", "AllowedIPs": "0.0.0.0/0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_sync(svc._assign_tunnel_address("de", path))
+    assert ["ip", "-4", "addr", "del", "10.75.248.145/32", "dev", "de"] in commands
+    assert ["ip", "-4", "addr", "add", "10.76.10.66/32", "dev", "de"] in commands
+    assert not any(cmd[3:4] == ["del"] and "fe80" in " ".join(cmd) for cmd in commands)
 
 
 def test_assign_tunnel_address_ignores_already_assigned(tmp_path: Path):

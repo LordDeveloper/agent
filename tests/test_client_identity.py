@@ -15,8 +15,10 @@ def test_split_link_uuid_and_agent_route_id():
     assert row["agent_id"] != row["id"]
 
     response = panel_client_response(row)
-    assert response["node_id"] == "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2"
     assert response["id"] == row["agent_id"]
+    assert response["node_id"] == row["agent_id"]
+    assert response["client_link_uuid"] == "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2"
+    assert response["client_link_uuid"] != response["node_id"]
     assert response["email"] == "HxCc1M"
 
 
@@ -55,6 +57,27 @@ def test_second_apply_keeps_agent_id():
     assert second["id"] == "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2"
     assert second["agent_id"] == first["agent_id"]
     assert second["agent_id"] != second["id"]
+
+
+def test_explicit_client_link_uuid_is_not_replaced_by_agent_pk():
+    link = "77682cfe-dd5f-43c6-9688-8be48138e954"
+    agent_pk = "ad72524c-2513-4555-b451-2c1092068514"
+    row = apply_panel_identity(
+        {
+            "id": agent_pk,
+            "node_id": link,
+            "client_link_uuid": link,
+            "email": "P0CbTS",
+        },
+        store_kind="xray",
+    )
+    assert row["id"] == link
+    assert row["client_link_uuid"] == link
+    assert row["agent_id"] == agent_pk
+    response = panel_client_response(row)
+    assert response["id"] == agent_pk
+    assert response["node_id"] == agent_pk
+    assert response["client_link_uuid"] == link
 
 
 def test_wireguard_store_uses_agent_id():

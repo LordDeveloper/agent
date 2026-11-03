@@ -317,7 +317,7 @@ def xray_protocol_user(
 
     if protocol == "vless":
         user: dict[str, Any] = {}
-        link_id = str(row.get("node_id") or "").strip()
+        link_id = str(row.get("client_link_uuid") or row.get("node_id") or "").strip()
         if link_id:
             user["id"] = link_id
         else:
@@ -332,7 +332,7 @@ def xray_protocol_user(
 
     if protocol == "vmess":
         user = {}
-        link_id = str(row.get("node_id") or "").strip()
+        link_id = str(row.get("client_link_uuid") or row.get("node_id") or "").strip()
         if link_id:
             user["id"] = link_id
         else:

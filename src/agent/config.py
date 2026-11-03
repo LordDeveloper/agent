@@ -92,6 +92,11 @@ class AgentSettings(BaseSettings):
     proxy_protocol_forwarder_binary: str = ""
     # Seconds between Mullvad exit fallback checks (0 disables).
     mullvad_fallback_interval: float = 90.0
+    # How many interface start/stop/restart operations may run at once.
+    interface_lifecycle_concurrency: int = 4
+    # Per-interface budget for one start, stop, or restart. A timeout is local
+    # to that interface and does not cancel the others.
+    interface_lifecycle_timeout: float = 180.0
 
     @property
     def xray(self) -> XraySettings:

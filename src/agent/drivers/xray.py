@@ -1512,8 +1512,8 @@ class XrayDriver(CoreDriver):
             edit_meta: list[dict[str, Any]] = []
             to_remove: list[str] = []
             remove_meta: list[dict[str, Any]] = []
-            uuid_rewrites: list[dict[str, Any]] = []
-            rewrite_meta: list[dict[str, Any]] = []
+            # (email, desired user, panel client, previous xray user)
+            uuid_replacements: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
 
             for raw in clients:
                 if not isinstance(raw, dict):
@@ -1582,18 +1582,37 @@ class XrayDriver(CoreDriver):
                     )
                     native["enable"] = True
                     native["is_enabled"] = True
-                    link_uuid = str(client.get("node_id") or "").strip()
+                    link_uuid = str(client.get("client_link_uuid") or client.get("node_id") or "").strip()
                     if link_uuid and str(protocol or "").strip().lower() in {"vless", "vmess"}:
-                        # Xray client UUID is meta.client_link_uuid, never the Agent PK.
+                        # Xray client UUID is the core id, never the Agent primary key.
                         native["id"] = link_uuid
                         cid = link_uuid
                     _keep_vless_flow(native, client, existing if isinstance(existing, dict) else None, inbound, protocol)
                     existing_id = str(existing.get("id") or "").strip() if isinstance(existing, dict) else ""
+                    agent_pk = str(client.get("agent_id") or "").strip()
                     if existing is not None and cid and existing_id and existing_id != cid:
-                        # users/edit keeps the old UUID. Rewrite the inbound row so
-                        # the link UUID replaces the Agent PK that was stored earlier.
-                        uuid_rewrites.append(native)
-                        rewrite_meta.append(client)
+                        # users/edit keeps the previous UUID. Replace it when the
+                        # live id is the Agent PK, or when this payload is a
+                        # legacy single-id rotation. A third UUID that matches
+                        # neither is left for manual correction.
+                        ambiguous = bool(agent_pk) and agent_pk != cid and agent_pk != existing_id
+                        if ambiguous:
+                            failed += 1
+                            errors.append({
+                                "email": email,
+                                "id": agent_pk,
+                                "node_id": agent_pk,
+                                "client_link_uuid": cid,
+                                "message": "Xray UUID differs from client_link_uuid and node_id; manual correction required",
+                            })
+                            continue
+                        previous = dict(existing) if isinstance(existing, dict) else {}
+                        uuid_replacements.append((
+                            str(previous.get("email") or email).strip(),
+                            native,
+                            client,
+                            previous,
+                        ))
                     elif existing is not None:
                         to_edit.append(native)
                         edit_meta.append(client)
@@ -1679,32 +1698,43 @@ class XrayDriver(CoreDriver):
                 errors.extend(part_errors)
                 applied.extend(part_applied)
 
-            if uuid_rewrites:
-                rewrite_error: str | None = None
-                try:
-                    await self._commit_clients_to_inbound(
-                        tag,
-                        uuid_rewrites,
-                        protocol=protocol,
-                        inbound_settings=inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None,
-                    )
-                except AgentError as exc:
-                    rewrite_error = exc.message
-                by_email, by_id = await self._visible_user_index(
-                    tag,
-                    [str(client.get("email") or "").strip() for client in rewrite_meta],
-                )
-                for _native, client in zip(uuid_rewrites, rewrite_meta):
-                    if self._client_uuid_visible(client, by_id, by_email):
-                        succeeded += 1
-                        applied.append(self._response_client(client, by_email, by_id))
-                        continue
+            for replace_email, native, client, previous in uuid_replacements:
+                # users/edit and inbound merge keep the old UUID. Remove that
+                # email and add the core id. Restore the previous user if the
+                # add does not show up, so a failed renewal cannot drop the client.
+                removed_emails = await self._remove_live_clients(tag, [replace_email], errors)
+                if replace_email not in removed_emails:
                     failed += 1
                     errors.append({
-                        "email": str(client.get("email") or ""),
-                        "id": str(client.get("node_id") or client.get("id") or ""),
-                        "message": rewrite_error or "Xray client UUID was not updated to client_link_uuid",
+                        "email": replace_email,
+                        "id": str(client.get("agent_id") or ""),
+                        "node_id": str(client.get("agent_id") or ""),
+                        "client_link_uuid": str(client.get("client_link_uuid") or native.get("id") or ""),
+                        "message": "Xray client UUID was not updated to client_link_uuid",
                     })
+                    continue
+                add_ok, add_fail, add_errors, add_applied = await _flush("add", [native], [client])
+                if add_applied:
+                    succeeded += add_ok
+                    failed += add_fail
+                    errors.extend(add_errors)
+                    applied.extend(add_applied)
+                    continue
+                previous_user = xray_protocol_user(
+                    protocol,
+                    previous,
+                    inbound_settings=inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None,
+                )
+                await _flush("add", [previous_user], [client])
+                failed += 1 + add_fail
+                errors.extend(add_errors)
+                errors.append({
+                    "email": replace_email,
+                    "id": str(client.get("agent_id") or ""),
+                    "node_id": str(client.get("agent_id") or ""),
+                    "client_link_uuid": str(native.get("id") or ""),
+                    "message": "Xray client UUID was not updated to client_link_uuid",
+                })
 
             await self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
             await self._save_client_quotas(applied)

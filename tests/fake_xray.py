@@ -24,6 +24,8 @@ class FakeXrayHttpClient:
         self._inbound_traffic: dict[str, dict[str, int]] = {}
         # When set, users/add lands only in the users API. inbounds/list omits them.
         self.users_hidden_from_inbound_list = False
+        # Real Xray users/edit matches by email and keeps the previous UUID.
+        self.edit_users_keeps_id = False
         self._hidden_users: dict[str, list[dict[str, Any]]] = {}
 
     def close(self) -> None:
@@ -106,7 +108,10 @@ class FakeXrayHttpClient:
                 for client in clients:
                     email = str(client.get("email"))
                     if email in by_email:
-                        existing[by_email[email]] = deepcopy(client)
+                        merged = deepcopy(client)
+                        if self.edit_users_keeps_id:
+                            merged["id"] = existing[by_email[email]].get("id")
+                        existing[by_email[email]] = merged
                     else:
                         existing.append(deepcopy(client))
                 return {"succeeded": len(clients), "failed": 0, "updated_users": len(clients)}

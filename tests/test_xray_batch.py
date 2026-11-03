@@ -670,9 +670,54 @@ def test_uuid_replacement_removes_stale_emails_in_one_call(client: TestClient, f
     body = replaced.json()
     assert body["failed"] == 0, body
     assert body["succeeded"] == 2
-    assert calls == []
+    # users/edit cannot change a UUID, so replacement removes the stale email first.
+    assert calls == [["one@x"], ["two@x"]]
     live = fake_xray.list_users("inbound-41")
     assert {row["id"] for row in live} == {
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
     }
+
+
+def test_renewal_replaces_agent_pk_stored_as_xray_uuid(client: TestClient, fake_xray: FakeXrayHttpClient):
+    """users/edit keeps the old UUID. Renewal must still install client_link_uuid."""
+    headers = {"Authorization": "Bearer dev-token"}
+    link = "77682cfe-dd5f-43c6-9688-8be48138e954"
+    agent_pk = "ad72524c-2513-4555-b451-2c1092068514"
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(42, 15401)).status_code == 200
+    seeded = client.post(
+        "/api/v1/cores/xray/inbounds/42/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": agent_pk, "email": "P0CbTS", "is_enabled": True, "flow": "xtls-rprx-vision"}]},
+    )
+    assert seeded.status_code == 200, seeded.text
+    fake_xray.edit_users_keeps_id = True
+
+    renewed = client.post(
+        "/api/v1/cores/xray/inbounds/42/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": agent_pk,
+                "node_id": link,
+                "client_link_uuid": link,
+                "email": "P0CbTS",
+                "is_enabled": True,
+                "flow": "xtls-rprx-vision",
+                "expires_at": "2026-12-01T00:00:00Z",
+            }],
+        },
+    )
+    assert renewed.status_code == 200, renewed.text
+    body = renewed.json()
+    assert body["failed"] == 0, body
+    assert body["succeeded"] == 1
+    row = body["clients"][0]
+    assert row["id"] == agent_pk
+    assert row["node_id"] == agent_pk
+    assert row["client_link_uuid"] == link
+    live = fake_xray.list_users("inbound-42", "P0CbTS")
+    assert len(live) == 1
+    assert live[0]["id"] == link
+    assert live[0].get("flow") == "xtls-rprx-vision"
