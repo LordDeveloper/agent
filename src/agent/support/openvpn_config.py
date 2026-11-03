@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 from pathlib import Path
@@ -10,6 +11,23 @@ from typing import Any
 from agent.errors import AgentError
 from agent.support import record_is_enabled
 from agent.support.openvpn_ip import openvpn_gateway, openvpn_netmask, normalize_openvpn_subnet
+
+log = logging.getLogger(__name__)
+
+# remote-cert-tls server requires these on the leaf. Without them OpenVPN
+# Connect reports "Peer Certificate Verification Failure".
+_CA_EXTENSIONS = """\
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+"""
+_SERVER_EXTENSIONS = """\
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+"""
 
 _SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
 _TLS_CRYPT_BEGIN = '-----BEGIN OpenVPN Static key V1-----'
@@ -70,21 +88,66 @@ def instance_name_for_server(server: dict[str, Any]) -> str:
     return sanitize_instance_name(server.get('name') or f"ovpn{server.get('id') or 0}")
 
 
-async def _run_openssl(args: list[str], *, cwd: Path | None = None) -> None:
-    from agent.support.process import run
+def certificate_text_is_ca(text: str) -> bool:
+    return bool(re.search(r'CA\s*:\s*TRUE', text or '', re.IGNORECASE))
 
-    try:
-        proc = await run(
-            ['openssl', *args],
-            timeout=60,
-            check=False,
-            env=None,
-        )
-    except FileNotFoundError as exc:
-        raise AgentError('VALIDATION_ERROR', 'openssl is required to issue OpenVPN certificates', 500) from exc
+
+def certificate_text_is_tls_server(text: str) -> bool:
+    """True when the cert satisfies OpenVPN ``remote-cert-tls server``."""
+    body = text or ''
+    lowered = body.lower()
+    has_eku = 'tls web server authentication' in lowered or 'serverauth' in lowered
+    has_ku = 'digital signature' in lowered and 'key encipherment' in lowered
+    return has_eku and has_ku
+
+
+def _subject_arg(raw: str, fallback_cn: str) -> str:
+    text = str(raw or '').strip()
+    if text.lower().startswith('subject='):
+        text = text.split('=', 1)[1].strip()
+    if not text:
+        return f'/CN={fallback_cn}'
+    if text.startswith('/'):
+        return text
+    return '/' + text.replace(', ', '/').replace(',', '/')
+
+
+async def _run_openssl(args: list[str], *, cwd: Path | None = None) -> None:
+    proc = await _openssl(args)
+    if proc is None:
+        raise AgentError('VALIDATION_ERROR', 'openssl is required to issue OpenVPN certificates', 500)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or 'openssl failed').strip()
         raise AgentError('EXEC_ERROR', f'openssl failed: {detail[:400]}', 500)
+
+
+async def _openssl(args: list[str]):
+    from agent.support.process import run
+
+    try:
+        return await run(['openssl', *args], timeout=60, check=False, env=None)
+    except FileNotFoundError:
+        return None
+
+
+async def _certificate_text(path: Path) -> str:
+    if not path.is_file():
+        return ''
+    proc = await _openssl(['x509', '-in', str(path), '-noout', '-text'])
+    if proc is None or proc.returncode != 0:
+        return ''
+    return proc.stdout or ''
+
+
+async def _certificate_subject(path: Path, fallback_cn: str) -> str:
+    proc = await _openssl(['x509', '-in', str(path), '-noout', '-subject', '-nameopt', 'compat'])
+    if proc is None or proc.returncode != 0:
+        return f'/CN={fallback_cn}'
+    return _subject_arg(proc.stdout or '', fallback_cn)
+
+
+def _write_extensions(path: Path, body: str) -> None:
+    path.write_text(body.strip() + '\n', encoding='utf-8')
 
 
 async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') -> dict[str, str]:
@@ -97,13 +160,26 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
     tls_crypt = pki_dir / 'tc.key'
     # dh.pem unused: server conf uses `dh none` (ECDH). Never run openssl dhparam.
 
+    ca_ext = pki_dir / 'ca.ext'
+    server_ext = pki_dir / 'server.ext'
+    _write_extensions(ca_ext, _CA_EXTENSIONS)
+    _write_extensions(server_ext, _SERVER_EXTENSIONS)
+
+    if not ca_key.is_file() and not ca_crt.is_file():
+        await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
+        try:
+            ca_key.chmod(0o600)
+        except OSError:
+            pass
+
+    ca_reissued = False
     if not ca_crt.is_file():
         if not ca_key.is_file():
-            await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
-            try:
-                ca_key.chmod(0o600)
-            except OSError:
-                pass
+            raise AgentError(
+                'VALIDATION_ERROR',
+                f'OpenVPN CA material is incomplete in {pki_dir}',
+                422,
+            )
         await _run_openssl(
             [
                 'req',
@@ -117,10 +193,52 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
                 str(ca_crt),
                 '-subj',
                 f'/CN={common_name}-ca',
+                '-extfile',
+                str(ca_ext),
             ]
         )
+        ca_reissued = True
+    elif ca_key.is_file():
+        ca_text = await _certificate_text(ca_crt)
+        if ca_text and not certificate_text_is_ca(ca_text):
+            # Same key, so already-issued server certs still chain. Profiles
+            # that embedded the old CA keep verifying; new profiles get a
+            # real CA trust anchor.
+            subject = await _certificate_subject(ca_crt, f'{common_name}-ca')
+            await _run_openssl(
+                [
+                    'req',
+                    '-new',
+                    '-x509',
+                    '-days',
+                    '3650',
+                    '-key',
+                    str(ca_key),
+                    '-out',
+                    str(ca_crt),
+                    '-subj',
+                    subject,
+                    '-extfile',
+                    str(ca_ext),
+                ]
+            )
+            ca_reissued = True
+            log.warning(
+                'reissued OpenVPN CA in %s; previous certificate was not a CA',
+                pki_dir,
+            )
 
-    if not server_crt.is_file() or not server_key.is_file():
+    needs_server = not server_crt.is_file() or not server_key.is_file() or ca_reissued
+    if server_crt.is_file() and server_key.is_file() and not needs_server:
+        server_text = await _certificate_text(server_crt)
+        if server_text and not certificate_text_is_tls_server(server_text):
+            needs_server = True
+            log.warning(
+                'OpenVPN server certificate in %s lacks TLS server usage; reissuing',
+                pki_dir,
+            )
+
+    if needs_server:
         if server_crt.is_file() and not server_key.is_file():
             raise AgentError(
                 'VALIDATION_ERROR',
@@ -136,6 +254,11 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
         req = pki_dir / 'server.csr'
         if not server_key.is_file():
             await _run_openssl(['genrsa', '-out', str(server_key), '2048'])
+        server_subject = (
+            await _certificate_subject(server_crt, f'{common_name}-server')
+            if server_crt.is_file()
+            else f'/CN={common_name}-server'
+        )
         await _run_openssl(
             [
                 'req',
@@ -145,26 +268,10 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
                 '-out',
                 str(req),
                 '-subj',
-                f'/CN={common_name}-server',
+                server_subject,
             ]
         )
-        await _run_openssl(
-            [
-                'x509',
-                '-req',
-                '-days',
-                '3650',
-                '-in',
-                str(req),
-                '-CA',
-                str(ca_crt),
-                '-CAkey',
-                str(ca_key),
-                '-CAcreateserial',
-                '-out',
-                str(server_crt),
-            ]
-        )
+        await _issue_server_certificate(req, ca_crt, ca_key, server_crt, server_ext)
         try:
             server_key.chmod(0o600)
             req.unlink(missing_ok=True)
@@ -192,6 +299,52 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
         'tls_crypt': existing_tls,
         'dh_pem': '',
     }
+
+
+async def _issue_server_certificate(
+    req: Path,
+    ca_crt: Path,
+    ca_key: Path,
+    server_crt: Path,
+    server_ext: Path,
+) -> None:
+    """Sign the server cert. Drop authorityKeyIdentifier if the CA has no SKI."""
+    args = [
+        'x509',
+        '-req',
+        '-days',
+        '3650',
+        '-in',
+        str(req),
+        '-CA',
+        str(ca_crt),
+        '-CAkey',
+        str(ca_key),
+        '-CAcreateserial',
+        '-out',
+        str(server_crt),
+        '-extfile',
+        str(server_ext),
+    ]
+    proc = await _openssl(args)
+    if proc is None:
+        raise AgentError('VALIDATION_ERROR', 'openssl is required to issue OpenVPN certificates', 500)
+    if proc.returncode == 0:
+        return
+    detail = (proc.stderr or proc.stdout or '').lower()
+    if 'key identifier' not in detail and 'authority' not in detail:
+        message = (proc.stderr or proc.stdout or 'openssl failed').strip()
+        raise AgentError('EXEC_ERROR', f'openssl failed: {message[:400]}', 500)
+    fallback = server_ext.with_name('server-noski.ext')
+    _write_extensions(
+        fallback,
+        '\n'.join(
+            line
+            for line in _SERVER_EXTENSIONS.splitlines()
+            if not line.startswith('authorityKeyIdentifier')
+        ),
+    )
+    await _run_openssl([*args[:-1], str(fallback)])
 
 
 async def _generate_tls_crypt_file(path: Path) -> str:

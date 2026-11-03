@@ -721,3 +721,40 @@ def test_renewal_replaces_agent_pk_stored_as_xray_uuid(client: TestClient, fake_
     assert len(live) == 1
     assert live[0]["id"] == link
     assert live[0].get("flow") == "xtls-rprx-vision"
+
+
+def test_stale_third_uuid_is_replaced_with_client_link_uuid(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    link = "77682cfe-dd5f-43c6-9688-8be48138e954"
+    agent_pk = "ad72524c-2513-4555-b451-2c1092068514"
+    stale = "11111111-2222-4333-8444-555555555555"
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(43, 15402)).status_code == 200
+    seeded = client.post(
+        "/api/v1/cores/xray/inbounds/43/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": stale, "email": "LesYsl", "is_enabled": True}]},
+    )
+    assert seeded.status_code == 200, seeded.text
+    fake_xray.edit_users_keeps_id = True
+
+    repaired = client.post(
+        "/api/v1/cores/xray/inbounds/43/clients/batch",
+        headers=headers,
+        json={
+            "mode": "upsert",
+            "clients": [{
+                "id": agent_pk,
+                "node_id": link,
+                "client_link_uuid": link,
+                "email": "LesYsl",
+                "is_enabled": True,
+            }],
+        },
+    )
+    assert repaired.status_code == 200, repaired.text
+    body = repaired.json()
+    assert body["failed"] == 0, body
+    assert body["clients"][0]["client_link_uuid"] == link
+    assert body["clients"][0]["node_id"] == agent_pk
+    live = fake_xray.list_users("inbound-43", "LesYsl")
+    assert [row["id"] for row in live] == [link]

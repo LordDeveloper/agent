@@ -1589,23 +1589,9 @@ class XrayDriver(CoreDriver):
                         cid = link_uuid
                     _keep_vless_flow(native, client, existing if isinstance(existing, dict) else None, inbound, protocol)
                     existing_id = str(existing.get("id") or "").strip() if isinstance(existing, dict) else ""
-                    agent_pk = str(client.get("agent_id") or "").strip()
                     if existing is not None and cid and existing_id and existing_id != cid:
-                        # users/edit keeps the previous UUID. Replace it when the
-                        # live id is the Agent PK, or when this payload is a
-                        # legacy single-id rotation. A third UUID that matches
-                        # neither is left for manual correction.
-                        ambiguous = bool(agent_pk) and agent_pk != cid and agent_pk != existing_id
-                        if ambiguous:
-                            failed += 1
-                            errors.append({
-                                "email": email,
-                                "id": agent_pk,
-                                "node_id": agent_pk,
-                                "client_link_uuid": cid,
-                                "message": "Xray UUID differs from client_link_uuid and node_id; manual correction required",
-                            })
-                            continue
+                        # users/edit keeps the previous UUID, including a stale id
+                        # that is neither the Agent PK nor the link UUID.
                         previous = dict(existing) if isinstance(existing, dict) else {}
                         uuid_replacements.append((
                             str(previous.get("email") or email).strip(),

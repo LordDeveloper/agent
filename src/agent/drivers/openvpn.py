@@ -1277,18 +1277,19 @@ class OpenVpnDriver(CoreDriver):
         stored_tls = normalize_tls_crypt(stored.get('tls_crypt'))
         if stored_tls:
             overlay['tls_crypt'] = stored_tls
-        missing = [key for key in _PKI_KEYS if not str(overlay.get(key) or '').strip()]
-        if missing:
-            staging = self._pki_dir(server)
-            self._write_pki_dir(staging, overlay, overwrite=False)
-            generated = await ensure_server_pki(
-                staging,
-                common_name=instance_name_for_server(server),
-            )
-            overlay = {
-                **{key: str(generated.get(key) or '') for key in _PKI_KEYS},
-                **overlay,
-            }
+        staging = self._pki_dir(server)
+        self._write_pki_dir(staging, overlay, overwrite=True)
+        generated = await ensure_server_pki(
+            staging,
+            common_name=instance_name_for_server(server),
+        )
+        # Repaired certs must replace a stored leaf that lacks TLS server usage.
+        for key in _PKI_KEYS:
+            value = str(generated.get(key) or '').strip()
+            if key == 'tls_crypt':
+                value = normalize_tls_crypt(value)
+            if value:
+                overlay[key] = value
         tls = normalize_tls_crypt(overlay.get('tls_crypt'))
         if tls:
             overlay['tls_crypt'] = tls
