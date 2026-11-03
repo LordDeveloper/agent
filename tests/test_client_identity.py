@@ -28,6 +28,35 @@ def test_legacy_single_id_payload():
     assert row["node_id"] == legacy_id
 
 
+def test_vless_user_id_is_panel_node_id_not_agent_pk():
+    from agent.support import xray_protocol_user
+
+    user = xray_protocol_user(
+        "vless",
+        {
+            "id": "agent-pk",
+            "node_id": "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2",
+            "email": "HxCc1M",
+            "flow": "xtls-rprx-vision",
+        },
+    )
+    assert user["id"] == "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2"
+    assert user["email"] == "HxCc1M"
+    assert "node_id" not in user
+    assert "agent_id" not in user
+
+
+def test_second_apply_keeps_agent_id():
+    first = apply_panel_identity(
+        {"node_id": "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2", "email": "HxCc1M"},
+        store_kind="xray",
+    )
+    second = apply_panel_identity(first, store_kind="xray")
+    assert second["id"] == "c6768135-1fa9-4cf8-8cf2-7ca02524b6f2"
+    assert second["agent_id"] == first["agent_id"]
+    assert second["agent_id"] != second["id"]
+
+
 def test_wireguard_store_uses_agent_id():
     row = apply_panel_identity(
         {

@@ -1489,9 +1489,6 @@ class XrayDriver(CoreDriver):
             edit_meta: list[dict[str, Any]] = []
             to_remove: list[str] = []
             remove_meta: list[dict[str, Any]] = []
-            # Email hit with a different panel uuid. Removed in one users/remove
-            # after the loop; a per-client call would add a full Xray wait each.
-            stale_replacements: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
             for raw in clients:
                 if not isinstance(raw, dict):
@@ -1561,19 +1558,11 @@ class XrayDriver(CoreDriver):
                     native["enable"] = True
                     native["is_enabled"] = True
                     if existing is not None:
-                        existing_id = str(existing.get("id") or "").strip()
-                        # Edit keeps the old uuid. The panel looks the client up
-                        # by node_id, so an email hit with another id must be replaced.
-                        if cid and existing_id and existing_id != cid:
-                            stale_email = str(existing.get("email") or email).strip()
-                            if stale_email:
-                                stale_replacements.append((stale_email, native, client))
-                            else:
-                                to_add.append(native)
-                                add_meta.append(client)
-                        else:
-                            to_edit.append(native)
-                            edit_meta.append(client)
+                        # Same email with a different Xray uuid is an edit of that
+                        # user. Do not remove first: a failed add used to leave the
+                        # inbound with no client while the panel still saw a hit.
+                        to_edit.append(native)
+                        edit_meta.append(client)
                     else:
                         to_add.append(native)
                         add_meta.append(client)
@@ -1638,18 +1627,11 @@ class XrayDriver(CoreDriver):
                         [],
                     )
 
-            stale_emails = [email for email, _native, _client in stale_replacements]
-            removed_emails = await self._remove_live_clients(tag, [*to_remove, *stale_emails], errors)
+            removed_emails = await self._remove_live_clients(tag, to_remove, errors)
             for email, client in zip(to_remove, remove_meta):
                 if email in removed_emails:
                     succeeded += 1
                     applied.append(client)
-                else:
-                    failed += 1
-            for email, native, client in stale_replacements:
-                if email in removed_emails:
-                    to_add.append(native)
-                    add_meta.append(client)
                 else:
                     failed += 1
             # Adds and edits target disjoint emails, so they can overlap.

@@ -22,17 +22,23 @@ def apply_panel_identity(
       - ``id``: agent-scoped route primary key (optional on first create)
     """
     row = dict(client)
+    prior_agent = _trim(row.get("agent_id"))
     panel_node_id = _trim(row.pop("node_id", None))
     incoming_id = _trim(row.get("id") or "")
 
     if panel_node_id and incoming_id and panel_node_id != incoming_id:
-        agent_id = incoming_id
+        agent_id = prior_agent or incoming_id
         protocol_id = panel_node_id
         panel_global = panel_node_id
     elif panel_node_id:
         protocol_id = panel_node_id
         panel_global = panel_node_id
-        agent_id = incoming_id or str(uuid.uuid4())
+        if prior_agent and prior_agent != panel_node_id:
+            agent_id = prior_agent
+        elif incoming_id and incoming_id != panel_node_id:
+            agent_id = incoming_id
+        else:
+            agent_id = str(uuid.uuid4())
     elif incoming_id:
         agent_id = incoming_id
         protocol_id = incoming_id

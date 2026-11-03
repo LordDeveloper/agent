@@ -317,7 +317,11 @@ def xray_protocol_user(
 
     if protocol == "vless":
         user: dict[str, Any] = {}
-        _copy_if_present(row, user, "id")
+        link_id = str(row.get("node_id") or "").strip()
+        if link_id:
+            user["id"] = link_id
+        else:
+            _copy_if_present(row, user, "id")
         _copy_if_present(row, user, "email")
         flow = str(row.get("flow") or "").strip()
         if flow and flow in _VLESS_FLOWS:
@@ -328,7 +332,11 @@ def xray_protocol_user(
 
     if protocol == "vmess":
         user = {}
-        _copy_if_present(row, user, "id")
+        link_id = str(row.get("node_id") or "").strip()
+        if link_id:
+            user["id"] = link_id
+        else:
+            _copy_if_present(row, user, "id")
         _copy_if_present(row, user, "email")
         user["alterId"] = _as_int(row.get("alterId", row.get("alter_id")))
         _copy_if_present(row, user, "security")

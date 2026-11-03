@@ -670,7 +670,7 @@ def test_uuid_replacement_removes_stale_emails_in_one_call(client: TestClient, f
     body = replaced.json()
     assert body["failed"] == 0, body
     assert body["succeeded"] == 2
-    assert calls == [["one@x", "two@x"]]
+    assert calls == []
     live = fake_xray.list_users("inbound-41")
     assert {row["id"] for row in live} == {
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
