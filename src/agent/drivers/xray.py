@@ -30,6 +30,12 @@ from agent.support import (
     xray_client_rows,
     xray_protocol_user,
 )
+from agent.support.client_identity import (
+    apply_panel_identity,
+    billing_client_id,
+    identity_lookup_keys,
+    panel_client_response,
+)
 from agent.support.disable_reason import mark_panel_disabled
 from agent.support.quota import apply_quota_meta, quota_meta_from_client
 from agent.support.config_validate import (
@@ -947,12 +953,23 @@ class XrayDriver(CoreDriver):
     def _row_matches_key(client: dict[str, Any], key: str) -> bool:
         # VLESS/VMess use id. Shadowsocks and Trojan use email, and the panel
         # node_id is often stored only as the user password.
-        return key in {
-            str(client.get("id") or "").strip(),
+        wanted = str(key or "").strip()
+        if not wanted:
+            return False
+        return wanted in identity_lookup_keys(client) or wanted in {
             str(client.get("uuid") or "").strip(),
-            str(client.get("email") or "").strip(),
-            str(client.get("password") or "").strip(),
         }
+
+    async def _lookup_keys_for_panel_id(self, key: str) -> list[str]:
+        wanted = str(key or "").strip()
+        if not wanted:
+            return []
+        keys = {wanted}
+        index = await self._quota_index()
+        for row in index.values():
+            if wanted in identity_lookup_keys(row):
+                keys.update(identity_lookup_keys(row))
+        return list(keys)
 
     async def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
         """Return client metadata from config.json (includes disabled / quota rows)."""
@@ -961,23 +978,27 @@ class XrayDriver(CoreDriver):
             raise AgentError("VALIDATION_ERROR", "client key is required", 422)
 
         tag = self.inbound_tag(inbound_id)
-        try:
-            disk_client = await self._client_copy_from_disk(inbound_id, key)
-        except AgentError:
-            disk_client = None
-        if disk_client is not None:
-            return await self._with_stored_quota(disk_client, include_flags=True)
+        aliases = await self._lookup_keys_for_panel_id(key)
+        for alias in aliases:
+            try:
+                disk_client = await self._client_copy_from_disk(inbound_id, alias)
+            except AgentError:
+                disk_client = None
+            if disk_client is not None:
+                return await self._with_stored_quota(disk_client, include_flags=True)
 
         # users/add updates the users API. config.json can omit that row.
         # get_inbound() would list every user first and sit past the panel's
         # 15s timeout with no response bytes. Match this key only.
-        live = await self._find_live_user(tag, key)
-        if live is not None:
-            return await self._live_client_record(normalize_xray_client(live), key)
+        for alias in aliases:
+            live = await self._find_live_user(tag, alias)
+            if live is not None:
+                return await self._live_client_record(normalize_xray_client(live), alias)
 
-        stored = await self._find_disabled_client(key)
-        if stored is not None:
-            return stored
+        for alias in aliases:
+            stored = await self._find_disabled_client(alias)
+            if stored is not None:
+                return stored
 
         raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
 
@@ -1117,28 +1138,21 @@ class XrayDriver(CoreDriver):
         by_email: dict[str, dict[str, Any]],
         by_id: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
-        """Return the identity the server actually stored.
-
-        Shadowsocks often has no uuid. GET then only works with the email, so
-        the panel can replace node_id with that key.
-        """
+        """Return panel identity (agent id + node_id) after verifying live Xray row."""
         email = str(client.get("email") or "").strip()
         cid = str(client.get("id") or "").strip()
         row = by_email.get(email) if email else None
         if row is None and cid:
             row = by_id.get(cid)
-        if not isinstance(row, dict):
-            return client
-        live_id = str(row.get("id") or row.get("uuid") or "").strip()
-        live_email = str(row.get("email") or "").strip()
         stamped = dict(client)
-        if live_id:
-            stamped["id"] = live_id
-        elif live_email:
-            stamped["id"] = live_email
-        if live_email:
-            stamped["email"] = live_email
-        return stamped
+        if isinstance(row, dict):
+            live_id = str(row.get("id") or row.get("uuid") or "").strip()
+            live_email = str(row.get("email") or "").strip()
+            if live_id:
+                stamped["id"] = live_id
+            if live_email:
+                stamped["email"] = live_email
+        return panel_client_response(stamped)
 
     def _client_uuid_visible(
         self,
@@ -1485,13 +1499,12 @@ class XrayDriver(CoreDriver):
                     errors.append({"email": "", "message": "client must be an object"})
                     continue
                 try:
-                    client = normalize_xray_client(raw)
-                    client.setdefault("id", str(uuid.uuid4()))
+                    client = apply_panel_identity(normalize_xray_client(raw), store_kind="xray")
                     if not client.get("email"):
-                        client["email"] = str(client["id"])[:8]
+                        client["email"] = str(client.get("id") or uuid.uuid4())[:8]
                     email = str(client.get("email") or "").strip()
                     cid = str(client.get("id") or "").strip()
-                    # Canonical identity is panel node_id (Xray id). Match id
+                    # Xray user id is panel ``node_id`` (link uuid). Match that id
                     # first so a rotated credential never collides with a stale
                     # row that still claims the same email alias.
                     existing = by_id.get(cid) if cid else None
@@ -1664,7 +1677,7 @@ class XrayDriver(CoreDriver):
             "succeeded": succeeded,
             "failed": failed,
             "errors": errors,
-            "clients": applied,
+            "clients": [panel_client_response(row) for row in applied],
             "ms": elapsed_ms,
         }
 
@@ -1852,7 +1865,7 @@ class XrayDriver(CoreDriver):
             if not isinstance(client, dict):
                 continue
             meta = quota_meta_from_client(client)
-            doc_id = str(meta.get("id") or meta.get("email") or "").strip()
+            doc_id = str(meta.get("agent_id") or meta.get("id") or meta.get("email") or "").strip()
             if not doc_id:
                 continue
             puts.append((doc_id, meta))
@@ -1860,6 +1873,9 @@ class XrayDriver(CoreDriver):
             cid = str(meta.get("id") or "").strip()
             if cid and email and email != cid:
                 deletes.append(email)
+            agent_id = str(meta.get("agent_id") or "").strip()
+            if agent_id and cid and agent_id != cid:
+                deletes.append(cid)
         if not puts and not deletes:
             return
         await self.store.write_docs(self.key, _QUOTA_KIND, puts, deletes)
@@ -2058,8 +2074,16 @@ class XrayDriver(CoreDriver):
                 continue
             cid = str(row.get("id") or "").strip()
             email = str(row.get("email") or "").strip()
-            doc_id = cid or email
-            if doc_id and (cid in wanted or email in wanted or doc_id in wanted):
+            agent_id = str(row.get("agent_id") or "").strip()
+            panel_node_id = str(row.get("node_id") or "").strip()
+            doc_id = agent_id or cid or email
+            if doc_id and (
+                cid in wanted
+                or email in wanted
+                or agent_id in wanted
+                or panel_node_id in wanted
+                or doc_id in wanted
+            ):
                 await self.store.delete_doc(self.key, _QUOTA_KIND, doc_id)
 
     async def _quota_index(self) -> dict[str, dict[str, Any]]:
@@ -2073,21 +2097,37 @@ class XrayDriver(CoreDriver):
                 continue
             cid = str(row.get("id") or "").strip()
             email = str(row.get("email") or "").strip()
+            agent_id = str(row.get("agent_id") or "").strip()
+            panel_node_id = str(row.get("node_id") or "").strip()
             if cid:
                 index[f"i:{cid}"] = row
             if email:
                 index[f"e:{email}"] = row
+            if agent_id:
+                index[f"a:{agent_id}"] = row
+            if panel_node_id:
+                index[f"n:{panel_node_id}"] = row
         return index
 
     async def _with_stored_quota(self, client: dict[str, Any], *, include_flags: bool) -> dict[str, Any]:
         index = await self._quota_index()
         cid = str(client.get("id") or "").strip()
         email = str(client.get("email") or "").strip()
+        agent_id = str(client.get("agent_id") or "").strip()
+        panel_node_id = str(client.get("node_id") or "").strip()
         meta = index.get(f"i:{cid}") if cid else None
+        if meta is None and agent_id:
+            meta = index.get(f"a:{agent_id}")
+        if meta is None and panel_node_id:
+            meta = index.get(f"n:{panel_node_id}")
         if meta is None and email:
             meta = index.get(f"e:{email}")
         if meta:
             apply_quota_meta(client, meta, include_flags=include_flags)
+            if meta.get("agent_id"):
+                client["agent_id"] = meta.get("agent_id")
+            if meta.get("node_id"):
+                client["node_id"] = meta.get("node_id")
         return client
 
     async def _overlay_quota(self, inbounds: list[dict[str, Any]], *, include_flags: bool) -> None:
@@ -2140,17 +2180,28 @@ class XrayDriver(CoreDriver):
         if current is None and payload_email and payload_email != str(client_key or "").strip():
             current = self._find_client(inbound, payload_email)
         if current is None:
-            merged = normalize_xray_client(payload)
-            merged.setdefault("id", client_key)
+            for alias in await self._lookup_keys_for_panel_id(str(client_key or "")):
+                current = self._find_client(inbound, alias)
+                if current is not None:
+                    break
+        if current is None:
+            merged = apply_panel_identity(normalize_xray_client(payload), store_kind="xray")
+            if not str(merged.get("agent_id") or "").strip():
+                merged["agent_id"] = str(client_key)
             if not merged.get("email"):
                 merged["email"] = payload_email or client_key
             mode = "upsert"
         else:
-            merged = normalize_xray_client({**current, **payload})
-            # Never rename the stored canonical id through an update payload.
+            merged = apply_panel_identity(
+                normalize_xray_client({**current, **payload}),
+                store_kind="xray",
+            )
+            # Never rename the stored Xray uuid through an update payload.
             stored_id = str(current.get("id") or "").strip()
             if stored_id:
                 merged["id"] = stored_id
+            if not str(merged.get("agent_id") or "").strip():
+                merged["agent_id"] = str(client_key)
             if not str(merged.get("email") or "").strip():
                 merged["email"] = payload_email or str(current.get("email") or client_key)
             mode = "update"
@@ -2859,6 +2910,7 @@ class XrayDriver(CoreDriver):
             identity_rows = await self._usage_identity_rows()
         except AgentError:
             identity_rows = []
+        quota_index = await self._quota_index()
         inbounds = [
             {
                 "id": inbound_id,
@@ -2887,7 +2939,12 @@ class XrayDriver(CoreDriver):
                     seen.add(email)
                 if cid:
                     seen.add(cid)
-                canonical = cid or email
+                meta = quota_index.get(f"i:{cid}") if cid else None
+                if meta is None and email:
+                    meta = quota_index.get(f"e:{email}")
+                canonical = billing_client_id(meta, protocol_id=cid, email=email)
+                if canonical:
+                    seen.add(canonical)
                 clients.append(
                     ClientUsageModel(
                         id=canonical,

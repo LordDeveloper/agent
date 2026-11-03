@@ -238,6 +238,8 @@ _NETINJA_CLIENT_KEYS = {
     "disableInsecureEncryption",
     "format",
     "name",
+    "agent_id",
+    "node_id",
 }
 
 

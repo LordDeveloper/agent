@@ -418,6 +418,8 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
     on the inbound user unless the agent stores it separately.
     """
     cid = str(client.get("id") or "").strip()
+    agent_id = str(client.get("agent_id") or "").strip()
+    panel_node_id = str(client.get("node_id") or "").strip()
     email = str(client.get("email") or "").strip()
     volume = client.get("volume") if "volume" in client else None
     try:
@@ -429,6 +431,8 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
 
     meta: dict[str, Any] = {
         "id": cid,
+        "agent_id": agent_id or cid,
+        "node_id": panel_node_id or cid,
         "email": email,
         "volume": volume,
     }

@@ -18,6 +18,7 @@ from agent.drivers.base import CoreDriver
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
+from agent.support.client_identity import apply_panel_identity, panel_client_response
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.asyncutil import bounded_gather, gather_independent
 from agent.support.process import run, run_exit
@@ -1610,10 +1611,9 @@ class WireGuardDriver(CoreDriver):
                 continue
             email = str(raw.get("email") or raw.get("name") or "")
             try:
-                probe = normalize_peer(raw)
-                probe.setdefault("id", str(raw.get("id") or uuid.uuid4()))
+                probe = apply_panel_identity(normalize_peer(raw), store_kind="agent")
                 if not probe.get("email"):
-                    probe["email"] = probe.get("name") or str(probe["id"])[:8]
+                    probe["email"] = probe.get("name") or str(probe.get("id") or uuid.uuid4())[:8]
                 email = str(probe.get("email") or email)
                 existing = self._find_existing_peer(by_id, by_email, probe)
 
@@ -1727,7 +1727,7 @@ class WireGuardDriver(CoreDriver):
             "succeeded": succeeded,
             "failed": failed,
             "errors": errors,
-            "peers": applied,
+            "peers": [panel_client_response(row) for row in applied],
             "ms": elapsed_ms,
         }
 
