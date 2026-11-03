@@ -83,6 +83,29 @@ def _is_inbound_missing_error(exc: AgentError) -> bool:
     return "inbound" in message and "not found" in message
 
 
+def _keep_vless_flow(
+    native: dict[str, Any],
+    client: dict[str, Any],
+    existing: dict[str, Any] | None,
+    inbound: dict[str, Any],
+    protocol: str,
+) -> None:
+    """Panel sync often omits flow. Editing the user must not wipe Vision."""
+    if str(protocol or "").strip().lower() != "vless":
+        return
+    flow = str(native.get("flow") or client.get("flow") or "").strip()
+    if not flow and isinstance(existing, dict):
+        flow = str(existing.get("flow") or "").strip()
+    if not flow:
+        stream = inbound.get("streamSettings") if isinstance(inbound.get("streamSettings"), dict) else {}
+        network = str(stream.get("network") or "tcp").strip().lower()
+        security = str(stream.get("security") or "").strip().lower()
+        if network == "tcp" and security == "reality":
+            flow = "xtls-rprx-vision"
+    if flow == "xtls-rprx-vision":
+        native["flow"] = flow
+
+
 def clients_already_on_inbound(
     clients: list[dict[str, Any]],
     by_email: dict[str, dict[str, Any]],
@@ -1557,6 +1580,7 @@ class XrayDriver(CoreDriver):
                     )
                     native["enable"] = True
                     native["is_enabled"] = True
+                    _keep_vless_flow(native, client, existing if isinstance(existing, dict) else None, inbound, protocol)
                     if existing is not None:
                         # Same email with a different Xray uuid is an edit of that
                         # user. Do not remove first: a failed add used to leave the
