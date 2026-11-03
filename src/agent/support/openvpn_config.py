@@ -101,6 +101,52 @@ def certificate_text_is_tls_server(text: str) -> bool:
     return has_eku and has_ku
 
 
+def certificate_host(value: Any) -> str:
+    """Hostname or IP safe to put in a certificate CN / SAN."""
+    host = str(value or '').strip().strip('[]')
+    if re.fullmatch(r'[A-Za-z0-9_.:-]{1,253}', host):
+        return host
+    return ''
+
+
+def subject_alt_name(host: str) -> str:
+    host = certificate_host(host)
+    if not host:
+        return ''
+    if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', host) or ':' in host:
+        return f'IP:{host}'
+    return f'DNS:{host}'
+
+
+def certificate_text_covers_host(text: str, host: str) -> bool:
+    host = certificate_host(host)
+    if not host:
+        return True
+    body = text or ''
+    if re.search(rf'(?:^|[/,\s])CN\s*=\s*{re.escape(host)}(?:\s|,|/|$)', body):
+        return True
+    alt = subject_alt_name(host)
+    if alt.startswith('DNS:') and f'DNS:{host}' in body:
+        return True
+    return f'IP Address:{host}' in body or f'IP:{host}' in body
+
+
+def verify_x509_name_line(common_name: str) -> str:
+    """Unquoted. OpenVPN Connect 3.3 rejects quotes around verify-x509-name."""
+    name = certificate_host(common_name)
+    if not name:
+        return ''
+    return f'verify-x509-name {name} name'
+
+
+def common_name_from_subject(subject: str) -> str:
+    text = _subject_arg(subject, '')
+    match = re.search(r'(?:^|/)CN=([^/]+)', text)
+    if not match:
+        return ''
+    return certificate_host(match.group(1).strip())
+
+
 def _subject_arg(raw: str, fallback_cn: str) -> str:
     text = str(raw or '').strip()
     if text.lower().startswith('subject='):
@@ -150,7 +196,18 @@ def _write_extensions(path: Path, body: str) -> None:
     path.write_text(body.strip() + '\n', encoding='utf-8')
 
 
-async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvpn') -> dict[str, str]:
+async def server_common_name(path: Path) -> str:
+    if not path.is_file():
+        return ''
+    return common_name_from_subject(await _certificate_subject(path, ''))
+
+
+async def ensure_server_pki(
+    pki_dir: Path,
+    *,
+    common_name: str = 'netinja-openvpn',
+    public_host: str = '',
+) -> dict[str, str]:
     """Create CA + server cert/key (+ tls-crypt key) under pki_dir if missing."""
     pki_dir.mkdir(parents=True, exist_ok=True)
     ca_key = pki_dir / 'ca.key'
@@ -160,10 +217,15 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
     tls_crypt = pki_dir / 'tc.key'
     # dh.pem unused: server conf uses `dh none` (ECDH). Never run openssl dhparam.
 
+    host = certificate_host(public_host)
     ca_ext = pki_dir / 'ca.ext'
     server_ext = pki_dir / 'server.ext'
     _write_extensions(ca_ext, _CA_EXTENSIONS)
-    _write_extensions(server_ext, _SERVER_EXTENSIONS)
+    server_ext_body = _SERVER_EXTENSIONS.strip()
+    alt_name = subject_alt_name(host)
+    if alt_name:
+        server_ext_body += f'\nsubjectAltName = {alt_name}'
+    _write_extensions(server_ext, server_ext_body)
 
     if not ca_key.is_file() and not ca_crt.is_file():
         await _run_openssl(['genrsa', '-out', str(ca_key), '2048'])
@@ -201,9 +263,8 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
     elif ca_key.is_file():
         ca_text = await _certificate_text(ca_crt)
         if ca_text and not certificate_text_is_ca(ca_text):
-            # Same key, so already-issued server certs still chain. Profiles
-            # that embedded the old CA keep verifying; new profiles get a
-            # real CA trust anchor.
+            # Same key, so a profile that already has this CA still chains.
+            # OpenSSL 3 still rejects that profile until it embeds this reissued CA.
             subject = await _certificate_subject(ca_crt, f'{common_name}-ca')
             await _run_openssl(
                 [
@@ -237,6 +298,13 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
                 'OpenVPN server certificate in %s lacks TLS server usage; reissuing',
                 pki_dir,
             )
+        elif host and server_text and not certificate_text_covers_host(server_text, host):
+            needs_server = True
+            log.warning(
+                'OpenVPN server certificate in %s does not match host %s; reissuing',
+                pki_dir,
+                host,
+            )
 
     if needs_server:
         if server_crt.is_file() and not server_key.is_file():
@@ -254,10 +322,11 @@ async def ensure_server_pki(pki_dir: Path, *, common_name: str = 'netinja-openvp
         req = pki_dir / 'server.csr'
         if not server_key.is_file():
             await _run_openssl(['genrsa', '-out', str(server_key), '2048'])
-        server_subject = (
-            await _certificate_subject(server_crt, f'{common_name}-server')
-            if server_crt.is_file()
-            else f'/CN={common_name}-server'
+        fallback_cn = host or f'{common_name}-server'
+        # Connect compares this CN to the profile verify-x509-name. Prefer the
+        # public host over a preserved internal name such as "ovpn0-server".
+        server_subject = f'/CN={fallback_cn}' if host or not server_crt.is_file() else (
+            await _certificate_subject(server_crt, fallback_cn)
         )
         await _run_openssl(
             [
@@ -511,6 +580,7 @@ def render_client_ovpn(
     ca_crt: str,
     tls_crypt: str = '',
     dns_servers: list[str] | None = None,
+    server_cn: str = '',
 ) -> str:
     host = str(endpoint_host or server.get('public_host') or '127.0.0.1').strip()
     port = int(server.get('listen_port') or 1194)
@@ -530,11 +600,16 @@ def render_client_ovpn(
         'persist-key',
         'persist-tun',
         'remote-cert-tls server',
+    ]
+    x509_name = verify_x509_name_line(server_cn)
+    if x509_name:
+        blocks.append(x509_name)
+    blocks.extend([
         'verb 3',
         '<ca>',
         ca_crt.strip(),
         '</ca>',
-    ]
+    ])
     tls_block = normalize_tls_crypt(tls_crypt)
     if tls_block:
         blocks.extend(['<tls-crypt>', tls_block, '</tls-crypt>'])

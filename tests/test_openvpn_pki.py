@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent.support.openvpn_config import (
+    certificate_text_covers_host,
     certificate_text_is_ca,
     certificate_text_is_tls_server,
     ensure_server_pki,
@@ -20,6 +21,23 @@ def test_tls_server_usage_predicate():
     assert not certificate_text_is_tls_server('X509v3 Basic Constraints: CA:TRUE')
     assert certificate_text_is_ca('X509v3 Basic Constraints:\n    CA:TRUE')
     assert not certificate_text_is_ca('CA:FALSE')
+    assert certificate_text_covers_host('Subject: CN = vpn.example.test', 'vpn.example.test')
+    assert not certificate_text_covers_host('Subject: CN = ovpn0-server', 'vpn.example.test')
+
+
+def test_client_profile_pins_server_name():
+    from agent.support.openvpn_config import render_client_ovpn
+
+    ovpn = render_client_ovpn(
+        {'listen_port': 1194, 'proto': 'udp'},
+        {'username': 'u', 'password': 'p', 'address': '10.8.0.2'},
+        endpoint_host='203.0.113.10',
+        ca_crt='-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----',
+        server_cn='vpn.example.test',
+    )
+    assert 'verify-x509-name vpn.example.test name' in ovpn
+    assert "verify-x509-name '" not in ovpn
+    assert 'remote 203.0.113.10 1194' in ovpn
 
 
 @pytest.mark.skipif(shutil.which('openssl') is None, reason='openssl is not installed')
@@ -68,7 +86,7 @@ def test_ensure_server_pki_repairs_leaf_without_server_auth(tmp_path: Path):
     )
     assert not certificate_text_is_tls_server(text.stdout or '')
 
-    repaired = asyncio.run(ensure_server_pki(pki, common_name='legacy'))
+    repaired = asyncio.run(ensure_server_pki(pki, common_name='legacy', public_host='vpn.example.test'))
     after = (pki / 'server.crt').read_text(encoding='utf-8')
     assert after != before
     assert 'BEGIN CERTIFICATE' in repaired['server_crt']
@@ -80,8 +98,10 @@ def test_ensure_server_pki_repairs_leaf_without_server_auth(tmp_path: Path):
     )
     assert certificate_text_is_tls_server(leaf.stdout or '')
     assert certificate_text_is_ca(ca.stdout or '')
+    assert certificate_text_covers_host(leaf.stdout or '', 'vpn.example.test')
+    assert 'DNS:vpn.example.test' in (leaf.stdout or '')
 
     stable = (pki / 'server.crt').read_text(encoding='utf-8')
-    asyncio.run(ensure_server_pki(pki, common_name='legacy'))
+    asyncio.run(ensure_server_pki(pki, common_name='legacy', public_host='vpn.example.test'))
     assert (pki / 'server.crt').read_text(encoding='utf-8') == stable
     assert (pki / 'ca.crt').read_text(encoding='utf-8') == repaired['ca_crt']

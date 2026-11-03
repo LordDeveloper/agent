@@ -30,6 +30,7 @@ from agent.support.openvpn_config import (
     parse_status_v2,
     render_ccd_file,
     render_client_ovpn,
+    server_common_name,
     render_passwd,
     render_server_conf,
     tun_dev_for_server,
@@ -934,7 +935,18 @@ class OpenVpnDriver(CoreDriver):
         live_port = self._live_listen_port(server)
         if live_port:
             server['listen_port'] = live_port
-        pki = await self._pki_texts(server)
+        pki = await self._resolved_pki(server)
+        live = self._read_live_pki(server)
+        if any(
+            str(pki.get(key) or '').strip() != str(live.get(key) or '').strip()
+            for key in ('ca_crt', 'ca_key', 'server_crt', 'server_key', 'tls_crypt')
+        ):
+            server_dir = self._server_dir(server)
+            server_dir.mkdir(parents=True, exist_ok=True)
+            self._write_pki_dir(server_dir, pki, overwrite=True)
+            if self._remember_pki(server, pki):
+                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+            await self._ensure_services(start=True, restart=True, only_ids=[server.get('id')])
         dns_servers: list[str] | None = None
         try:
             from agent.adguard import ADS_ENABLED_MARKER
@@ -944,6 +956,7 @@ class OpenVpnDriver(CoreDriver):
                 dns_servers = await preferred_client_dns()
         except Exception:
             dns_servers = []
+        server_cn = await server_common_name(self._pki_dir(server) / 'server.crt')
         ovpn = render_client_ovpn(
             server,
             user,
@@ -951,6 +964,7 @@ class OpenVpnDriver(CoreDriver):
             ca_crt=pki.get('ca_crt') or '',
             tls_crypt=pki.get('tls_crypt') or '',
             dns_servers=dns_servers,
+            server_cn=server_cn,
         )
         return {
             'type': 'OpenVPN',
@@ -1278,10 +1292,13 @@ class OpenVpnDriver(CoreDriver):
         if stored_tls:
             overlay['tls_crypt'] = stored_tls
         staging = self._pki_dir(server)
-        self._write_pki_dir(staging, overlay, overwrite=True)
+        # Do not replace a repaired cert with the panel copy. That copy is the
+        # pre-repair CA, and writing it back rotates the certificate forever.
+        self._write_pki_dir(staging, overlay, overwrite=False)
         generated = await ensure_server_pki(
             staging,
             common_name=instance_name_for_server(server),
+            public_host=str(server.get('public_host') or ''),
         )
         # Repaired certs must replace a stored leaf that lacks TLS server usage.
         for key in _PKI_KEYS:
