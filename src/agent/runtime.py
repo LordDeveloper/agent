@@ -39,6 +39,9 @@ def open_runtime(env_file: str | None = None) -> Runtime:
     settings = load_settings(env_file)
     store = Store(settings.resolve_db_path())
     asyncio.run(store.open())
+    from agent.support.quota_identity_migration import migrate_client_quota_identity
+
+    asyncio.run(migrate_client_quota_identity(store))
     audit = AuditLog(store)
     registry = CoreRegistry(settings, audit, store)
     return Runtime(settings=settings, store=store, audit=audit, registry=registry)

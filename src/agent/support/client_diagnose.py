@@ -210,6 +210,7 @@ async def diagnose_client_match(
 
     error_count = sum(1 for row in issues if row.get('level') == 'error')
     warning_count = sum(1 for row in issues if row.get('level') == 'warning')
+    stored_id = await _stored_client_id(driver, config_client)
 
     return {
         'healthy': error_count == 0,
@@ -218,12 +219,47 @@ async def diagnose_client_match(
         'inbound': inbound_summary,
         'address': str(config_client.get('email') or client_key),
         'email': str(config_client.get('email') or ''),
+        'id': stored_id,
         'client': config_client,
         'live': live,
         'checks': checks,
         'issues': issues,
         'issue_counts': {'error': error_count, 'warning': warning_count},
     }
+
+
+async def _stored_client_id(driver: Any, client: dict[str, Any]) -> str:
+    """Agent database id for this client. Not the Xray/link UUID."""
+    xray_id = str(client.get('id') or '').strip()
+    lookup = getattr(driver, '_quota_index', None)
+    if not callable(lookup):
+        return str(client.get('agent_id') or '').strip()
+
+    try:
+        index = await maybe_await(lookup())
+    except Exception:
+        index = None
+    if not isinstance(index, dict):
+        return str(client.get('agent_id') or '').strip()
+
+    email = str(client.get('email') or '').strip()
+    node_id = str(client.get('node_id') or '').strip()
+    meta = index.get(f'n:{xray_id}') if xray_id else None
+    if meta is None and node_id:
+        meta = index.get(f'n:{node_id}')
+    if meta is None and email:
+        meta = index.get(f'e:{email}')
+    if meta is None and xray_id:
+        meta = index.get(f'i:{xray_id}')
+    if not isinstance(meta, dict):
+        return str(client.get('agent_id') or '').strip()
+
+    link = str(meta.get('node_id') or xray_id).strip()
+    legacy = str(meta.get('agent_id') or meta.get('primary_key') or '').strip()
+    stored = str(meta.get('id') or '').strip()
+    if legacy and legacy != link:
+        return legacy
+    return stored
 
 
 async def _traffic_for_client(driver: Any, inbound_tag: str, inbound_id: str, config_client: dict[str, Any]) -> tuple[int, int]:

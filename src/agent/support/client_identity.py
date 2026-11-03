@@ -93,7 +93,13 @@ def identity_lookup_keys(client: dict[str, Any]) -> set[str]:
 def billing_client_id(meta: dict[str, Any] | None, *, protocol_id: str, email: str) -> str:
     """Panel ``subscribes.node_id`` (agent route id) for traffic rows."""
     if isinstance(meta, dict):
-        agent_id = _trim(meta.get("agent_id") or "")
-        if agent_id:
-            return agent_id
+        link = _trim(meta.get("node_id") or "")
+        legacy = _trim(meta.get("agent_id") or meta.get("primary_key") or "")
+        stored_id = _trim(meta.get("id") or "")
+        if legacy and legacy != link:
+            return legacy
+        if stored_id and link and stored_id != link:
+            return stored_id
+        if stored_id:
+            return stored_id
     return protocol_id or email

@@ -28,6 +28,7 @@ def test_format_xray_client_diagnose_report():
                 'healthy': False,
                 'inbound_tag': 'vless-in',
                 'email': 'abc123',
+                'id': '90c10bb2-ea51-492a-84c5-cfcef6aeaa55',
                 'inbound': {'tag': 'vless-in', 'port': 443, 'protocol': 'vless'},
                 'client': {
                     'id': '11111111-1111-1111-1111-111111111111',
@@ -54,6 +55,8 @@ def test_format_xray_client_diagnose_report():
     rendered = format_diagnose_report(report, use_color=False)
 
     assert 'Agent diagnose — Xray client' in rendered
+    assert 'id:' in rendered
+    assert '90c10bb2-ea51-492a-84c5-cfcef6aeaa55' in rendered
     assert 'abc123' in rendered
     assert 'vless-in' in rendered
     assert 'Checks' in rendered

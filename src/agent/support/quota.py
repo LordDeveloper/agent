@@ -417,8 +417,8 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
     Xray's users API only accepts protocol fields, so volume never survives
     on the inbound user unless the agent stores it separately.
     """
-    cid = str(client.get("id") or "").strip()
-    agent_id = str(client.get("agent_id") or "").strip()
+    xray_id = str(client.get("id") or "").strip()
+    agent_pk = str(client.get("agent_id") or "").strip()
     panel_node_id = str(client.get("node_id") or "").strip()
     email = str(client.get("email") or "").strip()
     volume = client.get("volume") if "volume" in client else None
@@ -429,10 +429,11 @@ def quota_meta_from_client(client: dict[str, Any]) -> dict[str, Any]:
     if volume is not None and volume <= 0:
         volume = None
 
+    link_id = panel_node_id or xray_id
+    stored_id = agent_pk or xray_id
     meta: dict[str, Any] = {
-        "id": cid,
-        "agent_id": agent_id or cid,
-        "node_id": panel_node_id or cid,
+        "id": stored_id,
+        "node_id": link_id,
         "email": email,
         "volume": volume,
     }

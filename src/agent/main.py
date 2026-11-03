@@ -126,6 +126,11 @@ def create_app(env_file: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await store.open()
+        from agent.support.quota_identity_migration import migrate_client_quota_identity
+
+        migrated = await migrate_client_quota_identity(store)
+        if migrated:
+            app_log.info("client quota identity migrated docs=%s", migrated)
         app_log.info(
             "agent started version=%s listen=%s cores=%s log=%s local_volume_quota=%s",
             __version__,

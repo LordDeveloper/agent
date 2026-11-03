@@ -326,6 +326,7 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
         '',
         'Client (config)',
         f'  Email:        {client.get("email") or "-"}',
+        f'  id:           {_truncate(str(match.get("id") or "-"), 40)}',
         f'  UUID:         {_truncate(str(client.get("id") or "-"), 40)}',
         f'  Enabled:      {_yes_no(client.get("is_enabled"))}',
         f'  Flow:         {client.get("flow") or "-"}',
