@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.support.bandwidth import with_provisioning
 from agent.drivers.amnezia import AmneziaDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import AmneziaInterfacePayload, AmneziaPeerPayload
@@ -94,7 +95,7 @@ async def add_peer(interface_id: str, payload: AmneziaPeerPayload, amnezia: Amne
         peer = await amnezia.add_peer(interface_id, body)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "peer": peer}
+    return with_provisioning({"success": True, "peer": peer}, peer.get("id"))
 
 
 @router.post("/interfaces/{interface_id}/peers/batch")
@@ -114,7 +115,7 @@ async def batch_peers(interface_id: str, body: dict[str, Any], amnezia: AmneziaD
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, **result}
+    return with_provisioning({"success": True, **result})
 
 
 @router.delete("/interfaces/{interface_id}/peers/batch")
@@ -128,7 +129,7 @@ async def batch_remove_peers(interface_id: str, body: dict[str, Any], amnezia: A
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, **result}
+    return with_provisioning({"success": True, **result})
 
 
 @router.put("/interfaces/{interface_id}/peers/{peer_id}")
@@ -140,7 +141,7 @@ async def update_peer(interface_id: str, peer_id: str, payload: AmneziaPeerPaylo
         peer = await amnezia.update_peer(interface_id, peer_id, body)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "peer": peer}
+    return with_provisioning({"success": True, "peer": peer}, peer.get("id"))
 
 
 @router.delete("/interfaces/{interface_id}/peers/{peer_id}")
@@ -149,7 +150,7 @@ async def delete_peer(interface_id: str, peer_id: str, amnezia: AmneziaDriver = 
         await amnezia.delete_peer(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True}
+    return with_provisioning({"success": True}, peer_id)
 
 
 @router.post("/interfaces/{interface_id}/peers/{peer_id}/reset-traffic")

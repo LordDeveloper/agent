@@ -327,11 +327,15 @@ async def diagnose_user_match(
 
     error_count = sum(1 for row in issues if row.get('level') == 'error')
     warning_count = sum(1 for row in issues if row.get('level') == 'warning')
+    from agent.support.bandwidth import diagnose_bandwidth
+
+    bandwidth = await diagnose_bandwidth(user, interface=tun or None, kind='tunnel')
 
     return {
         'core': core,
         'address': host,
         'cidr': cidr,
+        'bandwidth': bandwidth,
         'server': server,
         'user': {
             'id': user.get('id'),

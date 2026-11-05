@@ -1,16 +1,25 @@
+import asyncio
+import time
+
 import pytest
 
 from agent.support.bandwidth import (
     IFB_DOWN,
     IFB_UP,
+    BandwidthManager,
+    BandwidthValueError,
     collect_l2tp_plans,
     collect_openvpn_plans,
     collect_tunnel_plans,
+    diagnose_bandwidth,
     ifb_commands,
     mbps_to_kbit,
     normalize_bandwidth,
+    ppp_commands,
+    reset_runtime_for_tests,
+    resolve_enforcement_status,
     tunnel_commands,
-    BandwidthValueError,
+    with_provisioning,
 )
 
 
@@ -149,3 +158,166 @@ def test_l2tp_sessions_share_one_ifb_class():
     assert "match ip dst 10.7.0.2/32" in commands
     assert "match ip dst 10.7.0.8/32" in commands
     assert "dev ppp0" not in commands
+
+
+def _limited_peer(peer_id: str = "sub-1") -> dict:
+    return {
+        "id": peer_id,
+        "is_enabled": True,
+        "address": "10.8.0.2",
+        "allowed_ips": "10.8.0.2/32,10.8.0.3/32",
+        "bandwidth": {"download_mbps": 5, "upload_mbps": 5},
+    }
+
+
+def test_filters_use_u32_node_handles_and_are_not_deleted_first():
+    plans = collect_tunnel_plans([{"name": "wg1660", "peers": [_limited_peer()]}])
+    commands = "\n".join(tunnel_commands("wg1660", plans[0].limits))
+    assert "filter del" not in commands
+    assert "handle 800::" in commands
+    for line in commands.splitlines():
+        if "filter " in line:
+            handle = line.split("handle ", 1)[1].split(" ", 1)[0]
+            assert handle.startswith("800::")
+    assert "match ip dst 10.8.0.2/32" in commands
+    assert "match ip src 10.8.0.2/32" in commands
+    ppp = "\n".join(ppp_commands("ppp0", [("10.8.0.2", plans[0].limits[0])]))
+    assert "filter del" not in ppp
+    assert "800::" in ppp
+
+
+def test_status_is_not_active_without_kernel_verification():
+    assert resolve_enforcement_status(configured=False, verified=False) == "unlimited"
+    assert resolve_enforcement_status(configured=True, verified=True) == "active"
+    assert resolve_enforcement_status(configured=True, verified=False) == "error"
+    assert resolve_enforcement_status(configured=True, verified=True, task="queued") == "pending"
+    assert resolve_enforcement_status(configured=True, verified=False, task="running") == "installing"
+    assert resolve_enforcement_status(configured=True, verified=False, dependency_state="unsupported") == "unsupported"
+    assert resolve_enforcement_status(configured=True, verified=False, waiting=True) == "pending"
+
+
+def test_diagnostics_do_not_report_active_from_configuration_alone():
+    report = asyncio.run(diagnose_bandwidth(_limited_peer(), interface="wg1660", kind="tunnel"))
+    assert report["configured"] is True
+    assert report["download_mbps"] == 5
+    assert report["upload_mbps"] == 5
+    assert report["status"] != "active"
+    assert report["verified"] is False
+    unlimited = asyncio.run(diagnose_bandwidth({"id": "free", "is_enabled": True, "address": "10.8.0.4"}))
+    assert unlimited == {
+        "configured": False,
+        "status": "unlimited",
+        "download_mbps": None,
+        "upload_mbps": None,
+        "verified": False,
+        "method": None,
+        "interface": None,
+        "class_id": None,
+        "last_error": None,
+    }
+
+
+def test_provisioning_response_does_not_wait_and_keeps_success_on_bandwidth_failure(tmp_path):
+    reset_runtime_for_tests()
+    manager = BandwidthManager(object(), tmp_path, retry_delay=0)
+
+    async def fail():
+        await asyncio.sleep(0.2)
+        return {"state": "error", "last_error": "tc failed"}
+
+    manager._run = fail
+    started = time.perf_counter()
+    queued = manager.apply({"id": "example"}, core="wireguard", interface="wg1660")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.1
+    assert queued["status"] == "queued"
+    payload = with_provisioning({"success": True, "client_id": "example"}, "example")
+    # The helper reads the process manager. Bind it for this assertion.
+    from agent.support import bandwidth as bandwidth_module
+
+    bandwidth_module._manager = manager
+    try:
+        payload = with_provisioning({"success": True, "client_id": "example"}, "example")
+    finally:
+        reset_runtime_for_tests()
+    assert payload["success"] is True
+    assert payload["provisioning_status"] == "completed"
+    assert payload["background_tasks"]["bandwidth"] == "pending"
+
+
+def test_background_tasks_coalesce_retry_and_ignore_stale_state(tmp_path):
+    manager = BandwidthManager(object(), tmp_path, retry_delay=0)
+    state = {"rate": 5, "enabled": True, "present": True, "calls": []}
+
+    async def apply_desired():
+        observed = (state["rate"], state["enabled"], state["present"])
+        await asyncio.sleep(0.02)
+        state["calls"].append(observed)
+        if state.get("boom"):
+            state["boom"] = False
+            raise RuntimeError("transient tc failure")
+        return {"state": "idle"}
+
+    manager._run = apply_desired
+
+    async def scenario():
+        for index in range(20):
+            manager.update({"id": f"client-{index}"}, core="wireguard")
+        manager.update({"id": "client-0"}, core="wireguard")
+        drain = asyncio.create_task(manager._drain(asyncio.Event()))
+        await asyncio.sleep(0.01)
+        state["rate"] = 20
+        state["enabled"] = False
+        state["present"] = False
+        manager.remove("client-0")
+        await drain
+        state["boom"] = True
+        manager.update({"id": "client-0"})
+        await manager._drain(asyncio.Event())
+
+    asyncio.run(scenario())
+    assert state["calls"]
+    assert state["calls"][-1] == (20, False, False)
+    assert len(state["calls"]) < 20
+    failed = [row for row in manager._tasks.values() if row.get("status") == "failed"]
+    assert failed == []
+    assert any(int(row.get("retries") or 0) >= 1 for row in manager._tasks.values())
+
+
+def test_restart_requeues_unfinished_tasks(tmp_path):
+    manager = BandwidthManager(object(), tmp_path)
+    manager.apply({"id": "example"})
+    manager._tasks["example"]["status"] = "running"
+    manager._save_tasks()
+    restored = BandwidthManager(object(), tmp_path)
+    assert restored.requeue_unfinished() == 1
+    assert restored._tasks["example"]["status"] == "queued"
+    assert restored._wake.is_set()
+
+
+def test_slow_bandwidth_task_does_not_block_another_client(tmp_path):
+    manager = BandwidthManager(object(), tmp_path, retry_delay=0)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def slow():
+        entered.set()
+        await release.wait()
+        return {"state": "idle"}
+
+    manager._run = slow
+
+    async def scenario():
+        manager.apply({"id": "slow"}, core="wireguard", interface="wg1")
+        worker = asyncio.create_task(manager._drain(asyncio.Event()))
+        await entered.wait()
+        started = time.perf_counter()
+        manager.update({"id": "other"}, core="openvpn", interface="ovpn1")
+        elapsed = time.perf_counter() - started
+        release.set()
+        await worker
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+    assert elapsed < 0.1
+    assert manager._tasks["other"]["status"] in {"completed", "running", "queued"}

@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.support.bandwidth import with_provisioning
 from agent.drivers.openvpn import OpenVpnDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import OpenVpnServerPayload, OpenVpnUserPayload
@@ -80,7 +81,7 @@ async def add_user(server_id: str, payload: OpenVpnUserPayload, openvpn: OpenVpn
         user = await openvpn.add_user(server_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {'success': True, 'user': user}
+    return with_provisioning({'success': True, 'user': user}, user.get('id'))
 
 
 @router.post('/servers/{server_id}/users/batch')
@@ -100,7 +101,7 @@ async def batch_users(server_id: str, body: dict[str, Any], openvpn: OpenVpnDriv
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {'success': True, **result}
+    return with_provisioning({'success': True, **result})
 
 
 @router.put('/servers/{server_id}/users/{user_id}')
@@ -114,7 +115,7 @@ async def update_user(
         user = await openvpn.update_user(server_id, user_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {'success': True, 'user': user}
+    return with_provisioning({'success': True, 'user': user}, user.get('id'))
 
 
 @router.delete('/servers/{server_id}/users/{user_id}')
@@ -123,7 +124,7 @@ async def delete_user(server_id: str, user_id: str, openvpn: OpenVpnDriver = Dep
         await openvpn.delete_user(server_id, user_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {'success': True}
+    return with_provisioning({'success': True}, user_id)
 
 
 @router.get('/servers/{server_id}/users/{user_id}/config')

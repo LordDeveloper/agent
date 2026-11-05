@@ -495,12 +495,16 @@ async def diagnose_peer_match(
 
     error_count = sum(1 for row in issues if row.get('level') == 'error')
     warning_count = sum(1 for row in issues if row.get('level') == 'warning')
+    from agent.support.bandwidth import diagnose_bandwidth
+
+    bandwidth = await diagnose_bandwidth(peer, interface=iface_name or None, kind='tunnel')
 
     return {
         'core': core,
         'address': host,
         'cidr': cidr,
         'interface': iface,
+        'bandwidth': bandwidth,
         'peer': {
             'id': peer.get('id'),
             'email': peer.get('email'),

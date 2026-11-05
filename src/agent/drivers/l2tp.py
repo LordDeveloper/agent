@@ -714,12 +714,9 @@ class L2tpDriver(CoreDriver):
             started=started,
             success=True,
         )
-        try:
-            from agent.support.bandwidth import reconcile_current
+        from agent.support.bandwidth import schedule_bandwidth
 
-            await reconcile_current()
-        except Exception:
-            log.exception('l2tp bandwidth reconcile failed')
+        schedule_bandwidth(core=self.key)
 
     def _log_user_op(
         self,
@@ -1167,12 +1164,9 @@ class L2tpDriver(CoreDriver):
             await self._install_ppp_egress_hook()
         except Exception:
             log.exception('l2tp peer egress reconcile failed')
-        try:
-            from agent.support.bandwidth import reconcile_current
+        from agent.support.bandwidth import schedule_bandwidth
 
-            await reconcile_current()
-        except Exception:
-            log.exception('l2tp bandwidth reconcile failed')
+        schedule_bandwidth(core=self.key)
 
     async def _install_ppp_egress_hook(self) -> None:
         """Re-apply peer egress when a PPP session comes up (pppN appears after L2TP auth)."""

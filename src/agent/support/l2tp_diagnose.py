@@ -511,11 +511,16 @@ async def diagnose_user_match(
 
     error_count = sum(1 for row in issues if row.get('level') == 'error')
     warning_count = sum(1 for row in issues if row.get('level') == 'warning')
+    from agent.support.bandwidth import diagnose_bandwidth
+
+    ppp_iface = str((live or {}).get('interface') or '') or None
+    bandwidth = await diagnose_bandwidth(user, interface=ppp_iface, kind='l2tp')
 
     return {
         'core': core,
         'address': host,
         'cidr': cidr,
+        'bandwidth': bandwidth,
         'server': server,
         'user': {
             'id': user.get('id'),

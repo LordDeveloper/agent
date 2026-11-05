@@ -1641,9 +1641,6 @@ class OpenVpnDriver(CoreDriver):
             )
         except Exception:
             log.exception('openvpn peer egress reconcile failed')
-        try:
-            from agent.support.bandwidth import reconcile_current
+        from agent.support.bandwidth import schedule_bandwidth
 
-            await reconcile_current()
-        except Exception:
-            log.exception('openvpn bandwidth reconcile failed')
+        schedule_bandwidth(core=self.key)

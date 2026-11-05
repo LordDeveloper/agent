@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.support.bandwidth import with_provisioning
 from agent.drivers.wireguard import WireGuardDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import WgInterfacePayload, WgPeerPayload
@@ -85,7 +86,7 @@ async def add_peer(interface_id: str, payload: WgPeerPayload, wg: WireGuardDrive
         peer = await wg.add_peer(interface_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "peer": peer}
+    return with_provisioning({"success": True, "peer": peer}, peer.get("id"))
 
 
 @router.post("/interfaces/{interface_id}/peers/batch")
@@ -105,7 +106,7 @@ async def batch_peers(interface_id: str, body: dict[str, Any], wg: WireGuardDriv
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, **result}
+    return with_provisioning({"success": True, **result})
 
 
 @router.delete("/interfaces/{interface_id}/peers/batch")
@@ -119,7 +120,7 @@ async def batch_remove_peers(interface_id: str, body: dict[str, Any], wg: WireGu
         )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, **result}
+    return with_provisioning({"success": True, **result})
 
 
 @router.put("/interfaces/{interface_id}/peers/{peer_id}")
@@ -128,7 +129,7 @@ async def update_peer(interface_id: str, peer_id: str, payload: WgPeerPayload, w
         peer = await wg.update_peer(interface_id, peer_id, payload.model_dump(exclude_none=True))
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "peer": peer}
+    return with_provisioning({"success": True, "peer": peer}, peer.get("id"))
 
 
 @router.delete("/interfaces/{interface_id}/peers/{peer_id}")
@@ -137,7 +138,7 @@ async def delete_peer(interface_id: str, peer_id: str, wg: WireGuardDriver = Dep
         await wg.delete_peer(interface_id, peer_id)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True}
+    return with_provisioning({"success": True}, peer_id)
 
 
 @router.post("/interfaces/{interface_id}/peers/{peer_id}/reset-traffic")

@@ -2577,15 +2577,11 @@ class WireGuardDriver(CoreDriver):
         await self._sync_bandwidth()
         await self._sync_linked_l2tp(drop_keys=drop_keys)
 
-    async def _sync_bandwidth(self) -> None:
-        try:
-            from agent.support.bandwidth import reconcile_current
+    async def _sync_bandwidth(self, *client_ids: str) -> None:
+        # Traffic control is desired-state work. The request must not wait for it.
+        from agent.support.bandwidth import schedule_bandwidth
 
-            await reconcile_current()
-        except Exception:
-            from agent.logutil import get_logger
-
-            get_logger("wireguard").exception("bandwidth reconcile failed core=%s", self.key)
+        schedule_bandwidth(*client_ids, core=self.key, action="update" if client_ids else "reconcile")
 
     async def _sync_linked_l2tp(self, drop_keys: list[str] | None = None) -> None:
         try:
