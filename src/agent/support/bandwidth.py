@@ -309,16 +309,17 @@ def collect_l2tp_plans(
 
 
 def filter_handle(minor: int, index: int, used: set[int] | None = None) -> int:
-    """u32 node id inside the default 800: hash table (1..4095).
+    """u32 node id in the default 800: hash table (1..0xfff).
 
-    iproute2 treats a bare integer handle as a hash-table id. Handles such as
-    ``minor * 100`` never land in table 800, so ``filter add`` fails, the HTB
-    class stays empty, and every packet takes the full-rate default class.
+    ``tc`` parses both the hash-table id and the node id as hexadecimal, and
+    the node id must fit in 12 bits. A decimal token such as ``800::3654`` is
+    read as ``0x3654`` (13908), which is rejected, so the HTB class is created
+    and the classification filter is not.
     """
     slot = ((int(minor) * 17) + int(index)) % 0xFFE + 1
     taken = used if used is not None else set()
     start = slot
-    while slot in taken:
+    while slot in taken or slot > 0xFFF:
         slot = slot % 0xFFE + 1
         if slot == start:
             raise BandwidthValueError("no free u32 filter handle")
@@ -328,16 +329,25 @@ def filter_handle(minor: int, index: int, used: set[int] | None = None) -> int:
 
 
 def _handle_token(slot: int) -> str:
-    return f"800::{int(slot)}"
+    node = int(slot)
+    if node < 1 or node > 0xFFF:
+        raise BandwidthValueError("u32 filter handle is outside the 12-bit node range")
+    return f"800::{node:x}"
 
 
-def _filter_replace(device: str, parent: str, slot: int, match: str, action: str) -> str:
-    # replace is idempotent. A preceding delete of a missing filter makes
-    # ``tc -batch`` return an error and, on some iproute2 builds, skips the add.
-    return (
-        f"filter replace dev {device} {parent} protocol ip prio 10 handle {_handle_token(slot)} "
-        f"u32 match {match} {action}"
-    )
+def _filter_lines(device: str, parent: str, slot: int, match: str, action: str) -> list[str]:
+    """Delete our handle, then add it again.
+
+    ``filter replace`` does not create a missing u32 filter on every iproute2.
+    The delete is applied in a separate batch whose failure is ignored, so a
+    missing filter cannot abort the add. The explicit handle prevents duplicates.
+    """
+    token = _handle_token(slot)
+    selector = f"dev {device} {parent} protocol ip prio 10 handle {token} u32"
+    return [
+        f"filter del {selector}",
+        f"filter add {selector} match {match} {action}",
+    ]
 
 
 def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] | None = None) -> list[str]:
@@ -358,8 +368,8 @@ def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] |
             lines.append(_class_tokens(device, limit.minor, int(limit.download_kbit)))
             for index, address in enumerate(limit.addresses):
                 slot = filter_handle(limit.minor, index, root_used)
-                lines.append(
-                    _filter_replace(
+                lines.extend(
+                    _filter_lines(
                         device,
                         "parent 1:",
                         slot,
@@ -377,8 +387,8 @@ def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] |
         for limit in uploads:
             for index, address in enumerate(limit.addresses):
                 slot = filter_handle(limit.minor, index, ingress_used)
-                lines.append(
-                    _filter_replace(
+                lines.extend(
+                    _filter_lines(
                         device,
                         "ingress",
                         slot,
@@ -403,8 +413,8 @@ def ifb_commands(device: str, limits: list[Limit], *, direction: str) -> list[st
         lines.append(_class_tokens(device, limit.minor, kbit))
         for index, address in enumerate(limit.addresses):
             slot = filter_handle(limit.minor, index, used)
-            lines.append(
-                _filter_replace(
+            lines.extend(
+                _filter_lines(
                     device,
                     "parent 1:",
                     slot,
@@ -432,8 +442,8 @@ def ppp_commands(device: str, bindings: list[tuple[str, Limit]]) -> list[str]:
     for index, (address, limit) in enumerate(bindings):
         if limit.download_kbit:
             slot = filter_handle(limit.minor, index, egress_used)
-            lines.append(
-                _filter_replace(
+            lines.extend(
+                _filter_lines(
                     device,
                     "egress",
                     slot,
@@ -443,8 +453,8 @@ def ppp_commands(device: str, bindings: list[tuple[str, Limit]]) -> list[str]:
             )
         if limit.upload_kbit:
             slot = filter_handle(limit.minor, index, ingress_used)
-            lines.append(
-                _filter_replace(
+            lines.extend(
+                _filter_lines(
                     device,
                     "ingress",
                     slot,
@@ -771,10 +781,52 @@ def _ip_match_hex(address: str) -> str:
     return ipaddress.IPv4Address(address).packed.hex()
 
 
-def _filter_matches(text: str, address: str, flowid: str) -> bool:
-    folded = text.lower().replace(" ", "")
-    found = _ip_match_hex(address) in folded or address in text
-    return found and flowid in text
+def _filter_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("filter ") and current:
+            blocks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks or [text]
+
+
+def _block_has_address(block: str, address: str) -> bool:
+    folded = block.lower().replace(" ", "")
+    return _ip_match_hex(address) in folded or address in block
+
+
+def _flowid_in_block(block: str, minor: int) -> bool:
+    """Accept the class id spelling tc prints (hex) and the decimal minor."""
+    return f"1:{int(minor):x}" in block.lower() or f"1:{int(minor)}" in block
+
+
+def filter_show_has(text: str, address: str, *, minor: int | None = None, kind: str) -> bool:
+    """True when one filter block classifies this address.
+
+    ``kind`` is ``dst`` (download flowid), ``src`` (upload flowid), or
+    ``redirect`` (ingress mirred, no flowid). The address and the flowid must
+    be in the same block so another client's filter cannot satisfy the check.
+    """
+    for block in _filter_blocks(text):
+        if not _block_has_address(block, address):
+            continue
+        lowered = block.lower()
+        if kind == "redirect":
+            if "mirred" in lowered or IFB_UP in block or IFB_DOWN in block:
+                return True
+            continue
+        if minor is None or not _flowid_in_block(block, minor):
+            continue
+        if kind == "dst" and ("at 16" in lowered or "dst" in lowered):
+            return True
+        if kind == "src" and ("at 12" in lowered or "src" in lowered):
+            return True
+    return False
 
 
 async def _tc_show(args: list[str]) -> str:
@@ -787,11 +839,16 @@ async def _class_present(device: str, minor: int) -> bool:
     return f"1:{minor}" in text and "htb" in text
 
 
-async def _filters_present(device: str, limit: Limit, *, parent: list[str]) -> str | None:
-    text = await _tc_show(["tc", "filter", "show", "dev", device, *parent])
-    flowid = f"1:{limit.minor}"
+async def _filter_show(device: str, parent: list[str]) -> str:
+    specific = await _tc_show(["tc", "filter", "show", "dev", device, *parent])
+    broad = await _tc_show(["tc", "filter", "show", "dev", device])
+    return "\n".join(part for part in (specific, broad) if part)
+
+
+async def _filters_present(device: str, limit: Limit, *, parent: list[str], kind: str) -> str | None:
+    text = await _filter_show(device, parent)
     for address in limit.addresses:
-        if not _filter_matches(text, address, flowid):
+        if not filter_show_has(text, address, minor=limit.minor, kind=kind):
             where = " ".join(parent)
             return f"filter for {address} missing on {device} {where}"
     return None
@@ -854,41 +911,68 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
     limit: Limit = row["limit"]
     tunnels: list[str] = list(row.get("tunnels") or [])
     ppp: list[str] = list(row.get("ppp") or [])
+    objects: dict[str, bool | None] = {
+        "download_class": None,
+        "download_filter": None,
+        "upload_class": None,
+        "upload_filter": None,
+        "ingress_redirect": None,
+    }
+    missing: list[str] = []
     waiting = False
     if limit.download_kbit and tunnels:
+        objects["download_class"] = True
+        objects["download_filter"] = True
         for device in tunnels:
             if not await _class_present(device, limit.minor):
-                return False, f"class 1:{limit.minor} missing on {device}", False
-            reason = await _filters_present(device, limit, parent=["parent", "1:"])
+                objects["download_class"] = False
+                missing.append(f"download class 1:{limit.minor} missing on {device}")
+            reason = await _filters_present(device, limit, parent=["parent", "1:"], kind="dst")
             if reason:
-                return False, reason, False
+                objects["download_filter"] = False
+                missing.append(reason)
     if limit.download_kbit and not tunnels:
-        if not await _class_present(IFB_DOWN, limit.minor):
-            return False, f"class 1:{limit.minor} missing on {IFB_DOWN}", False
-        reason = await _filters_present(IFB_DOWN, limit, parent=["parent", "1:"])
+        objects["download_class"] = await _class_present(IFB_DOWN, limit.minor)
+        reason = await _filters_present(IFB_DOWN, limit, parent=["parent", "1:"], kind="dst")
+        objects["download_filter"] = reason is None
+        if not objects["download_class"]:
+            missing.append(f"download class 1:{limit.minor} missing on {IFB_DOWN}")
         if reason:
-            return False, reason, False
+            missing.append(reason)
         if not ppp:
             waiting = True
-        for device in ppp:
-            text = await _tc_show(["tc", "filter", "show", "dev", device, "egress"])
-            for address in limit.addresses:
-                if _ip_match_hex(address) not in text.lower().replace(" ", "") and address not in text:
-                    return False, f"download redirect for {address} missing on {device}", False
+            objects["ingress_redirect"] = False
+        else:
+            objects["ingress_redirect"] = True
+            for device in ppp:
+                text = await _filter_show(device, ["egress"])
+                for address in limit.addresses:
+                    if not filter_show_has(text, address, minor=limit.minor, kind="redirect"):
+                        objects["ingress_redirect"] = False
+                        missing.append(f"download redirect for {address} missing on {device}")
     if limit.upload_kbit:
-        if not await _class_present(IFB_UP, limit.minor):
-            return False, f"class 1:{limit.minor} missing on {IFB_UP}", False
-        reason = await _filters_present(IFB_UP, limit, parent=["parent", "1:"])
+        objects["upload_class"] = await _class_present(IFB_UP, limit.minor)
+        reason = await _filters_present(IFB_UP, limit, parent=["parent", "1:"], kind="src")
+        objects["upload_filter"] = reason is None
+        if not objects["upload_class"]:
+            missing.append(f"upload class 1:{limit.minor} missing on {IFB_UP}")
         if reason:
-            return False, reason, False
+            missing.append(reason)
         redirects = tunnels or ppp
         if not redirects:
             waiting = True
-        for device in redirects:
-            text = await _tc_show(["tc", "filter", "show", "dev", device, "ingress"])
-            for address in limit.addresses:
-                if _ip_match_hex(address) not in text.lower().replace(" ", "") and address not in text:
-                    return False, f"upload redirect for {address} missing on {device}", False
+            objects["ingress_redirect"] = False
+        else:
+            objects["ingress_redirect"] = True
+            for device in redirects:
+                text = await _filter_show(device, ["ingress"])
+                for address in limit.addresses:
+                    if not filter_show_has(text, address, kind="redirect"):
+                        objects["ingress_redirect"] = False
+                        missing.append(f"upload redirect for {address} missing on {device}")
+    row["objects"] = objects
+    if missing:
+        return False, "; ".join(missing), False
     if waiting:
         return False, "session interface is not up yet", True
     return True, None, False
@@ -928,6 +1012,7 @@ async def _verified_clients(
             "method": "htb_ifb" if limit.upload_kbit or not row.get("tunnels") else "htb",
             "download_mode": "shape" if limit.download_kbit else None,
             "upload_mode": "shape" if limit.upload_kbit else None,
+            "objects": dict(row.get("objects") or {}),
             "last_error": None if verified else reason,
         }
     return clients, all_ok and bool(clients)
@@ -1677,6 +1762,7 @@ async def _diagnose_client(
     )
     report["interface"] = row.get("interface") or interface
     report["method"] = row.get("method") or report["method"]
+    report["objects"] = dict(row.get("objects") or {})
     report["last_error"] = None if verified and report["status"] == "active" else row.get("last_error")
     if data_dir is not None and report.get("last_reconcile_at") is None:
         report["last_reconcile_at"] = read_status(data_dir).get("last_reconcile_at")

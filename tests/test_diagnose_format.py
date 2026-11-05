@@ -152,6 +152,13 @@ def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
         'interface': 'wg9a440050',
         'download_class': 'njbw-4793',
         'upload_class': 'njbw-4793',
+        'objects': {
+            'download_class': True,
+            'download_filter': True,
+            'upload_class': True,
+            'upload_filter': True,
+            'ingress_redirect': True,
+        },
         'verified': True,
         'last_reconcile_at': 1762346301,
     })
@@ -163,6 +170,9 @@ def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
     assert 'HTB / IFB' in active
     assert 'wg9a440050' in active
     assert 'njbw-4793' in active
+    assert 'Download filter: yes' in active
+    assert 'Upload filter: yes' in active
+    assert 'Ingress redirect: yes' in active
     assert 'Kernel verified: yes' in active
     assert 'PENDING' in active
     assert 'peer_enabled' in active

@@ -12,6 +12,8 @@ from agent.support.bandwidth import (
     collect_openvpn_plans,
     collect_tunnel_plans,
     diagnose_bandwidth,
+    filter_handle,
+    filter_show_has,
     ifb_commands,
     mbps_to_kbit,
     normalize_bandwidth,
@@ -21,6 +23,7 @@ from agent.support.bandwidth import (
     tunnel_commands,
     with_provisioning,
 )
+from agent.support.bandwidth import _handle_token
 
 
 def test_mbps_uses_decimal_kilobits():
@@ -170,20 +173,43 @@ def _limited_peer(peer_id: str = "sub-1") -> dict:
     }
 
 
-def test_filters_use_u32_node_handles_and_are_not_deleted_first():
-    plans = collect_tunnel_plans([{"name": "wg1660", "peers": [_limited_peer()]}])
-    commands = "\n".join(tunnel_commands("wg1660", plans[0].limits))
-    assert "filter del" not in commands
-    assert "handle 800::" in commands
-    for line in commands.splitlines():
-        if "filter " in line:
-            handle = line.split("handle ", 1)[1].split(" ", 1)[0]
-            assert handle.startswith("800::")
-    assert "match ip dst 10.8.0.2/32" in commands
-    assert "match ip src 10.8.0.2/32" in commands
-    ppp = "\n".join(ppp_commands("ppp0", [("10.8.0.2", plans[0].limits[0])]))
-    assert "filter del" not in ppp
-    assert "800::" in ppp
+def test_filters_use_hex_u32_handles_tc_can_install():
+    plans = collect_tunnel_plans([{
+        "name": "wg9a440050",
+        "peers": [{
+            "id": "sub-1",
+            "is_enabled": True,
+            "address": "10.90.68.108",
+            "bandwidth": {"download_mbps": 1, "upload_mbps": 1},
+        }],
+    }])
+    limit = plans[0].limits[0]
+    slot = filter_handle(limit.minor, 0)
+    token = _handle_token(slot)
+    assert int(token.split("::", 1)[1], 16) == slot
+    assert slot <= 0xFFF
+    commands = "\n".join(tunnel_commands("wg9a440050", plans[0].limits))
+    assert f"handle {token}" in commands
+    assert "filter add " in commands
+    assert "match ip dst 10.90.68.108/32" in commands
+    assert f"flowid 1:{limit.minor}" in commands
+    assert "match ip src 10.90.68.108/32" in commands
+    assert IFB_UP in commands
+    # A decimal handle such as 800::3654 is parsed as hex 0x3654 and rejected.
+    assert "::3654" not in commands
+
+
+def test_filter_show_parser_requires_the_same_block():
+    show = """
+filter parent 1: protocol ip pref 10 u32 chain 0 fh 800::e46 order 3654 key ht 800 bkt 0 flowid 1:1419
+  match 0a5a446c/ffffffff at 16
+filter parent ffff: protocol ip pref 10 u32 chain 0 fh 800::10 order 16 key ht 800 bkt 0
+  match 0a5a446c/ffffffff at 12
+  action order 1: mirred (Egress Redirect to device ifb-nj-up)
+"""
+    assert filter_show_has(show, "10.90.68.108", minor=0x1419, kind="dst")
+    assert filter_show_has(show, "10.90.68.108", kind="redirect")
+    assert filter_show_has(show, "10.90.68.108", minor=0x1419, kind="src") is False
 
 
 def test_status_is_not_active_without_kernel_verification():

@@ -382,6 +382,16 @@ def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
         lines.append(f'  Download class: {row.get("download_class")}')
     if row.get('upload_class'):
         lines.append(f'  Upload class:   {row.get("upload_class")}')
+    objects = row.get('objects') if isinstance(row.get('objects'), dict) else {}
+    for key, label in (
+        ('download_class', 'Download class exists'),
+        ('download_filter', 'Download filter'),
+        ('upload_class', 'Upload class exists'),
+        ('upload_filter', 'Upload filter'),
+        ('ingress_redirect', 'Ingress redirect'),
+    ):
+        if isinstance(objects.get(key), bool):
+            lines.append(f'  {label}: {_yes_no(objects.get(key))}')
     lines.append(f'  Kernel verified: {_yes_no(row.get("verified"))}')
     if row.get('last_reconcile_at'):
         lines.append(f'  Last reconcile: {_format_epoch(row.get("last_reconcile_at"))}')
