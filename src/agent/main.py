@@ -151,6 +151,13 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 "local volume quota enforcement disabled; panel sync must disable on is_exceeded",
             )
         await bootstrap_enabled_cores(settings, registry, app_log)
+        from agent.support.bandwidth import bandwidth_reconcile_loop, configure_runtime
+
+        configure_runtime(registry, settings.data_dir)
+        stop_bandwidth = asyncio.Event()
+        bandwidth_task = asyncio.create_task(
+            bandwidth_reconcile_loop(registry, settings, stop_bandwidth),
+        )
         try:
             from agent.support.xray_exit_bind import reapply_saved_binds
 
@@ -188,6 +195,8 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
         yield
 
+        stop_bandwidth.set()
+        await bandwidth_task
         stop_mullvad.set()
         if mullvad_task is not None:
             await mullvad_task

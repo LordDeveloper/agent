@@ -458,6 +458,18 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
     if "_outgoing" in peer:
         peer["_outgoing"] = _as_int(peer.get("_outgoing"))
 
+    if "bandwidth" in payload:
+        from agent.support.bandwidth import BandwidthValueError, normalize_bandwidth
+
+        try:
+            normalized_bandwidth = normalize_bandwidth(payload.get("bandwidth"))
+        except BandwidthValueError:
+            normalized_bandwidth = None
+        if normalized_bandwidth is None:
+            peer.pop("bandwidth", None)
+        else:
+            peer["bandwidth"] = normalized_bandwidth
+
     if "exit_interface" in peer:
         exit_iface = str(peer.get("exit_interface") or "").strip()
         if exit_iface:

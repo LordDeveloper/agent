@@ -1,5 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
+from agent.support.bandwidth import read_status
 from agent.support.sysstatus import collect_system_status
 
 router = APIRouter(tags=["status"])
@@ -15,3 +16,10 @@ async def status_sys():
     """
     payload = await collect_system_status()
     return {"success": True, **payload}
+
+
+@router.get("/status/bandwidth-limits")
+async def status_bandwidth_limits(request: Request):
+    """Configured subscription rates and the last kernel reconcile result."""
+    data_dir = request.app.state.settings.data_dir
+    return {"success": True, **read_status(data_dir)}

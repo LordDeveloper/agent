@@ -1484,6 +1484,7 @@ class WireGuardDriver(CoreDriver):
                     await self._sync_peer_egress()
                 else:
                     await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                    await self._sync_bandwidth()
                 return merged
         raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
 
@@ -2327,6 +2328,9 @@ class WireGuardDriver(CoreDriver):
 
         script = apply_script_path(self.settings.data_dir)
         lines.append(f"PostUp = {script.as_posix()} >/dev/null 2>&1 || true")
+        from agent.support.bandwidth import apply_script_path as bandwidth_apply_script
+
+        lines.append(f"PostUp = {bandwidth_apply_script(self.settings.data_dir).as_posix()} %i >/dev/null 2>&1 || true")
         lines.append("")
         return lines
 
@@ -2570,7 +2574,18 @@ class WireGuardDriver(CoreDriver):
             from agent.logutil import get_logger
 
             get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)
+        await self._sync_bandwidth()
         await self._sync_linked_l2tp(drop_keys=drop_keys)
+
+    async def _sync_bandwidth(self) -> None:
+        try:
+            from agent.support.bandwidth import reconcile_current
+
+            await reconcile_current()
+        except Exception:
+            from agent.logutil import get_logger
+
+            get_logger("wireguard").exception("bandwidth reconcile failed core=%s", self.key)
 
     async def _sync_linked_l2tp(self, drop_keys: list[str] | None = None) -> None:
         try:
