@@ -19,6 +19,7 @@ from agent.drivers.base import CoreDriver
 from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
+from agent.runtime import RuntimeTrace
 from agent.support import normalize_peer, record_is_enabled
 from agent.support.l2tp_config import (
     normalize_templates,
@@ -104,6 +105,32 @@ def _gen_psk() -> str:
     return DEFAULT_IPSEC_PSK
 
 
+class _UserEgressTouch:
+    """One address whose policy route must change after a user mutation."""
+
+    __slots__ = ('user', 'previous_address', 'remove')
+
+    def __init__(
+        self,
+        user: dict[str, Any],
+        *,
+        previous_address: str | None = None,
+        remove: bool = False,
+    ) -> None:
+        self.user = user
+        self.previous_address = previous_address
+        self.remove = remove
+
+
+def _egress_fingerprint(user: dict[str, Any]) -> tuple[str, str, bool, str]:
+    return (
+        _l2tp_host(user.get('address')),
+        str(user.get('exit_interface') or ''),
+        bool(record_is_enabled(user)),
+        str(user.get('linked_peer_id') or ''),
+    )
+
+
 class L2tpDriver(CoreDriver):
     key = 'l2tp'
     label = 'L2TP/IPsec'
@@ -113,6 +140,17 @@ class L2tpDriver(CoreDriver):
         self.settings = settings
         self.audit = audit
         self.store = store
+        self._server_locks: dict[str, asyncio.Lock] = {}
+        self._chap_lock = asyncio.Lock()
+        self._applying_configs = False
+
+    def _lock_for(self, server_id: int | str) -> asyncio.Lock:
+        key = str(server_id)
+        lock = self._server_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._server_locks[key] = lock
+        return lock
 
     def capabilities(self) -> list[str]:
         return [
@@ -445,15 +483,31 @@ class L2tpDriver(CoreDriver):
         payload: dict[str, Any],
         *,
         apply: bool = True,
+        touches_out: list[_UserEgressTouch] | None = None,
     ) -> dict[str, Any]:
+        async with self._lock_for(server_id):
+            user, touches = await self._add_user_locked(server_id, payload)
+        if touches_out is not None:
+            touches_out.extend(touches)
+        if apply:
+            await self._commit_user_runtime(touches, server_id=server_id, operation='add_user')
+        return user
+
+    async def _add_user_locked(
+        self,
+        server_id: int | str,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[_UserEgressTouch]]:
         server = await self.get_server(server_id)
-        user = normalize_peer(payload)
-        user.setdefault('id', str(uuid.uuid4()))
-        user.setdefault('email', user.get('name') or str(user['id'])[:8])
+        payload_id = str(payload.get('id') or '').strip()
+        email = str(payload.get('email') or payload.get('name') or '').strip()
+        touches: list[_UserEgressTouch] = []
 
         for existing in list(server.get('users') or []):
-            same_id = str(existing.get('id')) == str(user['id'])
-            same_email = str(existing.get('email') or '') == str(user.get('email') or '')
+            existing_id = str(existing.get('id') or '')
+            existing_email = str(existing.get('email') or '')
+            same_id = bool(payload_id) and existing_id == payload_id
+            same_email = bool(email) and existing_email == email
             if same_id:
                 existing_addr = str(existing.get('address') or '').strip()
                 subnet = str(server.get('subnet') or '')
@@ -465,31 +519,35 @@ class L2tpDriver(CoreDriver):
                     used_by_others.discard(existing_addr)
                     if existing_addr and existing_addr in used_by_others:
                         raise AgentError('VALIDATION_ERROR', f'Duplicate L2TP address [{existing_addr}]')
-                    return await self.update_user(
-                        server_id,
-                        str(existing.get('id') or user['id']),
-                        payload,
-                        apply=apply,
-                    )
+                    return await self._update_user_locked(server_id, existing_id, payload)
                 except AgentError:
                     # Subnet changed or duplicate IP — recreate with a free address.
-                    await self.delete_user(
-                        server_id,
-                        str(existing.get('id') or existing.get('email')),
-                        apply=apply,
-                    )
+                    removed = await self._delete_user_locked(server_id, existing_id)
+                    if removed is not None:
+                        touches.append(_UserEgressTouch(removed, remove=True))
                     server = await self.get_server(server_id)
                     break
+            if same_email and (not payload_id or payload_id == existing_id):
+                # Retry after a client timeout: the first create already stored this user.
+                # Keep credentials and address so a second POST cannot fork a duplicate.
+                return await self._update_user_locked(server_id, existing_id or existing_email, payload)
             if same_email:
-                # Peer identity rotate: drop the stale user so username/password/address can change.
-                await self.delete_user(
+                # Explicit new id for the same email — peer identity rotate.
+                removed = await self._delete_user_locked(
                     server_id,
-                    str(existing.get('id') or existing.get('email')),
-                    apply=apply,
+                    existing_id or existing_email,
                 )
+                if removed is not None:
+                    touches.append(_UserEgressTouch(removed, remove=True))
                 server = await self.get_server(server_id)
                 break
 
+        user = normalize_peer(payload)
+        if payload_id:
+            user['id'] = payload_id
+        else:
+            user.setdefault('id', str(uuid.uuid4()))
+        user.setdefault('email', user.get('name') or str(user['id'])[:8])
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())
         user['address'] = await self._allocate_l2tp_address(
@@ -511,9 +569,8 @@ class L2tpDriver(CoreDriver):
         server.setdefault('users', []).append(user)
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         await self.audit.record('create', f'{self.key}/user/{user.get("id")}')
-        if apply:
-            await self._commit_user_runtime()
-        return user
+        touches.append(_UserEgressTouch(user))
+        return user, touches
 
     async def update_user(
         self,
@@ -523,9 +580,23 @@ class L2tpDriver(CoreDriver):
         *,
         apply: bool = True,
     ) -> dict[str, Any]:
+        async with self._lock_for(server_id):
+            merged, touches = await self._update_user_locked(server_id, user_id, payload)
+        if apply:
+            await self._commit_user_runtime(touches, server_id=server_id, operation='update_user')
+        return merged
+
+    async def _update_user_locked(
+        self,
+        server_id: int | str,
+        user_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[_UserEgressTouch]]:
         server = await self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
             if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
+                before = _egress_fingerprint(user)
+                previous_address = _l2tp_host(user.get('address'))
                 merged = deepcopy(user)
                 normalized = normalize_peer(payload)
                 for key, value in normalized.items():
@@ -555,32 +626,157 @@ class L2tpDriver(CoreDriver):
                 await self._ensure_user_exit_interface(merged)
                 server['users'][idx] = merged
                 await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-                if apply:
-                    # Soft ensure — never restart xl2tpd/ipsec (keeps existing PPP sessions).
-                    await self._commit_user_runtime()
-                return merged
+                touches: list[_UserEgressTouch] = []
+                if _egress_fingerprint(merged) != before:
+                    touches.append(
+                        _UserEgressTouch(merged, previous_address=previous_address or None)
+                    )
+                return merged, touches
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
 
     async def delete_user(self, server_id: int | str, user_id: str, *, apply: bool = True) -> bool:
-        server = await self.get_server(server_id)
-        _ensure_l2tp_cursor(server)
-        users = server.get('users') or []
-        filtered = [u for u in users if str(u.get('id')) != user_id and str(u.get('email')) != user_id]
-        if len(filtered) == len(users):
-            raise AgentError('CLIENT_NOT_FOUND', f'L2TP user [{user_id}] not found', 404)
-        server['users'] = filtered
-        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        async with self._lock_for(server_id):
+            removed = await self._delete_user_locked(server_id, user_id)
+        if removed is None:
+            # Delete is idempotent. A timed-out delete may have removed the row
+            # before chap-secrets was rewritten; refresh secrets and return.
+            if apply:
+                await self._commit_user_runtime([], server_id=server_id, operation='delete_user')
+            return True
         if apply:
-            # chap-secrets update only — do not bounce live tunnels.
-            await self._commit_user_runtime()
+            await self._commit_user_runtime(
+                [_UserEgressTouch(removed, remove=True)],
+                server_id=server_id,
+                operation='delete_user',
+            )
         await self.audit.record('delete', f'{self.key}/user/{user_id}')
         return True
 
-    async def _commit_user_runtime(self) -> None:
-        """Write chap/ipsec once and ensure services without bouncing live tunnels."""
-        await self._apply_all_configs()
-        await self._sync_peer_egress()
-        await self._ensure_services(start=True)
+    async def _delete_user_locked(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
+        server = await self.get_server(server_id)
+        _ensure_l2tp_cursor(server)
+        users = list(server.get('users') or [])
+        removed = next(
+            (
+                user
+                for user in users
+                if str(user.get('id')) == user_id or str(user.get('email')) == user_id
+            ),
+            None,
+        )
+        if removed is None:
+            return None
+        server['users'] = [
+            user
+            for user in users
+            if str(user.get('id')) != user_id and str(user.get('email')) != user_id
+        ]
+        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        return removed
+
+    async def _commit_user_runtime(
+        self,
+        touches: list[_UserEgressTouch] | None = None,
+        *,
+        server_id: int | str | None = None,
+        operation: str = 'commit_user',
+    ) -> None:
+        """Publish chap-secrets and this user's route. Do not reload xl2tpd or IPsec.
+
+        pppd reads chap-secrets on each new authentication. The IPsec PSK and
+        xl2tpd pool are per-server, so a user row does not change them and must
+        not restart strongSwan or drop live PPP sessions.
+        """
+        started = time.perf_counter()
+        error: str | None = None
+        try:
+            with RuntimeTrace.span('l2tp.chap'):
+                await self._write_chap_secrets()
+            pending = list(touches or [])
+            if pending:
+                with RuntimeTrace.span('l2tp.user_egress'):
+                    await self._apply_user_egress(pending)
+                with RuntimeTrace.span('l2tp.egress_script'):
+                    await self._refresh_egress_script()
+        except Exception as exc:
+            error = str(exc)
+            self._log_user_op(
+                server_id=server_id,
+                operation=operation,
+                started=started,
+                success=False,
+                error=error,
+            )
+            raise
+        self._log_user_op(
+            server_id=server_id,
+            operation=operation,
+            started=started,
+            success=True,
+        )
+
+    def _log_user_op(
+        self,
+        *,
+        server_id: int | str | None,
+        operation: str,
+        started: float,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        duration_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            'l2tp_op request_id=%s node_id=%s server_id=%s operation=%s duration_ms=%.1f success=%s error=%s',
+            RuntimeTrace.request_id() or '-',
+            RuntimeTrace.node_id() or '-',
+            server_id if server_id is not None else '-',
+            operation,
+            duration_ms,
+            success,
+            error or '-',
+        )
+
+    async def _write_chap_secrets(self) -> None:
+        """Atomically replace chap-secrets from the store. Safe under concurrent servers."""
+        from agent.support import aiofs
+
+        async with self._chap_lock:
+            with RuntimeTrace.span('l2tp.chap_render'):
+                servers = await self.list_servers()
+                content = render_chap_secrets(servers)
+            staging = self._staging_dir() / 'chap-secrets'
+            system_path = Path('/etc/ppp/chap-secrets')
+            for path in (staging, system_path):
+                try:
+                    current = path.read_text(encoding='utf-8') if path.is_file() else None
+                except OSError:
+                    current = None
+                if current == content:
+                    continue
+                await aiofs.atomic_write(path, content, encoding='utf-8')
+                try:
+                    await aiofs.chmod(path, 0o600)
+                except OSError:
+                    pass
+
+    async def _apply_user_egress(self, touches: list[_UserEgressTouch]) -> None:
+        from agent.support.peer_egress import apply_l2tp_user_egress
+
+        for touch in touches:
+            await apply_l2tp_user_egress(
+                self.store,
+                touch.user,
+                previous_address=touch.previous_address,
+                remove=touch.remove,
+            )
+
+    async def _refresh_egress_script(self) -> None:
+        from agent.support.peer_egress import write_egress_script_only
+
+        try:
+            await write_egress_script_only(self.store, data_dir=self.settings.data_dir)
+        except Exception:
+            log.exception('l2tp egress boot script refresh failed')
 
     async def batch_users(
         self,
@@ -596,6 +792,7 @@ class L2tpDriver(CoreDriver):
         applied = 0
         failed = 0
         errors: list[dict[str, Any]] = []
+        touches: list[_UserEgressTouch] = []
 
         for row in users:
             if not isinstance(row, dict):
@@ -608,20 +805,26 @@ class L2tpDriver(CoreDriver):
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    await self.add_user(server_id, row, apply=False)
+                    await self.add_user(server_id, row, apply=False, touches_out=touches)
                 else:
-                    await self.update_user(server_id, uid, row, apply=False)
+                    async with self._lock_for(server_id):
+                        _merged, updated = await self._update_user_locked(server_id, uid, row)
+                    touches.extend(updated)
                 applied += 1
             except AgentError as exc:
                 failed += 1
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
                 if atomic:
                     if applied:
-                        await self._commit_user_runtime()
+                        await self._commit_user_runtime(
+                            touches,
+                            server_id=server_id,
+                            operation='batch_users',
+                        )
                     raise
 
         if applied:
-            await self._commit_user_runtime()
+            await self._commit_user_runtime(touches, server_id=server_id, operation='batch_users')
 
         return {'applied': applied, 'failed': failed, 'errors': errors}
 
@@ -862,9 +1065,28 @@ class L2tpDriver(CoreDriver):
         return path
 
     async def _apply_all_configs(self) -> None:
-        # Companion servers share one /16 (from L2TP core settings) — collapse duplicate IPs first.
-        await self._repair_duplicate_addresses()
-        await self._align_server_subnets_to_users()
+        # Server create/update/restore only. User mutations use _commit_user_runtime.
+        if self._applying_configs:
+            return
+        self._applying_configs = True
+        try:
+            with RuntimeTrace.span('l2tp.repair'):
+                # Companion servers share one /16 — collapse duplicate IPs first.
+                await self._repair_duplicate_addresses()
+                await self._align_server_subnets_to_users()
+            with RuntimeTrace.span('l2tp.config'):
+                await self._write_stack_configs()
+            with RuntimeTrace.span('l2tp.egress_full'):
+                await self._sync_peer_egress()
+        finally:
+            self._applying_configs = False
+
+    async def _write_stack_configs(self) -> None:
+        """Rewrite xl2tpd, PPP options, chap-secrets and IPsec. No service restart."""
+        async with self._chap_lock:
+            await self._write_stack_configs_locked()
+
+    async def _write_stack_configs_locked(self) -> None:
         servers = await self.list_servers()
         templates = resolve_templates(servers)
         staging = self._staging_dir()
@@ -890,7 +1112,6 @@ class L2tpDriver(CoreDriver):
                     pass
 
         await self._install_to_system(staging)
-        await self._sync_peer_egress()
 
     async def _egress_interfaces(self) -> list[dict[str, Any]]:
         from agent.support.peer_egress import l2tp_servers_as_interfaces
@@ -927,8 +1148,9 @@ class L2tpDriver(CoreDriver):
                     result.get('updated'),
                     result.get('removed'),
                 )
-                await self._apply_all_configs()
-                await self._ensure_services(start=True)
+                # Chap must match the new enable flags. Do not re-enter
+                # _apply_all_configs or restart xl2tpd/ipsec from here.
+                await self._write_stack_configs()
 
             await reconcile_core_egress(
                 self.store,
@@ -974,7 +1196,10 @@ class L2tpDriver(CoreDriver):
         }
         for src, dest in targets.items():
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(src.read_text(encoding='utf-8'), encoding='utf-8')
+            content = src.read_text(encoding='utf-8')
+            tmp = dest.with_name(dest.name + '.tmp')
+            tmp.write_text(content, encoding='utf-8')
+            tmp.replace(dest)
             if 'secrets' in dest.name or dest.name == 'chap-secrets':
                 try:
                     dest.chmod(0o600)
@@ -1092,12 +1317,15 @@ class L2tpDriver(CoreDriver):
             log.info('l2tp ipsec L2TP-PSK conn loaded')
 
     async def _ensure_xl2tpd(self, *, force_restart: bool = False) -> bool:
-        # Always rewrite configs before touching the unit — stale huge ip-range
-        # or invalid flags are the usual reason SysV start exits 1 with no detail.
-        try:
-            await self._apply_all_configs()
-        except Exception as exc:
-            log.error('l2tp config apply failed before xl2tpd start: %s', exc)
+        # Callers that change the pool or PSK already wrote configs. Rewriting
+        # here re-entered egress reconcile and ran systemd on every user create.
+        conf = Path('/etc/xl2tpd/xl2tpd.conf')
+        chap = Path('/etc/ppp/chap-secrets')
+        if not conf.is_file() or not chap.is_file():
+            try:
+                await self._write_stack_configs()
+            except Exception as exc:
+                log.error('l2tp config apply failed before xl2tpd start: %s', exc)
 
         self._ensure_runtime_dirs()
         await self._load_l2tp_kernel_modules()

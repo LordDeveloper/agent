@@ -49,24 +49,47 @@ def open_runtime(env_file: str | None = None) -> Runtime:
 _started: ContextVar[float | None] = ContextVar("runtime_started", default=None)
 _spans: ContextVar[list[tuple[str, float]] | None] = ContextVar("runtime_spans", default=None)
 _action: ContextVar[str] = ContextVar("runtime_action", default="")
+_request_id: ContextVar[str] = ContextVar("runtime_request_id", default="")
+_node_id: ContextVar[str] = ContextVar("runtime_node_id", default="")
 
 
 class RuntimeTrace:
     """Request-scoped timings exposed as the X-RUNTIME response header."""
 
     header_name = "X-RUNTIME"
+    request_header = "X-Request-Id"
 
     @classmethod
     def start(cls, action: str = "") -> None:
         _started.set(time.perf_counter())
         _spans.set([])
         _action.set(cls.safe_name(action) if action else "")
+        _request_id.set("")
+        _node_id.set("")
 
     @classmethod
     def reset(cls) -> None:
         _started.set(None)
         _spans.set(None)
         _action.set("")
+        _request_id.set("")
+        _node_id.set("")
+
+    @classmethod
+    def set_request_id(cls, value: str) -> None:
+        _request_id.set(cls.safe_name(value)[:64])
+
+    @classmethod
+    def request_id(cls) -> str:
+        return _request_id.get()
+
+    @classmethod
+    def set_node_id(cls, value: str) -> None:
+        _node_id.set(cls.safe_name(value)[:64])
+
+    @classmethod
+    def node_id(cls) -> str:
+        return _node_id.get()
 
     @classmethod
     def set_action(cls, action: str) -> None:

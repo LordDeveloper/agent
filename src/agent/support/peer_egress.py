@@ -46,6 +46,7 @@ Blind nft flush + systemctl start on every peer update caused multi-second
 packet loss every time the panel/API touched a peer.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -774,6 +775,204 @@ async def persist_peer_egress(
     should_start = (changed or force_start) if start_unit is None else bool(start_unit)
     unit = await ensure_peer_egress_unit(path, runner=runner, start=should_start)
     return {"script": str(path), "rules": len(rules), "changed": changed, "unit": unit}
+
+
+_l2tp_egress_state_lock = asyncio.Lock()
+
+
+async def write_egress_script_only(
+    store: Store,
+    *,
+    data_dir: str | Path | None = None,
+) -> bool:
+    """Refresh the boot apply script without starting systemd or touching nft.
+
+    Live rules are installed by the caller. Starting the oneshot re-runs every
+    iptables/nft statement and is what made a single user create exceed 15s.
+    """
+    from agent.support.xray_exit_bind import load_bind_ifaces
+
+    rules = await all_desired_rules_from_store(store)
+    tunnels = await all_tunnel_interface_names(store)
+    path = apply_script_path(data_dir)
+    new_text = render_apply_script(rules, tunnels, bind_ifaces=load_bind_ifaces())
+    previous = await aiofs.read_text(path, encoding="utf-8") if path.is_file() else None
+    if previous == new_text:
+        return False
+    await aiofs.atomic_write(path, new_text, encoding="utf-8")
+    try:
+        await aiofs.chmod(path, 0o755)
+    except (OSError, AttributeError):
+        pass
+    return True
+
+
+async def apply_l2tp_user_egress(
+    store: Store,
+    user: dict[str, Any],
+    *,
+    previous_address: str | None = None,
+    remove: bool = False,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Install or remove policy routing for one L2TP address.
+
+    Does not rebuild NAT, flush nft, or walk every other peer. Shared exit
+    interfaces already have MASQUERADE from the server/WireGuard reconcile.
+    """
+    current = str(peer_source_cidr(user.get("address")) or "").split("/", 1)[0].strip()
+    previous = str(previous_address or "").split("/", 1)[0].strip()
+    desired = [] if remove else desired_rules_from_interfaces([{"name": _PPP_TUNNEL, "peers": [user]}])
+    desired_addrs = {str(row["addr"]) for row in desired}
+
+    if not shutil.which("ip"):
+        async with _l2tp_egress_state_lock:
+            await _merge_l2tp_egress_state(store, desired, drop_addrs=_drop_addrs(current, previous, desired_addrs, remove))
+        return {"ok": True, "skipped": True, "reason": "ip not found"}
+
+    cache = _EgressCache()
+    drop = _drop_addrs(current, previous, desired_addrs, remove)
+    deferred: list[str] = []
+    applied: list[dict[str, str | int]] = []
+
+    for addr in sorted(drop):
+        await _delete_policy_for_host(runner, addr, cache)
+
+    for row in desired:
+        outcome = await _install_one_egress_rule(runner, row, cache)
+        if outcome == "deferred":
+            deferred.append(str(row["addr"]))
+            continue
+        if outcome == "applied":
+            applied.append(row)
+
+    async with _l2tp_egress_state_lock:
+        await _merge_l2tp_egress_state(
+            store,
+            applied,
+            drop_addrs=set(drop) | {str(row["addr"]) for row in applied},
+            retain_addrs=set(deferred),
+        )
+    return {
+        "ok": True,
+        "applied": len(applied),
+        "deferred": deferred,
+        "removed": sorted(drop),
+    }
+
+
+def _drop_addrs(current: str, previous: str, desired_addrs: set[str], remove: bool) -> set[str]:
+    drop: set[str] = set()
+    if previous and previous != current:
+        drop.add(previous)
+    if remove and current:
+        drop.add(current)
+    if current and current not in desired_addrs:
+        drop.add(current)
+    return drop
+
+
+async def _delete_policy_for_host(runner: Runner | None, host: str, cache: _EgressCache) -> None:
+    await cache.ensure_rules(runner)
+    cidr = f"{host}/32"
+    if cache.has_prohibit(cidr):
+        await _mutate_rule(runner, ["rule", "del", "from", cidr, "prohibit"], cache)
+    for known, table in list(cache.lookups):
+        if known == host:
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(table)], cache)
+
+
+async def _install_one_egress_rule(runner: Runner | None, row: dict[str, str | int], cache: _EgressCache) -> str:
+    addr = str(row["addr"])
+    cidr = str(row["cidr"])
+    action = str(row.get("action") or "lookup")
+    pref = rule_pref_for_addr(addr)
+    await cache.ensure_rules(runner)
+    if action == "prohibit":
+        for known, known_table in list(cache.lookups):
+            if known == addr:
+                await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(known_table)], cache)
+        if not await _has_from_prohibit_rule(runner, cidr=cidr, cache=cache):
+            if not await _mutate_rule(
+                runner,
+                ["rule", "add", "from", cidr, "pref", str(pref), "prohibit"],
+                cache,
+            ):
+                return "failed"
+        return "applied"
+
+    iface = str(row["iface"])
+    table = int(row["table"])
+    if not iface or not await _iface_exists(runner, iface, cache):
+        log.warning("l2tp egress deferred: exit interface [%s] missing for %s", iface, cidr)
+        return "deferred"
+    await _soften_rp_filter(runner, iface, cache)
+    if not await _install_default_route(runner, iface=iface, table=table, cache=cache):
+        log.warning("l2tp egress deferred: default route failed for %s via %s", cidr, iface)
+        return "deferred"
+    if not await _has_from_lookup_rule(runner, cidr=cidr, table=table, cache=cache):
+        if not await _mutate_rule(
+            runner,
+            ["rule", "add", "from", cidr, "lookup", str(table), "pref", str(pref)],
+            cache,
+        ):
+            return "failed"
+    if cache.has_prohibit(cidr):
+        await _mutate_rule(runner, ["rule", "del", "from", cidr, "prohibit"], cache)
+    for known, known_table in list(cache.lookups):
+        if known == addr and known_table != table:
+            await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(known_table)], cache)
+    return "applied"
+
+
+async def _merge_l2tp_egress_state(
+    store: Store,
+    applied: list[dict[str, str | int]],
+    *,
+    drop_addrs: set[str],
+    retain_addrs: set[str] | None = None,
+) -> None:
+    """Patch the L2TP egress snapshot for the addresses this call touched."""
+    retain = retain_addrs or set()
+    previous = await store.get_doc("l2tp", _STATE_KIND, _STATE_ID) or {}
+    rules = [row for row in (previous.get("rules") or []) if isinstance(row, dict)]
+    kept: list[dict[str, Any]] = []
+    for row in rules:
+        addr = str(row.get("addr") or "").strip()
+        if not addr:
+            continue
+        if addr in retain:
+            kept.append(row)
+            continue
+        if addr in drop_addrs:
+            continue
+        kept.append(row)
+    seen = {str(row.get("addr") or "") for row in kept}
+    for row in applied:
+        addr = str(row["addr"])
+        if addr in seen:
+            kept = [item for item in kept if str(item.get("addr") or "") != addr]
+        kept.append(
+            {
+                "addr": addr,
+                "table": int(row["table"]),
+                "iface": str(row["iface"]),
+                "action": str(row.get("action") or "lookup"),
+            }
+        )
+        seen.add(addr)
+    masq = [str(item).strip() for item in (previous.get("masq") or []) if str(item).strip()]
+    for row in applied:
+        iface = str(row.get("iface") or "").strip()
+        if iface and iface not in masq and str(row.get("action") or "lookup") == "lookup":
+            masq.append(iface)
+    tables = sorted({int(row.get("table") or 0) for row in kept if int(row.get("table") or 0) > 0})
+    await store.put_doc(
+        "l2tp",
+        _STATE_KIND,
+        _STATE_ID,
+        {"rules": kept, "tables": tables, "masq": masq},
+    )
 
 
 async def repair_peer_egress(

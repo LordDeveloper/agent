@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -57,6 +58,11 @@ def _request_action(request: Request) -> str:
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         RuntimeTrace.start()
+        request_id = (request.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex
+        node_id = (request.headers.get("x-node-id") or request.headers.get("x-node-host") or "").strip()
+        RuntimeTrace.set_request_id(request_id)
+        if node_id:
+            RuntimeTrace.set_node_id(node_id)
         started = time.perf_counter()
         client = request.client.host if request.client else "-"
         # Access log is written only after the handler returns. A client CRUD
@@ -80,6 +86,7 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         else:
             RuntimeTrace.set_action(_request_action(request))
             RuntimeTrace.apply(response)
+            response.headers[RuntimeTrace.request_header] = request_id
             elapsed_ms = (time.perf_counter() - started) * 1000
             level = log.warning if response.status_code >= 400 else log.info
             level(
