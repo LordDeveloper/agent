@@ -498,6 +498,13 @@ async def diagnose_peer_match(
     from agent.support.bandwidth import diagnose_bandwidth
 
     bandwidth = await diagnose_bandwidth(peer, interface=iface_name or None, kind='tunnel')
+    rule_check = next((row for row in checks if row.get('name') == 'ip_rule_present'), None)
+    from agent.support.egress_tasks import describe_routing
+
+    routing.update(describe_routing(
+        peer.get('id'),
+        verified=None if rule_check is None else bool(rule_check.get('ok')),
+    ))
 
     return {
         'core': core,

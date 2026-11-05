@@ -152,11 +152,17 @@ def create_app(env_file: str | None = None) -> FastAPI:
             )
         await bootstrap_enabled_cores(settings, registry, app_log)
         from agent.support.bandwidth import bandwidth_reconcile_loop, configure_runtime
+        from agent.support.egress_tasks import configure_egress, egress_reconcile_loop
 
         configure_runtime(registry, settings.data_dir)
+        configure_egress(registry, settings.data_dir)
         stop_bandwidth = asyncio.Event()
         bandwidth_task = asyncio.create_task(
             bandwidth_reconcile_loop(registry, settings, stop_bandwidth),
+        )
+        stop_egress = asyncio.Event()
+        egress_task = asyncio.create_task(
+            egress_reconcile_loop(registry, settings, stop_egress),
         )
         try:
             from agent.support.xray_exit_bind import reapply_saved_binds
@@ -197,6 +203,8 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
         stop_bandwidth.set()
         await bandwidth_task
+        stop_egress.set()
+        await egress_task
         stop_mullvad.set()
         if mullvad_task is not None:
             await mullvad_task

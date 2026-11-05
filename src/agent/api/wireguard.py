@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
-from agent.support.bandwidth import with_provisioning
+from agent.support.egress_tasks import tunnel_provisioning as with_provisioning
 from agent.drivers.wireguard import WireGuardDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import WgInterfacePayload, WgPeerPayload

@@ -1641,6 +1641,11 @@ async def _diagnose_client(
     limit = _merge_limits([limit])[0]
     report["class_id"] = f"1:{limit.minor}"
     report["filter_handles"] = _filter_handle_tokens(limit)
+    label = f"njbw-{limit.minor}"
+    if limit.download_kbit:
+        report["download_class"] = label
+    if limit.upload_kbit:
+        report["upload_class"] = label
     if not _linux():
         report["status"] = resolve_enforcement_status(
             configured=True,

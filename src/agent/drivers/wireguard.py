@@ -802,6 +802,19 @@ def _enabled_peers_sorted_by_ip(iface: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(peers, key=_peer_sort_key)
 
 
+def _unapplied_peer_keys(iface: dict[str, Any], dump: dict[str, Any]) -> list[str]:
+    """Public keys that are enabled in the store but absent from `wg show`."""
+    present = set(dump or {})
+    missing: list[str] = []
+    for peer in iface.get("peers") or []:
+        if not isinstance(peer, dict) or not record_is_enabled(peer):
+            continue
+        public_key = str(peer.get("public_key") or "").strip()
+        if public_key and public_key not in present:
+            missing.append(public_key)
+    return missing
+
+
 def _strip_peer_keepalive_fields(peer: dict[str, Any]) -> bool:
     """Remove stored keepalive so conf/live stay clean until panel sets seconds."""
     changed = False
@@ -2545,6 +2558,13 @@ class WireGuardDriver(CoreDriver):
             if sync.returncode != 0:
                 detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
+            missing = _unapplied_peer_keys(iface, await self._peer_dump(name)) if self._cli_bin() else []
+            if missing:
+                shown = ", ".join(key[:8] for key in missing)
+                raise AgentError(
+                    "VALIDATION_ERROR",
+                    f"WireGuard live apply did not install peer keys: {shown}",
+                )
             if sync_egress:
                 await self._sync_peer_egress(drop_keys=drop_keys)
         except AgentError:
@@ -2560,21 +2580,37 @@ class WireGuardDriver(CoreDriver):
         *,
         drop_keys: list[str] | None = None,
     ) -> None:
-        try:
-            from agent.support.peer_egress import reconcile_core_egress
+        # Policy routing is desired state. The peer is already on the interface.
+        from agent.support.egress_tasks import schedule_egress
 
-            rows = interfaces if interfaces is not None else await self.list_interfaces()
-            await reconcile_core_egress(
-                self.store,
-                self.key,
-                rows,
-                data_dir=self.settings.data_dir,
-            )
-        except Exception:
-            from agent.logutil import get_logger
+        only_ids = None
+        if interfaces is not None:
+            only_ids = {str(row.get("id")) for row in interfaces if isinstance(row, dict)}
+        scheduled = schedule_egress(self.key, only_ids=only_ids, drop_keys=drop_keys)
+        if scheduled is None:
+            try:
+                await self._apply_peer_egress(interfaces, drop_keys=drop_keys)
+            except Exception:
+                from agent.logutil import get_logger
 
-            get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)
+                get_logger("wireguard").exception("peer egress reconcile failed core=%s", self.key)
         await self._sync_bandwidth()
+
+    async def _apply_peer_egress(
+        self,
+        interfaces: list[dict[str, Any]] | None = None,
+        *,
+        drop_keys: list[str] | None = None,
+    ) -> None:
+        from agent.support.peer_egress import reconcile_core_egress
+
+        rows = interfaces if interfaces is not None else await self.list_interfaces()
+        await reconcile_core_egress(
+            self.store,
+            self.key,
+            rows,
+            data_dir=self.settings.data_dir,
+        )
         await self._sync_linked_l2tp(drop_keys=drop_keys)
 
     async def _sync_bandwidth(self, *client_ids: str) -> None:

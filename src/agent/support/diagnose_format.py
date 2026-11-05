@@ -276,13 +276,13 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
         ])
 
     if routing:
-        lines.extend([
-            '',
-            'Routing / egress',
-            f'  Exit iface:   {routing.get("exit_interface") or "-"}',
-            f'  Expected tbl: {routing.get("expected_table") or "-"}',
-            f'  Rule pref:    {routing.get("expected_rule_pref") or "-"}',
-        ])
+        lines.extend(['', 'Routing / egress'])
+        if routing.get('status'):
+            lines.append(f'  Status:       {_status_label(routing.get("status"))}')
+            lines.append(f'  Verified:     {_yes_no(routing.get("verified"))}')
+        lines.append(f'  Exit iface:   {routing.get("exit_interface") or "-"}')
+        lines.append(f'  Expected tbl: {routing.get("expected_table") or "-"}')
+        lines.append(f'  Rule pref:    {routing.get("expected_rule_pref") or "-"}')
         policy = routing.get('policy_route') if isinstance(routing.get('policy_route'), dict) else {}
         if policy:
             lines.append(
@@ -322,6 +322,7 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
             f'  Server:       {companion.get("server_name") or companion.get("server_id") or "-"}',
         ])
 
+    lines.extend(_format_bandwidth_section(match.get('bandwidth') if isinstance(match.get('bandwidth'), dict) else None))
     lines.append('')
 
     checks = list(match.get('checks') or [])
@@ -332,6 +333,60 @@ def _format_peer_match(match: dict[str, Any], *, index: int, total: int) -> list
     if issues:
         lines.extend(['Issues', _format_issues_table(issues), ''])
 
+    return lines
+
+
+def _status_label(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return '-'
+    return text.replace('_', ' ').upper()
+
+
+def _mbps_label(value: Any) -> str:
+    if value in (None, ''):
+        return 'unlimited'
+    return f'{value} Mbps'
+
+
+def _method_label(value: Any) -> str:
+    text = str(value or '').strip().lower()
+    if text == 'htb_ifb':
+        return 'HTB / IFB'
+    if text == 'htb':
+        return 'HTB'
+    return text or '-'
+
+
+def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
+    """Always render bandwidth. A missing block is unlimited, not a peer error."""
+    row = bandwidth or {'configured': False, 'status': 'unlimited'}
+    configured = bool(row.get('configured'))
+    status = _status_label(row.get('status') or ('unlimited' if not configured else 'pending'))
+    lines = [
+        '',
+        'Bandwidth',
+        f'  Configured:    {_yes_no(configured)}',
+    ]
+    if configured:
+        lines.append(f'  Download:      {_mbps_label(row.get("download_mbps"))}')
+        lines.append(f'  Upload:        {_mbps_label(row.get("upload_mbps"))}')
+    lines.append(f'  Status:        {status}')
+    if not configured:
+        return lines
+    if row.get('method'):
+        lines.append(f'  Method:        {_method_label(row.get("method"))}')
+    if row.get('interface'):
+        lines.append(f'  Interface:     {row.get("interface")}')
+    if row.get('download_class'):
+        lines.append(f'  Download class: {row.get("download_class")}')
+    if row.get('upload_class'):
+        lines.append(f'  Upload class:   {row.get("upload_class")}')
+    lines.append(f'  Kernel verified: {_yes_no(row.get("verified"))}')
+    if row.get('last_reconcile_at'):
+        lines.append(f'  Last reconcile: {_format_epoch(row.get("last_reconcile_at"))}')
+    if row.get('last_error') and status not in {'ACTIVE', 'UNLIMITED'}:
+        lines.append(f'  Error:         {_truncate(str(row.get("last_error")), 96)}')
     return lines
 
 

@@ -115,3 +115,71 @@ def test_format_l2tp_user_diagnose_shows_username():
     assert 'u_e123916e' in rendered
     assert 'Linked peer:' in rendered
     assert 'wg-l2tp-12' in rendered
+    assert 'Bandwidth' in rendered
+    assert 'UNLIMITED' in rendered
+
+
+def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
+    base = {
+        'success': True,
+        'found': True,
+        'core': 'wireguard',
+        'address': '10.90.68.108',
+        'summary': {'healthy': True, 'issue_count': 0, 'warning_count': 0, 'match_count': 1},
+    }
+
+    def render(bandwidth: dict, routing: dict | None = None) -> str:
+        report = {
+            **base,
+            'matches': [{
+                'address': '10.90.68.108',
+                'interface': {'name': 'wg9a440050'},
+                'peer': {'email': 'BOZIfQ', 'is_enabled': True, 'address': '10.90.68.108'},
+                'live': {'is_up': True},
+                'routing': routing or {'exit_interface': 'de', 'status': 'pending', 'verified': False},
+                'bandwidth': bandwidth,
+                'checks': [{'name': 'peer_enabled', 'ok': True}],
+            }],
+        }
+        return format_diagnose_report(report, use_color=False)
+
+    active = render({
+        'configured': True,
+        'download_mbps': 5,
+        'upload_mbps': 5,
+        'status': 'active',
+        'method': 'htb_ifb',
+        'interface': 'wg9a440050',
+        'download_class': 'njbw-4793',
+        'upload_class': 'njbw-4793',
+        'verified': True,
+        'last_reconcile_at': 1762346301,
+    })
+    assert 'Bandwidth' in active
+    assert 'Configured:    yes' in active
+    assert 'Download:      5 Mbps' in active
+    assert 'Upload:        5 Mbps' in active
+    assert 'Status:        ACTIVE' in active
+    assert 'HTB / IFB' in active
+    assert 'wg9a440050' in active
+    assert 'njbw-4793' in active
+    assert 'Kernel verified: yes' in active
+    assert 'PENDING' in active
+    assert 'peer_enabled' in active
+
+    unlimited = render({'configured': False, 'status': 'unlimited'})
+    assert 'Configured:    no' in unlimited
+    assert 'UNLIMITED' in unlimited
+    assert 'Error:' not in unlimited
+
+    failed = render({
+        'configured': True,
+        'download_mbps': 5,
+        'upload_mbps': 5,
+        'status': 'error',
+        'verified': False,
+        'last_error': 'Expected HTB class not found',
+    })
+    assert 'Status:        ERROR' in failed
+    assert 'Kernel verified: no' in failed
+    assert 'Expected HTB class not found' in failed

@@ -3,7 +3,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
-from agent.support.bandwidth import with_provisioning
+from agent.support.egress_tasks import tunnel_provisioning
+
+
+def with_provisioning(payload: dict[str, Any], *client_ids: Any) -> dict[str, Any]:
+    return tunnel_provisioning(payload, *client_ids, peer_field="amnezia_peer")
 from agent.drivers.amnezia import AmneziaDriver
 from agent.errors import AgentError, raise_agent_error
 from agent.models import AmneziaInterfacePayload, AmneziaPeerPayload
