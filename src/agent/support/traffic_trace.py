@@ -19,7 +19,7 @@ from agent.support.client_diagnose import (
     _find_config_clients_by_key,
 )
 from agent.support.process import run_dump
-from agent.support.routing_test import test_routing_rules
+from agent.support.routing_test import _as_list, test_routing_rules
 
 _IFACE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_.-]{0,14}$')
 _SECRET_KEYS = {
@@ -135,6 +135,109 @@ async def _observe_iface(name: str) -> dict[str, Any]:
                 endpoints.append(endpoint)
         result['endpoints'] = list(dict.fromkeys(endpoints))[:6]
     return result
+
+
+def parse_destination(value: str | None) -> dict[str, Any]:
+    """Split an optional ``host``, ``ip``, ``host:port``, or ``[ipv6]:port``."""
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    if any(ch.isspace() for ch in text) or len(text) > 253:
+        raise ValueError("destination must be a host or ip, optionally with a port")
+
+    host = text
+    port: int | None = None
+    if text.startswith("["):
+        end = text.find("]")
+        if end <= 1:
+            raise ValueError("destination must be a host or ip, optionally with a port")
+        host = text[1:end]
+        rest = text[end + 1 :]
+        if rest:
+            if not rest.startswith(":"):
+                raise ValueError("destination must be a host or ip, optionally with a port")
+            port = _port(rest[1:])
+    elif text.count(":") == 1:
+        host, _, raw_port = text.partition(":")
+        port = _port(raw_port)
+    elif text.count(":") > 1:
+        host = text
+
+    host = host.strip().rstrip(".")
+    if not host or any(ch in host for ch in " /\\\"'`;$|&"):
+        raise ValueError("destination must be a host or ip, optionally with a port")
+
+    try:
+        ipaddress.ip_address(host)
+        parsed: dict[str, Any] = {"ip": host}
+    except ValueError:
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+            raise ValueError("destination must be a host or ip, optionally with a port")
+        parsed = {"domain": host.lower()}
+    if port is not None:
+        parsed["port"] = port
+    return parsed
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise ValueError("destination port is invalid") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("destination port is invalid")
+    return port
+
+
+def classify_public_exit(
+    *,
+    probe_ip: str | None,
+    iface_addresses: list[str],
+    bound_iface: str | None,
+    probe_error: str | None = None,
+) -> dict[str, Any]:
+    """A verified exit is a probed global address that is not the bound interface itself.
+
+    Host NIC names and addresses configured on the selected interface are never
+    reported as a verified public exit.
+    """
+    iface = str(bound_iface or "").strip()
+    ip = str(probe_ip or "").strip()
+    configured = set()
+    for item in iface_addresses:
+        text = str(item or "").split("/")[0].strip()
+        if text:
+            configured.add(text)
+
+    def unverified(detail: str, **extra: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {"ip": None, "basis": "UNVERIFIED", "detail": detail}
+        row.update(extra)
+        return row
+
+    if not iface:
+        return unverified(
+            probe_error
+            or "No outbound interface is bound. The host default route is not a verified exit."
+        )
+    if iface == "eth0" or iface.startswith(("eth", "ens", "eno", "enp")):
+        shown = f" Probe returned {ip}." if ip else ""
+        return unverified(
+            f"Interface [{iface}] is a host NIC, not a remote exit.{shown} Reported as UNVERIFIED.",
+            probe_ip=ip or None,
+        )
+    if not ip:
+        return unverified(probe_error or f"Public-IP probe through [{iface}] failed.")
+    if not _is_global(ip):
+        return unverified(f"Probe through [{iface}] returned non-global address {ip}.")
+    if ip in configured:
+        return unverified(
+            f"Probe through [{iface}] returned {ip}, which is an address on that interface, not a remote exit."
+        )
+    return {
+        "ip": ip,
+        "basis": "verified",
+        "detail": f"IPv4 probe through [{iface}] returned {ip}.",
+    }
 
 
 def _public_exit(addresses: list[str], *, nat: bool | None, tunnel: bool) -> dict[str, Any]:
@@ -289,11 +392,16 @@ def _routing_decision(
     binary_path: str | None,
 ) -> tuple[dict[str, Any], list[str]]:
     result = test_routing_rules(rules, attrs, config_path=config_path, binary_path=binary_path)
-    limitations = [
-        'No destination was supplied, so domain, IP, and destination-port rules were not tested. '
-        'The matched outbound is the first rule that fits this inbound and user without a destination. '
-        'Live traffic can hit an earlier rule when its destination matches.',
-    ]
+    has_destination = bool(str(attrs.get('domain') or attrs.get('ip') or '').strip())
+    if has_destination:
+        limitations = [
+            'Destination-dependent rules were tested with the supplied host, address, and port.',
+        ]
+    else:
+        limitations = [
+            'No destination was supplied, so domain, IP, and destination-port rules were not tested. '
+            'A rule that also matches those fields is not counted as a client match.',
+        ]
     for warning in result.get('warnings') or []:
         text = str(warning).strip()
         if text and text not in limitations:
@@ -301,7 +409,29 @@ def _routing_decision(
     return result, limitations
 
 
-async def _kernel_egress(hops: list[dict[str, Any]], limitations: list[str], iface: str | None) -> dict[str, Any]:
+async def _probe_public_ip(iface: str) -> tuple[str | None, str | None]:
+    if not iface or not _IFACE_RE.match(iface):
+        return None, "interface name missing or rejected"
+    errors: list[str] = []
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        result = await _run(
+            ["curl", "-4", "--interface", iface, "--max-time", "8", "-fsS", url]
+        )
+        text = str(result.get("stdout") or "").strip().split()
+        candidate = text[0] if text else ""
+        if result.get("ok") and _is_global(candidate):
+            return candidate, None
+        detail = str(result.get("stderr") or result.get("stdout") or "probe failed").strip()
+        errors.append(detail[:160])
+    return None, errors[-1] if errors else "public IP probe failed"
+
+
+async def _kernel_egress(
+    hops: list[dict[str, Any]],
+    limitations: list[str],
+    iface: str | None,
+    destination_ip: str | None,
+) -> dict[str, Any]:
     observed = await _observe_iface(iface or '')
     if iface:
         if observed.get('available'):
@@ -333,34 +463,61 @@ async def _kernel_egress(hops: list[dict[str, Any]], limitations: list[str], ifa
         else:
             limitations.append(f'Interface [{iface}] could not be read ({observed.get("detail") or "unavailable"}).')
 
-    route = await _run(['ip', 'route', 'get', '1.1.1.1'] + (['oif', iface] if iface and _IFACE_RE.match(iface) else []))
-    if route['ok'] and str(route.get('stdout') or '').strip():
-        raw = str(route['stdout']).strip().splitlines()[0][:180]
-        parsed = _parse_route_get(raw)
-        hops.append(_hop(
-            len(hops) + 1,
-            'egress',
-            'kernel-lookup',
-            f'ip route get 1.1.1.1 → {raw}. Lookup only; 1.1.1.1 is not the client destination and this is not a captured packet.',
-            dev=parsed.get('dev'),
-            src=parsed.get('src'),
-        ))
-    elif iface:
-        limitations.append('Kernel route lookup failed, so the egress device was not observed.')
+    target = str(destination_ip or '').strip()
+    observed_route = ''
+    if target:
+        route_args = ['ip', 'route', 'get', target]
+        if iface and _IFACE_RE.match(iface):
+            route_args.extend(['oif', iface])
+        route = await _run(route_args)
+        if route['ok'] and str(route.get('stdout') or '').strip():
+            observed_route = str(route['stdout']).strip().splitlines()[0][:180]
+            parsed = _parse_route_get(observed_route)
+            hops.append(_hop(
+                len(hops) + 1,
+                'kernel-route',
+                'kernel-lookup',
+                f'ip route get {target} → {observed_route}. Lookup only; not a captured packet.',
+                dev=parsed.get('dev'),
+                src=parsed.get('src'),
+                destination=target,
+            ))
+        else:
+            limitations.append(f'Kernel route lookup for {target} failed, so the egress device was not observed.')
     else:
-        limitations.append('No interface was configured on the final outbound, and no kernel egress lookup was recorded.')
+        limitations.append(
+            'No destination IP was supplied, so the kernel path for this client was not looked up. '
+            'Pass destination to test a specific address.'
+        )
 
     addresses = list(observed.get('addresses') or [])
-    parsed_src = ''
-    if hops and hops[-1].get('role') == 'egress':
-        parsed_src = str(hops[-1].get('src') or '')
-        if parsed_src:
-            addresses.append(parsed_src)
-    tunnel = bool(observed.get('endpoints')) or str(iface or '').startswith(('wg', 'awg', 'tun', 'ppp'))
-    return _public_exit(addresses, nat=None, tunnel=tunnel)
+    return {
+        'addresses': addresses,
+        'route': observed_route,
+        'endpoints': list(observed.get('endpoints') or []),
+    }
 
 
-async def trace_xray_client(driver: Any, client_key: str, inbound_id: str | int | None = None) -> dict[str, Any]:
+def _rules_for_user(rules: list[dict[str, Any]], email: str) -> list[dict[str, Any]]:
+    wanted = email.strip().lower()
+    found: list[dict[str, Any]] = []
+    if not wanted:
+        return found
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        users = [item.lower() for item in _as_list(rule.get('user'))]
+        if wanted in users:
+            found.append(rule)
+    return found
+
+
+async def trace_xray_client(
+    driver: Any,
+    client_key: str,
+    inbound_id: str | int | None = None,
+    destination: str | None = None,
+) -> dict[str, Any]:
     key = str(client_key or '').strip()
     if not key:
         raise ValueError('client key is required')
@@ -415,11 +572,32 @@ async def trace_xray_client(driver: Any, client_key: str, inbound_id: str | int 
             'summary': _summary(False, [], limitations),
         }
 
+    try:
+        destination_attrs = parse_destination(destination)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
     rules = []
     routing = config.get('routing') if isinstance(config.get('routing'), dict) else {}
     raw_rules = routing.get('rules') if isinstance(routing, dict) else None
     if isinstance(raw_rules, list):
         rules = [row for row in raw_rules if isinstance(row, dict)]
+    config_rules = list(rules)
+    list_rules = getattr(driver, 'list_rules', None)
+    runtime_rules: list[dict[str, Any]] | None = None
+    runtime_error = ''
+    if callable(list_rules):
+        try:
+            listed = await list_rules()
+            if isinstance(listed, list) and listed:
+                runtime_rules = [row for row in listed if isinstance(row, dict)]
+        except Exception as exc:  # noqa: BLE001
+            runtime_error = str(exc) or exc.__class__.__name__
+    runtime_has_users = bool(
+        runtime_rules and any(_as_list(row.get('user')) for row in runtime_rules)
+    )
+    # A runtime summary that omits users cannot decide a client match.
+    match_rules = runtime_rules if runtime_has_users and runtime_rules is not None else config_rules
     outbound_by_tag = _outbound_map(config)
     balancers: dict[str, Any] = {}
     for row in routing.get('balancers') or []:
@@ -451,19 +629,51 @@ async def trace_xray_client(driver: Any, client_key: str, inbound_id: str | int 
             port=port,
             tag=tag,
         )]
+        user_rules = _rules_for_user(config_rules, email)
+        user_labels = []
+        for rule in user_rules[:6]:
+            label = str(rule.get('tag') or rule.get('ruleTag') or '-')
+            target = str(rule.get('outboundTag') or rule.get('balancerTag') or '-')
+            user_labels.append(f'{label} → {target}')
+        hops.append(_hop(
+            len(hops) + 1,
+            'configured-rules',
+            'configured',
+            (
+                f'{len(user_rules)} routing rule(s) list user {email}'
+                + (f': {"; ".join(user_labels)}' if user_labels else '.')
+            ),
+        ))
+        if runtime_error:
+            limitations_seed = [f'Running Xray rule list could not be read ({runtime_error}). Config rules were used.']
+        elif runtime_rules is not None and not runtime_has_users:
+            limitations_seed = [
+                'The running Xray rule list omitted users, so the client match used config.json and does not prove those users are loaded.',
+            ]
+        elif runtime_has_users and runtime_rules is not None and len(runtime_rules) != len(config_rules):
+            limitations_seed = [
+                f'Running Xray has {len(runtime_rules)} rules; config.json has {len(config_rules)}. The match below uses the running rules.',
+            ]
+        else:
+            limitations_seed = []
         attrs = {
             'inboundTag': tag,
             'protocol': protocol,
             'user': email,
             'network': network or None,
+            'domain': destination_attrs.get('domain'),
+            'ip': destination_attrs.get('ip'),
+            'port': destination_attrs.get('port'),
         }
         decision, limitations = _routing_decision(
-            rules,
+            match_rules,
             attrs,
             config_path=config_path or None,
             binary_path=binary_path,
         )
+        limitations = limitations_seed + limitations
         outbound_tag = str(decision.get('outboundTag') or '').strip()
+        selection = 'matched' if decision.get('matched') else 'fallback'
         balancer_tag = ''
         if decision.get('matched') and isinstance(decision.get('rule'), dict):
             rule = decision['rule']
@@ -471,23 +681,34 @@ async def trace_xray_client(driver: Any, client_key: str, inbound_id: str | int 
             target = outbound_tag or str(rule.get('balancerTag') or '')
             hops.append(_hop(
                 len(hops) + 1,
-                'routing',
+                'routing-match',
                 'configured',
-                f'Rule {label} → {target or "unspecified"}. {limitations[0]}',
+                f'Matched rule {label} → outbound {target or "unspecified"}.',
                 rule=label,
                 outbound=outbound_tag or None,
             ))
         else:
             first = next(iter(outbound_by_tag), '')
             outbound_tag = first
+            if user_rules:
+                summary = (
+                    f'No rule matched user {email} for this destination. '
+                    f'{len(user_rules)} configured rule(s) list this user but did not match. '
+                    f'Fallback outbound is [{first or "-"}].'
+                )
+            else:
+                summary = (
+                    f'No routing rule lists user {email}. '
+                    f'Xray falls through to the first outbound [{first or "-"}].'
+                )
             hops.append(_hop(
                 len(hops) + 1,
-                'routing',
+                'routing-match',
                 'configured',
-                f'No rule matched this inbound/user without a destination. Xray would use the first outbound [{first or "-"}] only when no earlier rule matches the real destination.',
+                summary,
                 outbound=first or None,
             ))
-            limitations.append('The default outbound is a fallback, not a verified path for every destination.')
+            limitations.append('The fallback outbound is not a matched client route.')
 
         if not outbound_tag and decision.get('matched'):
             balancer_tag = str((decision.get('rule') or {}).get('balancerTag') or '')
@@ -511,23 +732,54 @@ async def trace_xray_client(driver: Any, client_key: str, inbound_id: str | int 
             )
             bound_iface = _iface
 
+        kernel = {'addresses': [], 'route': '', 'endpoints': []}
         if final_protocol in {'blackhole', 'dns'}:
             public_exit = {
                 'ip': None,
-                'basis': 'unavailable',
+                'basis': 'UNVERIFIED',
                 'detail': f'Outbound protocol [{final_protocol}] does not forward traffic to a network egress.',
             }
         else:
-            public_exit = await _kernel_egress(hops, limitations, bound_iface)
-            if not bound_iface:
-                limitations.append(
-                    'The final outbound does not name an interface. Any kernel egress shown is the host default route, '
-                    'not proof that this configuration uses it.'
+            kernel = await _kernel_egress(
+                hops,
+                limitations,
+                bound_iface,
+                str(destination_attrs.get('ip') or ''),
+            )
+            if bound_iface and final_protocol == 'freedom':
+                probe_ip, probe_error = await _probe_public_ip(bound_iface)
+            else:
+                probe_ip, probe_error = None, (
+                    'The selected outbound has no interface binding, so the public exit was not probed.'
+                    if not bound_iface
+                    else f'Outbound protocol [{final_protocol or "unknown"}] was not probed for a public IP.'
                 )
+            public_exit = classify_public_exit(
+                probe_ip=probe_ip,
+                iface_addresses=list(kernel.get('addresses') or []),
+                bound_iface=bound_iface if selection == 'matched' else None,
+                probe_error=probe_error,
+            )
+            if selection != 'matched':
+                public_exit = {
+                    'ip': None,
+                    'basis': 'UNVERIFIED',
+                    'detail': 'No client routing rule matched, so the fallback path was not treated as a verified exit.',
+                }
         matches.append({
             'address': email,
             'email': email,
             'inbound': {'tag': tag, 'port': port, 'protocol': protocol, 'listen': listen},
+            'routing': {
+                'configured_user_rules': len(user_rules),
+                'matched': selection == 'matched',
+                'selection': selection,
+                'rules_source': 'runtime' if runtime_has_users else 'config',
+                'selected_outbound': outbound_tag or None,
+                'interface': bound_iface,
+                'kernel_route': kernel.get('route') or None,
+                'destination': destination_attrs or None,
+            },
             'hops': hops[:_MAX_HOPS],
             'limitations': limitations[:8],
             'public_exit': public_exit,

@@ -420,6 +420,7 @@ async def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int
 def render_apply_script(
     rules: list[dict[str, str | int]],
     tunnel_ifaces: list[str] | None = None,
+    bind_ifaces: list[str] | None = None,
 ) -> str:
     """Self-contained shell script so egress survives reboot (wg-quick PostUp / systemd)."""
     lines = [
@@ -603,6 +604,10 @@ def render_apply_script(
     lines.append("fi")
     lines.append("")
 
+    if bind_ifaces:
+        from agent.support.xray_exit_bind import script_lines
+
+        lines.extend(script_lines(bind_ifaces))
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 
@@ -666,8 +671,14 @@ async def write_apply_script(
     data_dir: str | Path | None = None,
     tunnel_ifaces: list[str] | None = None,
 ) -> Path:
+    from agent.support.xray_exit_bind import load_bind_ifaces
+
     path = apply_script_path(data_dir)
-    await aiofs.atomic_write(path, render_apply_script(rules, tunnel_ifaces), encoding="utf-8")
+    await aiofs.atomic_write(
+        path,
+        render_apply_script(rules, tunnel_ifaces, bind_ifaces=load_bind_ifaces()),
+        encoding="utf-8",
+    )
     try:
         await aiofs.chmod(path, 0o755)
     except (OSError, AttributeError):
@@ -746,10 +757,12 @@ async def persist_peer_egress(
     force_start: bool = False,
     start_unit: bool | None = None,
 ) -> dict[str, Any]:
+    from agent.support.xray_exit_bind import load_bind_ifaces
+
     rules = await all_desired_rules_from_store(store)
     tunnels = await all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
-    new_text = render_apply_script(rules, tunnels)
+    new_text = render_apply_script(rules, tunnels, bind_ifaces=load_bind_ifaces())
     previous = await aiofs.read_text(path, encoding="utf-8") if path.is_file() else None
     changed = previous != new_text
     if changed:
@@ -1034,8 +1047,11 @@ async def reconcile_core_egress(
         if int(row.get("table") or 0) > 0
     }
 
+    from agent.support.xray_exit_bind import bind_table_ids, reapply_saved_binds
+
+    protected_tables = set(bind_table_ids())
     for table in prev_tables:
-        if table not in desired_tables:
+        if table not in desired_tables and table not in protected_tables:
             await _ip(runner, ["route", "flush", "table", str(table)])
 
     masq_ifaces = sorted({str(row["iface"]) for row in applied if str(row.get("iface") or "").strip()})
@@ -1100,6 +1116,10 @@ async def reconcile_core_egress(
         cache.counts["route_replace"],
         cache.counts["sysctl_write"],
     )
+    try:
+        await reapply_saved_binds(runner=runner)
+    except Exception:
+        log.exception("xray exit bind reapply failed")
     persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
     return {
         "ok": True,

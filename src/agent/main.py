@@ -144,6 +144,18 @@ def create_app(env_file: str | None = None) -> FastAPI:
                 "local volume quota enforcement disabled; panel sync must disable on is_exceeded",
             )
         await bootstrap_enabled_cores(settings, registry, app_log)
+        try:
+            from agent.support.xray_exit_bind import reapply_saved_binds
+
+            rebound = await reapply_saved_binds()
+            if rebound.get("applied") or rebound.get("failed"):
+                app_log.info(
+                    "xray exit binds applied=%s failed=%s",
+                    rebound.get("applied"),
+                    rebound.get("failed"),
+                )
+        except Exception:
+            app_log.exception("xray exit bind reapply failed")
 
         stop_quota = asyncio.Event()
         quota_task = None

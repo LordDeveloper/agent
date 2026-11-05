@@ -428,15 +428,25 @@ def format_trace_report(report: dict[str, Any], *, use_color: bool = True) -> st
                 f'  [{hop.get("basis") or "unknown"}]'
             )
             lines.append(f'     {hop.get("summary") or "-"}')
+        routing = match.get('routing') if isinstance(match.get('routing'), dict) else {}
+        if routing:
+            lines.extend([
+                '',
+                'Routing',
+                f'  Source:   {routing.get("rules_source") or "-"}',
+                f'  Rules:    {routing.get("configured_user_rules") if routing.get("configured_user_rules") is not None else "-"}',
+                f'  Match:    {routing.get("selection") or "-"}',
+                f'  Outbound: {routing.get("selected_outbound") or "-"}',
+                f'  Iface:    {routing.get("interface") or "-"}',
+                f'  Kernel:   {routing.get("kernel_route") or "-"}',
+            ])
         exit_info = match.get('public_exit') if isinstance(match.get('public_exit'), dict) else {}
         lines.extend(['', 'Public exit'])
-        shown_ip = exit_info.get('ip') or exit_info.get('interface_global')
-        if exit_info.get('ip'):
-            lines.append(f'  IP:     {exit_info.get("ip")}  [{exit_info.get("basis") or "observed"}]')
-        elif shown_ip:
-            lines.append(f'  IP:     {shown_ip}  [interface address, not a verified exit IP]')
+        basis = str(exit_info.get('basis') or '')
+        if exit_info.get('ip') and basis.lower() == 'verified':
+            lines.append(f'  IP:     {exit_info.get("ip")}  [verified]')
         else:
-            lines.append('  IP:     unavailable')
+            lines.append('  IP:     UNVERIFIED')
         if exit_info.get('detail'):
             lines.append(f'  Note:   {exit_info.get("detail")}')
         limits = list(match.get('limitations') or [])

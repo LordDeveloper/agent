@@ -1092,13 +1092,18 @@ class XrayDriver(CoreDriver):
 
         return await diagnose_xray_clients_by_key(self, key)
 
-    async def trace_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
+    async def trace_client(
+        self,
+        client_key: str,
+        inbound_id: int | str | None = None,
+        destination: str | None = None,
+    ) -> dict[str, Any]:
         from agent.support.traffic_trace import trace_xray_client
 
         key = str(client_key or "").strip()
         if not key:
             raise ValueError("client key is required")
-        return await trace_xray_client(self, key, inbound_id=inbound_id)
+        return await trace_xray_client(self, key, inbound_id=inbound_id, destination=destination)
 
     def _index_clients(self, inbound: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         by_email: dict[str, dict[str, Any]] = {}
@@ -2759,10 +2764,36 @@ class XrayDriver(CoreDriver):
         return await self._api_call("list_outbounds", )
 
     async def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return await self._api_call("add_outbounds", outbounds)
+        result = await self._api_call("add_outbounds", outbounds)
+        await self._ensure_outbound_binds(outbounds)
+        return result
 
     async def edit_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
-        return await self._api_call("edit_outbounds", outbounds)
+        result = await self._api_call("edit_outbounds", outbounds)
+        await self._ensure_outbound_binds(outbounds)
+        return result
+
+    async def ensure_exit_bind(self, interface: str) -> dict[str, Any]:
+        from agent.support.xray_exit_bind import ensure_interface_bind_route
+
+        return await ensure_interface_bind_route(interface)
+
+    async def _ensure_outbound_binds(self, outbounds: list[dict[str, Any]]) -> None:
+        from agent.support.xray_exit_bind import ensure_interface_bind_route
+
+        seen: set[str] = set()
+        for outbound in outbounds:
+            if not isinstance(outbound, dict):
+                continue
+            if str(outbound.get("protocol") or "").lower() != "freedom":
+                continue
+            stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
+            sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
+            iface = str(sockopt.get("interface") or "").strip()
+            if not iface or iface in seen:
+                continue
+            seen.add(iface)
+            await ensure_interface_bind_route(iface)
 
     async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
         return await self._api_call("remove_outbounds", tags)

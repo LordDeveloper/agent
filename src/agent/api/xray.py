@@ -232,16 +232,32 @@ async def trace_client(
     email: str | None = None,
     client_id: str | None = None,
     inbound_id: str | None = None,
+    destination: str | None = None,
     xray: XrayDriver = Depends(get_xray),
 ):
     client_key = str(key or email or client_id or "").strip()
     if not client_key:
         raise_agent_error("VALIDATION_ERROR", "key, email, or client_id is required", 422)
     try:
-        report = await xray.trace_client(client_key, inbound_id=inbound_id)
+        report = await xray.trace_client(
+            client_key,
+            inbound_id=inbound_id,
+            destination=str(destination or "").strip() or None,
+        )
     except ValueError as exc:
         raise_agent_error("VALIDATION_ERROR", str(exc), 422)
     return report
+
+
+@router.post("/exit-bind")
+async def exit_bind(body: dict[str, Any], xray: XrayDriver = Depends(get_xray)):
+    interface = str(body.get("interface") or "").strip()
+    if not interface:
+        raise_agent_error("VALIDATION_ERROR", "interface is required", 422)
+    try:
+        return await xray.ensure_exit_bind(interface)
+    except AgentError as exc:
+        raise_agent_error(exc.code, exc.message, exc.status)
 
 
 @router.get("/clients/{email}/ips")

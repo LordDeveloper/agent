@@ -556,7 +556,8 @@ def cmd_client_trace(args: argparse.Namespace) -> int:
         if not client_key:
             raise AgentError("VALIDATION_ERROR", "email, key, or client_id is required")
         inbound_id = str(getattr(args, "inbound_id", "") or "").strip() or None
-        report = run_sync(driver.trace_client(client_key, inbound_id=inbound_id))
+        destination = str(getattr(args, "destination", "") or "").strip() or None
+        report = run_sync(driver.trace_client(client_key, inbound_id=inbound_id, destination=destination))
         _emit_diagnose_report(report, args)
         if report.get("found") is False:
             return 2
@@ -1100,6 +1101,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_client_trace.add_argument("--key", help="Alias for email or client UUID")
     p_client_trace.add_argument("--client-id", help="Client UUID")
     p_client_trace.add_argument("--inbound-id", help="Optional inbound id/tag scope")
+    p_client_trace.add_argument("--destination", help="Optional IP or domain, with optional :port")
     p_client_trace.add_argument("--json", action="store_true", help="Output raw JSON")
     p_client_trace.set_defaults(func=cmd_client_trace)
 
