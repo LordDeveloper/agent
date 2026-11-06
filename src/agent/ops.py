@@ -515,6 +515,21 @@ async def relax_agent_start_post(unit_path: Path | None = None, runner=None) -> 
     return True
 
 
+async def ensure_worker_unit() -> bool:
+    """Write agent-worker.service when an older install only has the API unit."""
+    worker = systemd_worker_unit_path()
+    if worker.is_file():
+        return False
+    try:
+        worker.parent.mkdir(parents=True, exist_ok=True)
+        worker.write_text(default_worker_unit_text(), encoding="utf-8")
+    except OSError:
+        return False
+    await run_cmd(["systemctl", "daemon-reload"], check=False)
+    await run_cmd(["systemctl", "enable", "agent-worker"], check=False)
+    return True
+
+
 async def service_action(action: str) -> dict:
     if not which("systemctl"):
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found (Linux systemd required)")
@@ -544,6 +559,11 @@ async def service_action(action: str) -> dict:
     allowed = {"start", "stop", "restart", "status", "enable", "disable"}
     if action not in allowed:
         raise AgentError("VALIDATION_ERROR", f"Unknown service action [{action}]")
+    # Upgrades restart both units. Nodes installed before the worker split have
+    # no agent-worker.service, so create and enable it before systemctl restart.
+    worker_installed = False
+    if action in {"start", "restart", "enable"}:
+        worker_installed = await ensure_worker_unit()
     # The listener must come up even when the worker unit is missing or failing.
     worker_proc = await run_cmd(["systemctl", action, "agent-worker"], check=False)
     proc = await run_cmd(["systemctl", action, "agent"], check=False)
@@ -551,6 +571,7 @@ async def service_action(action: str) -> dict:
         "action": action,
         "ok": proc.returncode == 0,
         "worker_ok": worker_proc.returncode == 0,
+        "worker_installed": worker_installed,
         "stdout": (proc.stdout or "").strip(),
         "stderr": (proc.stderr or "").strip(),
         "worker_stdout": (worker_proc.stdout or "").strip(),
