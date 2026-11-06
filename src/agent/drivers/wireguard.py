@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import shutil
 import subprocess
@@ -38,6 +39,12 @@ _AWG_MTU = 1280
 _PEER_BATCH_MAX = 200
 
 log = get_logger("wireguard")
+
+
+def _read_text_if_present(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 def _wg_quick_already_down(stderr: str) -> bool:
@@ -815,6 +822,147 @@ def _unapplied_peer_keys(iface: dict[str, Any], dump: dict[str, Any]) -> list[st
     return missing
 
 
+def _allowed_ip_set(value: Any) -> frozenset[str]:
+    """Order-insensitive AllowedIPs. Formatting differences are not drift."""
+    found: set[str] = set()
+    for part in str(value or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            if "/" in token:
+                found.add(str(ipaddress.ip_network(token, strict=False)))
+            else:
+                addr = ipaddress.ip_address(token)
+                prefix = 32 if addr.version == 4 else 128
+                found.add(str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False)))
+        except ValueError:
+            found.add(token)
+    return frozenset(found)
+
+
+def _dump_is_usable(iface: dict[str, Any], dump: dict[str, Any] | None) -> bool:
+    """An empty dump is a failed `wg show`, not evidence that every peer is missing."""
+    if dump:
+        return True
+    for peer in iface.get("peers") or []:
+        if isinstance(peer, dict) and record_is_enabled(peer) and str(peer.get("public_key") or "").strip():
+            return False
+    return True
+
+
+def _iface_apply_token(iface: dict[str, Any]) -> tuple[Any, ...]:
+    """Identity of the config `wg syncconf` installs. Routes and counters are excluded."""
+    peers: list[tuple[Any, ...]] = []
+    for peer in iface.get("peers") or []:
+        if not isinstance(peer, dict):
+            continue
+        peers.append(
+            (
+                str(peer.get("id") or ""),
+                str(peer.get("public_key") or "").strip(),
+                record_is_enabled(peer),
+                tuple(sorted(_allowed_ip_set(peer.get("allowed_ips")))),
+                _peer_keepalive_seconds(peer) or 0,
+                str(peer.get("preshared_key") or ""),
+            )
+        )
+    peers.sort()
+    return (
+        str(iface.get("name") or ""),
+        str(iface.get("private_key") or ""),
+        str(iface.get("listen_port") or ""),
+        tuple(peers),
+    )
+
+
+def _peer_kernel_drift(iface: dict[str, Any], dump: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Peers whose kernel config cannot match the store.
+
+    Handshake time and RX/TX are ignored. An idle peer that is present with the
+    right AllowedIPs is healthy. Two enabled peers that want the same prefix
+    are reported as a conflict and must not be reinstalled in a loop.
+    """
+    live = dump or {}
+    enabled: list[tuple[str, dict[str, Any]]] = []
+    owners: dict[str, str] = {}
+    conflicts: set[str] = set()
+    for peer in iface.get("peers") or []:
+        if not isinstance(peer, dict) or not record_is_enabled(peer):
+            continue
+        public_key = str(peer.get("public_key") or "").strip()
+        if not public_key:
+            continue
+        enabled.append((public_key, peer))
+        for prefix in _allowed_ip_set(peer.get("allowed_ips")):
+            previous = owners.get(prefix)
+            if previous is not None and previous != public_key:
+                conflicts.add(previous)
+                conflicts.add(public_key)
+            else:
+                owners[prefix] = public_key
+
+    desired_keys = {public_key for public_key, _peer in enabled}
+    drift: list[dict[str, Any]] = []
+    for public_key, peer in enabled:
+        row = live.get(public_key)
+        peer_id = str(peer.get("id") or peer.get("email") or "")
+        if public_key in conflicts:
+            drift.append(
+                {
+                    "peer": peer,
+                    "peer_id": peer_id,
+                    "public_key": public_key,
+                    "reason": "allowed_ips_conflict",
+                    "live_allowed": str((row or {}).get("allowed_ips") or ""),
+                    "action": "skip",
+                }
+            )
+            continue
+        desired = _allowed_ip_set(peer.get("allowed_ips"))
+        if not desired:
+            continue
+        if row is None:
+            drift.append(
+                {
+                    "peer": peer,
+                    "peer_id": peer_id,
+                    "public_key": public_key,
+                    "reason": "missing",
+                    "live_allowed": "",
+                    "action": "add",
+                }
+            )
+            continue
+        if desired != _allowed_ip_set(row.get("allowed_ips")):
+            drift.append(
+                {
+                    "peer": peer,
+                    "peer_id": peer_id,
+                    "public_key": public_key,
+                    "reason": "allowed_ips",
+                    "live_allowed": str(row.get("allowed_ips") or ""),
+                    "action": "reinstall",
+                }
+            )
+
+    for public_key, row in live.items():
+        if public_key in desired_keys:
+            continue
+        drift.append(
+            {
+                "peer": {},
+                "peer_id": "",
+                "public_key": public_key,
+                "reason": "disabled_present",
+                "live_allowed": str((row or {}).get("allowed_ips") or ""),
+                "action": "remove",
+            }
+        )
+    return drift
+
+
 def _strip_peer_keepalive_fields(peer: dict[str, Any]) -> bool:
     """Remove stored keepalive so conf/live stay clean until panel sets seconds."""
     changed = False
@@ -1005,6 +1153,7 @@ class WireGuardDriver(CoreDriver):
         self.audit = audit
         self.store = store
         self._iface_locks = InterfaceLockRegistry()
+        self._repair_noted: set[tuple[str, str, str]] = set()
 
     async def _migrate_keepalive_opt_in(self) -> None:
         """
@@ -1184,6 +1333,11 @@ class WireGuardDriver(CoreDriver):
         Kernel rx/tx only reset when the peer is removed and re-added on the live
         interface; clearing agent store fields alone would re-bill old usage.
         """
+        iface = await self.get_interface(interface_id)
+        async with self._iface_locks.lock(self._iface_lock_key(iface)):
+            return await self._reset_peer_traffic_locked(interface_id, peer_id)
+
+    async def _reset_peer_traffic_locked(self, interface_id: int | str, peer_id: str) -> dict[str, Any]:
         iface = await self.get_interface(interface_id)
         iface_name = str(iface.get("name") or "")
         target_idx: int | None = None
@@ -2232,6 +2386,12 @@ class WireGuardDriver(CoreDriver):
 
             if changed:
                 await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+            if _dump_is_usable(iface, live):
+                drift = _peer_kernel_drift(iface, live)
+                if any(row["action"] != "skip" for row in drift):
+                    await self._repair_kernel_peers(iface, hold_lock=True)
+                elif drift:
+                    self._log_peer_recovery(str(iface.get("name") or ""), drift, verified=set())
 
     async def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
         """AdGuard gateway when ads-block is on; otherwise a public resolver."""
@@ -2374,6 +2534,199 @@ class WireGuardDriver(CoreDriver):
         result = await run([cli, "show", name], check=False, timeout=5)
         return result.returncode == 0
 
+    async def _coalesce_apply_snapshot(
+        self,
+        iface: dict[str, Any],
+        stripped: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Apply the interface currently in the store when a newer write landed first."""
+        iface_id = iface.get("id")
+        if iface_id is None:
+            return iface, stripped
+        try:
+            stored = await self.get_interface(iface_id)
+        except AgentError:
+            return iface, stripped
+        if _iface_apply_token(stored) == _iface_apply_token(iface):
+            return iface, stripped
+        log.info("wireguard apply coalesced iface=%s", stored.get("name"))
+        return stored, await self._validate_before_apply(stored)
+
+    async def _repair_kernel_peers(self, iface: dict[str, Any], *, hold_lock: bool = True) -> bool:
+        """
+        Reinstall only peers whose live AllowedIPs or presence disagree with the store.
+
+        ``wg syncconf`` skips a peer once `wg show` lists the same key, so a stale
+        AllowedIP set survives and the handshake still completes. Removing and
+        adding that peer rebuilds its cryptokey route. Healthy peers are not touched.
+        """
+        if hold_lock:
+            async with self._iface_locks.lock(self._iface_lock_key(iface)):
+                return await self._repair_kernel_peers(iface, hold_lock=False)
+
+        iface_id = iface.get("id")
+        if iface_id is not None:
+            try:
+                iface = await self.get_interface(iface_id)
+            except AgentError:
+                return True
+        name = str(iface.get("name") or "")
+        if not name or not self._cli_bin():
+            return True
+        dump = await self._peer_dump(name)
+        if not _dump_is_usable(iface, dump):
+            return False
+
+        drift = _peer_kernel_drift(iface, dump)
+        actionable = [row for row in drift if row["action"] != "skip"]
+        self._log_peer_recovery(name, [row for row in drift if row["action"] == "skip"], verified=set())
+        if not actionable:
+            return True
+
+        psk_files: list[Path] = []
+        try:
+            await self._wg_set_chunked(
+                name,
+                [
+                    ["peer", row["public_key"], "remove"]
+                    for row in actionable
+                    if row["action"] in {"remove", "reinstall"}
+                ],
+                per_peer=True,
+            )
+            await self._wg_set_chunked(
+                name,
+                [
+                    self._peer_add_argv(row["peer"], row["public_key"], psk_files)
+                    for row in actionable
+                    if row["action"] in {"add", "reinstall"}
+                ],
+                per_peer=True,
+            )
+        finally:
+            for path in psk_files:
+                path.unlink(missing_ok=True)
+
+        verify = await self._peer_dump(name)
+        if not _dump_is_usable(iface, verify):
+            note = (name, "", "unverified")
+            if note not in self._repair_noted:
+                self._repair_noted.add(note)
+                log.warning("peer recovery iface=%s result=unverified verify=unverified", name)
+            return False
+        self._repair_noted.discard((name, "", "unverified"))
+        still = {
+            row["public_key"]
+            for row in _peer_kernel_drift(iface, verify)
+            if row["action"] != "skip"
+        }
+        self._log_peer_recovery(name, actionable, verified=still)
+        return not still
+
+    def _log_peer_recovery(
+        self,
+        iface_name: str,
+        rows: list[dict[str, Any]],
+        *,
+        verified: set[str],
+    ) -> None:
+        for row in rows:
+            public_key = str(row.get("public_key") or "")
+            reason = str(row.get("reason") or "")
+            note = (iface_name, public_key, reason)
+            skipped = row.get("action") == "skip"
+            ok = not skipped and public_key not in verified
+            if ok:
+                self._repair_noted.discard(note)
+            elif note in self._repair_noted:
+                continue
+            else:
+                self._repair_noted.add(note)
+            before = str(row.get("live_allowed") or "")
+            if len(before) > 120:
+                before = before[:117] + "..."
+            log.info(
+                "peer recovery iface=%s peer=%s key=%s reason=%s before=%s action=%s result=%s verify=%s",
+                iface_name,
+                row.get("peer_id") or "",
+                public_key[:8],
+                reason,
+                before,
+                row.get("action") or "",
+                "skipped" if skipped else ("ok" if ok else "failed"),
+                "skipped" if skipped else ("ok" if ok else "still_drifted"),
+            )
+
+    def _peer_add_argv(self, peer: dict[str, Any], public_key: str, psk_files: list[Path]) -> list[str]:
+        allowed = str(peer.get("allowed_ips") or "").strip()
+        argv = [
+            "peer",
+            public_key,
+            "allowed-ips",
+            allowed,
+            "persistent-keepalive",
+            str(_peer_keepalive_seconds(peer) or 0),
+        ]
+        psk = str(peer.get("preshared_key") or "").strip()
+        if not psk:
+            return argv
+        self._config_dir().mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".psk.",
+            suffix=".key",
+            dir=self._config_dir(),
+            delete=False,
+        )
+        try:
+            handle.write(psk + "\n")
+        finally:
+            handle.close()
+        path = Path(handle.name)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        psk_files.append(path)
+        argv.extend(["preshared-key", str(path)])
+        return argv
+
+    async def _wg_set_chunked(
+        self,
+        iface_name: str,
+        groups: list[list[str]],
+        *,
+        per_peer: bool = False,
+    ) -> bool:
+        groups = [group for group in groups if group]
+        if not groups:
+            return True
+        cli = self._cli_bin()
+        if not cli:
+            return False
+        ok = True
+        step = 64
+
+        async def once(args: list[list[str]]) -> bool:
+            flat: list[str] = []
+            for group in args:
+                flat.extend(group)
+            result = await run([cli, "set", iface_name, *flat], check=False, timeout=20)
+            return result.returncode == 0
+
+        for offset in range(0, len(groups), step):
+            chunk = groups[offset : offset + step]
+            if await once(chunk):
+                continue
+            if not per_peer:
+                ok = False
+                continue
+            for group in chunk:
+                if not await once([group]):
+                    ok = False
+        return ok
+
     async def _remove_live_peer(self, iface_name: str, public_key: str) -> bool:
         cli = self._cli_bin()
         if not cli or not iface_name or not public_key:
@@ -2502,7 +2855,20 @@ class WireGuardDriver(CoreDriver):
         stripped: str | None = None,
         drop_keys: list[str] | None = None,
         sync_egress: bool = True,
+        hold_lock: bool = True,
     ) -> None:
+        if hold_lock:
+            async with self._iface_locks.lock(self._iface_lock_key(iface)):
+                await self._apply_live(
+                    iface,
+                    force_bring_up=force_bring_up,
+                    stripped=stripped,
+                    drop_keys=drop_keys,
+                    sync_egress=sync_egress,
+                    hold_lock=False,
+                )
+            return
+        iface, stripped = await self._coalesce_apply_snapshot(iface, stripped)
         if stripped is None:
             stripped = await self._validate_before_apply(iface)
 
@@ -2510,7 +2876,7 @@ class WireGuardDriver(CoreDriver):
         quick = self._quick_bin()
         name = iface["name"]
         conf_path = self._conf_file(name)
-        backup = conf_path.read_text(encoding="utf-8") if conf_path.exists() else None
+        backup = await asyncio.to_thread(_read_text_if_present, conf_path)
 
         if not cli or not quick:
             self._sync_conf(iface)
@@ -2521,7 +2887,7 @@ class WireGuardDriver(CoreDriver):
         if force_bring_up:
             try:
                 if await self._interface_is_up(name):
-                    down = await self._bring_down(iface)
+                    down = await self._bring_down(iface, hold_lock=False)
                     if not down.get("ok"):
                         detail = (down.get("stderr") or "wg-quick down failed").strip()
                         raise AgentError("VALIDATION_ERROR", f"WireGuard interface recycle failed: {detail}")
@@ -2530,6 +2896,7 @@ class WireGuardDriver(CoreDriver):
                     already_valid=True,
                     drop_keys=drop_keys,
                     sync_egress=sync_egress,
+                    hold_lock=False,
                 )
                 if not up.get("ok"):
                     detail = (up.get("stderr") or up.get("message") or "wg-quick up failed").strip()
@@ -2558,9 +2925,9 @@ class WireGuardDriver(CoreDriver):
             if sync.returncode != 0:
                 detail = (sync.stderr or sync.stdout or "wg syncconf failed").strip()
                 raise AgentError("VALIDATION_ERROR", f"WireGuard live apply rejected: {detail}")
-            missing = _unapplied_peer_keys(iface, await self._peer_dump(name)) if self._cli_bin() else []
-            if missing:
-                shown = ", ".join(key[:8] for key in missing)
+            if not await self._repair_kernel_peers(iface, hold_lock=False):
+                missing = _unapplied_peer_keys(iface, await self._peer_dump(name))
+                shown = ", ".join(key[:8] for key in missing) or "allowed-ips drift"
                 raise AgentError(
                     "VALIDATION_ERROR",
                     f"WireGuard live apply did not install peer keys: {shown}",

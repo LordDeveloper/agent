@@ -57,7 +57,7 @@ from agent.support.proxy_protocol_forwarder import (
     stop_forwarders,
     sync_forwarders_from_inbounds,
 )
-from agent.asyncutil import bounded_gather, gather_independent, maybe_await
+from agent.asyncutil import READ_BUDGET_SECONDS, bounded_gather, gather_independent, maybe_await, read_deadline
 from agent.support import aiofs
 from agent.xray_service import api_base_from_config, describe_httpapi_guard, xray_auth_from_config
 
@@ -68,6 +68,16 @@ _CLIENT_BATCH_MAX = 200
 _SMALL_CLIENT_BATCH = 8
 # Overlap per-client Xray writes. Wall time stays near one call, not N calls.
 _CLIENT_PARALLELISM = 32
+
+
+def _drain_task(task: asyncio.Task) -> None:
+    """Retrieve a cancelled flight's exception so asyncio does not warn."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        return
 _QUOTA_KIND = "client_quota"
 _DISABLED_KIND = "xray_disabled_client"
 # One user's Xray lookup. A full inbound dump does not fit in the panel probe.
@@ -171,6 +181,7 @@ class XrayDriver(CoreDriver):
         # Share one in-flight query and reuse it until the next traffic sample.
         self._usage_gate: asyncio.Lock | None = None
         self._usage_flight: asyncio.Task | None = None
+        self._usage_waiters = 0
         self._usage_cache: tuple[float, UsageSnapshotModel] | None = None
         self._quota_index_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
         # id/uuid/password → email, so a later GET does not list every user.
@@ -2898,21 +2909,19 @@ class XrayDriver(CoreDriver):
         if path.is_file():
             os.chmod(path, 0o600)
 
-    def httpapi_guard(self) -> dict[str, Any]:
-        path = Path(self.settings.xray.config)
+    async def httpapi_guard(self) -> dict[str, Any]:
         httpapi: dict[str, Any] = {}
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                data = {}
-            raw = data.get("httpapi") if isinstance(data, dict) else None
-            if isinstance(raw, dict):
-                httpapi = raw
+        try:
+            data = await self._cached_config()
+        except AgentError:
+            data = {}
+        raw = data.get("httpapi") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            httpapi = raw
         base = self.settings.xray
         return describe_httpapi_guard(httpapi, base.username, base.password)
 
-    def ensure_httpapi_auth(self) -> dict[str, Any]:
+    async def ensure_httpapi_auth(self) -> dict[str, Any]:
         """Write Agent XRAY_USERNAME/PASSWORD into httpapi when the block is empty."""
         from agent.xray_service import ensure_xray_httpapi_config
 
@@ -2930,7 +2939,7 @@ class XrayDriver(CoreDriver):
                 self.restrict_config_permissions()
             except OSError:
                 pass
-        return self.httpapi_guard()
+        return await self.httpapi_guard()
 
     async def edit_rules(self, rules: list[dict[str, Any]]) -> dict[str, Any]:
         if not rules:
@@ -3054,21 +3063,40 @@ class XrayDriver(CoreDriver):
             return None
         return snapshot
 
+    def _usage_cache_max_age(self) -> float:
+        interval = float(getattr(self.settings, "traffic_sample_interval", 30.0) or 30.0)
+        return max(3.0, interval / 2.0)
+
     async def usage_snapshot(self) -> UsageSnapshotModel:
+        max_age = self._usage_cache_max_age()
+        cached = self.cached_usage_snapshot(max_age)
+        if cached is not None:
+            return cached
         if self._usage_gate is None:
             self._usage_gate = asyncio.Lock()
         async with self._usage_gate:
+            cached = self.cached_usage_snapshot(max_age)
+            if cached is not None:
+                return cached
             flight = self._usage_flight
-            if flight is None:
+            if flight is None or flight.done():
                 flight = asyncio.create_task(self._load_usage_snapshot())
                 self._usage_flight = flight
+                self._usage_waiters = 0
+            self._usage_waiters += 1
         try:
-            return await asyncio.shield(flight)
+            return await flight
         finally:
             if self._usage_gate is not None:
                 async with self._usage_gate:
-                    if self._usage_flight is flight and flight.done():
-                        self._usage_flight = None
+                    self._usage_waiters = max(0, self._usage_waiters - 1)
+                    if self._usage_flight is flight:
+                        if flight.done():
+                            self._usage_flight = None
+                        elif self._usage_waiters == 0:
+                            flight.cancel()
+                            self._usage_flight = None
+                            flight.add_done_callback(_drain_task)
 
     async def _load_usage_snapshot(self) -> UsageSnapshotModel:
         snapshot = await self._build_usage_snapshot()
@@ -3224,10 +3252,21 @@ class XrayDriver(CoreDriver):
                 ips = []
             return email, ips
 
-        parts = await bounded_gather(
-            [lambda email=email: fetch(email) for email in emails],
-            limit=_CLIENT_PARALLELISM,
-        )
+        budget = read_deadline.get() or READ_BUDGET_SECONDS
+        try:
+            parts = await asyncio.wait_for(
+                bounded_gather(
+                    [lambda email=email: fetch(email) for email in emails],
+                    limit=_CLIENT_PARALLELISM,
+                ),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError as exc:
+            raise AgentError(
+                "UPSTREAM_TIMEOUT",
+                "online ip fallback timed out before every client was read",
+                503,
+            ) from exc
         out: dict[str, Any] = {}
         for part in parts:
             if not isinstance(part, tuple):

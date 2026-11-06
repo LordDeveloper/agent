@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from agent.asyncutil import read_deadline
 from agent.config import XraySettings
 from agent.errors import AgentError
 from agent.logutil import get_logger
@@ -188,9 +189,10 @@ class XrayHttpClient:
         span = RuntimeTrace.safe_name(f"xray.{method_u}.{path.rstrip('/').split('/')[-1] or 'root'}")
         started = time.perf_counter()
         slow = asyncio.create_task(self._warn_if_slow(route))
+        deadline = read_deadline.get() if method_u == "GET" else None
         try:
             with RuntimeTrace.span(span):
-                response = await self._client.request(
+                request = self._client.request(
                     method,
                     path,
                     params=params,
@@ -199,6 +201,16 @@ class XrayHttpClient:
                     data=data,
                     headers=headers,
                 )
+                if deadline is not None and deadline > 0:
+                    response = await asyncio.wait_for(request, timeout=deadline)
+                else:
+                    response = await request
+        except asyncio.TimeoutError as exc:
+            raise AgentError(
+                "UPSTREAM_TIMEOUT",
+                f"Xray HTTP API timed out [{route}]",
+                503,
+            ) from exc
         except httpx.HTTPError as exc:
             raise AgentError(
                 "CONFIG_NOT_FOUND",

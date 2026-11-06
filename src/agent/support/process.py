@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Callable
 from typing import Any
 
+from agent.asyncutil import read_deadline
 from agent.errors import AgentError
 from agent.runtime import RuntimeTrace, command_span_name
 
@@ -88,6 +89,14 @@ async def _collect_output(proc: asyncio.subprocess.Process) -> tuple[bytes, byte
     return stdout_b or b"", stderr_b or b""
 
 
+def _bounded_timeout(timeout: float) -> float:
+    """A panel read must not leave a child running after the handler should have answered."""
+    budget = read_deadline.get()
+    if budget is None or budget <= 0:
+        return timeout
+    return min(timeout, budget)
+
+
 async def run(
     args: list[str],
     *,
@@ -97,6 +106,7 @@ async def run(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess without blocking the event loop."""
+    timeout = _bounded_timeout(timeout)
     with RuntimeTrace.span(command_span_name(args)):
         proc: asyncio.subprocess.Process | None = None
         try:
@@ -156,6 +166,7 @@ async def run_exit(
     the agent reports ``TimeoutExpired`` after 30 seconds. Temp files are not
     pipes: ``wait()`` returns when ``awg-quick`` / ``wg-quick`` itself exits.
     """
+    timeout = _bounded_timeout(timeout)
     with RuntimeTrace.span(command_span_name(args)):
         stdout_file = tempfile.TemporaryFile()
         stderr_file = tempfile.TemporaryFile()

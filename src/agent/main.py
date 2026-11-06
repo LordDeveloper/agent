@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from agent import __version__
+from agent.asyncutil import READ_BUDGET_SECONDS, read_deadline, short_read_path
 from agent.audit import AuditLog
 from agent.auth import verify_auth
 from agent.config import load_settings
@@ -68,17 +69,23 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         # Access log is written only after the handler returns. A client CRUD
         # stuck in Xray otherwise leaves the panel timeout with an empty log.
         watch = asyncio.create_task(self._warn_if_slow(request, client))
+        deadline_token = None
+        if short_read_path(request.method, request.url.path):
+            deadline_token = read_deadline.set(READ_BUDGET_SECONDS)
+        handler = asyncio.ensure_future(self._call_until_disconnect(request, call_next))
         try:
-            response = await call_next(request)
+            with RuntimeTrace.span("handler"):
+                response = await handler
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
             if isinstance(exc, HTTPException):
                 raise
             log.exception(
-                "request failed method=%s path=%s client=%s duration_ms=%.1f runtime=%s",
+                "request failed method=%s path=%s client=%s request_id=%s duration_ms=%.1f runtime=%s",
                 request.method,
                 request.url.path,
                 client,
+                RuntimeTrace.request_id() or "-",
                 elapsed_ms,
                 RuntimeTrace.header() or "-",
             )
@@ -100,8 +107,48 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
             )
             return response
         finally:
+            if not handler.done():
+                handler.cancel()
             watch.cancel()
+            if deadline_token is not None:
+                read_deadline.reset(deadline_token)
             RuntimeTrace.reset()
+
+    @staticmethod
+    async def _call_until_disconnect(request: Request, call_next):
+        """Cancel the handler when the panel closes the socket.
+
+        The handler task is what awaits the core. Cancelling it aborts httpx
+        and child processes instead of leaving them until the core's own budget.
+        ``is_disconnected`` is only polled for GET/HEAD so a POST body is not
+        pulled off the receive stream before the endpoint reads it.
+        """
+        handler = asyncio.ensure_future(call_next(request))
+        if request.method not in {"GET", "HEAD"}:
+            return await handler
+        try:
+            while not handler.done():
+                probe = asyncio.ensure_future(request.is_disconnected())
+                done, _pending = await asyncio.wait(
+                    {handler, probe},
+                    timeout=0.5,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if handler in done:
+                    if not probe.done():
+                        probe.cancel()
+                    break
+                disconnected = probe.done() and not probe.cancelled() and bool(probe.result())
+                if not probe.done():
+                    probe.cancel()
+                if disconnected:
+                    handler.cancel()
+                    break
+            return await handler
+        except asyncio.CancelledError:
+            if not handler.done():
+                handler.cancel()
+            raise
 
     @staticmethod
     async def _warn_if_slow(request: Request, client: str) -> None:
@@ -110,10 +157,12 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         except asyncio.CancelledError:
             return
         log.warning(
-            "request still running method=%s path=%s client=%s",
+            "request still running method=%s path=%s client=%s request_id=%s runtime=%s",
             request.method,
             request.url.path,
             client,
+            RuntimeTrace.request_id() or "-",
+            RuntimeTrace.header() or "-",
         )
 
 

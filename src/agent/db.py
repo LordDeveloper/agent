@@ -2,19 +2,73 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
+from agent.runtime import RuntimeTrace
+
+# A few dozen peers already produce a document large enough to stall the loop
+# if it is parsed inline. Smaller rows stay on the loop to avoid thread hops.
+_JSON_OFFLOAD_BYTES = 64 * 1024
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _loads(raw: str) -> Any:
+    return json.loads(raw)
+
+
+def _json_is_large(value: Any) -> bool:
+    if isinstance(value, str):
+        return len(value) >= _JSON_OFFLOAD_BYTES
+    if isinstance(value, list):
+        return len(value) >= 32
+    if isinstance(value, dict):
+        for item in value.values():
+            if isinstance(item, str) and len(item) >= _JSON_OFFLOAD_BYTES:
+                return True
+            if isinstance(item, list) and len(item) >= 32:
+                return True
+            if isinstance(item, dict):
+                for nested in item.values():
+                    if isinstance(nested, list) and len(nested) >= 32:
+                        return True
+                    if isinstance(nested, str) and len(nested) >= _JSON_OFFLOAD_BYTES:
+                        return True
+    return False
+
+
+async def _encode_json(value: Any) -> str:
+    if _json_is_large(value):
+        return await asyncio.to_thread(_dumps, value)
+    return _dumps(value)
+
+
+async def _decode_json(raw: str) -> Any:
+    if len(raw) >= _JSON_OFFLOAD_BYTES:
+        return await asyncio.to_thread(_loads, raw)
+    return _loads(raw)
+
 
 class Store:
-    """Single SQLite database for agent state (inbounds, peers, audit, meta)."""
+    """SQLite state for the agent.
+
+    Writes use one connection and the write lock. Reads use a second connection
+    and do not take that lock, so a large document commit cannot stall health
+    and stats reads. WAL is enabled in ``open``.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = asyncio.Lock()
         self._conn: aiosqlite.Connection | None = None
+        self._read: aiosqlite.Connection | None = None
 
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -25,21 +79,48 @@ class Store:
         await self._conn.execute("PRAGMA busy_timeout=2000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._migrate()
+        self._read = await aiosqlite.connect(str(self.path), isolation_level=None)
+        self._read.row_factory = aiosqlite.Row
+        await self._read.execute("PRAGMA query_only=ON")
+        await self._read.execute("PRAGMA busy_timeout=2000")
+        await self._read.execute("PRAGMA foreign_keys=ON")
 
     async def close(self) -> None:
         async with self._lock:
             if self._conn is not None:
                 await self._conn.close()
                 self._conn = None
+        if self._read is not None:
+            await self._read.close()
+            self._read = None
 
-    def _connection(self) -> aiosqlite.Connection:
+    def _writer(self) -> aiosqlite.Connection:
         if self._conn is None:
             raise RuntimeError("Store is not open; await store.open() first")
         return self._conn
 
+    def _reader(self) -> aiosqlite.Connection:
+        if self._read is None:
+            raise RuntimeError("Store is not open; await store.open() first")
+        return self._read
+
+    @asynccontextmanager
+    async def _writing(self) -> AsyncIterator[aiosqlite.Connection]:
+        with RuntimeTrace.span("db.wait"):
+            await self._lock.acquire()
+        try:
+            with RuntimeTrace.span("db.query"):
+                yield self._writer()
+        finally:
+            self._lock.release()
+
+    async def _fetch(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        with RuntimeTrace.span("db.query"):
+            cursor = await self._reader().execute(sql, params)
+            return await cursor.fetchall()
+
     async def _migrate(self) -> None:
-        conn = self._connection()
-        async with self._lock:
+        async with self._writing() as conn:
             await conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -92,27 +173,25 @@ class Store:
             await conn.commit()
 
     async def list_docs(self, core: str, kind: str) -> list[dict[str, Any]]:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT data FROM documents WHERE core = ? AND kind = ? ORDER BY doc_id",
-                (core, kind),
-            )
-            rows = await cursor.fetchall()
-        return [json.loads(row["data"]) for row in rows]
+        rows = await self._fetch(
+            "SELECT data FROM documents WHERE core = ? AND kind = ? ORDER BY doc_id",
+            (core, kind),
+        )
+        return [await _decode_json(row["data"]) for row in rows]
 
     async def get_doc(self, core: str, kind: str, doc_id: str) -> dict[str, Any] | None:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT data FROM documents WHERE core = ? AND kind = ? AND doc_id = ?",
-                (core, kind, str(doc_id)),
-            )
-            row = await cursor.fetchone()
-        return json.loads(row["data"]) if row else None
+        rows = await self._fetch(
+            "SELECT data FROM documents WHERE core = ? AND kind = ? AND doc_id = ?",
+            (core, kind, str(doc_id)),
+        )
+        if not rows:
+            return None
+        return await _decode_json(rows[0]["data"])
 
     async def put_doc(self, core: str, kind: str, doc_id: str, data: dict[str, Any]) -> None:
-        payload = json.dumps(data, ensure_ascii=False)
-        async with self._lock:
-            await self._connection().execute(
+        payload = await _encode_json(data)
+        async with self._writing() as conn:
+            await conn.execute(
                 """
                 INSERT INTO documents (core, kind, doc_id, data, updated_at)
                 VALUES (?, ?, ?, ?, datetime('now'))
@@ -122,15 +201,15 @@ class Store:
                 """,
                 (core, kind, str(doc_id), payload),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def delete_doc(self, core: str, kind: str, doc_id: str) -> bool:
-        async with self._lock:
-            cursor = await self._connection().execute(
+        async with self._writing() as conn:
+            cursor = await conn.execute(
                 "DELETE FROM documents WHERE core = ? AND kind = ? AND doc_id = ?",
                 (core, kind, str(doc_id)),
             )
-            await self._connection().commit()
+            await conn.commit()
             return cursor.rowcount > 0
 
     async def write_docs(
@@ -140,10 +219,9 @@ class Store:
         puts: list[tuple[str, dict[str, Any]]],
         deletes: list[str] | None = None,
     ) -> None:
-        async with self._lock:
-            conn = self._connection()
-            for doc_id, data in puts:
-                payload = json.dumps(data, ensure_ascii=False)
+        encoded = [(str(doc_id), await _encode_json(data)) for doc_id, data in puts]
+        async with self._writing() as conn:
+            for doc_id, payload in encoded:
                 await conn.execute(
                     """
                     INSERT INTO documents (core, kind, doc_id, data, updated_at)
@@ -152,7 +230,7 @@ class Store:
                         data = excluded.data,
                         updated_at = datetime('now')
                     """,
-                    (core, kind, str(doc_id), payload),
+                    (core, kind, doc_id, payload),
                 )
             for doc_id in deletes or []:
                 if not str(doc_id).strip():
@@ -170,56 +248,52 @@ class Store:
         docs: list[dict[str, Any]],
         id_key: str = "id",
     ) -> None:
-        async with self._lock:
-            conn = self._connection()
+        encoded = [(str(doc.get(id_key, "")), await _encode_json(doc)) for doc in docs]
+        async with self._writing() as conn:
             await conn.execute(
                 "DELETE FROM documents WHERE core = ? AND kind = ?",
                 (core, kind),
             )
-            for doc in docs:
-                doc_id = str(doc.get(id_key, ""))
+            for doc_id, payload in encoded:
                 await conn.execute(
                     """
                     INSERT INTO documents (core, kind, doc_id, data, updated_at)
                     VALUES (?, ?, ?, ?, datetime('now'))
                     """,
-                    (core, kind, doc_id, json.dumps(doc, ensure_ascii=False)),
+                    (core, kind, doc_id, payload),
                 )
             await conn.commit()
 
     async def get_meta(self, core: str, key: str, default: Any = None) -> Any:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT value FROM meta WHERE core = ? AND key = ?",
-                (core, key),
-            )
-            row = await cursor.fetchone()
-        if row is None:
+        rows = await self._fetch(
+            "SELECT value FROM meta WHERE core = ? AND key = ?",
+            (core, key),
+        )
+        if not rows:
             return default
-        return json.loads(row["value"])
+        return await _decode_json(rows[0]["value"])
 
     async def set_meta(self, core: str, key: str, value: Any) -> None:
-        async with self._lock:
-            await self._connection().execute(
+        payload = await _encode_json(value)
+        async with self._writing() as conn:
+            await conn.execute(
                 """
                 INSERT INTO meta (core, key, value) VALUES (?, ?, ?)
                 ON CONFLICT(core, key) DO UPDATE SET value = excluded.value
                 """,
-                (core, key, json.dumps(value, ensure_ascii=False)),
+                (core, key, payload),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def dump_documents(self) -> list[dict[str, Any]]:
         """Every stored document. Traffic and audit tables are not included."""
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id"
-            )
-            rows = await cursor.fetchall()
+        rows = await self._fetch(
+            "SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id"
+        )
         dumped: list[dict[str, Any]] = []
         for row in rows:
             try:
-                data = json.loads(row["data"])
+                data = await _decode_json(row["data"])
             except (TypeError, json.JSONDecodeError):
                 continue
             if not isinstance(data, dict):
@@ -234,48 +308,44 @@ class Store:
 
     async def replace_all_documents(self, rows: list[dict[str, Any]]) -> int:
         """Replace the document table with a transferred snapshot."""
-        async with self._lock:
-            conn = self._connection()
+        prepared: list[tuple[str, str, str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            core = str(row.get("core") or "").strip()
+            kind = str(row.get("kind") or "").strip()
+            doc_id = str(row.get("doc_id") or "").strip()
+            data = row.get("data")
+            if (
+                not core
+                or not kind
+                or not doc_id
+                or not isinstance(data, dict)
+                or len(core) > 64
+                or len(kind) > 64
+                or len(doc_id) > 512
+            ):
+                continue
+            prepared.append((core, kind, doc_id, await _encode_json(data)))
+        async with self._writing() as conn:
             await conn.execute("DELETE FROM documents")
-            count = 0
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                core = str(row.get("core") or "").strip()
-                kind = str(row.get("kind") or "").strip()
-                doc_id = str(row.get("doc_id") or "").strip()
-                data = row.get("data")
-                if (
-                    not core
-                    or not kind
-                    or not doc_id
-                    or not isinstance(data, dict)
-                    or len(core) > 64
-                    or len(kind) > 64
-                    or len(doc_id) > 512
-                ):
-                    continue
+            for core, kind, doc_id, payload in prepared:
                 await conn.execute(
                     """
                     INSERT INTO documents (core, kind, doc_id, data, updated_at)
                     VALUES (?, ?, ?, ?, datetime('now'))
                     """,
-                    (core, kind, doc_id, json.dumps(data, ensure_ascii=False)),
+                    (core, kind, doc_id, payload),
                 )
-                count += 1
             await conn.commit()
-            return count
+            return len(prepared)
 
     async def dump_meta(self) -> list[dict[str, Any]]:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT core, key, value FROM meta ORDER BY core, key"
-            )
-            rows = await cursor.fetchall()
+        rows = await self._fetch("SELECT core, key, value FROM meta ORDER BY core, key")
         dumped: list[dict[str, Any]] = []
         for row in rows:
             try:
-                value = json.loads(row["value"])
+                value = await _decode_json(row["value"])
             except (TypeError, json.JSONDecodeError):
                 continue
             dumped.append({
@@ -286,37 +356,36 @@ class Store:
         return dumped
 
     async def replace_all_meta(self, rows: list[dict[str, Any]]) -> int:
-        async with self._lock:
-            conn = self._connection()
+        prepared: list[tuple[str, str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            core = str(row.get("core") or "").strip()
+            key = str(row.get("key") or "").strip()
+            if not core or not key or len(core) > 64 or len(key) > 128 or "value" not in row:
+                continue
+            prepared.append((core, key, await _encode_json(row.get("value"))))
+        async with self._writing() as conn:
             await conn.execute("DELETE FROM meta")
-            count = 0
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                core = str(row.get("core") or "").strip()
-                key = str(row.get("key") or "").strip()
-                if not core or not key or len(core) > 64 or len(key) > 128 or "value" not in row:
-                    continue
+            for core, key, payload in prepared:
                 await conn.execute(
                     "INSERT INTO meta (core, key, value) VALUES (?, ?, ?)",
-                    (core, key, json.dumps(row.get("value"), ensure_ascii=False)),
+                    (core, key, payload),
                 )
-                count += 1
             await conn.commit()
-            return count
+            return len(prepared)
 
     async def get_traffic_ack(self, core: str, client_key: str) -> dict[str, int] | None:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                """
-                SELECT incoming, outgoing FROM traffic_ack
-                WHERE core = ? AND client_key = ?
-                """,
-                (core, client_key),
-            )
-            row = await cursor.fetchone()
-        if row is None:
+        rows = await self._fetch(
+            """
+            SELECT incoming, outgoing FROM traffic_ack
+            WHERE core = ? AND client_key = ?
+            """,
+            (core, client_key),
+        )
+        if not rows:
             return None
+        row = rows[0]
         return {"incoming": int(row["incoming"]), "outgoing": int(row["outgoing"])}
 
     async def set_traffic_ack(
@@ -326,8 +395,8 @@ class Store:
         incoming: int,
         outgoing: int,
     ) -> None:
-        async with self._lock:
-            await self._connection().execute(
+        async with self._writing() as conn:
+            await conn.execute(
                 """
                 INSERT INTO traffic_ack (core, client_key, incoming, outgoing, updated_at)
                 VALUES (?, ?, ?, ?, datetime('now'))
@@ -338,15 +407,15 @@ class Store:
                 """,
                 (core, client_key, incoming, outgoing),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def delete_traffic_ack(self, core: str, client_key: str) -> None:
-        async with self._lock:
-            await self._connection().execute(
+        async with self._writing() as conn:
+            await conn.execute(
                 "DELETE FROM traffic_ack WHERE core = ? AND client_key = ?",
                 (core, client_key),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def upsert_traffic_pending(
         self,
@@ -357,8 +426,8 @@ class Store:
         current_incoming: int,
         current_outgoing: int,
     ) -> None:
-        async with self._lock:
-            await self._connection().execute(
+        async with self._writing() as conn:
+            await conn.execute(
                 """
                 INSERT INTO traffic_pending (
                     core, client_key,
@@ -382,54 +451,45 @@ class Store:
                     current_outgoing,
                 ),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def delete_traffic_pending(self, core: str, client_key: str) -> None:
-        async with self._lock:
-            await self._connection().execute(
+        async with self._writing() as conn:
+            await conn.execute(
                 "DELETE FROM traffic_pending WHERE core = ? AND client_key = ?",
                 (core, client_key),
             )
-            await self._connection().commit()
+            await conn.commit()
 
     async def get_traffic_pending(self, core: str, client_key: str) -> dict[str, Any] | None:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                """
-                SELECT core, client_key, delta_incoming, delta_outgoing,
-                       current_incoming, current_outgoing, updated_at
-                FROM traffic_pending
-                WHERE core = ? AND client_key = ?
-                """,
-                (core, client_key),
-            )
-            row = await cursor.fetchone()
-        return dict(row) if row is not None else None
+        rows = await self._fetch(
+            """
+            SELECT core, client_key, delta_incoming, delta_outgoing,
+                   current_incoming, current_outgoing, updated_at
+            FROM traffic_pending
+            WHERE core = ? AND client_key = ?
+            """,
+            (core, client_key),
+        )
+        return dict(rows[0]) if rows else None
 
     async def list_traffic_pending(self) -> list[dict[str, Any]]:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                """
-                SELECT core, client_key, delta_incoming, delta_outgoing,
-                       current_incoming, current_outgoing, updated_at
-                FROM traffic_pending
-                ORDER BY core, client_key
-                """,
-            )
-            rows = await cursor.fetchall()
+        rows = await self._fetch(
+            """
+            SELECT core, client_key, delta_incoming, delta_outgoing,
+                   current_incoming, current_outgoing, updated_at
+            FROM traffic_pending
+            ORDER BY core, client_key
+            """
+        )
         return [dict(row) for row in rows]
 
     async def count_traffic_pending(self) -> int:
-        async with self._lock:
-            cursor = await self._connection().execute(
-                "SELECT COUNT(*) AS c FROM traffic_pending",
-            )
-            row = await cursor.fetchone()
-        return int(row["c"]) if row else 0
+        rows = await self._fetch("SELECT COUNT(*) AS c FROM traffic_pending")
+        return int(rows[0]["c"]) if rows else 0
 
     async def apply_traffic_sample(self, plan) -> dict[str, int]:
-        async with self._lock:
-            conn = self._connection()
+        async with self._writing() as conn:
             acks: dict[tuple[str, str], tuple[int, int]] = {}
             cursor = await conn.execute(
                 "SELECT core, client_key, incoming, outgoing FROM traffic_ack",
@@ -529,8 +589,7 @@ class Store:
     async def ack_traffic_rows(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        async with self._lock:
-            conn = self._connection()
+        async with self._writing() as conn:
             seen: set[tuple[str, str]] = set()
             for row in rows:
                 key = (str(row["core"]), str(row["client_key"]))
@@ -562,9 +621,9 @@ class Store:
     async def audit(self, action: str, resource: str, detail: str = "") -> None:
         from datetime import datetime, timezone
 
-        async with self._lock:
-            await self._connection().execute(
+        async with self._writing() as conn:
+            await conn.execute(
                 "INSERT INTO audit_log (ts, action, resource, detail) VALUES (?, ?, ?, ?)",
                 (datetime.now(timezone.utc).isoformat(), action, resource, detail),
             )
-            await self._connection().commit()
+            await conn.commit()

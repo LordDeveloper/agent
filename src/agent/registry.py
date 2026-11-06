@@ -1,6 +1,8 @@
+import asyncio
+import time
 from typing import Any
 
-from agent.asyncutil import gather_independent, maybe_await
+from agent.asyncutil import gather_independent, is_upstream_failure, maybe_await
 from agent.audit import AuditLog
 from agent.config import AgentSettings
 from agent.db import Store
@@ -22,6 +24,9 @@ class CoreRegistry:
         self.audit = audit
         self.store = store
         self._drivers: dict[str, CoreDriver] = {}
+        self._read_cache: dict[str, tuple[float, Any]] = {}
+        self._read_flights: dict[str, asyncio.Task] = {}
+        self._read_ttl = 3.0
         factories: dict[str, type[CoreDriver]] = {
             "xray": XrayDriver,
             "wireguard": WireGuardDriver,
@@ -81,15 +86,27 @@ class CoreRegistry:
         return sorted(set(users))
 
     async def online_users_by_core(self) -> dict[str, list[str]]:
+        users, _unavailable = await self.online_users_report()
+        return users
+
+    async def online_users_report(self) -> tuple[dict[str, list[str]], list[str]]:
+        return await self._cached_read("online_users", self._online_users_report)
+
+    async def _online_users_report(self) -> tuple[dict[str, list[str]], list[str]]:
         enabled = set(self.settings.cores())
         keys = list(self._drivers)
         results = await gather_independent(
-            *(self._online_users_for(key, self._drivers[key], enabled) for key in keys)
+            *(self._online_users_for(key, self._drivers[key], enabled) for key in keys),
+            return_exceptions=True,
         )
-        return {
-            key: rows if isinstance(rows, list) else []
-            for key, rows in zip(keys, results)
-        }
+        users: dict[str, list[str]] = {}
+        unavailable: list[str] = []
+        for key, rows in zip(keys, results):
+            if isinstance(rows, Exception):
+                unavailable.append(key)
+                continue
+            users[key] = rows if isinstance(rows, list) else []
+        return users, unavailable
 
     async def _online_users_for(
         self,
@@ -101,7 +118,9 @@ class CoreRegistry:
             return []
         try:
             return list(await maybe_await(driver.online_users()))
-        except AgentError:
+        except AgentError as exc:
+            if is_upstream_failure(exc):
+                raise
             return []
 
     async def online_ips(self, core: str | None = None) -> dict[str, Any]:
@@ -110,15 +129,21 @@ class CoreRegistry:
         return await self.online_ips_by_core()
 
     async def online_ips_by_core(self) -> dict[str, Any]:
+        users, _unavailable = await self.online_ips_report()
+        return users
+
+    async def online_ips_report(self) -> tuple[dict[str, Any], list[str]]:
+        """IP map plus cores that timed out. A timeout is not an empty map."""
+        return await self._cached_read("online_ips", self._online_ips_report)
+
+    async def _online_ips_report(self) -> tuple[dict[str, Any], list[str]]:
         enabled = set(self.settings.cores())
         keys = list(self._drivers)
         results = await gather_independent(
-            *(self._online_ips_for(key, self._drivers[key], enabled) for key in keys)
+            *(self._online_ips_for(key, self._drivers[key], enabled) for key in keys),
+            return_exceptions=True,
         )
-        return {
-            key: rows if isinstance(rows, dict) else {}
-            for key, rows in zip(keys, results)
-        }
+        return self._split_core_results(keys, results)
 
     async def _online_ips_for(
         self,
@@ -130,7 +155,9 @@ class CoreRegistry:
             return {}
         try:
             ips = await maybe_await(driver.online_ips_map())
-        except AgentError:
+        except AgentError as exc:
+            if is_upstream_failure(exc):
+                raise
             return {}
         return ips if isinstance(ips, dict) else {}
 
@@ -170,7 +197,9 @@ class CoreRegistry:
             return {}
         try:
             return await self._online_traffic_for(driver)
-        except AgentError:
+        except AgentError as exc:
+            if is_upstream_failure(exc):
+                raise
             return {}
 
     async def _online_traffic_for(self, driver: CoreDriver) -> dict[str, dict[str, int]]:
@@ -183,12 +212,33 @@ class CoreRegistry:
         return await online_traffic_from_snapshot(driver)
 
     async def live_stats(self) -> dict[str, Any]:
+        payload, _unavailable = await self.live_stats_report()
+        return payload
+
+    async def live_stats_report(self) -> tuple[dict[str, Any], list[str]]:
+        """Live payload plus cores that did not answer. Failures are not cached."""
+        return await self._cached_read("live_stats", self._live_stats_report)
+
+    async def _live_stats_report(self) -> tuple[dict[str, Any], list[str]]:
         """One walk per enabled core: snapshot + online users + ips + traffic."""
         enabled = set(self.settings.cores())
         keys = list(self._drivers)
         parts = await gather_independent(
-            *(self._live_core(key, self._drivers[key], enabled) for key in keys)
+            *(self._live_core(key, self._drivers[key], enabled) for key in keys),
+            return_exceptions=True,
         )
+        unavailable: list[str] = []
+        ok_keys: list[str] = []
+        payloads: list[Any] = []
+        for key, part in zip(keys, parts):
+            if isinstance(part, Exception):
+                unavailable.append(key)
+                continue
+            ok_keys.append(key)
+            payloads.append(part if isinstance(part, dict) else self._empty_live_core())
+        return self._assemble_live(ok_keys, payloads), unavailable
+
+    def _assemble_live(self, keys: list[str], parts: list[Any]) -> dict[str, Any]:
         cores: dict[str, Any] = {}
         flat_online_users: list[str] = []
         flat_online_traffic: dict[str, dict[str, int]] = {}
@@ -225,7 +275,13 @@ class CoreRegistry:
             return_exceptions=True,
         )
         if isinstance(snapshot_r, Exception):
+            if is_upstream_failure(snapshot_r):
+                raise snapshot_r
             return self._empty_live_core()
+        if isinstance(online_r, Exception) and is_upstream_failure(online_r):
+            raise online_r
+        if isinstance(ips_r, Exception) and is_upstream_failure(ips_r):
+            raise ips_r
 
         online = list(online_r) if not isinstance(online_r, Exception) else []
         ips = ips_r if isinstance(ips_r, dict) else {}
@@ -245,6 +301,40 @@ class CoreRegistry:
             "traffic": {},
             "snapshot": {"inbounds": []},
         }
+
+    async def _cached_read(self, key: str, factory):
+        now = time.monotonic()
+        cached = self._read_cache.get(key)
+        if cached is not None and now - cached[0] < self._read_ttl:
+            return cached[1]
+        flight = self._read_flights.get(key)
+        if flight is None or flight.done():
+            flight = asyncio.create_task(factory())
+            self._read_flights[key] = flight
+        try:
+            result = await flight
+        finally:
+            current = self._read_flights.get(key)
+            if current is flight and flight.done():
+                self._read_flights.pop(key, None)
+        unavailable = result[1] if isinstance(result, tuple) and len(result) > 1 else ["failed"]
+        if not unavailable:
+            self._read_cache[key] = (time.monotonic(), result)
+        return result
+
+    def _split_core_results(
+        self,
+        keys: list[str],
+        results: list[Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        out: dict[str, Any] = {}
+        unavailable: list[str] = []
+        for key, rows in zip(keys, results):
+            if isinstance(rows, Exception):
+                unavailable.append(key)
+                continue
+            out[key] = rows if isinstance(rows, dict) else {}
+        return out, unavailable
 
     async def _info(self, driver: CoreDriver) -> CoreInfo:
         try:

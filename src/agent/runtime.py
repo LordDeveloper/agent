@@ -48,6 +48,9 @@ def open_runtime(env_file: str | None = None) -> Runtime:
 
 _started: ContextVar[float | None] = ContextVar("runtime_started", default=None)
 _spans: ContextVar[list[tuple[str, float]] | None] = ContextVar("runtime_spans", default=None)
+# Mutable box copied into child tasks with the context, so a waiter sees the
+# span the handler is inside right now. A ContextVar set later is not shared.
+_cursor: ContextVar[dict[str, str] | None] = ContextVar("runtime_cursor", default=None)
 _action: ContextVar[str] = ContextVar("runtime_action", default="")
 _request_id: ContextVar[str] = ContextVar("runtime_request_id", default="")
 _node_id: ContextVar[str] = ContextVar("runtime_node_id", default="")
@@ -63,6 +66,7 @@ class RuntimeTrace:
     def start(cls, action: str = "") -> None:
         _started.set(time.perf_counter())
         _spans.set([])
+        _cursor.set({"current": ""})
         _action.set(cls.safe_name(action) if action else "")
         _request_id.set("")
         _node_id.set("")
@@ -71,6 +75,7 @@ class RuntimeTrace:
     def reset(cls) -> None:
         _started.set(None)
         _spans.set(None)
+        _cursor.set(None)
         _action.set("")
         _request_id.set("")
         _node_id.set("")
@@ -108,14 +113,19 @@ class RuntimeTrace:
     @classmethod
     @contextmanager
     def span(cls, name: str) -> Iterator[None]:
-        if _spans.get() is None:
+        cursor = _cursor.get()
+        if _spans.get() is None or cursor is None:
             yield
             return
+        token = cls.safe_name(name)
+        previous = cursor.get("current", "")
+        cursor["current"] = token
         started = time.perf_counter()
         try:
             yield
         finally:
-            cls.add(name, (time.perf_counter() - started) * 1000)
+            cursor["current"] = previous
+            cls.add(token, (time.perf_counter() - started) * 1000)
 
     @classmethod
     def header(cls) -> str:
@@ -129,6 +139,9 @@ class RuntimeTrace:
         if action:
             parts.append(f"action={action}")
         parts.append(f"total={total_ms:.1f}ms")
+        current = str((_cursor.get() or {}).get("current") or "")
+        if current:
+            parts.append(f"current={current}")
 
         for name, ms, count in cls._aggregated():
             item = f"{name}={ms:.1f}ms"

@@ -19,6 +19,20 @@ def get_traffic(request: Request) -> TrafficService:
     return request.app.state.traffic
 
 
+def _read_body(payload: dict[str, Any], unavailable: list[str], *, key: str) -> dict[str, Any]:
+    """Attach cores that did not answer. Never describe that as an empty collection."""
+    if unavailable and not payload.get(key):
+        raise_agent_error(
+            "UPSTREAM_TIMEOUT",
+            "cores unavailable: " + ", ".join(unavailable),
+            503,
+        )
+    body = {"success": True, **payload}
+    if unavailable:
+        body["unavailable_cores"] = unavailable
+    return body
+
+
 @router.get("/stats/online")
 async def stats_online(
     core: str | None = Query(None),
@@ -30,12 +44,12 @@ async def stats_online(
     ignored for response shape so panels never fan out per-core HTTP calls.
     """
     try:
-        users = await registry.online_users_by_core()
+        users, unavailable = await registry.online_users_report()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     # Keep query param for older clients; do not change the global payload shape.
     _ = resolve_core_key(core)
-    return {"success": True, "users": users}
+    return _read_body({"users": users}, unavailable, key="users")
 
 
 @router.get("/stats/online/ips")
@@ -45,11 +59,11 @@ async def stats_online_ips(
 ):
     """Live client IPs for every enabled core: ``{"xray": {...}, "wireguard": {...}}``."""
     try:
-        users = await registry.online_ips_by_core()
+        users, unavailable = await registry.online_ips_report()
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     _ = resolve_core_key(core)
-    return {"success": True, "users": users}
+    return _read_body({"users": users}, unavailable, key="users")
 
 
 @router.get("/stats/online/traffic")
@@ -112,7 +126,19 @@ async def stats_snapshot(
 
 
 async def _live_payload(registry: CoreRegistry) -> dict[str, Any]:
-    return {"success": True, **(await registry.live_stats())}
+    payload, unavailable = await registry.live_stats_report()
+    if unavailable and not payload.get("ips") and not payload.get("online_users") and not (
+        (payload.get("snapshot") or {}).get("inbounds")
+    ):
+        raise_agent_error(
+            "UPSTREAM_TIMEOUT",
+            "cores unavailable: " + ", ".join(unavailable),
+            503,
+        )
+    body = {"success": True, **payload}
+    if unavailable:
+        body["unavailable_cores"] = unavailable
+    return body
 
 
 @router.get("/stats/live")

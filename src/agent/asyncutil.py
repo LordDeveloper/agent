@@ -3,9 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 T = TypeVar("T")
+
+# Panel read timeouts are 8s and up. A core read that is still open at 4s
+# would otherwise stay on the core until its own 45s budget, after the panel
+# has already closed the socket and received zero bytes.
+READ_BUDGET_SECONDS = 4.0
+read_deadline: ContextVar[float | None] = ContextVar("agent_read_deadline", default=None)
 
 
 async def maybe_await(value: T | Awaitable[T]) -> T:
@@ -46,6 +53,31 @@ async def gather_independent(
     if not coros:
         return []
     return await asyncio.gather(*coros, return_exceptions=return_exceptions)
+
+
+def is_upstream_failure(exc: BaseException) -> bool:
+    """A core that did not answer. This is not an empty stats or user list."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    status = getattr(exc, "status", None)
+    code = getattr(exc, "code", None)
+    if code == "UPSTREAM_TIMEOUT":
+        return True
+    if isinstance(status, int) and status >= 500:
+        return True
+    return type(exc).__name__ in {"TimeoutExpired", "ConnectTimeout", "ReadTimeout"}
+
+
+def short_read_path(method: str, path: str) -> bool:
+    """Routes whose result the panel can replace on the next poll."""
+    if method.upper() not in {"GET", "HEAD"}:
+        return False
+    normalized = path.split("?", 1)[0].rstrip("/") or "/"
+    if normalized == "/health" or normalized.endswith("/health"):
+        return True
+    if normalized.startswith("/api/v1/stats") or normalized.startswith("/cores/"):
+        return True
+    return "/diagnose" in normalized
 
 
 async def bounded_gather(
