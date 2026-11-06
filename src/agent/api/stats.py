@@ -178,7 +178,7 @@ async def stats_clients_traffic_pending(
     interval_ms = int(float(getattr(request.app.state.settings, "traffic_sample_interval", 30.0) or 30.0) * 1000)
     fresh_ms = max(3000, interval_ms // 2)
     with RuntimeTrace.span("stats.pending.ensure_sample"):
-        await traffic.ensure_sample_fresh(registry, max_sample_age_ms=fresh_ms)
+        scheduled = await traffic.ensure_sample_fresh(registry, max_sample_age_ms=fresh_ms)
     payload = await traffic.pending_payload()
 
     return {
@@ -186,6 +186,7 @@ async def stats_clients_traffic_pending(
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
+        "sample_refresh_scheduled": scheduled,
     }
 
 

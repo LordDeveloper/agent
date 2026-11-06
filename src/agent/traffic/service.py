@@ -34,6 +34,30 @@ class TrafficService:
         self._sample_lock = asyncio.Lock()
         self._sample_flight: asyncio.Task | None = None
 
+    def _schedule_sample_all(self, registry: CoreRegistry) -> None:
+        """Start a background ``sample_all`` if none is running (does not await)."""
+
+        async def _run() -> None:
+            try:
+                await self.sample_all(registry)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("traffic background sample failed")
+            finally:
+                async with self._sample_lock:
+                    if self._sample_flight is not None and self._sample_flight.done():
+                        self._sample_flight = None
+
+        async def _guard() -> None:
+            async with self._sample_lock:
+                if self._sample_flight is not None and not self._sample_flight.done():
+                    return
+                self._sample_flight = asyncio.create_task(_run())
+
+        loop = asyncio.get_running_loop()
+        loop.create_task(_guard())
+
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from core counters (online not required)."""
         from agent.asyncutil import gather_independent, maybe_await
@@ -102,34 +126,24 @@ class TrafficService:
         registry: CoreRegistry,
         *,
         max_sample_age_ms: int,
-    ) -> None:
-        """Run at most one concurrent full sample when the worker snapshot is stale.
+    ) -> bool:
+        """If the last snapshot is stale, schedule a background ``sample_all``.
 
-        GET /stats/clients/traffic/pending used to call sample_all inline, doubling work
-        with the background traffic worker and piling onto SQLite under concurrent polls.
+        Returns True when a refresh was scheduled. **Never awaits** the sample: the panel
+        uses a ~20s HTTP timeout; ``sample_all`` can block longer when cores are slow, which
+        caused cURL error 28 with 0 bytes. The GET always returns promptly with whatever is
+        in the pending queue; the traffic worker or the next poll sees fresher data.
         """
         if max_sample_age_ms <= 0:
-            await self.sample_all(registry)
-            return
+            self._schedule_sample_all(registry)
+            return True
 
         age = await self.last_sample_age_ms()
         if age is not None and age <= max_sample_age_ms:
-            return
+            return False
 
-        async with self._sample_lock:
-            age_again = await self.last_sample_age_ms()
-            if age_again is not None and age_again <= max_sample_age_ms:
-                return
-            flight = self._sample_flight
-            if flight is None or flight.done():
-                self._sample_flight = asyncio.create_task(self.sample_all(registry))
-                flight = self._sample_flight
-            try:
-                await flight
-            finally:
-                current = self._sample_flight
-                if current is flight and flight.done():
-                    self._sample_flight = None
+        self._schedule_sample_all(registry)
+        return True
 
     async def _commit_samples(self, samples: list[dict[str, Any]], sampled_at: str) -> dict[str, int]:
         def plan(acks: dict, pending: dict) -> dict[str, Any]:

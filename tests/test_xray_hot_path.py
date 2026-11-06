@@ -1,4 +1,6 @@
+import asyncio
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -210,9 +212,9 @@ def test_pending_get_skips_resample_when_fresh(client: TestClient, monkeypatch):
     samples = {"n": 0}
     real = traffic.sample_all
 
-    def counted(registry):
+    async def counted(registry):
         samples["n"] += 1
-        return real(registry)
+        return await real(registry)
 
     monkeypatch.setattr(traffic, "sample_all", counted)
     first = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
@@ -220,3 +222,33 @@ def test_pending_get_skips_resample_when_fresh(client: TestClient, monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 200
     assert samples["n"] == 0
+
+
+def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, monkeypatch):
+    """GET must not await sample_all: panel 20s timeout caused cURL 28 with 0 bytes."""
+    headers = {"Authorization": "Bearer dev-token"}
+    traffic = client.app.state.traffic
+
+    async def stale_age() -> int:
+        return 999_999
+
+    async def slow_sample(registry):
+        await asyncio.sleep(2)
+        return {
+            "clients_seen": 0,
+            "pending": 0,
+            "initialized": 0,
+            "regressed": 0,
+        }
+
+    monkeypatch.setattr(traffic, "last_sample_age_ms", stale_age)
+    monkeypatch.setattr(traffic, "sample_all", slow_sample)
+
+    started = time.perf_counter()
+    response = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
+    elapsed = time.perf_counter() - started
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("sample_refresh_scheduled") is True
+    assert elapsed < 1.0
