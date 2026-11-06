@@ -184,12 +184,37 @@ def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
 
     failed = render({
         'configured': True,
-        'download_mbps': 5,
-        'upload_mbps': 5,
+        'download_mbps': 1,
+        'upload_mbps': 1,
         'status': 'error',
+        'interface': 'wg9a440050',
         'verified': False,
-        'last_error': 'Expected HTB class not found',
+        'objects': {
+            'download_class': True,
+            'download_filter': False,
+            'upload_class': True,
+            'upload_filter': False,
+            'ingress_redirect': False,
+        },
+        'details': {
+            'download_filter': {
+                'interface': 'wg9a440050',
+                'parent': '1:',
+                'protocol': 'ip',
+                'priority': 10,
+                'classid': '1:1419',
+                'match': 'ip dst 10.90.68.108/32',
+                'observed': 'no u32 filter with that destination and flowid',
+            },
+        },
+        'last_error': 'filter for 10.90.68.108 missing on wg9a440050 parent 1:',
     })
     assert 'Status:        ERROR' in failed
+    assert 'Download filter: no' in failed
     assert 'Kernel verified: no' in failed
-    assert 'Expected HTB class not found' in failed
+    assert 'parent 1:' in failed
+    assert 'protocol ip' in failed
+    assert 'prio 10' in failed
+    assert 'classid 1:1419' in failed
+    assert 'ip dst 10.90.68.108/32' in failed
+    assert 'no u32 filter' in failed

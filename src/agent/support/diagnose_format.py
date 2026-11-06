@@ -383,6 +383,7 @@ def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
     if row.get('upload_class'):
         lines.append(f'  Upload class:   {row.get("upload_class")}')
     objects = row.get('objects') if isinstance(row.get('objects'), dict) else {}
+    details = row.get('details') if isinstance(row.get('details'), dict) else {}
     for key, label in (
         ('download_class', 'Download class exists'),
         ('download_filter', 'Download filter'),
@@ -392,6 +393,17 @@ def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
     ):
         if isinstance(objects.get(key), bool):
             lines.append(f'  {label}: {_yes_no(objects.get(key))}')
+        info = details.get(key)
+        if objects.get(key) is False and isinstance(info, dict):
+            lines.append(
+                f'    expected: dev {info.get("interface") or "-"} '
+                f'parent {info.get("parent") or "-"} '
+                f'protocol {info.get("protocol") or "-"} '
+                f'prio {info.get("priority") if info.get("priority") is not None else "-"} '
+                f'classid {info.get("classid") or "-"} '
+                f'match {info.get("match") or "-"}'
+            )
+            lines.append(f'    observed: {info.get("observed") or "missing"}')
     lines.append(f'  Kernel verified: {_yes_no(row.get("verified"))}')
     if row.get('last_reconcile_at'):
         lines.append(f'  Last reconcile: {_format_epoch(row.get("last_reconcile_at"))}')

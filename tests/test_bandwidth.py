@@ -12,9 +12,10 @@ from agent.support.bandwidth import (
     collect_openvpn_plans,
     collect_tunnel_plans,
     diagnose_bandwidth,
-    filter_handle,
     filter_show_has,
     ifb_commands,
+    repair_ifb_commands,
+    repair_tunnel_commands,
     mbps_to_kbit,
     normalize_bandwidth,
     ppp_commands,
@@ -23,9 +24,6 @@ from agent.support.bandwidth import (
     tunnel_commands,
     with_provisioning,
 )
-from agent.support.bandwidth import _handle_token
-
-
 def test_mbps_uses_decimal_kilobits():
     assert mbps_to_kbit(1) == 1000
     assert mbps_to_kbit(5) == 5000
@@ -173,7 +171,7 @@ def _limited_peer(peer_id: str = "sub-1") -> dict:
     }
 
 
-def test_filters_use_hex_u32_handles_tc_can_install():
+def test_filters_are_installed_without_an_explicit_u32_handle():
     plans = collect_tunnel_plans([{
         "name": "wg9a440050",
         "peers": [{
@@ -184,19 +182,118 @@ def test_filters_use_hex_u32_handles_tc_can_install():
         }],
     }])
     limit = plans[0].limits[0]
-    slot = filter_handle(limit.minor, 0)
-    token = _handle_token(slot)
-    assert int(token.split("::", 1)[1], 16) == slot
-    assert slot <= 0xFFF
     commands = "\n".join(tunnel_commands("wg9a440050", plans[0].limits))
-    assert f"handle {token}" in commands
-    assert "filter add " in commands
-    assert "match ip dst 10.90.68.108/32" in commands
-    assert f"flowid 1:{limit.minor}" in commands
-    assert "match ip src 10.90.68.108/32" in commands
-    assert IFB_UP in commands
-    # A decimal handle such as 800::3654 is parsed as hex 0x3654 and rejected.
-    assert "::3654" not in commands
+    assert "qdisc replace dev wg9a440050 root handle 1: htb" in commands
+    assert "qdisc replace dev wg9a440050 clsact" in commands
+    assert (
+        "filter add dev wg9a440050 parent 1: protocol ip prio 10 "
+        f"u32 match ip dst 10.90.68.108/32 flowid 1:{limit.minor}"
+    ) in commands
+    assert (
+        "filter add dev wg9a440050 ingress protocol ip prio 10 "
+        "u32 match ip src 10.90.68.108/32 "
+        f"action mirred egress redirect dev {IFB_UP}"
+    ) in commands
+    # An explicit 800:: node is rejected unless that hash table already exists.
+    assert "handle 800::" not in commands
+    assert "filter del " not in commands
+
+
+_HTB = "qdisc htb 1: root refcnt 2 r2q 10 default 0x270f"
+_CLSACT = "qdisc clsact ffff: parent ffff:fff1"
+
+
+def test_repair_adds_missing_filters_without_replacing_qdiscs():
+    plans = collect_tunnel_plans([{
+        "name": "wg9a440050",
+        "peers": [{
+            "id": "sub-1",
+            "is_enabled": True,
+            "address": "10.90.68.108",
+            "bandwidth": {"download_mbps": 1, "upload_mbps": 1},
+        }],
+    }])
+    limit = plans[0].limits[0]
+    qdisc = "\n".join([_HTB, _CLSACT])
+    commands = "\n".join(repair_tunnel_commands(
+        "wg9a440050",
+        plans[0].limits,
+        qdisc_text=qdisc,
+        filter_text="",
+        previous={"classes": [limit.minor]},
+    ))
+    assert "qdisc replace" not in commands
+    assert "qdisc add" not in commands
+    assert f"class replace dev wg9a440050 parent 1:1 classid 1:{limit.minor} " in commands
+    assert f"match ip dst 10.90.68.108/32 flowid 1:{limit.minor}" in commands
+    assert f"match ip src 10.90.68.108/32 action mirred egress redirect dev {IFB_UP}" in commands
+    assert "handle 800::" not in commands
+
+    ifb = "\n".join(repair_ifb_commands(
+        IFB_UP,
+        plans[0].limits,
+        direction="upload",
+        qdisc_text=_HTB,
+        filter_text="",
+    ))
+    assert "qdisc replace" not in ifb
+    assert f"match ip src 10.90.68.108/32 flowid 1:{limit.minor}" in ifb
+
+
+def test_repair_keeps_another_clients_filter_and_drops_only_the_removed_one():
+    plans = collect_tunnel_plans([{
+        "name": "wg9a440050",
+        "peers": [
+            {
+                "id": "keep",
+                "is_enabled": True,
+                "address": "10.90.68.108",
+                "bandwidth": {"download_mbps": 1, "upload_mbps": 1},
+            },
+            {
+                "id": "other",
+                "is_enabled": True,
+                "address": "10.90.68.109",
+                "bandwidth": {"download_mbps": 5, "upload_mbps": 5},
+            },
+        ],
+    }])
+    kept, other = plans[0].limits
+    show = f"""
+filter parent 1: protocol ip pref 10 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:{kept.minor}
+  match 0a5a446c/ffffffff at 16
+filter parent 1: protocol ip pref 10 u32 chain 0 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:{other.minor}
+  match 0a5a446d/ffffffff at 16
+filter parent ffff: protocol ip pref 10 u32 chain 0 fh 800::802 order 2050 key ht 800 bkt 0
+  match 0a5a446c/ffffffff at 12
+  action order 1: mirred (Egress Redirect to device ifb-nj-up)
+filter parent ffff: protocol ip pref 10 u32 chain 0 fh 800::803 order 2051 key ht 800 bkt 0
+  match 0a5a446d/ffffffff at 12
+  action order 1: mirred (Egress Redirect to device ifb-nj-up)
+"""
+    both = "\n".join(repair_tunnel_commands(
+        "wg9a440050",
+        plans[0].limits,
+        qdisc_text="\n".join([_HTB, _CLSACT]),
+        filter_text=show,
+    ))
+    assert "filter add " not in both
+    assert "filter del " not in both
+    assert "qdisc replace" not in both
+
+    only_kept = "\n".join(repair_tunnel_commands(
+        "wg9a440050",
+        [kept],
+        qdisc_text="\n".join([_HTB, _CLSACT]),
+        filter_text=show,
+        previous={"classes": [kept.minor, other.minor]},
+    ))
+    assert "fh 800::800" not in only_kept
+    assert "handle 800::801" in only_kept
+    assert "handle 800::803" in only_kept
+    assert "handle 800::802" not in only_kept
+    assert f"class del dev wg9a440050 classid 1:{other.minor}" in only_kept
+    assert f"classid 1:{kept.minor}" in only_kept
 
 
 def test_filter_show_parser_requires_the_same_block():

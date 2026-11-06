@@ -19,6 +19,8 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 import time
@@ -335,19 +337,38 @@ def _handle_token(slot: int) -> str:
     return f"800::{node:x}"
 
 
-def _filter_lines(device: str, parent: str, slot: int, match: str, action: str) -> list[str]:
-    """Delete our handle, then add it again.
+FILTER_PRIO = 10
 
-    ``filter replace`` does not create a missing u32 filter on every iproute2.
-    The delete is applied in a separate batch whose failure is ignored, so a
-    missing filter cannot abort the add. The explicit handle prevents duplicates.
+
+def _filter_add(device: str, parent: str, match: str, action: str) -> str:
+    """One u32 selector. The handle is left unset on purpose.
+
+    ``tc filter add ... handle 800::node`` asks for a key inside hash table
+    800. On current kernels that table id is only used for the first u32
+    classifier, and a node id is rejected when the table is not already
+    present (``Handle specified hash table address mismatch`` or an illegal
+    handle). The HTB class command does not need that table, so the class is
+    created and the filter is not. Omitting the handle makes ``tc`` create
+    the root hash table and the key in the same command, which is the form
+    documented by tc-u32(8).
     """
-    token = _handle_token(slot)
-    selector = f"dev {device} {parent} protocol ip prio 10 handle {token} u32"
-    return [
-        f"filter del {selector}",
-        f"filter add {selector} match {match} {action}",
-    ]
+    return (
+        f"filter add dev {device} {parent} protocol ip prio {FILTER_PRIO} "
+        f"u32 match {match} {action}"
+    )
+
+
+def _filter_del(device: str, parent: str, handle: str) -> str:
+    return (
+        f"filter del dev {device} {parent} protocol ip prio {FILTER_PRIO} "
+        f"handle {handle} u32"
+    )
+
+
+def _filter_lines(device: str, parent: str, slot: int, match: str, action: str) -> list[str]:
+    """Compatibility wrapper. The slot is unused: explicit u32 handles are not installed."""
+    del slot
+    return [_filter_add(device, parent, match, action)]
 
 
 def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] | None = None) -> list[str]:
@@ -465,6 +486,271 @@ def ppp_commands(device: str, bindings: list[tuple[str, Limit]]) -> list[str]:
     return lines
 
 
+def _has_htb_root(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("qdisc htb 1:") and " root" in f" {stripped}":
+            return True
+    return False
+
+
+def _clsact_state(text: str) -> str:
+    """``clsact``, legacy ``ingress``, or ``absent``."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("qdisc clsact"):
+            return "clsact"
+        if stripped.startswith("qdisc ingress"):
+            return "ingress"
+    return "absent"
+
+
+_FLOW_ID = re.compile(r"flowid\s+(\S+)")
+_U32_MATCH = re.compile(r"match\s+([0-9a-fA-F]{8})/[0-9a-fA-F]+\s+at\s+(\d+)")
+_MIRRED_DEV = re.compile(r"\b(?:to\s+device|dev)\s+([A-Za-z0-9_.:-]+)", re.IGNORECASE)
+
+
+def _shown_filters(text: str) -> list[dict[str, str]]:
+    """Parse ``tc filter show`` into the key nodes, skipping hash-table headers."""
+    found: list[dict[str, str]] = []
+    for block in _filter_blocks(text):
+        head = next((line.strip() for line in block.splitlines() if line.strip()), "")
+        if not head.startswith("filter parent "):
+            continue
+        parts = head.split()
+        parent = parts[2] if len(parts) > 2 else ""
+        pref = ""
+        handle = ""
+        if "pref" in parts:
+            pref = parts[parts.index("pref") + 1]
+        if "fh" in parts:
+            handle = parts[parts.index("fh") + 1]
+        # A hash table is printed as ``fh 800:`` with no node. Deleting it removes every key.
+        if "::" not in handle:
+            continue
+        flow = _FLOW_ID.search(block)
+        match = _U32_MATCH.search(block)
+        mirred = _MIRRED_DEV.search(block)
+        found.append({
+            "parent": parent,
+            "pref": pref,
+            "handle": handle,
+            "flowid": flow.group(1) if flow else "",
+            "match": match.group(1).lower() if match else "",
+            "offset": match.group(2) if match else "",
+            "mirred": mirred.group(1) if mirred else "",
+        })
+    return found
+
+
+def _address_from_match(value: str) -> str | None:
+    if len(value) != 8:
+        return None
+    try:
+        return str(ipaddress.IPv4Address(bytes.fromhex(value)))
+    except ValueError:
+        return None
+
+
+def _delete_parent(shown: str) -> str:
+    if shown in {"ffff:", "ingress"} or shown.startswith("ffff:"):
+        return "ingress" if shown in {"ffff:", "ingress"} else f"parent {shown}"
+    if shown.startswith("1:"):
+        return "parent 1:"
+    return f"parent {shown}" if shown else "parent 1:"
+
+
+def _obsolete_filter_deletes(
+    device: str,
+    text: str,
+    *,
+    mode: str,
+    keep: set[str],
+) -> list[str]:
+    """Delete prio-10 filters of one kind whose address is no longer shaped.
+
+    ``mode`` is ``dst``, ``src``, or ``redirect``. Other kinds on the same
+    device are left alone, so a download repair cannot remove an upload redirect.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in _shown_filters(text):
+        if item["pref"] != str(FILTER_PRIO):
+            continue
+        address = _address_from_match(item["match"])
+        if address is None:
+            continue
+        if mode == "redirect":
+            drop = bool(item["mirred"]) and item["mirred"] in {IFB_UP, IFB_DOWN} and address not in keep
+        elif mode == "dst":
+            drop = item["offset"] == "16" and not item["mirred"] and address not in keep
+        elif mode == "src":
+            drop = item["offset"] == "12" and not item["mirred"] and address not in keep
+        else:
+            drop = False
+        if not drop:
+            continue
+        parent = _delete_parent(item["parent"])
+        # clsact egress is not the ingress parent. Keep the printed parent for egress.
+        if item["parent"].startswith("ffff:") and item["parent"] != "ffff:" and item["offset"] == "16":
+            parent = f"parent {item['parent']}"
+        line = _filter_del(device, parent, item["handle"])
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    return lines
+
+
+def repair_tunnel_commands(
+    device: str,
+    limits: list[Limit],
+    *,
+    qdisc_text: str,
+    filter_text: str,
+    previous: dict[str, Any] | None = None,
+) -> list[str]:
+    """Install missing objects without replacing a qdisc that is already correct.
+
+    ``qdisc replace`` on an existing HTB root deletes every class and filter.
+    A missing classifier is added on its own. A filter whose address is still
+    in the plan is not deleted.
+    """
+    prior = previous or {}
+    downloads = [item for item in limits if item.download_kbit]
+    uploads = [item for item in limits if item.upload_kbit]
+    lines: list[str] = []
+    fresh_root = not _has_htb_root(qdisc_text)
+    if downloads:
+        if fresh_root:
+            lines.extend(_root_tokens(device))
+        for limit in downloads:
+            lines.append(_class_tokens(device, limit.minor, int(limit.download_kbit)))
+            for address in limit.addresses:
+                present = (not fresh_root) and filter_show_has(
+                    filter_text, address, minor=limit.minor, kind="dst", parent="1:"
+                )
+                if not present:
+                    lines.append(_filter_add(
+                        device, "parent 1:", f"ip dst {address}/32", f"flowid 1:{limit.minor}",
+                    ))
+        if not fresh_root:
+            keep_dst = {address for limit in downloads for address in limit.addresses}
+            lines.extend(_obsolete_filter_deletes(device, filter_text, mode="dst", keep=keep_dst))
+            current = {item.minor for item in downloads}
+            for minor in prior.get("classes") or []:
+                if int(minor) not in current:
+                    lines.append(f"class del dev {device} classid 1:{int(minor)}")
+    elif not fresh_root and (prior.get("classes") or prior.get("root_filters") or prior.get("root")):
+        lines.append(f"qdisc del dev {device} root")
+
+    clsact = _clsact_state(qdisc_text)
+    if uploads:
+        rebuild_ingress = clsact != "clsact"
+        if clsact == "absent":
+            lines.append(f"qdisc add dev {device} clsact")
+        elif clsact == "ingress":
+            # A legacy ingress qdisc cannot sit beside clsact. Replacing it
+            # removes its filters, so every redirect is installed again below.
+            lines.append(f"qdisc replace dev {device} clsact")
+        keep_redirect = {address for limit in uploads for address in limit.addresses}
+        for limit in uploads:
+            for address in limit.addresses:
+                present = (not rebuild_ingress) and filter_show_has(
+                    filter_text, address, kind="redirect", parent="ffff:"
+                )
+                if not present:
+                    lines.append(_filter_add(
+                        device,
+                        "ingress",
+                        f"ip src {address}/32",
+                        f"action mirred egress redirect dev {IFB_UP}",
+                    ))
+        if not rebuild_ingress:
+            lines.extend(_obsolete_filter_deletes(
+                device, filter_text, mode="redirect", keep=keep_redirect,
+            ))
+    elif clsact != "absent" and (prior.get("ingress_filters") or prior.get("ingress")):
+        lines.append(f"qdisc del dev {device} clsact")
+    return lines
+
+
+def repair_ifb_commands(
+    device: str,
+    limits: list[Limit],
+    *,
+    direction: str,
+    qdisc_text: str,
+    filter_text: str,
+) -> list[str]:
+    selected = [item for item in limits if (item.upload_kbit if direction == "upload" else item.download_kbit)]
+    fresh = not _has_htb_root(qdisc_text)
+    if not selected:
+        return [f"qdisc del dev {device} root"] if not fresh else []
+    lines: list[str] = []
+    if fresh:
+        lines.extend(_root_tokens(device))
+    match = "src" if direction == "upload" else "dst"
+    kind = "src" if direction == "upload" else "dst"
+    for limit in selected:
+        kbit = int(limit.upload_kbit if direction == "upload" else limit.download_kbit)
+        lines.append(_class_tokens(device, limit.minor, kbit))
+        for address in limit.addresses:
+            present = (not fresh) and filter_show_has(
+                filter_text, address, minor=limit.minor, kind=kind, parent="1:"
+            )
+            if not present:
+                lines.append(_filter_add(
+                    device, "parent 1:", f"ip {match} {address}/32", f"flowid 1:{limit.minor}",
+                ))
+    if not fresh:
+        keep = {address for limit in selected for address in limit.addresses}
+        lines.extend(_obsolete_filter_deletes(
+            device,
+            filter_text,
+            mode="src" if direction == "upload" else "dst",
+            keep=keep,
+        ))
+    return lines
+
+
+def repair_ppp_commands(
+    device: str,
+    bindings: list[tuple[str, Limit]],
+    *,
+    qdisc_text: str,
+    filter_text: str,
+) -> list[str]:
+    """Same chain as ``ppp_commands``, without replacing clsact when it is already there."""
+    if _clsact_state(qdisc_text) != "clsact":
+        return ppp_commands(device, bindings)
+    lines: list[str] = []
+    if MARK not in filter_text:
+        lines.append(
+            f"filter add dev {device} egress protocol ip prio 1 handle 1 "
+            f"fw mark {MARK} action gact ok"
+        )
+    for index, (address, limit) in enumerate(bindings):
+        if limit.download_kbit and not _redirect_present(filter_text, address, IFB_DOWN):
+            slot = filter_handle(limit.minor, index)
+            lines.extend(_filter_lines(
+                device,
+                "egress",
+                slot,
+                f"ip dst {address}/32",
+                f"action skbedit mark {MARK} pipe mirred egress redirect dev {IFB_DOWN}",
+            ))
+        if limit.upload_kbit and not _redirect_present(filter_text, address, IFB_UP):
+            slot = filter_handle(limit.minor, index)
+            lines.extend(_filter_lines(
+                device,
+                "ingress",
+                slot,
+                f"ip src {address}/32",
+                f"action mirred egress redirect dev {IFB_UP}",
+            ))
+    return lines
+
+
 def _status_path(data_dir: str | Path) -> Path:
     return Path(data_dir) / "bandwidth" / "status.json"
 
@@ -549,18 +835,6 @@ async def _run(args: list[str], *, timeout: float = 30) -> tuple[int, str]:
     return int(getattr(result, "returncode", 1) or 0), text
 
 
-def _partition_batch(lines: list[str]) -> tuple[list[str], list[str]]:
-    """Deletes of missing objects must not fail the batch that installs filters."""
-    cleanup: list[str] = []
-    apply: list[str] = []
-    for line in lines:
-        if line.startswith(("filter del", "class del", "qdisc del")):
-            cleanup.append(line)
-        else:
-            apply.append(line)
-    return cleanup, apply
-
-
 def _batch_failed(code: int, text: str) -> bool:
     if code != 0:
         return True
@@ -569,31 +843,50 @@ def _batch_failed(code: int, text: str) -> bool:
     return False
 
 
-async def _run_batch(lines: list[str], *, strict: bool = True) -> tuple[int, str]:
+def _object_absent(text: str) -> bool:
+    folded = text.lower()
+    return any(part in folded for part in (
+        "no such file",
+        "cannot find",
+        "not found",
+        "invalid handle",
+        "no such device",
+    ))
+
+
+async def _run_tc_lines(lines: list[str]) -> tuple[int, str]:
+    """Run each tc command on its own and keep the failing command with its stderr.
+
+    Deletes of an object that is already gone are not failures. A failed add,
+    class, or qdisc is. Later lines still run, so one bad filter does not hide
+    the result of the next command.
+    """
     if not lines:
         return 0, ""
-    cleanup, apply = _partition_batch(lines) if strict else (lines, [])
-    script_lines = cleanup + apply if not strict else apply
-    # When strict, run deletes first and ignore their result, then apply.
-    if strict and cleanup:
-        await _run_batch(cleanup, strict=False)
-    if not script_lines:
-        return 0, ""
-    script = "\n".join(script_lines) + "\n"
-    directory = Path(os.environ.get("TMPDIR") or "/tmp")
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"njbw-{os.getpid()}-{time.time_ns()}.batch"
-    path.write_text(script, encoding="utf-8")
-    try:
-        code, text = await _run(["tc", "-force", "-batch", str(path)], timeout=60)
-    finally:
-        path.unlink(missing_ok=True)
-    if strict and _batch_failed(code, text):
-        log.warning("bandwidth tc batch failed code=%s output=%s", code, text[-800:])
-        return 1, text
+    errors: list[str] = []
+    for line in lines:
+        optional = line.startswith(("filter del", "class del", "qdisc del"))
+        code, text = await _run(["tc", *shlex.split(line)])
+        if not _batch_failed(code, text):
+            log.info("bandwidth tc ok: %s", line)
+            continue
+        if optional and (_object_absent(text) or not text):
+            log.info("bandwidth tc delete skipped code=%s line=%s", code, line)
+            continue
+        log.warning("bandwidth tc failed code=%s line=%s output=%s", code, line, text[-500:])
+        errors.append(f"{line} (exit {code}): {text or 'tc failed'}")
+    if errors:
+        return 1, " | ".join(errors)[:800]
+    return 0, ""
+
+
+async def _run_batch(lines: list[str], *, strict: bool = True) -> tuple[int, str]:
+    """Retained for the dependency probe. Enforcement uses ``_run_tc_lines``."""
     if not strict:
-        return 0, text
-    return 0, text
+        for line in lines:
+            await _run(["tc", *shlex.split(line)])
+        return 0, ""
+    return await _run_tc_lines(lines)
 
 
 def _linux() -> bool:
@@ -687,7 +980,7 @@ def _write_apply_script(data_dir: Path) -> Path:
 IFACE="$1"
 BATCH="{data_dir / "bandwidth" / "batches"}/$IFACE.batch"
 if [ -n "$IFACE" ] && [ -f "$BATCH" ]; then
-  tc -force -batch "$BATCH" >/dev/null 2>&1 || true
+  tc -force -batch "$BATCH" >>"{data_dir / "bandwidth" / "apply.log"}" 2>&1 || true
 fi
 """
     script.parent.mkdir(parents=True, exist_ok=True)
@@ -805,14 +1098,47 @@ def _flowid_in_block(block: str, minor: int) -> bool:
     return f"1:{int(minor):x}" in block.lower() or f"1:{int(minor)}" in block
 
 
-def filter_show_has(text: str, address: str, *, minor: int | None = None, kind: str) -> bool:
+def _parent_matches(block: str, parent: str) -> bool:
+    found = re.search(r"\bparent\s+(\S+)", block)
+    if not found:
+        return False
+    shown = found.group(1)
+    if parent in {"1:", "1:0"}:
+        return shown in {"1:", "1:0"}
+    if parent in {"ffff:", "ingress"}:
+        return shown == "ffff:"
+    return shown == parent
+
+
+def _redirect_present(text: str, address: str, target: str) -> bool:
+    """True when this address is redirected to ``target`` in one filter block."""
+    for block in _filter_blocks(text):
+        if not _block_has_address(block, address):
+            continue
+        if target in block and "mirred" in block.lower():
+            return True
+    return False
+
+
+def filter_show_has(
+    text: str,
+    address: str,
+    *,
+    minor: int | None = None,
+    kind: str,
+    parent: str | None = None,
+) -> bool:
     """True when one filter block classifies this address.
 
     ``kind`` is ``dst`` (download flowid), ``src`` (upload flowid), or
     ``redirect`` (ingress mirred, no flowid). The address and the flowid must
     be in the same block so another client's filter cannot satisfy the check.
+    ``parent`` is the qdisc parent printed by ``tc`` (``1:`` or ``ffff:``).
+    A filter attached somewhere else does not count.
     """
     for block in _filter_blocks(text):
+        if parent is not None and not _parent_matches(block, parent):
+            continue
         if not _block_has_address(block, address):
             continue
         lowered = block.lower()
@@ -840,17 +1166,48 @@ async def _class_present(device: str, minor: int) -> bool:
 
 
 async def _filter_show(device: str, parent: list[str]) -> str:
-    specific = await _tc_show(["tc", "filter", "show", "dev", device, *parent])
+    specific = await _tc_show(["tc", "filter", "show", "dev", device, *parent]) if parent else ""
     broad = await _tc_show(["tc", "filter", "show", "dev", device])
     return "\n".join(part for part in (specific, broad) if part)
 
 
+async def _device_snapshot(device: str) -> tuple[str, str]:
+    qdisc = await _tc_show(["tc", "qdisc", "show", "dev", device])
+    filters = await _filter_show(device, [])
+    return qdisc, filters
+
+
+def _check_detail(
+    *,
+    interface: str,
+    parent: str,
+    classid: str | None,
+    match: str | None,
+    observed: str,
+) -> dict[str, Any]:
+    return {
+        "interface": interface,
+        "parent": parent,
+        "protocol": "ip",
+        "priority": FILTER_PRIO,
+        "classid": classid,
+        "match": match,
+        "observed": observed,
+    }
+
+
 async def _filters_present(device: str, limit: Limit, *, parent: list[str], kind: str) -> str | None:
     text = await _filter_show(device, parent)
+    parent_token = "ffff:" if parent == ["ingress"] else "1:"
     for address in limit.addresses:
-        if not filter_show_has(text, address, minor=limit.minor, kind=kind):
+        if not filter_show_has(text, address, minor=limit.minor, kind=kind, parent=parent_token):
             where = " ".join(parent)
-            return f"filter for {address} missing on {device} {where}"
+            direction = "dst" if kind == "dst" else "src"
+            return (
+                f"filter for {address} missing on {device} {where} "
+                f"protocol ip prio {FILTER_PRIO} match ip {direction} {address}/32 "
+                f"flowid 1:{limit.minor}"
+            )
     return None
 
 
@@ -919,6 +1276,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
         "ingress_redirect": None,
     }
     missing: list[str] = []
+    details: dict[str, Any] = {}
     waiting = False
     if limit.download_kbit and tunnels:
         objects["download_class"] = True
@@ -926,18 +1284,43 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
         for device in tunnels:
             if not await _class_present(device, limit.minor):
                 objects["download_class"] = False
-                missing.append(f"download class 1:{limit.minor} missing on {device}")
+                details["download_class"] = _check_detail(
+                    interface=device,
+                    parent="1:1",
+                    classid=f"1:{limit.minor}",
+                    match=None,
+                    observed="htb class not found",
+                )
+                missing.append(
+                    f"download class 1:{limit.minor} missing on {device} parent 1:1"
+                )
             reason = await _filters_present(device, limit, parent=["parent", "1:"], kind="dst")
             if reason:
                 objects["download_filter"] = False
+                details["download_filter"] = _check_detail(
+                    interface=device,
+                    parent="1:",
+                    classid=f"1:{limit.minor}",
+                    match=f"ip dst {limit.addresses[0]}/32" if limit.addresses else None,
+                    observed="no u32 filter with that destination and flowid",
+                )
                 missing.append(reason)
     if limit.download_kbit and not tunnels:
         objects["download_class"] = await _class_present(IFB_DOWN, limit.minor)
         reason = await _filters_present(IFB_DOWN, limit, parent=["parent", "1:"], kind="dst")
         objects["download_filter"] = reason is None
         if not objects["download_class"]:
-            missing.append(f"download class 1:{limit.minor} missing on {IFB_DOWN}")
+            details["download_class"] = _check_detail(
+                interface=IFB_DOWN, parent="1:1", classid=f"1:{limit.minor}", match=None,
+                observed="htb class not found",
+            )
+            missing.append(f"download class 1:{limit.minor} missing on {IFB_DOWN} parent 1:1")
         if reason:
+            details["download_filter"] = _check_detail(
+                interface=IFB_DOWN, parent="1:", classid=f"1:{limit.minor}",
+                match=f"ip dst {limit.addresses[0]}/32" if limit.addresses else None,
+                observed="no u32 filter with that destination and flowid",
+            )
             missing.append(reason)
         if not ppp:
             waiting = True
@@ -947,16 +1330,33 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
             for device in ppp:
                 text = await _filter_show(device, ["egress"])
                 for address in limit.addresses:
-                    if not filter_show_has(text, address, minor=limit.minor, kind="redirect"):
+                    if not _redirect_present(text, address, IFB_DOWN):
                         objects["ingress_redirect"] = False
-                        missing.append(f"download redirect for {address} missing on {device}")
+                        details["ingress_redirect"] = _check_detail(
+                            interface=device, parent="egress", classid=None,
+                            match=f"ip dst {address}/32",
+                            observed=f"mirred redirect to {IFB_DOWN} not found",
+                        )
+                        missing.append(
+                            f"download redirect for {address} missing on {device} egress "
+                            f"protocol ip prio {FILTER_PRIO} action mirred egress redirect dev {IFB_DOWN}"
+                        )
     if limit.upload_kbit:
         objects["upload_class"] = await _class_present(IFB_UP, limit.minor)
         reason = await _filters_present(IFB_UP, limit, parent=["parent", "1:"], kind="src")
         objects["upload_filter"] = reason is None
         if not objects["upload_class"]:
-            missing.append(f"upload class 1:{limit.minor} missing on {IFB_UP}")
+            details["upload_class"] = _check_detail(
+                interface=IFB_UP, parent="1:1", classid=f"1:{limit.minor}", match=None,
+                observed="htb class not found",
+            )
+            missing.append(f"upload class 1:{limit.minor} missing on {IFB_UP} parent 1:1")
         if reason:
+            details["upload_filter"] = _check_detail(
+                interface=IFB_UP, parent="1:", classid=f"1:{limit.minor}",
+                match=f"ip src {limit.addresses[0]}/32" if limit.addresses else None,
+                observed="no u32 filter with that source and flowid",
+            )
             missing.append(reason)
         redirects = tunnels or ppp
         if not redirects:
@@ -967,10 +1367,19 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
             for device in redirects:
                 text = await _filter_show(device, ["ingress"])
                 for address in limit.addresses:
-                    if not filter_show_has(text, address, kind="redirect"):
+                    if not filter_show_has(text, address, kind="redirect", parent="ffff:"):
                         objects["ingress_redirect"] = False
-                        missing.append(f"upload redirect for {address} missing on {device}")
+                        details["ingress_redirect"] = _check_detail(
+                            interface=device, parent="ffff:", classid=None,
+                            match=f"ip src {address}/32",
+                            observed=f"mirred redirect to {IFB_UP} not found",
+                        )
+                        missing.append(
+                            f"upload redirect for {address} missing on {device} ingress "
+                            f"protocol ip prio {FILTER_PRIO} action mirred egress redirect dev {IFB_UP}"
+                        )
     row["objects"] = objects
+    row["details"] = details
     if missing:
         return False, "; ".join(missing), False
     if waiting:
@@ -1013,6 +1422,7 @@ async def _verified_clients(
             "download_mode": "shape" if limit.download_kbit else None,
             "upload_mode": "shape" if limit.upload_kbit else None,
             "objects": dict(row.get("objects") or {}),
+            "details": dict(row.get("details") or {}),
             "last_error": None if verified else reason,
         }
     return clients, all_ok and bool(clients)
@@ -1111,49 +1521,78 @@ async def _reconcile_locked(
 
     batches: dict[str, list[str]] = {}
     errors: list[str] = []
+
+    async def _apply(name: str, full: list[str], repair: list[str]) -> None:
+        # The batch file is the full chain for a newly created interface.
+        # The live reconcile only adds what is missing.
+        batches[name] = full
+        code, text = await _run_tc_lines(repair)
+        if code != 0:
+            errors.append(f"{name}: {text}")
+
     if upload_limits:
-        lines = ifb_commands(IFB_UP, upload_limits, direction="upload")
-        batches[IFB_UP] = lines
-        code, text = await _run_batch(lines)
-        if code != 0:
-            errors.append(text[-400:] or f"{IFB_UP} batch failed")
+        qdisc_text, filter_text = await _device_snapshot(IFB_UP)
+        await _apply(
+            IFB_UP,
+            ifb_commands(IFB_UP, upload_limits, direction="upload"),
+            repair_ifb_commands(
+                IFB_UP, upload_limits, direction="upload",
+                qdisc_text=qdisc_text, filter_text=filter_text,
+            ),
+        )
     if download_limits:
-        lines = ifb_commands(IFB_DOWN, download_limits, direction="download")
-        batches[IFB_DOWN] = lines
-        code, text = await _run_batch(lines)
-        if code != 0:
-            errors.append(text[-400:] or f"{IFB_DOWN} batch failed")
+        qdisc_text, filter_text = await _device_snapshot(IFB_DOWN)
+        await _apply(
+            IFB_DOWN,
+            ifb_commands(IFB_DOWN, download_limits, direction="download"),
+            repair_ifb_commands(
+                IFB_DOWN, download_limits, direction="download",
+                qdisc_text=qdisc_text, filter_text=filter_text,
+            ),
+        )
     if not upload_limits and previous.get("ifb_up"):
-        await _run_batch([f"qdisc del dev {IFB_UP} root"])
+        code, text = await _run_tc_lines([f"qdisc del dev {IFB_UP} root"])
+        if code != 0:
+            errors.append(f"{IFB_UP}: {text}")
     if not download_limits and previous.get("ifb_down"):
-        await _run_batch([f"qdisc del dev {IFB_DOWN} root"])
+        code, text = await _run_tc_lines([f"qdisc del dev {IFB_DOWN} root"])
+        if code != 0:
+            errors.append(f"{IFB_DOWN}: {text}")
 
     owned = previous.get("devices") if isinstance(previous.get("devices"), dict) else {}
     seen: set[str] = set()
     for plan in tunnels:
         seen.add(plan.name)
         prior = owned.get(plan.name) if isinstance(owned.get(plan.name), dict) else {}
-        lines = tunnel_commands(plan.name, plan.limits, prior if isinstance(prior, dict) else {})
-        batches[plan.name] = lines
-        code, text = await _run_batch(lines)
-        if code != 0:
-            errors.append(f"{plan.name}: {(text or 'tc failed')[-300:]}")
+        prior = prior if isinstance(prior, dict) else {}
+        qdisc_text, filter_text = await _device_snapshot(plan.name)
+        await _apply(
+            plan.name,
+            tunnel_commands(plan.name, plan.limits, prior),
+            repair_tunnel_commands(
+                plan.name, plan.limits,
+                qdisc_text=qdisc_text, filter_text=filter_text, previous=prior,
+            ),
+        )
     for name, bindings in l2tp_sessions.items():
         seen.add(name)
-        lines = ppp_commands(name, bindings)
-        batches[name] = lines
-        code, text = await _run_batch(lines)
-        if code != 0:
-            errors.append(f"{name}: {(text or 'tc failed')[-300:]}")
+        qdisc_text, filter_text = await _device_snapshot(name)
+        await _apply(
+            name,
+            ppp_commands(name, bindings),
+            repair_ppp_commands(name, bindings, qdisc_text=qdisc_text, filter_text=filter_text),
+        )
 
     for name, meta in owned.items():
         if name in seen or name in {IFB_UP, IFB_DOWN}:
             continue
         if isinstance(meta, dict) and meta.get("owned") == _OWNED:
-            await _run_batch([
+            code, text = await _run_tc_lines([
                 f"qdisc del dev {name} clsact",
                 f"qdisc del dev {name} root",
             ])
+            if code != 0:
+                errors.append(f"{name}: {text}")
 
     _write_apply_script(root)
     _write_batches(root, batches)
@@ -1763,9 +2202,16 @@ async def _diagnose_client(
     report["interface"] = row.get("interface") or interface
     report["method"] = row.get("method") or report["method"]
     report["objects"] = dict(row.get("objects") or {})
+    report["details"] = dict(row.get("details") or {})
     report["last_error"] = None if verified and report["status"] == "active" else row.get("last_error")
-    if data_dir is not None and report.get("last_reconcile_at") is None:
-        report["last_reconcile_at"] = read_status(data_dir).get("last_reconcile_at")
+    if data_dir is not None:
+        stored = read_status(data_dir)
+        report["last_reconcile_at"] = stored.get("last_reconcile_at")
+        tc_error = stored.get("last_error")
+        if tc_error and not verified:
+            live = str(report.get("last_error") or "")
+            if str(tc_error) not in live:
+                report["last_error"] = f"{live}; tc: {tc_error}" if live else str(tc_error)
     return report
 
 
