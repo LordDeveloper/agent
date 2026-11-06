@@ -70,6 +70,12 @@ _SMALL_CLIENT_BATCH = 8
 _CLIENT_PARALLELISM = 32
 _QUOTA_KIND = "client_quota"
 _DISABLED_KIND = "xray_disabled_client"
+# One user's Xray lookup. A full inbound dump does not fit in the panel probe.
+_RUNTIME_PROBE_SECONDS = 1.0
+_QUOTA_INDEX_TTL = 30.0
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _log = get_logger("xray")
 
 
@@ -166,6 +172,9 @@ class XrayDriver(CoreDriver):
         self._usage_gate: asyncio.Lock | None = None
         self._usage_flight: asyncio.Task | None = None
         self._usage_cache: tuple[float, UsageSnapshotModel] | None = None
+        self._quota_index_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
+        # id/uuid/password → email, so a later GET does not list every user.
+        self._identity_email: dict[str, str] = {}
 
     def _resolved_xray_settings(self) -> XraySettings:
         base = self.settings.xray
@@ -995,35 +1004,122 @@ class XrayDriver(CoreDriver):
         return list(keys)
 
     async def get_client_record(self, inbound_id: int | str, client_key: str) -> dict[str, Any]:
-        """Return client metadata from config.json (includes disabled / quota rows)."""
+        """One client. Disk and a filtered users query; never the whole inbound.
+
+        ``_presence`` is where the row was read (config, runtime, disabled).
+        ``_runtime`` is whether that user is attached to Xray right now
+        (present, absent, unknown). A config hit is not proof of activation.
+        """
         key = str(client_key or "").strip()
         if not key:
             raise AgentError("VALIDATION_ERROR", "client key is required", 422)
 
         tag = self.inbound_tag(inbound_id)
         aliases = await self._lookup_keys_for_panel_id(key)
+        disk_client: dict[str, Any] | None = None
         for alias in aliases:
             try:
                 disk_client = await self._client_copy_from_disk(inbound_id, alias)
             except AgentError:
                 disk_client = None
             if disk_client is not None:
-                return await self._with_stored_quota(disk_client, include_flags=True)
+                break
 
-        # users/add updates the users API. config.json can omit that row.
-        # get_inbound() would list every user first and sit past the panel's
-        # 15s timeout with no response bytes. Match this key only.
-        for alias in aliases:
-            live = await self._find_live_user(tag, alias)
+        if disk_client is not None:
+            row = await self._with_stored_quota(disk_client, include_flags=True)
+            self._remember_identities([row])
+            email = str(row.get("email") or "").strip()
+            if record_is_enabled(row):
+                runtime = await self._probe_runtime(tag, email)
+            else:
+                runtime = "absent"
+            return self._annotate_record(row, "config", runtime)
+
+        probe_email = self._probe_email(aliases)
+        if probe_email:
+            live = await self._filtered_live_user(tag, probe_email)
             if live is not None:
-                return await self._live_client_record(normalize_xray_client(live), alias)
+                row = await self._live_client_record(normalize_xray_client(live), probe_email)
+                self._remember_identities([row])
+                return self._annotate_record(row, "runtime", "present")
 
         for alias in aliases:
             stored = await self._find_disabled_client(alias)
             if stored is not None:
-                return stored
+                self._remember_identities([stored])
+                return self._annotate_record(stored, "disabled", "absent")
 
         raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404)
+
+    @staticmethod
+    def _annotate_record(row: dict[str, Any], presence: str, runtime: str) -> dict[str, Any]:
+        annotated = dict(row)
+        annotated["_presence"] = presence
+        annotated["_runtime"] = runtime
+        return annotated
+
+    def _probe_email(self, aliases: list[str]) -> str:
+        for alias in aliases:
+            remembered = self._identity_email.get(alias, "")
+            if remembered:
+                return remembered
+        for alias in aliases:
+            if alias and not _UUID_RE.match(alias):
+                return alias
+        return ""
+
+    async def _probe_runtime(self, tag: str, email: str) -> str:
+        """present, absent, or unknown. Unknown means the users API did not answer in time."""
+        email = str(email or "").strip()
+        if email == "" or tag == "":
+            return "unknown"
+        try:
+            users = await asyncio.wait_for(
+                self._api_call("list_users", tag, email),
+                timeout=_RUNTIME_PROBE_SECONDS,
+            )
+        except (asyncio.TimeoutError, AgentError):
+            return "unknown"
+        except Exception:
+            return "unknown"
+        for user in users or []:
+            if isinstance(user, dict) and self._row_matches_key(user, email):
+                return "present"
+        return "absent"
+
+    async def _filtered_live_user(self, tag: str, email: str) -> dict[str, Any] | None:
+        """Email-filtered users query. An unmatched UUID must not list the inbound."""
+        email = str(email or "").strip()
+        if email == "":
+            return None
+        try:
+            users = await asyncio.wait_for(
+                self._api_call("list_users", tag, email),
+                timeout=_RUNTIME_PROBE_SECONDS,
+            )
+        except (asyncio.TimeoutError, AgentError):
+            return None
+        except Exception:
+            return None
+        for user in users or []:
+            if isinstance(user, dict) and self._row_matches_key(user, email):
+                return user
+        return None
+
+    def _remember_identities(self, clients: list[dict[str, Any]]) -> None:
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            email = str(client.get("email") or "").strip()
+            if email == "":
+                continue
+            for field in ("id", "uuid", "node_id", "password", "client_link_uuid", "agent_id"):
+                value = str(client.get(field) or "").strip()
+                if value:
+                    self._identity_email[value] = email
+            self._identity_email[email] = email
+        if len(self._identity_email) > 50000:
+            self._identity_email.clear()
 
     async def _client_copy_from_disk(self, inbound_id: int | str, key: str) -> dict[str, Any] | None:
         """One client off the cached document. Does not copy the rest of the file."""
@@ -1060,24 +1156,9 @@ class XrayDriver(CoreDriver):
         for user in users:
             if isinstance(user, dict) and self._row_matches_key(user, key):
                 return user
-        # The users API filters by email only. A UUID that is not on disk has
-        # to walk every user. Log it before the call: the panel gives up at 15s
-        # and the access log is written only after this returns.
-        _log.warning("xray client lookup scanning all users tag=%s key=%s", tag, key)
-        try:
-            users = await self._api_call("list_users", tag)
-        except AgentError:
-            return None
-        for user in users:
-            if not isinstance(user, dict):
-                continue
-            cid = str(user.get("id") or user.get("uuid") or "").strip()
-            email = str(user.get("email") or "").strip()
-            password = str(user.get("password") or "").strip()
-            if key in {cid, email, password}:
-                if not user.get("id") and cid:
-                    user = {**user, "id": cid}
-                return user
+        remembered = self._identity_email.get(key, "")
+        if remembered and remembered != key:
+            return await self._filtered_live_user(tag, remembered)
         return None
 
     async def diagnose_client(self, client_key: str, inbound_id: int | str | None = None) -> dict[str, Any]:
@@ -1729,6 +1810,7 @@ class XrayDriver(CoreDriver):
 
             await self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
             await self._save_client_quotas(applied)
+            self._remember_identities(applied)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         await self.audit.record(
@@ -1941,6 +2023,7 @@ class XrayDriver(CoreDriver):
                 deletes.append(link_id)
         if not puts and not deletes:
             return
+        self._quota_index_cache = None
         await self.store.write_docs(self.key, _QUOTA_KIND, puts, deletes)
 
     def _stamp_disabled_client(self, client: dict[str, Any]) -> dict[str, Any]:
@@ -2132,6 +2215,7 @@ class XrayDriver(CoreDriver):
         wanted = {str(key).strip() for key in keys if str(key).strip()}
         if not wanted:
             return
+        self._quota_index_cache = None
         for row in await self.store.list_docs(self.key, _QUOTA_KIND):
             if not isinstance(row, dict):
                 continue
@@ -2150,6 +2234,10 @@ class XrayDriver(CoreDriver):
                 await self.store.delete_doc(self.key, _QUOTA_KIND, doc_id)
 
     async def _quota_index(self) -> dict[str, dict[str, Any]]:
+        cached = self._quota_index_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < _QUOTA_INDEX_TTL:
+            return cached[1]
         index: dict[str, dict[str, Any]] = {}
         try:
             rows = await self.store.list_docs(self.key, _QUOTA_KIND)
@@ -2170,6 +2258,7 @@ class XrayDriver(CoreDriver):
                 index[f"a:{legacy_agent_id}"] = row
             if panel_node_id:
                 index[f"n:{panel_node_id}"] = row
+        self._quota_index_cache = (now, index)
         return index
 
     async def _with_stored_quota(self, client: dict[str, Any], *, include_flags: bool) -> dict[str, Any]:
@@ -2344,27 +2433,27 @@ class XrayDriver(CoreDriver):
             tag, email = await self._locate_disk_client(inbound_id, key)
         except AgentError:
             tag, email = "", ""
+        removed = False
         if not email:
-            # Panel sends the email as the path key. Remove that key directly.
-            # Listing every user is the 15s timeout on a busy inbound, and it
-            # only matters when the key is a uuid that config.json does not have.
+            # Panel sends the email as the path key. A UUID remembered from
+            # the upsert maps to that email without listing the inbound.
             tag = self.inbound_tag(inbound_id)
+            remembered = self._identity_email.get(key, "")
+            if remembered and remembered != key:
+                email = remembered
+        if not email:
+            tag = tag or self.inbound_tag(inbound_id)
             try:
                 await self._api_call("remove_users", tag, [key])
                 email = key
+                removed = True
             except AgentError as exc:
                 if _is_inbound_missing_error(exc) or not _is_missing_user_error(exc):
                     raise
                 email = await self._client_email_from_users(tag, key)
                 if not email or email == key:
                     raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
-                try:
-                    await self._api_call("remove_users", tag, [email])
-                except AgentError as remove_exc:
-                    if _is_missing_user_error(remove_exc):
-                        raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from remove_exc
-                    raise
-        else:
+        if not removed:
             try:
                 await self._api_call("remove_users", tag, [email])
             except AgentError as exc:
@@ -2417,16 +2506,9 @@ class XrayDriver(CoreDriver):
                 continue
             email = str(row.get("email") or "").strip()
             return email or client_key
-        _log.warning("xray client delete scanning all users tag=%s key=%s", tag, client_key)
-        try:
-            users = await self._api_call("list_users", tag)
-        except AgentError:
-            return ""
-        for row in users:
-            if not isinstance(row, dict) or not self._row_matches_key(row, client_key):
-                continue
-            email = str(row.get("email") or "").strip()
-            return email or client_key
+        remembered = self._identity_email.get(client_key, "")
+        if remembered and remembered != client_key:
+            return remembered
         return ""
 
     async def _forget_client_keys(self, keys: list[str]) -> None:

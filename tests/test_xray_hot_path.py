@@ -126,6 +126,42 @@ def test_format_refresh_does_not_dump_every_user(client: TestClient, fake_xray: 
     assert {row["email"] for row in kept} == {"a@x", "b@x"}
 
 
+def test_client_get_does_not_list_every_user(client: TestClient, fake_xray: FakeXrayHttpClient):
+    headers = {"Authorization": "Bearer dev-token"}
+    assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(1644, 8443)).status_code == 200
+    uuid = "8f04f83b-cde1-4089-b0a5-ae7f082b34fe"
+    created = client.post(
+        "/api/v1/cores/xray/inbounds/1644/clients/batch",
+        headers=headers,
+        json={"mode": "upsert", "clients": [{"id": uuid, "email": "one@x", "enable": True}]},
+    )
+    assert created.status_code == 200
+
+    calls: list[tuple[str, str | None]] = []
+    real = fake_xray.list_users
+
+    def tracked(tag: str, email: str | None = None):
+        calls.append((tag, email))
+        return real(tag, email)
+
+    fake_xray.list_users = tracked  # type: ignore[method-assign]
+
+    found = client.get(f"/api/v1/cores/xray/inbounds/1644/clients/{uuid}", headers=headers)
+    assert found.status_code == 200, found.text
+    body = found.json()
+    assert body["client"]["email"] == "one@x"
+    assert body["runtime"] in {"present", "unknown", "absent"}
+    assert body["presence"] in {"config", "runtime", "disabled"}
+    assert all(email is not None for _tag, email in calls)
+
+    missing = client.get(
+        "/api/v1/cores/xray/inbounds/1644/clients/00000000-0000-0000-0000-000000000099",
+        headers=headers,
+    )
+    assert missing.status_code == 404
+    assert all(email is not None for _tag, email in calls)
+
+
 def test_single_client_upsert_looks_up_one_email(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(50, 4450)).status_code == 200

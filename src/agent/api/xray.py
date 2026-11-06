@@ -168,7 +168,9 @@ async def get_client_record(inbound_id: str, client_key: str, xray: XrayDriver =
         client = await xray.get_client_record(inbound_id, client_key)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, "client": client}
+    presence = str(client.pop("_presence", "config"))
+    runtime = str(client.pop("_runtime", "unknown"))
+    return {"success": True, "client": client, "presence": presence, "runtime": runtime}
 
 
 @router.put("/inbounds/{inbound_id}/clients/{client_key}")
