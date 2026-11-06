@@ -63,6 +63,9 @@ def test_format_xray_client_diagnose_report():
     assert 'client_enabled' in rendered
     assert 'Issues' in rendered
     assert 'CLIENT_OFFLINE' in rendered
+    assert 'Bandwidth' in rendered
+    assert 'NOT APPLICABLE' in rendered
+    assert 'UNLIMITED' not in rendered
 
 
 def test_format_l2tp_user_diagnose_shows_username():

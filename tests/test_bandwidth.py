@@ -12,6 +12,7 @@ from agent.support.bandwidth import (
     collect_openvpn_plans,
     collect_tunnel_plans,
     diagnose_bandwidth,
+    core_supports_bandwidth,
     filter_show_has,
     ifb_commands,
     repair_ifb_commands,
@@ -21,6 +22,7 @@ from agent.support.bandwidth import (
     ppp_commands,
     reset_runtime_for_tests,
     resolve_enforcement_status,
+    schedule_bandwidth,
     tunnel_commands,
     with_provisioning,
 )
@@ -490,3 +492,25 @@ def test_slow_bandwidth_task_does_not_block_another_client(tmp_path):
     elapsed = asyncio.run(scenario())
     assert elapsed < 0.1
     assert manager._tasks["other"]["status"] in {"completed", "running", "queued"}
+
+
+def test_each_shaped_core_can_enqueue_and_xray_cannot(tmp_path):
+    reset_runtime_for_tests()
+    manager = BandwidthManager(object(), tmp_path, retry_delay=0)
+    from agent.support import bandwidth as bandwidth_module
+
+    bandwidth_module._manager = manager
+    try:
+        for core in ("wireguard", "amnezia", "openvpn", "l2tp"):
+            assert core_supports_bandwidth(core) is True
+            queued = schedule_bandwidth(f"client-{core}", core=core, action="update")
+            assert queued["status"] == "queued"
+        assert core_supports_bandwidth("xray") is False
+        refused = schedule_bandwidth("xray-client", core="xray", action="update")
+        assert refused == {"status": "unsupported", "enqueued": False}
+        assert "xray-client" not in manager._tasks
+        direct = manager.apply({"id": "xray-direct"}, core="xray")
+        assert direct["status"] == "unsupported"
+        assert "xray-direct" not in manager._tasks
+    finally:
+        reset_runtime_for_tests()

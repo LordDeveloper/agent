@@ -476,6 +476,7 @@ async def diagnose_client_match(
     error_count = sum(1 for row in issues if row.get('level') == 'error')
     warning_count = sum(1 for row in issues if row.get('level') == 'warning')
     stored_id = await _stored_client_id(driver, config_client)
+    from agent.support.bandwidth import unsupported_bandwidth_report
 
     return {
         'healthy': error_count == 0,
@@ -490,6 +491,7 @@ async def diagnose_client_match(
         'checks': checks,
         'issues': issues,
         'issue_counts': {'error': error_count, 'warning': warning_count},
+        'bandwidth': unsupported_bandwidth_report(),
     }
 
 

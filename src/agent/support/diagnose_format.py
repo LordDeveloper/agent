@@ -358,6 +358,26 @@ def _method_label(value: Any) -> str:
     return text or '-'
 
 
+def _xray_bandwidth_section(match: dict[str, Any]) -> dict[str, Any]:
+    """Xray is never shaped. A missing block must not be reported as unlimited."""
+    row = match.get('bandwidth') if isinstance(match.get('bandwidth'), dict) else {}
+    status = str(row.get('status') or '').strip().lower()
+    if status in {'not_applicable', 'unsupported'}:
+        return row
+    return {
+        'configured': False,
+        'status': 'not_applicable',
+        'applicable': False,
+        'verified': False,
+        'download_mbps': None,
+        'upload_mbps': None,
+        'method': None,
+        'interface': None,
+        'class_id': None,
+        'last_error': None,
+    }
+
+
 def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
     """Always render bandwidth. A missing block is unlimited, not a peer error."""
     row = bandwidth or {'configured': False, 'status': 'unlimited'}
@@ -456,6 +476,8 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
         )
     if live.get('online_reason'):
         lines.append(f'  Reason:       {_truncate(str(live.get("online_reason")), 96)}')
+
+    lines.extend(_format_bandwidth_section(_xray_bandwidth_section(match)))
     lines.append('')
 
     checks = list(match.get('checks') or [])

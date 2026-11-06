@@ -99,6 +99,8 @@ def test_diagnose_xray_client_by_inbound():
     assert report["found"] is True
     assert report["email"] == "abc123"
     assert report["matches"][0]["healthy"] is True
+    assert report["matches"][0]["bandwidth"]["status"] == "not_applicable"
+    assert report["matches"][0]["bandwidth"]["configured"] is False
 
 
 def test_diagnose_xray_client_by_email_all_inbounds():

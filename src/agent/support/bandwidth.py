@@ -34,6 +34,7 @@ from agent.logutil import get_logger
 log = get_logger("bandwidth")
 
 MAX_MBPS = 100000
+SHAPED_CORES = frozenset({"wireguard", "amnezia", "openvpn", "l2tp"})
 IFB_UP = "ifb-nj-up"
 IFB_DOWN = "ifb-nj-down"
 MARK = "0x6e6a"
@@ -1901,6 +1902,32 @@ def _client_id(client: dict[str, Any] | str | None) -> str:
     return str(client.get("id") or client.get("email") or client.get("username") or "").strip()
 
 
+def core_supports_bandwidth(core: str | None) -> bool:
+    """True only for the four cores that install traffic-control objects."""
+    return str(core or "").strip().lower() in SHAPED_CORES
+
+
+def _core_may_enqueue(core: str | None) -> bool:
+    text = str(core or "").strip().lower()
+    return text == "" or text in SHAPED_CORES
+
+
+def unsupported_bandwidth_report() -> dict[str, Any]:
+    """Diagnostics for a core that must not be shaped. Nothing is installed."""
+    return {
+        "configured": False,
+        "status": "not_applicable",
+        "applicable": False,
+        "verified": False,
+        "download_mbps": None,
+        "upload_mbps": None,
+        "method": None,
+        "interface": None,
+        "class_id": None,
+        "last_error": None,
+    }
+
+
 def schedule_bandwidth(
     *client_ids: Any,
     core: str = "",
@@ -1908,6 +1935,8 @@ def schedule_bandwidth(
     action: str = "reconcile",
 ) -> dict[str, Any] | None:
     """Queue a coalesced reconcile. This does not apply traffic control itself."""
+    if not _core_may_enqueue(core):
+        return {"status": "unsupported", "enqueued": False}
     manager = get_manager()
     if manager is None:
         return None
@@ -2048,6 +2077,8 @@ class BandwidthManager:
         _write_json(self._task_path(), {"generation": self.generation, "tasks": self._tasks})
 
     def _enqueue(self, client_ids: list[str], *, action: str, core: str, interface: str) -> dict[str, Any]:
+        if not _core_may_enqueue(core):
+            return {"status": "unsupported", "generation": self.generation, "task": None}
         self.generation += 1
         now = time.time()
         ids = [item for item in client_ids if item] or ["*"]
