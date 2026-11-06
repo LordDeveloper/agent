@@ -166,12 +166,35 @@ def _class_tokens(device: str, minor: int, kbit: int) -> str:
     )
 
 
-def _root_tokens(device: str) -> list[str]:
-    return [
-        f"qdisc replace dev {device} root handle 1: htb default 9999",
+def _has_root_qdisc(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("qdisc ") and " root" in f" {stripped}":
+            return True
+    return False
+
+
+def _htb_root_lines(device: str, qdisc_text: str = "") -> list[str]:
+    """Install HTB on the root hook without ``qdisc replace``.
+
+    IFB and several other devices answer ``Change operation not supported by
+    specified qdisc`` when the live root is pfifo_fast (or similar) and ``tc``
+    tries to morph it into HTB. Delete the old root, then ``add`` HTB.
+    """
+    lines: list[str] = []
+    if not _has_htb_root(qdisc_text):
+        if _has_root_qdisc(qdisc_text):
+            lines.append(f"qdisc del dev {device} root")
+        lines.append(f"qdisc add dev {device} root handle 1: htb default 9999")
+    lines.extend([
         f"class replace dev {device} parent 1: classid 1:1 htb rate {PARENT_RATE} ceil {PARENT_RATE}",
         f"class replace dev {device} parent 1:1 classid 1:9999 htb rate {PARENT_RATE} ceil {PARENT_RATE}",
-    ]
+    ])
+    return lines
+
+
+def _root_tokens(device: str, qdisc_text: str = "") -> list[str]:
+    return _htb_root_lines(device, qdisc_text)
 
 
 def peer_addresses(peer: dict[str, Any], extra: list[str] | None = None) -> list[str]:
@@ -341,11 +364,20 @@ FILTER_PRIO = 10
 HTB_FILTER_PARENT = "parent 1:0"
 
 
+def _ipv4_ip_match(address: str, direction: str) -> str:
+    """High-level selector understood by all supported iproute2 builds."""
+    return f"ip {direction} {address}/32"
+
+
 def _ipv4_u32_match(address: str, direction: str) -> str:
-    """Raw u32 selector at IPv4 destination (16) or source (12)."""
+    """Raw u32 selector at IPv4 destination (16) or source (12).
+
+    Key and mask must be separate tokens; a single ``0a5a446c/ffffffff`` token
+    is rejected by ``parse_u32`` even though ``tc filter show`` prints a slash.
+    """
     offset = 16 if direction == "dst" else 12
     hexval = ipaddress.IPv4Address(address).packed.hex()
-    return f"u32 {hexval}/ffffffff at {offset}"
+    return f"u32 {hexval} ffffffff at {offset}"
 
 
 def _flowid_action(minor: int) -> str:
@@ -390,7 +422,7 @@ def _filter_lines(
     """Build filter add lines. Prefer raw u32 when ``direction`` and ``address`` are set."""
     del slot
     if direction and address:
-        match = _ipv4_u32_match(address, direction)
+        match = _ipv4_ip_match(address, direction)
     return [_filter_add(device, parent, match, action)]
 
 
@@ -569,7 +601,10 @@ def _clsact_state(text: str) -> str:
 
 
 _FLOW_ID = re.compile(r"flowid\s+(\S+)")
-_U32_MATCH = re.compile(r"match\s+([0-9a-fA-F]{8})/[0-9a-fA-F]+\s+at\s+(\d+)")
+_U32_MATCH = re.compile(
+    r"match\s+([0-9a-fA-F]{8})(?:/[0-9a-fA-F]+|\s+[0-9a-fA-F]+)\s+at\s+(\d+)",
+    re.IGNORECASE,
+)
 _MIRRED_DEV = re.compile(r"\b(?:to\s+device|dev)\s+([A-Za-z0-9_.:-]+)", re.IGNORECASE)
 
 
@@ -685,7 +720,7 @@ def repair_tunnel_commands(
     fresh_root = not _has_htb_root(qdisc_text)
     if downloads:
         if fresh_root:
-            lines.extend(_root_tokens(device))
+            lines.extend(_htb_root_lines(device, qdisc_text))
         for limit in downloads:
             lines.append(_class_tokens(device, limit.minor, int(limit.download_kbit)))
             for address in limit.addresses:
@@ -699,7 +734,7 @@ def repair_tunnel_commands(
                     lines.append(_filter_add(
                         device,
                         HTB_FILTER_PARENT,
-                        _ipv4_u32_match(address, "dst"),
+                        _ipv4_ip_match(address, "dst"),
                         _flowid_action(limit.minor),
                     ))
         if not fresh_root:
@@ -715,11 +750,8 @@ def repair_tunnel_commands(
     clsact = _clsact_state(qdisc_text)
     if uploads:
         rebuild_ingress = clsact != "clsact"
-        if clsact == "absent":
-            lines.append(f"qdisc add dev {device} clsact")
-        elif clsact == "ingress":
-            # A legacy ingress qdisc cannot sit beside clsact. Replacing it
-            # removes its filters, so every redirect is installed again below.
+        if clsact != "clsact":
+            # ``replace`` creates clsact or upgrades legacy ingress in one step.
             lines.append(f"qdisc replace dev {device} clsact")
         keep_redirect = {address for limit in uploads for address in limit.addresses}
         for limit in uploads:
@@ -734,7 +766,7 @@ def repair_tunnel_commands(
                     lines.append(_filter_add(
                         device,
                         "ingress",
-                        _ipv4_u32_match(address, "src"),
+                        _ipv4_ip_match(address, "src"),
                         f"action mirred egress redirect dev {IFB_UP}",
                     ))
         if not rebuild_ingress:
@@ -760,7 +792,7 @@ def repair_ifb_commands(
         return [f"qdisc del dev {device} root"] if not fresh else []
     lines: list[str] = []
     if fresh:
-        lines.extend(_root_tokens(device))
+        lines.extend(_htb_root_lines(device, qdisc_text))
     match = "src" if direction == "upload" else "dst"
     kind = "src" if direction == "upload" else "dst"
     for limit in selected:
@@ -777,7 +809,7 @@ def repair_ifb_commands(
                 lines.append(_filter_add(
                     device,
                     HTB_FILTER_PARENT,
-                    _ipv4_u32_match(address, match),
+                    _ipv4_ip_match(address, match),
                     _flowid_action(limit.minor),
                 ))
     if not fresh:
@@ -944,6 +976,18 @@ def _object_absent(text: str) -> bool:
     ))
 
 
+def _filter_add_fallbacks(line: str) -> list[str]:
+    """If ``match ip dst|src A.B.C.D/32`` fails, retry raw u32 with separate mask tokens."""
+    if not line.startswith("filter add "):
+        return [line]
+    match = re.search(r"match ip (dst|src) (\d+\.\d+\.\d+\.\d+)/32", line)
+    if not match:
+        return [line]
+    direction, address = match.group(1), match.group(2)
+    raw = _ipv4_u32_match(address, direction)
+    return [line, re.sub(r"match ip (?:dst|src) \d+\.\d+\.\d+\.\d+/32", f"match {raw}", line, count=1)]
+
+
 async def _run_tc_lines(lines: list[str]) -> tuple[int, str]:
     """Run each tc command on its own and keep the failing command with its stderr.
 
@@ -959,15 +1003,27 @@ async def _run_tc_lines(lines: list[str]) -> tuple[int, str]:
     errors: list[str] = []
     for line in lines:
         optional = line.startswith(("filter del", "class del", "qdisc del"))
-        code, text = await _run(["tc", *shlex.split(line)])
-        if not _batch_failed(code, text):
-            log.info("bandwidth tc ok: %s", line)
+        attempts = _filter_add_fallbacks(line) if line.startswith("filter add ") else [line]
+        last_code, last_text = 0, ""
+        for attempt in attempts:
+            last_code, last_text = await _run(["tc", *shlex.split(attempt)])
+            if not _batch_failed(last_code, last_text):
+                log.info("bandwidth tc ok: %s", attempt)
+                break
+            log.warning(
+                "bandwidth tc failed code=%s line=%s output=%s",
+                last_code,
+                attempt,
+                last_text[-500:],
+            )
+        else:
+            if optional and (_object_absent(last_text) or not last_text):
+                log.info("bandwidth tc delete skipped code=%s line=%s", last_code, line)
+                continue
+            errors.append(f"{attempts[-1]} (exit {last_code}): {last_text or 'tc failed'}")
             continue
-        if optional and (_object_absent(text) or not text):
-            log.info("bandwidth tc delete skipped code=%s line=%s", code, line)
+        if optional:
             continue
-        log.warning("bandwidth tc failed code=%s line=%s output=%s", code, line, text[-500:])
-        errors.append(f"{line} (exit {code}): {text or 'tc failed'}")
     if errors:
         return 1, " | ".join(errors)[:800]
     return 0, ""
@@ -1021,10 +1077,9 @@ async def ensure_dependencies(*, install: bool = False) -> dict[str, Any]:
         if code != 0 and "File exists" not in text and "exists" not in text.lower():
             return {"state": "unsupported", "error": f"IFB device {name} is unavailable: {text}", "tc": True, "ifb": False, "htb": False}
         await _run(["ip", "link", "set", name, "up"])
-    probe = [
-        f"qdisc replace dev {IFB_UP} root handle 1: htb default 9999",
-        f"class replace dev {IFB_UP} parent 1: classid 1:1 htb rate {PARENT_RATE} ceil {PARENT_RATE}",
-        "class replace dev " + IFB_UP + " parent 1:1 classid 1:2 htb rate 1000kbit ceil 1000kbit",
+    probe_qdisc = await _tc_show(["tc", "qdisc", "show", "dev", IFB_UP])
+    probe = _htb_root_lines(IFB_UP, probe_qdisc) + [
+        f"class replace dev {IFB_UP} parent 1:1 classid 1:2 htb rate 1000kbit ceil 1000kbit",
     ]
     code, text = await _run_batch(probe)
     shown, shown_text = await _run(["tc", "class", "show", "dev", IFB_UP, "classid", "1:2"])
