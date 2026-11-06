@@ -199,7 +199,7 @@ def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
         'details': {
             'download_filter': {
                 'interface': 'wg9a440050',
-                'parent': '1:',
+                'parent': '1:0',
                 'protocol': 'ip',
                 'priority': 10,
                 'classid': '1:1419',
@@ -212,7 +212,7 @@ def test_format_wireguard_peer_diagnose_shows_bandwidth_states():
     assert 'Status:        ERROR' in failed
     assert 'Download filter: no' in failed
     assert 'Kernel verified: no' in failed
-    assert 'parent 1:' in failed
+    assert 'parent 1:0' in failed
     assert 'protocol ip' in failed
     assert 'prio 10' in failed
     assert 'classid 1:1419' in failed

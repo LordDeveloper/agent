@@ -338,6 +338,18 @@ def _handle_token(slot: int) -> str:
 
 
 FILTER_PRIO = 10
+HTB_FILTER_PARENT = "parent 1:0"
+
+
+def _ipv4_u32_match(address: str, direction: str) -> str:
+    """Raw u32 selector at IPv4 destination (16) or source (12)."""
+    offset = 16 if direction == "dst" else 12
+    hexval = ipaddress.IPv4Address(address).packed.hex()
+    return f"u32 {hexval}/ffffffff at {offset}"
+
+
+def _flowid_action(minor: int) -> str:
+    return f"flowid 1:{minor}"
 
 
 def _filter_add(device: str, parent: str, match: str, action: str) -> str:
@@ -365,10 +377,55 @@ def _filter_del(device: str, parent: str, handle: str) -> str:
     )
 
 
-def _filter_lines(device: str, parent: str, slot: int, match: str, action: str) -> list[str]:
-    """Compatibility wrapper. The slot is unused: explicit u32 handles are not installed."""
+def _filter_lines(
+    device: str,
+    parent: str,
+    slot: int,
+    match: str,
+    action: str,
+    *,
+    direction: str | None = None,
+    address: str | None = None,
+) -> list[str]:
+    """Build filter add lines. Prefer raw u32 when ``direction`` and ``address`` are set."""
     del slot
+    if direction and address:
+        match = _ipv4_u32_match(address, direction)
     return [_filter_add(device, parent, match, action)]
+
+
+def _purge_address_filters(
+    device: str,
+    text: str,
+    address: str,
+    *,
+    mode: str,
+) -> list[str]:
+    """Drop prio-10 filters for one address so a broken rule cannot block reinstall."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in _shown_filters(text):
+        if item["pref"] != str(FILTER_PRIO):
+            continue
+        if _address_from_match(item["match"]) != address:
+            continue
+        if mode == "redirect":
+            if not item["mirred"]:
+                continue
+        elif mode == "dst":
+            if item["offset"] != "16" or item["mirred"]:
+                continue
+        elif mode == "src":
+            if item["offset"] != "12" or item["mirred"]:
+                continue
+        else:
+            continue
+        parent = _delete_parent(item["parent"])
+        line = _filter_del(device, parent, item["handle"])
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    return lines
 
 
 def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] | None = None) -> list[str]:
@@ -392,10 +449,12 @@ def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] |
                 lines.extend(
                     _filter_lines(
                         device,
-                        "parent 1:",
+                        HTB_FILTER_PARENT,
                         slot,
-                        f"ip dst {address}/32",
-                        f"flowid 1:{limit.minor}",
+                        "",
+                        _flowid_action(limit.minor),
+                        direction="dst",
+                        address=address,
                     )
                 )
         for minor in old_classes:
@@ -413,8 +472,10 @@ def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] |
                         device,
                         "ingress",
                         slot,
-                        f"ip src {address}/32",
+                        "",
                         f"action mirred egress redirect dev {IFB_UP}",
+                        direction="src",
+                        address=address,
                     )
                 )
     elif old_ingress:
@@ -437,10 +498,12 @@ def ifb_commands(device: str, limits: list[Limit], *, direction: str) -> list[st
             lines.extend(
                 _filter_lines(
                     device,
-                    "parent 1:",
+                    HTB_FILTER_PARENT,
                     slot,
-                    f"ip {match} {address}/32",
-                    f"flowid 1:{limit.minor}",
+                    "",
+                    _flowid_action(limit.minor),
+                    direction=match,
+                    address=address,
                 )
             )
     return lines
@@ -627,11 +690,17 @@ def repair_tunnel_commands(
             lines.append(_class_tokens(device, limit.minor, int(limit.download_kbit)))
             for address in limit.addresses:
                 present = (not fresh_root) and filter_show_has(
-                    filter_text, address, minor=limit.minor, kind="dst", parent="1:"
+                    filter_text, address, minor=limit.minor, kind="dst", parent="1:0",
                 )
                 if not present:
+                    lines.extend(_purge_address_filters(
+                        device, filter_text, address, mode="dst",
+                    ))
                     lines.append(_filter_add(
-                        device, "parent 1:", f"ip dst {address}/32", f"flowid 1:{limit.minor}",
+                        device,
+                        HTB_FILTER_PARENT,
+                        _ipv4_u32_match(address, "dst"),
+                        _flowid_action(limit.minor),
                     ))
         if not fresh_root:
             keep_dst = {address for limit in downloads for address in limit.addresses}
@@ -659,10 +728,13 @@ def repair_tunnel_commands(
                     filter_text, address, kind="redirect", parent="ffff:"
                 )
                 if not present:
+                    lines.extend(_purge_address_filters(
+                        device, filter_text, address, mode="redirect",
+                    ))
                     lines.append(_filter_add(
                         device,
                         "ingress",
-                        f"ip src {address}/32",
+                        _ipv4_u32_match(address, "src"),
                         f"action mirred egress redirect dev {IFB_UP}",
                     ))
         if not rebuild_ingress:
@@ -696,11 +768,17 @@ def repair_ifb_commands(
         lines.append(_class_tokens(device, limit.minor, kbit))
         for address in limit.addresses:
             present = (not fresh) and filter_show_has(
-                filter_text, address, minor=limit.minor, kind=kind, parent="1:"
+                filter_text, address, minor=limit.minor, kind=kind, parent="1:0",
             )
             if not present:
+                lines.extend(_purge_address_filters(
+                    device, filter_text, address, mode=kind,
+                ))
                 lines.append(_filter_add(
-                    device, "parent 1:", f"ip {match} {address}/32", f"flowid 1:{limit.minor}",
+                    device,
+                    HTB_FILTER_PARENT,
+                    _ipv4_u32_match(address, match),
+                    _flowid_action(limit.minor),
                 ))
     if not fresh:
         keep = {address for limit in selected for address in limit.addresses}
@@ -835,6 +913,18 @@ async def _run(args: list[str], *, timeout: float = 30) -> tuple[int, str]:
     return int(getattr(result, "returncode", 1) or 0), text
 
 
+def _partition_batch(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Run every delete before any add/replace inside one reconcile pass."""
+    cleanup: list[str] = []
+    apply: list[str] = []
+    for line in lines:
+        if line.startswith(("filter del", "class del", "qdisc del")):
+            cleanup.append(line)
+        else:
+            apply.append(line)
+    return cleanup, apply
+
+
 def _batch_failed(code: int, text: str) -> bool:
     if code != 0:
         return True
@@ -859,10 +949,13 @@ async def _run_tc_lines(lines: list[str]) -> tuple[int, str]:
 
     Deletes of an object that is already gone are not failures. A failed add,
     class, or qdisc is. Later lines still run, so one bad filter does not hide
-    the result of the next command.
+    the result of the next command. Every delete is applied before any add so a
+    stale handle from an earlier snapshot cannot remove a filter we just added.
     """
     if not lines:
         return 0, ""
+    cleanup, apply = _partition_batch(lines)
+    lines = cleanup + apply
     errors: list[str] = []
     for line in lines:
         optional = line.startswith(("filter del", "class del", "qdisc del"))
@@ -1095,7 +1188,12 @@ def _block_has_address(block: str, address: str) -> bool:
 
 def _flowid_in_block(block: str, minor: int) -> bool:
     """Accept the class id spelling tc prints (hex) and the decimal minor."""
-    return f"1:{int(minor):x}" in block.lower() or f"1:{int(minor)}" in block
+    lowered = block.lower()
+    token = f"1:{int(minor)}"
+    hex_token = f"1:{int(minor):x}"
+    if hex_token in lowered or token in lowered:
+        return True
+    return f"classid {hex_token}" in lowered or f"classid {token}" in lowered
 
 
 def _parent_matches(block: str, parent: str) -> bool:
@@ -1198,7 +1296,10 @@ def _check_detail(
 
 async def _filters_present(device: str, limit: Limit, *, parent: list[str], kind: str) -> str | None:
     text = await _filter_show(device, parent)
-    parent_token = "ffff:" if parent == ["ingress"] else "1:"
+    if parent == ["ingress"]:
+        parent_token = "ffff:"
+    else:
+        parent_token = "1:0"
     for address in limit.addresses:
         if not filter_show_has(text, address, minor=limit.minor, kind=kind, parent=parent_token):
             where = " ".join(parent)
@@ -1294,12 +1395,12 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
                 missing.append(
                     f"download class 1:{limit.minor} missing on {device} parent 1:1"
                 )
-            reason = await _filters_present(device, limit, parent=["parent", "1:"], kind="dst")
+            reason = await _filters_present(device, limit, parent=["parent", "1:0"], kind="dst")
             if reason:
                 objects["download_filter"] = False
                 details["download_filter"] = _check_detail(
                     interface=device,
-                    parent="1:",
+                    parent="1:0",
                     classid=f"1:{limit.minor}",
                     match=f"ip dst {limit.addresses[0]}/32" if limit.addresses else None,
                     observed="no u32 filter with that destination and flowid",
@@ -1307,7 +1408,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
                 missing.append(reason)
     if limit.download_kbit and not tunnels:
         objects["download_class"] = await _class_present(IFB_DOWN, limit.minor)
-        reason = await _filters_present(IFB_DOWN, limit, parent=["parent", "1:"], kind="dst")
+        reason = await _filters_present(IFB_DOWN, limit, parent=["parent", "1:0"], kind="dst")
         objects["download_filter"] = reason is None
         if not objects["download_class"]:
             details["download_class"] = _check_detail(
@@ -1317,7 +1418,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
             missing.append(f"download class 1:{limit.minor} missing on {IFB_DOWN} parent 1:1")
         if reason:
             details["download_filter"] = _check_detail(
-                interface=IFB_DOWN, parent="1:", classid=f"1:{limit.minor}",
+                interface=IFB_DOWN, parent="1:0", classid=f"1:{limit.minor}",
                 match=f"ip dst {limit.addresses[0]}/32" if limit.addresses else None,
                 observed="no u32 filter with that destination and flowid",
             )
@@ -1343,7 +1444,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
                         )
     if limit.upload_kbit:
         objects["upload_class"] = await _class_present(IFB_UP, limit.minor)
-        reason = await _filters_present(IFB_UP, limit, parent=["parent", "1:"], kind="src")
+        reason = await _filters_present(IFB_UP, limit, parent=["parent", "1:0"], kind="src")
         objects["upload_filter"] = reason is None
         if not objects["upload_class"]:
             details["upload_class"] = _check_detail(
@@ -1353,7 +1454,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
             missing.append(f"upload class 1:{limit.minor} missing on {IFB_UP} parent 1:1")
         if reason:
             details["upload_filter"] = _check_detail(
-                interface=IFB_UP, parent="1:", classid=f"1:{limit.minor}",
+                interface=IFB_UP, parent="1:0", classid=f"1:{limit.minor}",
                 match=f"ip src {limit.addresses[0]}/32" if limit.addresses else None,
                 observed="no u32 filter with that source and flowid",
             )
@@ -1529,6 +1630,9 @@ async def _reconcile_locked(
         code, text = await _run_tc_lines(repair)
         if code != 0:
             errors.append(f"{name}: {text}")
+            code, text = await _run_tc_lines(full)
+            if code != 0:
+                errors.append(f"{name} (full): {text}")
 
     if upload_limits:
         qdisc_text, filter_text = await _device_snapshot(IFB_UP)

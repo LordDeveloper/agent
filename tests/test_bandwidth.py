@@ -83,10 +83,10 @@ def test_two_tunnel_addresses_share_one_class():
     first = plans[0].limits[0]
     commands = "\n".join(tunnel_commands("wg0", plans[0].limits))
     assert commands.count(f"classid 1:{first.minor} ") == 1
-    assert "match ip dst 10.8.0.2/32" in commands
-    assert "match ip dst 10.8.0.3/32" in commands
+    assert "match u32 0a080002/ffffffff at 16" in commands
+    assert "match u32 0a080003/ffffffff at 16" in commands
     assert f"flowid 1:{first.minor}" in commands
-    assert "10.8.0.4/32" in commands
+    assert "match u32 0a080004/ffffffff at 16" in commands
     assert "dev wg0 root" in commands
     assert IFB_UP in commands
 
@@ -127,7 +127,7 @@ def test_openvpn_sessions_share_the_subscription_class():
     commands = "\n".join(tunnel_commands(plans[0].name, plans[0].limits))
     minor = plans[0].limits[0].minor
     assert commands.count(f"classid 1:{minor} ") == 1
-    assert "10.9.0.9/32" in commands
+    assert "match u32 0a090009/ffffffff at 16" in commands
 
 
 def test_l2tp_sessions_share_one_ifb_class():
@@ -156,8 +156,8 @@ def test_l2tp_sessions_share_one_ifb_class():
     commands = "\n".join(ifb_commands(IFB_DOWN, limits, direction="download"))
     minor = limits[0].minor
     assert commands.count(f"classid 1:{minor} ") == 1
-    assert "match ip dst 10.7.0.2/32" in commands
-    assert "match ip dst 10.7.0.8/32" in commands
+    assert "match u32 0a070002/ffffffff at 16" in commands
+    assert "match u32 0a070008/ffffffff at 16" in commands
     assert "dev ppp0" not in commands
 
 
@@ -186,12 +186,13 @@ def test_filters_are_installed_without_an_explicit_u32_handle():
     assert "qdisc replace dev wg9a440050 root handle 1: htb" in commands
     assert "qdisc replace dev wg9a440050 clsact" in commands
     assert (
-        "filter add dev wg9a440050 parent 1: protocol ip prio 10 "
-        f"u32 match ip dst 10.90.68.108/32 flowid 1:{limit.minor}"
+        "filter add dev wg9a440050 parent 1:0 protocol ip prio 10 "
+        "u32 match u32 0a5a446c/ffffffff at 16 "
+        f"flowid 1:{limit.minor}"
     ) in commands
     assert (
         "filter add dev wg9a440050 ingress protocol ip prio 10 "
-        "u32 match ip src 10.90.68.108/32 "
+        "u32 match u32 0a5a446c/ffffffff at 12 "
         f"action mirred egress redirect dev {IFB_UP}"
     ) in commands
     # An explicit 800:: node is rejected unless that hash table already exists.
@@ -225,8 +226,10 @@ def test_repair_adds_missing_filters_without_replacing_qdiscs():
     assert "qdisc replace" not in commands
     assert "qdisc add" not in commands
     assert f"class replace dev wg9a440050 parent 1:1 classid 1:{limit.minor} " in commands
-    assert f"match ip dst 10.90.68.108/32 flowid 1:{limit.minor}" in commands
-    assert f"match ip src 10.90.68.108/32 action mirred egress redirect dev {IFB_UP}" in commands
+    assert "match u32 0a5a446c/ffffffff at 16" in commands
+    assert f"flowid 1:{limit.minor}" in commands
+    assert "match u32 0a5a446c/ffffffff at 12" in commands
+    assert f"action mirred egress redirect dev {IFB_UP}" in commands
     assert "handle 800::" not in commands
 
     ifb = "\n".join(repair_ifb_commands(
@@ -237,7 +240,8 @@ def test_repair_adds_missing_filters_without_replacing_qdiscs():
         filter_text="",
     ))
     assert "qdisc replace" not in ifb
-    assert f"match ip src 10.90.68.108/32 flowid 1:{limit.minor}" in ifb
+    assert "match u32 0a5a446c/ffffffff at 12" in ifb
+    assert f"flowid 1:{limit.minor}" in ifb
 
 
 def test_repair_keeps_another_clients_filter_and_drops_only_the_removed_one():
@@ -294,6 +298,24 @@ filter parent ffff: protocol ip pref 10 u32 chain 0 fh 800::803 order 2051 key h
     assert "handle 800::802" not in only_kept
     assert f"class del dev wg9a440050 classid 1:{other.minor}" in only_kept
     assert f"classid 1:{kept.minor}" in only_kept
+
+
+def test_run_tc_lines_applies_deletes_before_adds():
+    from agent.support import bandwidth as bw
+
+    calls: list[str] = []
+
+    async def fake_run(args, **kwargs):
+        calls.append(" ".join(args))
+        return 0, ""
+
+    bw._run = fake_run
+    asyncio.run(bw._run_tc_lines([
+        "filter add dev wg0 parent 1:0 protocol ip prio 10 u32 match u32 aa/ffffffff at 16 flowid 1:2",
+        "filter del dev wg0 parent 1:0 protocol ip prio 10 handle 800::800 u32",
+    ]))
+    assert calls[0].startswith("tc filter del")
+    assert calls[1].startswith("tc filter add")
 
 
 def test_filter_show_parser_requires_the_same_block():
