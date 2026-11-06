@@ -362,6 +362,9 @@ def _handle_token(slot: int) -> str:
 
 FILTER_PRIO = 10
 HTB_FILTER_PARENT = "parent 1:0"
+# clsact ingress filters attach at ffff:; some iproute2 builds reject the ``ingress`` alias.
+CLSACT_INGRESS_PARENT = "parent ffff:"
+CLSACT_INGRESS_ALT = "ingress"
 
 
 def _ipv4_ip_match(address: str, direction: str) -> str:
@@ -382,6 +385,17 @@ def _ipv4_u32_match(address: str, direction: str) -> str:
 
 def _flowid_action(minor: int) -> str:
     return f"flowid 1:{minor}"
+
+
+def _mirred_redirect_action(target: str) -> str:
+    return f"action mirred egress redirect dev {target}"
+
+
+def _ingress_redirect_add(device: str, address: str, *, target: str = IFB_UP) -> list[str]:
+    """Install clsact ingress redirect (``parent ffff:``; ``ingress`` is a runtime fallback)."""
+    match = _ipv4_ip_match(address, "src")
+    action = _mirred_redirect_action(target)
+    return [_filter_add(device, CLSACT_INGRESS_PARENT, match, action)]
 
 
 def _filter_add(device: str, parent: str, match: str, action: str) -> str:
@@ -499,17 +513,7 @@ def tunnel_commands(device: str, limits: list[Limit], previous: dict[str, Any] |
         for limit in uploads:
             for index, address in enumerate(limit.addresses):
                 slot = filter_handle(limit.minor, index, ingress_used)
-                lines.extend(
-                    _filter_lines(
-                        device,
-                        "ingress",
-                        slot,
-                        "",
-                        f"action mirred egress redirect dev {IFB_UP}",
-                        direction="src",
-                        address=address,
-                    )
-                )
+                lines.extend(_ingress_redirect_add(device, address))
     elif old_ingress:
         lines.append(f"qdisc del dev {device} clsact")
     return lines
@@ -568,16 +572,7 @@ def ppp_commands(device: str, bindings: list[tuple[str, Limit]]) -> list[str]:
                 )
             )
         if limit.upload_kbit:
-            slot = filter_handle(limit.minor, index, ingress_used)
-            lines.extend(
-                _filter_lines(
-                    device,
-                    "ingress",
-                    slot,
-                    f"ip src {address}/32",
-                    f"action mirred egress redirect dev {IFB_UP}",
-                )
-            )
+            lines.extend(_ingress_redirect_add(device, address))
     return lines
 
 
@@ -756,19 +751,14 @@ def repair_tunnel_commands(
         keep_redirect = {address for limit in uploads for address in limit.addresses}
         for limit in uploads:
             for address in limit.addresses:
-                present = (not rebuild_ingress) and filter_show_has(
-                    filter_text, address, kind="redirect", parent="ffff:"
+                present = (not rebuild_ingress) and _redirect_present(
+                    filter_text, address, IFB_UP,
                 )
                 if not present:
                     lines.extend(_purge_address_filters(
                         device, filter_text, address, mode="redirect",
                     ))
-                    lines.append(_filter_add(
-                        device,
-                        "ingress",
-                        _ipv4_ip_match(address, "src"),
-                        f"action mirred egress redirect dev {IFB_UP}",
-                    ))
+                    lines.extend(_ingress_redirect_add(device, address))
         if not rebuild_ingress:
             lines.extend(_obsolete_filter_deletes(
                 device, filter_text, mode="redirect", keep=keep_redirect,
@@ -850,14 +840,7 @@ def repair_ppp_commands(
                 f"action skbedit mark {MARK} pipe mirred egress redirect dev {IFB_DOWN}",
             ))
         if limit.upload_kbit and not _redirect_present(filter_text, address, IFB_UP):
-            slot = filter_handle(limit.minor, index)
-            lines.extend(_filter_lines(
-                device,
-                "ingress",
-                slot,
-                f"ip src {address}/32",
-                f"action mirred egress redirect dev {IFB_UP}",
-            ))
+            lines.extend(_ingress_redirect_add(device, address))
     return lines
 
 
@@ -977,15 +960,27 @@ def _object_absent(text: str) -> bool:
 
 
 def _filter_add_fallbacks(line: str) -> list[str]:
-    """If ``match ip dst|src A.B.C.D/32`` fails, retry raw u32 with separate mask tokens."""
+    """Retry clsact parent spelling and raw u32 matches when ``tc`` rejects the first form."""
     if not line.startswith("filter add "):
         return [line]
+    alts = [line]
+    if "mirred egress redirect" in line:
+        if CLSACT_INGRESS_PARENT in line:
+            alts.append(line.replace(CLSACT_INGRESS_PARENT, CLSACT_INGRESS_ALT, 1))
+        elif f" {CLSACT_INGRESS_ALT} " in f" {line} ":
+            alts.append(line.replace(f" {CLSACT_INGRESS_ALT} ", f" {CLSACT_INGRESS_PARENT} ", 1))
     match = re.search(r"match ip (dst|src) (\d+\.\d+\.\d+\.\d+)/32", line)
-    if not match:
-        return [line]
-    direction, address = match.group(1), match.group(2)
-    raw = _ipv4_u32_match(address, direction)
-    return [line, re.sub(r"match ip (?:dst|src) \d+\.\d+\.\d+\.\d+/32", f"match {raw}", line, count=1)]
+    if match:
+        direction, address = match.group(1), match.group(2)
+        raw = _ipv4_u32_match(address, direction)
+        alts.append(re.sub(r"match ip (?:dst|src) \d+\.\d+\.\d+\.\d+/32", f"match {raw}", line, count=1))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in alts:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
 
 
 async def _run_tc_lines(lines: list[str]) -> tuple[int, str]:
@@ -1137,6 +1132,11 @@ fi
     return script
 
 
+def _ordered_batch_lines(lines: list[str]) -> list[str]:
+    cleanup, apply = _partition_batch(lines)
+    return cleanup + apply
+
+
 def _write_batches(data_dir: Path, batches: dict[str, list[str]]) -> None:
     root = data_dir / "bandwidth" / "batches"
     root.mkdir(parents=True, exist_ok=True)
@@ -1146,7 +1146,29 @@ def _write_batches(data_dir: Path, batches: dict[str, list[str]]) -> None:
             path.unlink(missing_ok=True)
     for name, lines in batches.items():
         safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
-        (root / f"{safe}.batch").write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        ordered = _ordered_batch_lines(lines) if lines else []
+        (root / f"{safe}.batch").write_text(("\n".join(ordered) + "\n") if ordered else "", encoding="utf-8")
+
+
+def _ensure_upload_on_tunnel_limits(plan_limits: list[Limit], upload_limits: list[Limit]) -> list[Limit]:
+    """Copy upload rates from the IFB plan when a tunnel row only carried download."""
+    by_key = {item.key: item for item in upload_limits if item.upload_kbit}
+    merged: list[Limit] = []
+    for limit in plan_limits:
+        if limit.upload_kbit or limit.key not in by_key:
+            merged.append(limit)
+            continue
+        upl = by_key[limit.key]
+        merged.append(
+            Limit(
+                key=limit.key,
+                addresses=list(limit.addresses),
+                download_kbit=limit.download_kbit,
+                upload_kbit=upl.upload_kbit,
+                minor=limit.minor or upl.minor,
+            )
+        )
+    return merged
 
 
 def _write_ppp_hook(data_dir: Path, limits: list[Limit]) -> None:
@@ -1259,7 +1281,7 @@ def _parent_matches(block: str, parent: str) -> bool:
     if parent in {"1:", "1:0"}:
         return shown in {"1:", "1:0"}
     if parent in {"ffff:", "ingress"}:
-        return shown == "ffff:"
+        return shown == "ffff:" or shown.startswith("ffff:")
     return shown == parent
 
 
@@ -1319,9 +1341,15 @@ async def _class_present(device: str, minor: int) -> bool:
 
 
 async def _filter_show(device: str, parent: list[str]) -> str:
-    specific = await _tc_show(["tc", "filter", "show", "dev", device, *parent]) if parent else ""
-    broad = await _tc_show(["tc", "filter", "show", "dev", device])
-    return "\n".join(part for part in (specific, broad) if part)
+    chunks: list[str] = []
+    if parent:
+        chunks.append(await _tc_show(["tc", "filter", "show", "dev", device, *parent]))
+    chunks.append(await _tc_show(["tc", "filter", "show", "dev", device]))
+    if parent == ["ingress"] or parent == ["parent", "ffff:"]:
+        for extra in (["parent", "ffff:"], ["ingress"]):
+            if parent != extra:
+                chunks.append(await _tc_show(["tc", "filter", "show", "dev", device, *extra]))
+    return "\n".join(part for part in chunks if part)
 
 
 async def _device_snapshot(device: str) -> tuple[str, str]:
@@ -1523,7 +1551,7 @@ async def _verify_placement(row: dict[str, Any]) -> tuple[bool, str | None, bool
             for device in redirects:
                 text = await _filter_show(device, ["ingress"])
                 for address in limit.addresses:
-                    if not filter_show_has(text, address, kind="redirect", parent="ffff:"):
+                    if not _redirect_present(text, address, IFB_UP):
                         objects["ingress_redirect"] = False
                         details["ingress_redirect"] = _check_detail(
                             interface=device, parent="ffff:", classid=None,
@@ -1725,11 +1753,12 @@ async def _reconcile_locked(
         prior = owned.get(plan.name) if isinstance(owned.get(plan.name), dict) else {}
         prior = prior if isinstance(prior, dict) else {}
         qdisc_text, filter_text = await _device_snapshot(plan.name)
+        limits = _ensure_upload_on_tunnel_limits(plan.limits, upload_limits)
         await _apply(
             plan.name,
-            tunnel_commands(plan.name, plan.limits, prior),
+            tunnel_commands(plan.name, limits, prior),
             repair_tunnel_commands(
-                plan.name, plan.limits,
+                plan.name, limits,
                 qdisc_text=qdisc_text, filter_text=filter_text, previous=prior,
             ),
         )

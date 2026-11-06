@@ -191,7 +191,7 @@ def test_filters_are_installed_without_an_explicit_u32_handle():
         f"flowid 1:{limit.minor}"
     ) in commands
     assert (
-        "filter add dev wg9a440050 ingress protocol ip prio 10 "
+        "filter add dev wg9a440050 parent ffff: protocol ip prio 10 "
         "u32 match ip src 10.90.68.108/32 "
         f"action mirred egress redirect dev {IFB_UP}"
     ) in commands
