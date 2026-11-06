@@ -470,6 +470,12 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             peer["bandwidth"] = normalized_bandwidth
 
+    if "bandwidth_enabled" in payload:
+        if payload.get("bandwidth_enabled") is None:
+            peer.pop("bandwidth_enabled", None)
+        else:
+            peer["bandwidth_enabled"] = bool(payload.get("bandwidth_enabled"))
+
     if "exit_interface" in peer:
         exit_iface = str(peer.get("exit_interface") or "").strip()
         if exit_iface:

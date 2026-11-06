@@ -391,6 +391,8 @@ def _format_bandwidth_section(bandwidth: dict[str, Any] | None) -> list[str]:
     if configured:
         lines.append(f'  Download:      {_mbps_label(row.get("download_mbps"))}')
         lines.append(f'  Upload:        {_mbps_label(row.get("upload_mbps"))}')
+    if row.get('enabled') is not None:
+        lines.append(f'  Enabled:       {_yes_no(row.get("enabled"))}')
     lines.append(f'  Status:        {status}')
     if not configured:
         return lines

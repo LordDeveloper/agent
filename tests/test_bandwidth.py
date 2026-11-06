@@ -12,6 +12,7 @@ from agent.support.bandwidth import (
     collect_openvpn_plans,
     collect_tunnel_plans,
     diagnose_bandwidth,
+    limit_from_peer,
     core_supports_bandwidth,
     filter_show_has,
     ifb_commands,
@@ -492,6 +493,21 @@ def test_slow_bandwidth_task_does_not_block_another_client(tmp_path):
     elapsed = asyncio.run(scenario())
     assert elapsed < 0.1
     assert manager._tasks["other"]["status"] in {"completed", "running", "queued"}
+
+
+def test_disabled_bandwidth_does_not_install_limit():
+    peer = {
+        "id": "limited",
+        "is_enabled": True,
+        "address": "10.8.0.5",
+        "bandwidth": {"download_mbps": 5, "upload_mbps": 5},
+        "bandwidth_enabled": False,
+    }
+    assert limit_from_peer(peer) is None
+    report = asyncio.run(diagnose_bandwidth(peer, interface="wg1", kind="tunnel"))
+    assert report["configured"] is True
+    assert report["enabled"] is False
+    assert report["status"] == "disabled"
 
 
 def test_each_shaped_core_can_enqueue_and_xray_cannot(tmp_path):

@@ -213,6 +213,8 @@ def limit_from_peer(peer: dict[str, Any], extra: list[str] | None = None) -> Lim
 
     if not isinstance(peer, dict) or not record_is_enabled(peer):
         return None
+    if peer.get("bandwidth_enabled") is False:
+        return None
     try:
         bandwidth = normalize_bandwidth(peer.get("bandwidth"))
     except BandwidthValueError:
@@ -2360,8 +2362,12 @@ async def _diagnose_client(
         }
     download = normalized.get("download_mbps")
     upload = normalized.get("upload_mbps")
+    enabled = True
+    if isinstance(client, dict) and client.get("bandwidth_enabled") is False:
+        enabled = False
     report: dict[str, Any] = {
         "configured": True,
+        "enabled": enabled,
         "download_mbps": download,
         "upload_mbps": upload,
         "method": "htb_ifb" if upload or kind == "l2tp" else "htb",
@@ -2369,6 +2375,11 @@ async def _diagnose_client(
         "verified": False,
         "last_error": None,
     }
+    if not enabled:
+        report["status"] = "disabled"
+        report["verified"] = True
+        report["last_error"] = None
+        return report
     if not record_is_enabled(client):
         report["status"] = resolve_enforcement_status(configured=True, verified=False, task=task, waiting=task not in {"running"})
         if task == "running":
