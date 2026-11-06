@@ -1,3 +1,5 @@
+import asyncio
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -15,6 +17,9 @@ router = APIRouter(prefix="/network", tags=["network"])
 
 _probe_fallback_pending: set[str] = set()
 _probe_fallback_running = False
+_PROBE_JOB_LIMIT = 32
+_probe_jobs: dict[str, dict[str, Any]] = {}
+_probe_tasks: set[asyncio.Task[None]] = set()
 
 
 @router.get("/interfaces")
@@ -117,58 +122,157 @@ def _coerce_probe_fallback(value: Any, *, default: bool = True) -> bool:
     return default
 
 
-@router.post("/nodes/probe")
-async def probe_region_nodes(body: dict[str, Any], request: Request):
+def _remember_probe_job(probe_id: str, record: dict[str, Any]) -> None:
+    _probe_jobs[probe_id] = record
+    while len(_probe_jobs) > _PROBE_JOB_LIMIT:
+        oldest = next(iter(_probe_jobs))
+        if oldest == probe_id:
+            break
+        _probe_jobs.pop(oldest, None)
+
+
+def _probe_job(probe_id: str) -> dict[str, Any] | None:
+    record = _probe_jobs.get(probe_id)
+    return dict(record) if isinstance(record, dict) else None
+
+
+async def _load_probe_outbounds(registry: Any) -> list[dict[str, Any]]:
     from agent.drivers.xray import XrayDriver
+
+    try:
+        driver = registry.get("xray")
+    except Exception:
+        return []
+    if not isinstance(driver, XrayDriver):
+        return []
+    try:
+        listed = await driver.list_outbounds()
+    except Exception:
+        return []
+    if not isinstance(listed, list):
+        return []
+    return [row for row in listed if isinstance(row, dict)]
+
+
+def _failed_probe_ifaces(nodes: list[Any], result: dict[str, Any]) -> list[str]:
+    failed: list[str] = []
+    by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict)}
+    for row in result.get("nodes") or []:
+        if not isinstance(row, dict) or row.get("ok"):
+            continue
+        raw = by_id.get(str(row.get("id")))
+        iface = ""
+        if isinstance(raw, dict):
+            iface = str(raw.get("exit_interface") or "").strip()
+        # Dead exits (incl. timeout / no handshake) should still trigger fallback.
+        # Fixed relays remain pinned inside MullvadService.fallback_iface.
+        if iface:
+            failed.append(iface)
+    return failed
+
+
+async def _execute_probe_job(
+    probe_id: str,
+    nodes: list[Any],
+    *,
+    schedule_fallback: bool,
+    registry: Any,
+    store: Store,
+    settings: Any,
+) -> None:
     from agent.support.node_probe import probe_region_nodes as run_probe
 
+    log.info("region probe started probe_id=%s", probe_id)
+    try:
+        outbounds = await _load_probe_outbounds(registry)
+        result = await run_probe(nodes, outbounds)
+        if schedule_fallback:
+            failed = _failed_probe_ifaces(nodes, result)
+            if failed:
+                _schedule_probe_fallbacks(failed, store=store, settings=settings)
+        _remember_probe_job(probe_id, {"success": True, "status": "done", "probe_id": probe_id, **result})
+    except AgentError as exc:
+        log.warning("region probe failed probe_id=%s code=%s %s", probe_id, exc.code, exc.message)
+        _remember_probe_job(
+            probe_id,
+            {
+                "success": False,
+                "status": "error",
+                "probe_id": probe_id,
+                "error": {"code": exc.code, "message": exc.message},
+            },
+        )
+    except Exception:
+        log.exception("region probe failed probe_id=%s", probe_id)
+        _remember_probe_job(
+            probe_id,
+            {
+                "success": False,
+                "status": "error",
+                "probe_id": probe_id,
+                "error": {"code": "INTERNAL_ERROR", "message": "region probe failed"},
+            },
+        )
+
+
+def _schedule_probe_job(
+    probe_id: str,
+    nodes: list[Any],
+    *,
+    schedule_fallback: bool,
+    registry: Any,
+    store: Store,
+    settings: Any,
+) -> None:
+    async def _kickoff() -> None:
+        # Let the accept response flush before curl, ping, or route locks run.
+        # This task is not the request task: a client disconnect must not cancel it.
+        await asyncio.sleep(0)
+        await _execute_probe_job(
+            probe_id,
+            nodes,
+            schedule_fallback=schedule_fallback,
+            registry=registry,
+            store=store,
+            settings=settings,
+        )
+
+    task = asyncio.create_task(_kickoff())
+    _probe_tasks.add(task)
+    task.add_done_callback(_probe_tasks.discard)
+
+
+@router.post("/nodes/probe")
+async def probe_region_nodes(body: dict[str, Any], request: Request):
     nodes = body.get("nodes") or []
     if not isinstance(nodes, list):
         raise_agent_error("VALIDATION_ERROR", "nodes must be an array", 422)
+    if not any(isinstance(item, dict) and item.get("id") is not None for item in nodes):
+        raise_agent_error("VALIDATION_ERROR", "nodes list is required", 422)
 
     # Admin panel traffic tests pass fallback=false so false timeouts do not thrash relays.
     # Region monitor / ops probes keep the default (true) so dead exits still recover.
     schedule_fallback = _coerce_probe_fallback(body.get("fallback"), default=True)
+    probe_id = uuid.uuid4().hex
+    _remember_probe_job(probe_id, {"success": True, "status": "running", "probe_id": probe_id})
+    _schedule_probe_job(
+        probe_id,
+        nodes,
+        schedule_fallback=schedule_fallback,
+        registry=request.app.state.registry,
+        store=request.app.state.store,
+        settings=request.app.state.settings,
+    )
+    log.info("region probe accepted probe_id=%s", probe_id)
+    return {"success": True, "status": "running", "probe_id": probe_id}
 
-    outbounds: list[dict[str, Any]] = []
-    registry = request.app.state.registry
-    try:
-        driver = registry.get("xray")
-        if isinstance(driver, XrayDriver):
-            listed = await driver.list_outbounds()
-            if isinstance(listed, list):
-                outbounds = [row for row in listed if isinstance(row, dict)]
-    except Exception:
-        outbounds = []
 
-    try:
-        result = await run_probe(nodes, outbounds)
-    except AgentError as exc:
-        raise_agent_error(exc.code, exc.message, exc.status)
-
-    if schedule_fallback:
-        failed: list[str] = []
-        by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict)}
-        for row in result.get("nodes") or []:
-            if not isinstance(row, dict) or row.get("ok"):
-                continue
-            raw = by_id.get(str(row.get("id")))
-            iface = ""
-            if isinstance(raw, dict):
-                iface = str(raw.get("exit_interface") or "").strip()
-            # Dead exits (incl. timeout / no handshake) should still trigger fallback.
-            # Fixed relays remain pinned inside MullvadService.fallback_iface.
-            if iface:
-                failed.append(iface)
-
-        if failed:
-            _schedule_probe_fallbacks(
-                failed,
-                store=request.app.state.store,
-                settings=request.app.state.settings,
-            )
-
-    return {"success": True, **result}
+@router.get("/nodes/probe/{probe_id}")
+async def probe_region_nodes_status(probe_id: str):
+    record = _probe_job(probe_id)
+    if record is None:
+        raise_agent_error("NOT_FOUND", "probe not found", 404)
+    return record
 
 
 @router.post("/egress/repair")
