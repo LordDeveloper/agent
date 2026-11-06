@@ -10,7 +10,7 @@ unmarked egress there, the shaped packet is marked, and the second pass
 on the PPP device sends it. Several sessions of one subscription share
 one class. This is queue shaping, not a drop policer.
 
-NULL bandwidth is unlimited and installs no class. Zero is invalid.
+NULL bandwidth is unlimited and installs no class. Zero is invalid. 
 """
 
 from __future__ import annotations
