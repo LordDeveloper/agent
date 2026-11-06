@@ -28,8 +28,10 @@ def test_upstream_failure_is_not_an_empty_result():
     assert not is_upstream_failure(AgentError("CONFIG_NOT_FOUND", "missing", 404))
 
 
-def test_read_budget_is_shorter_than_the_panel_poll():
-    assert READ_BUDGET_SECONDS <= 4.0
+def test_read_budget_is_within_panel_client_timeouts():
+    # Laravel HttpClient defaults to ~15s; stay below multi-second dead air but
+    # above trivially fast paths so cores get a fair slice.
+    assert 4.0 <= READ_BUDGET_SECONDS <= 20.0
 
 
 def _driver() -> XrayDriver:

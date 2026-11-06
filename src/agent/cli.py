@@ -56,7 +56,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.port:
         port = args.port
     run_sync(runtime.close())
-    uvicorn.run(create_app(args.env_file), host=host, port=port, factory=False)
+
+    env_path = args.env_file
+    if env_path:
+        os.environ["ENV_FILE"] = str(env_path)
+
+    kw = dict(
+        host=host,
+        port=port,
+        backlog=max(1, int(args.backlog)),
+        timeout_keep_alive=int(float(args.keep_alive)),
+    )
+    if args.limit_concurrency is not None:
+        kw["limit_concurrency"] = int(args.limit_concurrency)
+
+    workers = max(1, int(args.workers))
+    if workers > 1:
+        # Multi-worker must load the factory by import string; each process reads ENV_FILE.
+        uvicorn.run("agent.main:create_app", factory=True, workers=workers, **kw)
+    else:
+        uvicorn.run(create_app(args.env_file), factory=False, **kw)
     return 0
 
 
@@ -735,6 +754,30 @@ def build_parser() -> argparse.ArgumentParser:
     _env_flag(p_serve)
     p_serve.add_argument("--host", default=None)
     p_serve.add_argument("--port", type=int, default=None)
+    p_serve.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Uvicorn worker processes (default 1; >1 shares one SQLite DB — use with care).",
+    )
+    p_serve.add_argument(
+        "--backlog",
+        type=int,
+        default=2048,
+        help="Socket listen backlog (default 2048).",
+    )
+    p_serve.add_argument(
+        "--limit-concurrency",
+        type=int,
+        default=None,
+        help="Max concurrent connections per worker (Uvicorn default ~1000). Omit for library default.",
+    )
+    p_serve.add_argument(
+        "--keep-alive",
+        type=float,
+        default=5.0,
+        help="HTTP keep-alive timeout in seconds.",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_menu = sub.add_parser("menu", help="Interactive nested menu (arrow keys)")

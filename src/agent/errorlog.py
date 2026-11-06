@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from agent.logutil import flush_logging, get_logger
 from agent.routing import SLUG_TO_CORE
+from agent.runtime import RuntimeTrace
 
 _CORE_PATH = re.compile(r"^/(?:api/v1/)?cores/(xray|wireguard|amnezia)(?:/|$)", re.IGNORECASE)
 _SKIP_SUFFIXES = ("/health", "/errors")
@@ -288,20 +289,21 @@ class CoreErrorCaptureMiddleware(BaseHTTPMiddleware):
         if errors is None:
             return response
 
-        body, response = await read_response_body(response)
-        code, message, _detail = parse_error_payload(body)
-        if not message:
-            message = f"HTTP {response.status_code}"
+        with RuntimeTrace.span("middleware.error_capture"):
+            body, response = await read_response_body(response)
+            code, message, _detail = parse_error_payload(body)
+            if not message:
+                message = f"HTTP {response.status_code}"
 
-        errors.record(
-            core=core_from_path(path),
-            message=message,
-            code=code or ("HTTP_ERROR" if response.status_code < 500 else "INTERNAL_ERROR"),
-            level="error" if response.status_code >= 500 else "warning",
-            method=request.method,
-            path=path,
-            status=response.status_code,
-            detail=_detail,
-        )
+            errors.record(
+                core=core_from_path(path),
+                message=message,
+                code=code or ("HTTP_ERROR" if response.status_code < 500 else "INTERNAL_ERROR"),
+                level="error" if response.status_code >= 500 else "warning",
+                method=request.method,
+                path=path,
+                status=response.status_code,
+                detail=_detail,
+            )
 
         return response

@@ -8,10 +8,11 @@ from typing import Any, TypeVar
 
 T = TypeVar("T")
 
-# Panel read timeouts are 8s and up. A core read that is still open at 4s
-# would otherwise stay on the core until its own 45s budget, after the panel
-# has already closed the socket and received zero bytes.
-READ_BUDGET_SECONDS = 4.0
+# Fallback when read_deadline ContextVar is unset (CLI/tests). The server sets
+# the budget per request from AgentSettings.read_budget_seconds (default 12s) so
+# core I/O stays within typical Laravel Guzzle timeouts while still failing before
+# bare 45s core budgets.
+READ_BUDGET_SECONDS = 12.0
 read_deadline: ContextVar[float | None] = ContextVar("agent_read_deadline", default=None)
 
 

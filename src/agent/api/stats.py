@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from agent.asyncutil import maybe_await
 from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
+from agent.runtime import RuntimeTrace
 from agent.routing import resolve_core_key
 from agent.traffic.service import TrafficService
 
@@ -174,11 +175,10 @@ async def stats_clients_traffic_pending(
          email so only growth after the GET snapshot remains queued.
     """
     registry: CoreRegistry = request.app.state.registry
-    age = await traffic.last_sample_age_ms()
     interval_ms = int(float(getattr(request.app.state.settings, "traffic_sample_interval", 30.0) or 30.0) * 1000)
     fresh_ms = max(3000, interval_ms // 2)
-    if age is None or age > fresh_ms:
-        await traffic.sample_all(registry)
+    with RuntimeTrace.span("stats.pending.ensure_sample"):
+        await traffic.ensure_sample_fresh(registry, max_sample_age_ms=fresh_ms)
     payload = await traffic.pending_payload()
 
     return {

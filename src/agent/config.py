@@ -87,6 +87,13 @@ class AgentSettings(BaseSettings):
     enforce_local_volume_quota: bool = True
     # Seconds between traffic delta samples for panel billing (0 disables background worker).
     traffic_sample_interval: float = 30.0
+    # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
+    # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
+    read_budget_seconds: float = 12.0
+    # Log SQLite operations slower than this (ms); 0 disables.
+    slow_query_log_ms: float = 500.0
+    # Log one line with X-RUNTIME breakdown when total duration exceeds this (ms); 0 disables.
+    slow_request_log_ms: float = 500.0
     # Sidecar TCP forwarder injecting PROXY protocol v1 for Xray acceptProxyProtocol inbounds.
     proxy_protocol_forwarder_enabled: bool = True
     proxy_protocol_forwarder_binary: str = ""

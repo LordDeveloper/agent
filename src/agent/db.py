@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Any
 
 import aiosqlite
 
+from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
+
+_sql_log = get_logger("sql")
 
 # A few dozen peers already produce a document large enough to stall the loop
 # if it is parsed inline. Smaller rows stay on the loop to avoid thread hops.
@@ -64,11 +68,18 @@ class Store:
     and stats reads. WAL is enabled in ``open``.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, slow_query_log_ms: float = 0.0):
         self.path = Path(path)
+        self._slow_query_log_ms = max(0.0, float(slow_query_log_ms))
         self._lock = asyncio.Lock()
         self._conn: aiosqlite.Connection | None = None
         self._read: aiosqlite.Connection | None = None
+
+    def _maybe_log_slow(self, phase: str, elapsed_ms: float, extra: str = "") -> None:
+        if self._slow_query_log_ms <= 0 or elapsed_ms < self._slow_query_log_ms:
+            return
+        suffix = f" {extra}" if extra else ""
+        _sql_log.warning("slow_sql phase=%s duration_ms=%.1f%s", phase, elapsed_ms, suffix)
 
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,18 +117,29 @@ class Store:
 
     @asynccontextmanager
     async def _writing(self) -> AsyncIterator[aiosqlite.Connection]:
+        wait_started = time.perf_counter()
         with RuntimeTrace.span("db.wait"):
             await self._lock.acquire()
+        self._maybe_log_slow("db.wait_lock", (time.perf_counter() - wait_started) * 1000)
         try:
+            q_started = time.perf_counter()
             with RuntimeTrace.span("db.query"):
                 yield self._writer()
+            self._maybe_log_slow("db.write", (time.perf_counter() - q_started) * 1000)
         finally:
             self._lock.release()
 
     async def _fetch(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        q_started = time.perf_counter()
         with RuntimeTrace.span("db.query"):
             cursor = await self._reader().execute(sql, params)
-            return await cursor.fetchall()
+            rows = await cursor.fetchall()
+        self._maybe_log_slow(
+            "db.read",
+            (time.perf_counter() - q_started) * 1000,
+            extra=f"sql={sql[:120]}",
+        )
+        return rows
 
     async def _migrate(self) -> None:
         async with self._writing() as conn:

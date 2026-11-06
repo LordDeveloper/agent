@@ -841,16 +841,34 @@ class OpenVpnDriver(CoreDriver):
 
     async def _commit_user_runtime(self, server: dict[str, Any]) -> None:
         """Refresh passwd/CCD and egress once for the whole user set."""
+        auth_started = time.perf_counter()
         await self._apply_server_auth_files(server)
+        auth_ms = int((time.perf_counter() - auth_started) * 1000)
+        egress_started = time.perf_counter()
         await self._sync_peer_egress()
+        log.info(
+            'openvpn runtime commit server=%s auth_ms=%s egress_ms=%s',
+            server.get('id'),
+            auth_ms,
+            int((time.perf_counter() - egress_started) * 1000),
+        )
 
     async def _commit_after_user_change(self, server: dict[str, Any], subnet_before: str) -> None:
         """Rewrite the server when the pool had to grow so the new tunnel IP is routed."""
-        if str(server.get('subnet') or '') != str(subnet_before or ''):
+        started = time.perf_counter()
+        subnet_changed = str(server.get('subnet') or '') != str(subnet_before or '')
+        if subnet_changed:
             await self._apply_all_configs()
             await self._ensure_services(start=True, restart=True, only_ids=[server.get('id')])
-            return
-        await self._commit_user_runtime(server)
+        else:
+            await self._commit_user_runtime(server)
+        log.info(
+            'openvpn user commit server=%s subnet_changed=%s restart=%s elapsed_ms=%s',
+            server.get('id'),
+            subnet_changed,
+            subnet_changed,
+            int((time.perf_counter() - started) * 1000),
+        )
 
     async def batch_users(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,8 @@ class TrafficService:
         self._aliases: dict[str, str] = {}
         self._emails: dict[str, str] = {}
         self._fetch_snapshot: dict[str, list[dict[str, Any]]] = {}
+        self._sample_lock = asyncio.Lock()
+        self._sample_flight: asyncio.Task | None = None
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from core counters (online not required)."""
@@ -93,6 +96,40 @@ class TrafficService:
         stored = await self._commit_samples(samples, sampled_at)
         stats.update(stored)
         return stats
+
+    async def ensure_sample_fresh(
+        self,
+        registry: CoreRegistry,
+        *,
+        max_sample_age_ms: int,
+    ) -> None:
+        """Run at most one concurrent full sample when the worker snapshot is stale.
+
+        GET /stats/clients/traffic/pending used to call sample_all inline, doubling work
+        with the background traffic worker and piling onto SQLite under concurrent polls.
+        """
+        if max_sample_age_ms <= 0:
+            await self.sample_all(registry)
+            return
+
+        age = await self.last_sample_age_ms()
+        if age is not None and age <= max_sample_age_ms:
+            return
+
+        async with self._sample_lock:
+            age_again = await self.last_sample_age_ms()
+            if age_again is not None and age_again <= max_sample_age_ms:
+                return
+            flight = self._sample_flight
+            if flight is None or flight.done():
+                self._sample_flight = asyncio.create_task(self.sample_all(registry))
+                flight = self._sample_flight
+            try:
+                await flight
+            finally:
+                current = self._sample_flight
+                if current is flight and flight.done():
+                    self._sample_flight = None
 
     async def _commit_samples(self, samples: list[dict[str, Any]], sampled_at: str) -> dict[str, int]:
         def plan(acks: dict, pending: dict) -> dict[str, Any]:

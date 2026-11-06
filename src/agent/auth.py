@@ -36,38 +36,41 @@ def verify_auth(
     bearer: HTTPAuthorizationCredentials | None = Depends(security_bearer),
     basic: HTTPBasicCredentials | None = Depends(security_basic),
 ) -> None:
-    settings: AgentSettings = request.app.state.settings
-    client_key = request.client.host if request.client else "unknown"
+    from agent.runtime import RuntimeTrace
 
-    token = settings.auth_token
-    if not token and not (settings.auth_username and settings.auth_password):
-        log.error("auth not configured path=%s client=%s", request.url.path, client_key)
-        raise HTTPException(
-            status_code=500,
-            detail=error_body("CONFIG_NOT_FOUND", "Agent auth is not configured"),
-        )
+    with RuntimeTrace.span("middleware.auth"):
+        settings: AgentSettings = request.app.state.settings
+        client_key = request.client.host if request.client else "unknown"
 
-    if bearer and bearer.credentials:
-        if token and bearer.credentials == token:
-            _clear_failures(client_key)
-            return
+        token = settings.auth_token
+        if not token and not (settings.auth_username and settings.auth_password):
+            log.error("auth not configured path=%s client=%s", request.url.path, client_key)
+            raise HTTPException(
+                status_code=500,
+                detail=error_body("CONFIG_NOT_FOUND", "Agent auth is not configured"),
+            )
+
+        if bearer and bearer.credentials:
+            if token and bearer.credentials == token:
+                _clear_failures(client_key)
+                return
+            _record_failure(client_key)
+            log.warning("invalid bearer token path=%s client=%s", request.url.path, client_key)
+            raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid bearer token"))
+
+        if basic and settings.auth_username and settings.auth_password:
+            if basic.username == settings.auth_username and basic.password == settings.auth_password:
+                _clear_failures(client_key)
+                return
+            _record_failure(client_key)
+            log.warning("invalid basic credentials path=%s client=%s", request.url.path, client_key)
+            raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid basic credentials"))
+
+        if token:
+            _record_failure(client_key)
+            log.warning("bearer token required path=%s client=%s", request.url.path, client_key)
+            raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Bearer token required"))
+
         _record_failure(client_key)
-        log.warning("invalid bearer token path=%s client=%s", request.url.path, client_key)
-        raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid bearer token"))
-
-    if basic and settings.auth_username and settings.auth_password:
-        if basic.username == settings.auth_username and basic.password == settings.auth_password:
-            _clear_failures(client_key)
-            return
-        _record_failure(client_key)
-        log.warning("invalid basic credentials path=%s client=%s", request.url.path, client_key)
-        raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Invalid basic credentials"))
-
-    if token:
-        _record_failure(client_key)
-        log.warning("bearer token required path=%s client=%s", request.url.path, client_key)
-        raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Bearer token required"))
-
-    _record_failure(client_key)
-    log.warning("authentication required path=%s client=%s", request.url.path, client_key)
-    raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Authentication required"))
+        log.warning("authentication required path=%s client=%s", request.url.path, client_key)
+        raise HTTPException(status_code=401, detail=error_body("INVALID_CREDENTIALS", "Authentication required"))
