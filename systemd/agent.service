@@ -1,7 +1,7 @@
 [Unit]
 Description=Netinja node agent API
-After=network-online.target
-Wants=network-online.target
+After=network-online.target agent-worker.service
+Wants=network-online.target agent-worker.service
 
 [Service]
 Type=simple

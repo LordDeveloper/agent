@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent.asyncutil import wait_signal
 from agent.logutil import get_logger
 
 log = get_logger("bandwidth")
@@ -2057,7 +2058,9 @@ class BandwidthManager:
         self.generation = 0
         self._wake = asyncio.Event()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._disk_mtime = 0
         self._load_tasks()
+        self._remember_disk()
 
     def _task_path(self) -> Path:
         return self.data_dir / "bandwidth" / "tasks.json"
@@ -2077,6 +2080,26 @@ class BandwidthManager:
 
     def _save_tasks(self) -> None:
         _write_json(self._task_path(), {"generation": self.generation, "tasks": self._tasks})
+        self._remember_disk()
+
+    def _remember_disk(self) -> None:
+        path = self._task_path()
+        try:
+            self._disk_mtime = path.stat().st_mtime_ns if path.is_file() else 0
+        except OSError:
+            self._disk_mtime = 0
+
+    def reload_from_disk(self) -> None:
+        """Pick up status written by the other process (API or worker)."""
+        path = self._task_path()
+        try:
+            mtime = path.stat().st_mtime_ns if path.is_file() else 0
+        except OSError:
+            return
+        if mtime == self._disk_mtime:
+            return
+        self._load_tasks()
+        self._disk_mtime = mtime
 
     def _enqueue(self, client_ids: list[str], *, action: str, core: str, interface: str) -> dict[str, Any]:
         if not _core_may_enqueue(core):
@@ -2132,6 +2155,7 @@ class BandwidthManager:
         return self._enqueue([], action="reconcile", core="", interface="")
 
     def bandwidth_status(self, client_ids: list[str] | None = None) -> str:
+        self.reload_from_disk()
         ids = [item for item in (client_ids or []) if item]
         rows: list[Any] = [self._tasks.get(cid) for cid in ids] if ids else []
         bulk = self._tasks.get("*")
@@ -2226,14 +2250,12 @@ class BandwidthManager:
             log.info("bandwidth recovered unfinished tasks=%s", restored)
         self.reconcile()
         while not stop.is_set():
-            if not self._wake.is_set():
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=LOOP_SECONDS)
-                except asyncio.TimeoutError:
-                    self.reconcile()
-                    continue
-                if stop.is_set():
-                    break
+            signal = await wait_signal(self._wake, stop, LOOP_SECONDS)
+            if signal == "stop":
+                break
+            if signal == "timeout":
+                self.reconcile()
+                continue
             await self._drain(stop)
 
     async def _drain(self, stop: asyncio.Event) -> None:

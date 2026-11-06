@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent.main import RequestLogMiddleware
+from agent.http import AgentHttpMiddleware
 from agent.runtime import RuntimeTrace, command_span_name
 
 
@@ -33,7 +33,7 @@ def test_command_span_name():
 
 def test_middleware_sets_x_runtime_header():
     app = FastAPI()
-    app.add_middleware(RequestLogMiddleware)
+    app.add_middleware(AgentHttpMiddleware)
 
     @app.get("/ping")
     def ping():

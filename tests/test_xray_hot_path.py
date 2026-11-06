@@ -228,11 +228,13 @@ def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, mon
     """GET must not await sample_all: panel 20s timeout caused cURL 28 with 0 bytes."""
     headers = {"Authorization": "Bearer dev-token"}
     traffic = client.app.state.traffic
+    samples = {"n": 0}
 
     async def stale_age() -> int:
         return 999_999
 
     async def slow_sample(registry):
+        samples["n"] += 1
         await asyncio.sleep(2)
         return {
             "clients_seen": 0,
@@ -250,5 +252,8 @@ def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, mon
 
     assert response.status_code == 200
     body = response.json()
-    assert body.get("sample_refresh_scheduled") is True
+    assert body.get("sample_refresh_scheduled") is False
+    assert body.get("success") is True
+    assert isinstance(body.get("users"), dict)
+    assert samples["n"] == 0
     assert elapsed < 1.0

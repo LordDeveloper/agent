@@ -5,7 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.asyncutil import READ_BUDGET_SECONDS, is_upstream_failure, read_deadline, short_read_path
+from agent.asyncutil import (
+    READ_BUDGET_SECONDS,
+    is_upstream_failure,
+    panel_read_path,
+    read_deadline,
+    short_read_path,
+)
 from agent.drivers.xray import XrayDriver
 from agent.errors import AgentError
 from agent.models import UsageSnapshotModel
@@ -18,8 +24,17 @@ def test_short_read_paths_cover_every_stats_and_health_route():
     assert short_read_path("GET", "/health")
     assert short_read_path("GET", "/cores/xray/health")
     assert short_read_path("GET", "/api/v1/wireguard/diagnose")
+    assert short_read_path("GET", "/api/v1/mullvad/locations")
     assert not short_read_path("POST", "/api/v1/stats/clients/traffic/pending/ack")
     assert not short_read_path("GET", "/api/v1/xray/inbounds/1")
+
+
+def test_panel_reads_are_the_routes_that_must_answer_quickly():
+    assert panel_read_path("GET", "/health")
+    assert panel_read_path("GET", "/api/v1/stats/clients/traffic/pending")
+    assert panel_read_path("GET", "/api/v1/mullvad/locations")
+    assert not panel_read_path("GET", "/api/v1/mullvad/locations/se/relays")
+    assert not panel_read_path("POST", "/api/v1/stats/clients/traffic/pending/ack")
 
 
 def test_upstream_failure_is_not_an_empty_result():
@@ -137,3 +152,151 @@ async def test_iplist_fallback_deadline_is_an_error(monkeypatch):
         assert caught.value.status == 503
     finally:
         read_deadline.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_slow_panel_reads_return_json_within_the_deadline():
+    """A stuck handler must not leave health or pending traffic with zero bytes."""
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from agent.http import AgentHttpMiddleware
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await asyncio.sleep(5)
+        body = b'{"success":true,"users":{"late":1}}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    wrapped = AgentHttpMiddleware(app, read_response_seconds=0.2, write_response_seconds=2.0)
+    transport = ASGITransport(app=wrapped)
+    async with AsyncClient(transport=transport, base_url="http://agent") as client:
+        started = time.perf_counter()
+        health, pending = await asyncio.gather(
+            client.get("/health"),
+            client.get("/api/v1/stats/clients/traffic/pending"),
+        )
+        elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0
+    for response in (health, pending):
+        assert response.status_code == 200
+        assert response.content
+        body = response.json()
+        assert body["success"] is True
+        assert body["stale"] is True
+    assert pending.json()["users"] == {}
+
+
+@pytest.mark.asyncio
+async def test_read_deadline_replays_the_last_json_body():
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from agent.http import AgentHttpMiddleware
+
+    gate = {"slow": False}
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        if gate["slow"]:
+            await asyncio.sleep(5)
+        body = b'{"success":true,"users":{"node":{"uplink":4}}}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    wrapped = AgentHttpMiddleware(app, read_response_seconds=0.2, write_response_seconds=2.0)
+    transport = ASGITransport(app=wrapped)
+    async with AsyncClient(transport=transport, base_url="http://agent") as client:
+        fresh = await client.get("/api/v1/stats/clients/traffic/pending")
+        assert fresh.status_code == 200
+        assert fresh.json()["users"]["node"]["uplink"] == 4
+        assert "stale" not in fresh.json()
+        gate["slow"] = True
+        started = time.perf_counter()
+        stale = await client.get("/api/v1/stats/clients/traffic/pending")
+        elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0
+    assert stale.status_code == 200
+    assert stale.content
+    assert stale.json()["stale"] is True
+    assert stale.json()["users"]["node"]["uplink"] == 4
+
+
+@pytest.mark.asyncio
+async def test_write_deadline_returns_a_json_body():
+    from httpx import ASGITransport, AsyncClient
+
+    from agent.http import AgentHttpMiddleware
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await asyncio.sleep(5)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    wrapped = AgentHttpMiddleware(app, read_response_seconds=0.2, write_response_seconds=0.2)
+    transport = ASGITransport(app=wrapped)
+    async with AsyncClient(transport=transport, base_url="http://agent") as client:
+        response = await client.post("/api/v1/cores/xray/inbounds", json={"name": "x"})
+
+    assert response.status_code == 504
+    assert response.content
+    assert response.json()["error"]["code"] == "READ_DEADLINE"
+
+
+@pytest.mark.asyncio
+async def test_cached_mullvad_locations_do_not_fetch(tmp_path):
+    from agent.db import Store
+    from agent.support.mullvad import _CACHE, MullvadService
+
+    _CACHE["rows"] = []
+    _CACHE["at"] = 0.0
+    store = Store(tmp_path / "agent.db")
+    await store.open()
+    try:
+        async def fetch():
+            raise AssertionError("mullvad network")
+
+        service = MullvadService(store, fetch=fetch)
+        empty = await service.locations(cached=True, ping=False)
+        assert empty["locations"] == []
+        assert empty["stale"] is True
+
+        await service.persist_catalog(
+            [
+                {
+                    "country_code": "se",
+                    "country_name": "Sweden",
+                    "active": True,
+                    "city_code": "sto",
+                    "city_name": "Stockholm",
+                }
+            ]
+        )
+        listed = await service.locations(cached=True, ping=False)
+        assert listed.get("stale") is not True
+        assert any(row["country_code"] == "se" for row in listed["locations"])
+    finally:
+        _CACHE["rows"] = []
+        _CACHE["at"] = 0.0
+        await store.close()

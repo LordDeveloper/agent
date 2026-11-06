@@ -79,6 +79,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_work(args: argparse.Namespace) -> int:
+    from agent.worker import run_worker
+
+    return run_worker(args.env_file)
+
+
 def cmd_menu(_: argparse.Namespace) -> int:
     from agent.menu import run_interactive
 
@@ -779,6 +785,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP keep-alive timeout in seconds.",
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    p_work = sub.add_parser("work", help="Run background loops (traffic, quota, egress, Mullvad)")
+    _env_flag(p_work)
+    p_work.set_defaults(func=cmd_work)
 
     p_menu = sub.add_parser("menu", help="Interactive nested menu (arrow keys)")
     p_menu.set_defaults(func=cmd_menu)

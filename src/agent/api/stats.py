@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, Query, Request
 from agent.asyncutil import maybe_await
 from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
-from agent.runtime import RuntimeTrace
 from agent.routing import resolve_core_key
 from agent.traffic.service import TrafficService
 
@@ -162,23 +161,17 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 
 @router.get("/stats/clients/traffic/pending")
 async def stats_clients_traffic_pending(
-    request: Request,
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
-      1. Worker keeps ``pending = current_cumulative - ack`` until POST ack.
-      2. GET returns the queue. It re-samples only when the worker snapshot is stale.
+      1. ``agent work`` keeps ``pending = current_cumulative - ack`` until POST ack.
+      2. GET only reads that queue. It does not sample cores.
       3. Panel bills those bytes, then POST ``/pending/ack`` with node_id and/or
          email so only growth after the GET snapshot remains queued.
     """
-    registry: CoreRegistry = request.app.state.registry
-    interval_ms = int(float(getattr(request.app.state.settings, "traffic_sample_interval", 30.0) or 30.0) * 1000)
-    fresh_ms = max(3000, interval_ms // 2)
-    with RuntimeTrace.span("stats.pending.ensure_sample"):
-        scheduled = await traffic.ensure_sample_fresh(registry, max_sample_age_ms=fresh_ms)
     payload = await traffic.pending_payload()
 
     return {
@@ -186,7 +179,7 @@ async def stats_clients_traffic_pending(
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
-        "sample_refresh_scheduled": scheduled,
+        "sample_refresh_scheduled": False,
     }
 
 

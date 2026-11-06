@@ -25,6 +25,12 @@ async def mullvad_worker_loop(
     service = MullvadService(store, config_dir=settings.wireguard_config_dir)
 
     try:
+        count = await service.refresh_catalog()
+        log.info("mullvad catalog relays=%s", count)
+    except Exception:
+        log.exception("mullvad catalog refresh failed")
+
+    try:
         await asyncio.wait_for(stop_event.wait(), timeout=5)
         log.info("mullvad fallback worker stopped")
         return
@@ -33,6 +39,10 @@ async def mullvad_worker_loop(
 
     while not stop_event.is_set():
         try:
+            try:
+                await service.refresh_catalog()
+            except Exception:
+                log.exception("mullvad catalog refresh failed")
             # These methods are async; await repair on the loop directly.
             # return value is an unawaited coroutine and .get() crashes.
             restored = await service.restore_interfaces()

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.db import Store, _JSON_OFFLOAD_BYTES, _loads
-from agent.main import RequestLogMiddleware
+from agent.http import warn_if_slow
 from agent.runtime import RuntimeTrace
 
 
@@ -88,11 +88,13 @@ def test_slow_request_log_includes_request_and_span(caplog) -> None:
         async def instant(_seconds: float) -> None:
             return None
 
+        logging.getLogger("agent").propagate = True
+        logging.getLogger("agent.http").propagate = True
         with caplog.at_level(logging.WARNING, logger="agent.http"), patch(
-            "agent.main.asyncio.sleep",
+            "agent.http.asyncio.sleep",
             instant,
         ):
-            await RequestLogMiddleware._warn_if_slow(request, "10.0.0.1")
+            await warn_if_slow(request, "10.0.0.1")
         RuntimeTrace.reset()
 
     asyncio.run(scenario())

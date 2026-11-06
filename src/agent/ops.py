@@ -428,11 +428,15 @@ def systemd_unit_path() -> Path:
     return Path("/etc/systemd/system/agent.service")
 
 
+def systemd_worker_unit_path() -> Path:
+    return Path("/etc/systemd/system/agent-worker.service")
+
+
 def default_unit_text() -> str:
     return """[Unit]
 Description=Netinja node agent API
-After=network-online.target
-Wants=network-online.target
+After=network-online.target agent-worker.service
+Wants=network-online.target agent-worker.service
 
 [Service]
 Type=simple
@@ -442,6 +446,25 @@ ExecStart=/opt/agent/bin/agent serve
 # Re-apply peer egress without blocking activation. The apply script used to
 # sleep once per missing exit interface and held this unit in start-post.
 ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def default_worker_unit_text() -> str:
+    return """[Unit]
+Description=Netinja node agent background worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent/.env
+WorkingDirectory=/opt/agent
+ExecStart=/opt/agent/bin/agent work
 Restart=on-failure
 RestartSec=3
 
@@ -497,28 +520,41 @@ async def service_action(action: str) -> dict:
         raise AgentError("UNSUPPORTED_CAPABILITY", "systemctl not found (Linux systemd required)")
     if action == "install":
         unit = systemd_unit_path()
+        worker = systemd_worker_unit_path()
         unit.write_text(default_unit_text(), encoding="utf-8")
+        worker.write_text(default_worker_unit_text(), encoding="utf-8")
         await run_cmd(["systemctl", "daemon-reload"], check=False)
+        await run_cmd(["systemctl", "enable", "agent-worker"], check=False)
         await run_cmd(["systemctl", "enable", "agent"], check=False)
-        return {"action": "install", "unit": str(unit), "ok": True}
+        return {"action": "install", "unit": str(unit), "worker": str(worker), "ok": True}
     if action == "uninstall":
         await run_cmd(["systemctl", "stop", "agent"], check=False)
+        await run_cmd(["systemctl", "stop", "agent-worker"], check=False)
         await run_cmd(["systemctl", "disable", "agent"], check=False)
+        await run_cmd(["systemctl", "disable", "agent-worker"], check=False)
         unit = systemd_unit_path()
+        worker = systemd_worker_unit_path()
         if unit.exists():
             unit.unlink()
+        if worker.exists():
+            worker.unlink()
         await run_cmd(["systemctl", "daemon-reload"], check=False)
         return {"action": "uninstall", "ok": True}
 
     allowed = {"start", "stop", "restart", "status", "enable", "disable"}
     if action not in allowed:
         raise AgentError("VALIDATION_ERROR", f"Unknown service action [{action}]")
+    # The listener must come up even when the worker unit is missing or failing.
+    worker_proc = await run_cmd(["systemctl", action, "agent-worker"], check=False)
     proc = await run_cmd(["systemctl", action, "agent"], check=False)
     return {
         "action": action,
         "ok": proc.returncode == 0,
+        "worker_ok": worker_proc.returncode == 0,
         "stdout": (proc.stdout or "").strip(),
         "stderr": (proc.stderr or "").strip(),
+        "worker_stdout": (worker_proc.stdout or "").strip(),
+        "worker_stderr": (worker_proc.stderr or "").strip(),
         "code": proc.returncode,
     }
 

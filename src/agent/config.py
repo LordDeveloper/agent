@@ -90,6 +90,11 @@ class AgentSettings(BaseSettings):
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0
+    # HTTP budget for health, stats, and Mullvad locations. The handler is cancelled and
+    # the last JSON body is returned with stale=true so the panel never waits on 0 bytes.
+    read_response_seconds: float = 3.0
+    # HTTP budget for writes and every other route. A timeout still writes a JSON body.
+    write_response_seconds: float = 180.0
     # Log SQLite operations slower than this (ms); 0 disables.
     slow_query_log_ms: float = 500.0
     # Log one line with X-RUNTIME breakdown when total duration exceeds this (ms); 0 disables.

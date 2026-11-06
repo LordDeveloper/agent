@@ -5,13 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-
 from agent.logutil import flush_logging, get_logger
 from agent.routing import SLUG_TO_CORE
-from agent.runtime import RuntimeTrace
 
 _CORE_PATH = re.compile(r"^/(?:api/v1/)?cores/(xray|wireguard|amnezia)(?:/|$)", re.IGNORECASE)
 _SKIP_SUFFIXES = ("/health", "/errors")
@@ -246,64 +241,3 @@ def list_log_errors(
 
     return rows
 
-
-async def read_response_body(response: Response) -> tuple[bytes, Response]:
-    body = getattr(response, "body", b"") or b""
-    if body:
-        return (body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8", "replace")), response
-
-    iterator = getattr(response, "body_iterator", None)
-    if iterator is None:
-        return b"", response
-
-    chunks: list[bytes] = []
-    async for chunk in iterator:
-        if isinstance(chunk, memoryview):
-            chunk = chunk.tobytes()
-        elif isinstance(chunk, str):
-            chunk = chunk.encode("utf-8", "replace")
-        elif not isinstance(chunk, (bytes, bytearray)):
-            chunk = bytes(chunk)
-        chunks.append(chunk)
-    data = b"".join(chunks)
-
-    async def replay():
-        yield data
-
-    response.body_iterator = replay()
-    return data, response
-
-
-class CoreErrorCaptureMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
-        response = await call_next(request)
-
-        if response.status_code < 400:
-            return response
-
-        path = request.url.path
-        if should_skip_path(path):
-            return response
-
-        errors: CoreErrorLog | None = getattr(request.app.state, "errors", None)
-        if errors is None:
-            return response
-
-        with RuntimeTrace.span("middleware.error_capture"):
-            body, response = await read_response_body(response)
-            code, message, _detail = parse_error_payload(body)
-            if not message:
-                message = f"HTTP {response.status_code}"
-
-            errors.record(
-                core=core_from_path(path),
-                message=message,
-                code=code or ("HTTP_ERROR" if response.status_code < 500 else "INTERNAL_ERROR"),
-                level="error" if response.status_code >= 500 else "warning",
-                method=request.method,
-                path=path,
-                status=response.status_code,
-                detail=_detail,
-            )
-
-        return response

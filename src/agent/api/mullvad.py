@@ -15,7 +15,10 @@ def _service(request: Request) -> MullvadService:
 @router.get("/locations")
 async def mullvad_locations(request: Request, force: bool = False, ping: bool = False):
     try:
-        payload = await _service(request).locations(force=force, ping=ping)
+        # Catalog refresh belongs to `agent work`. force is accepted so older
+        # panels keep working, and still does not call Mullvad from this request.
+        _ = force
+        payload = await _service(request).locations(ping=ping, cached=True)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {"success": True, **payload}

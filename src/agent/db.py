@@ -510,34 +510,46 @@ class Store:
         rows = await self._fetch("SELECT COUNT(*) AS c FROM traffic_pending")
         return int(rows[0]["c"]) if rows else 0
 
+    async def _traffic_books(self) -> tuple[
+        dict[tuple[str, str], tuple[int, int]],
+        dict[tuple[str, str], dict[str, int]],
+    ]:
+        """Read ack and pending on the read connection, outside the write lock."""
+        ack_rows = await self._fetch(
+            "SELECT core, client_key, incoming, outgoing FROM traffic_ack",
+        )
+        acks = {
+            (str(row["core"]), str(row["client_key"])): (
+                int(row["incoming"]),
+                int(row["outgoing"]),
+            )
+            for row in ack_rows
+        }
+        pending_rows = await self._fetch(
+            """
+            SELECT core, client_key, delta_incoming, delta_outgoing,
+                   current_incoming, current_outgoing
+            FROM traffic_pending
+            """
+        )
+        pending = {
+            (str(row["core"]), str(row["client_key"])): {
+                "delta_incoming": int(row["delta_incoming"]),
+                "delta_outgoing": int(row["delta_outgoing"]),
+                "current_incoming": int(row["current_incoming"]),
+                "current_outgoing": int(row["current_outgoing"]),
+            }
+            for row in pending_rows
+        }
+        return acks, pending
+
     async def apply_traffic_sample(self, plan) -> dict[str, int]:
+        # Planning walks every client. Do it before the write lock so a large
+        # sample cannot stall other writers, and never on the HTTP process.
+        acks, pending = await self._traffic_books()
+        writes = plan(acks, pending)
         async with self._writing() as conn:
-            acks: dict[tuple[str, str], tuple[int, int]] = {}
-            cursor = await conn.execute(
-                "SELECT core, client_key, incoming, outgoing FROM traffic_ack",
-            )
-            async for row in cursor:
-                acks[(str(row["core"]), str(row["client_key"]))] = (
-                    int(row["incoming"]),
-                    int(row["outgoing"]),
-                )
-            pending: dict[tuple[str, str], dict[str, int]] = {}
-            cursor = await conn.execute(
-                """
-                SELECT core, client_key, delta_incoming, delta_outgoing,
-                       current_incoming, current_outgoing
-                FROM traffic_pending
-                """,
-            )
-            async for row in cursor:
-                pending[(str(row["core"]), str(row["client_key"]))] = {
-                    "delta_incoming": int(row["delta_incoming"]),
-                    "delta_outgoing": int(row["delta_outgoing"]),
-                    "current_incoming": int(row["current_incoming"]),
-                    "current_outgoing": int(row["current_outgoing"]),
-                }
             try:
-                writes = plan(acks, pending)
                 await self._write_traffic_plan(conn, writes)
                 await conn.commit()
             except Exception:

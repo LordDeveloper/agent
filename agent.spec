@@ -11,8 +11,10 @@ a = Analysis(
     datas=[],
     hiddenimports=[
         'agent.cli',
+        'agent.http',
         'agent.ops',
         'agent.runtime',
+        'agent.worker',
         'agent.drivers.xray_http',
         'uvicorn.logging',
         'uvicorn.loops',

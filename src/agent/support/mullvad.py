@@ -46,6 +46,9 @@ CACHE_TTL = 3600.0
 _PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.I)
 KIND_SETTINGS = "settings"
 KIND_LOCATION = "location"
+KIND_CATALOG = "catalog"
+CATALOG_ID = "relays"
+CATALOG_AT_KEY = "catalog_at"
 CORE = "mullvad"
 SETTINGS_ID = "account"
 RELAY_METRIC_PING = "ping"
@@ -902,9 +905,54 @@ class MullvadService:
             return {**legacy, "country_code": code}
         return row if isinstance(row, dict) else None
 
-    async def locations(self, *, force: bool = False, ping: bool = False) -> dict[str, Any]:
-        relays = await maybe_await(fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch())
+    async def load_catalog(self) -> tuple[list[dict[str, Any]], bool]:
+        """Relays last saved by the worker. Never calls the Mullvad API."""
+        saved_at = await self.store.get_meta(CORE, CATALOG_AT_KEY, None)
+        try:
+            saved_at_f = float(saved_at) if saved_at is not None else 0.0
+        except (TypeError, ValueError):
+            saved_at_f = 0.0
+        if _CACHE["rows"] and float(_CACHE["at"] or 0) == saved_at_f and saved_at_f > 0:
+            fresh = (time.time() - saved_at_f) < CACHE_TTL
+            return list(_CACHE["rows"]), fresh
+        raw = await self.store.get_doc(CORE, KIND_CATALOG, CATALOG_ID)
+        rows: list[dict[str, Any]] = []
+        at = saved_at_f
+        if isinstance(raw, dict) and isinstance(raw.get("rows"), list):
+            rows = [row for row in raw["rows"] if isinstance(row, dict)]
+            try:
+                at = float(raw.get("at") or saved_at_f or 0)
+            except (TypeError, ValueError):
+                at = saved_at_f
+        _CACHE["rows"] = rows
+        _CACHE["at"] = at
+        fresh = bool(rows) and at > 0 and (time.time() - at) < CACHE_TTL
+        return list(rows), fresh
+
+    async def persist_catalog(self, relays: list[dict[str, Any]]) -> None:
+        now = time.time()
+        rows = [row for row in relays if isinstance(row, dict)]
+        _CACHE["at"] = now
+        _CACHE["rows"] = rows
+        await self.store.put_doc(CORE, KIND_CATALOG, CATALOG_ID, {"at": now, "rows": rows})
+        await self.store.set_meta(CORE, CATALOG_AT_KEY, now)
+
+    async def refresh_catalog(self) -> int:
+        """Fetch relays, store them, and adopt interfaces. Worker only."""
+        relays = await maybe_await(self.fetch())
+        await self.persist_catalog(relays)
         await self.refresh_bindings(relays)
+        return len(relays)
+
+    async def locations(self, *, force: bool = False, ping: bool = False, cached: bool = False) -> dict[str, Any]:
+        stale = False
+        if cached:
+            relays, fresh = await self.load_catalog()
+            stale = not fresh
+        else:
+            relays = await maybe_await(fetch_relays(force=True) if force and self.fetch is fetch_relays else self.fetch())
+            await self.persist_catalog(relays)
+            await self.refresh_bindings(relays)
         bound: dict[str, dict[str, Any]] = {}
         for row in await self.bindings():
             code = canonical_country_code(str(row.get("country_code") or ""))
@@ -938,13 +986,41 @@ class MullvadService:
                     "ping_via": None,
                 }
             )
+        seen = {str(item.get("country_code") or "") for item in locations}
+        for code, bind in bound.items():
+            if code in seen:
+                continue
+            locations.append(
+                {
+                    "country_code": code,
+                    "country_name": str(bind.get("country_name") or code.upper()),
+                    "iface": str(bind.get("iface") or preferred_iface(code)),
+                    "relay_count": 0,
+                    "cities": [],
+                    "bound": True,
+                    "adopted": bool(bind.get("adopted")),
+                    "hostname": str(bind.get("hostname") or "") or None,
+                    "endpoint": str(bind.get("endpoint") or "") or None,
+                    "fixed": bool(bind.get("fixed") or bind.get("pinned")),
+                    "pinned": bool(bind.get("fixed") or bind.get("pinned")),
+                    "ping_ms": None,
+                    "ping_ip": None,
+                    "reachable": None,
+                    "ping_via": None,
+                }
+            )
+            if cached:
+                stale = True
         if ping:
             locations = await self._attach_pings(locations, relays)
         settings = await self.settings()
-        return {
+        payload = {
             "settings": {k: v for k, v in settings.items() if k != "private_key"},
             "locations": locations,
         }
+        if stale:
+            payload["stale"] = True
+        return payload
 
     async def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
         jobs: list[tuple[str, str]] = []

@@ -69,16 +69,60 @@ def is_upstream_failure(exc: BaseException) -> bool:
     return type(exc).__name__ in {"TimeoutExpired", "ConnectTimeout", "ReadTimeout"}
 
 
+def _request_path(path: str) -> str:
+    return path.split("?", 1)[0].rstrip("/") or "/"
+
+
 def short_read_path(method: str, path: str) -> bool:
     """Routes whose result the panel can replace on the next poll."""
     if method.upper() not in {"GET", "HEAD"}:
         return False
-    normalized = path.split("?", 1)[0].rstrip("/") or "/"
+    normalized = _request_path(path)
     if normalized == "/health" or normalized.endswith("/health"):
         return True
     if normalized.startswith("/api/v1/stats") or normalized.startswith("/cores/"):
         return True
+    if normalized == "/api/v1/mullvad/locations":
+        return True
     return "/diagnose" in normalized
+
+
+def panel_read_path(method: str, path: str) -> bool:
+    """Polls that must answer in a few seconds, from cache when the handler is slow."""
+    if method.upper() not in {"GET", "HEAD"}:
+        return False
+    normalized = _request_path(path)
+    if normalized == "/health" or normalized.endswith("/health"):
+        return True
+    if normalized.startswith("/api/v1/stats"):
+        return True
+    return normalized == "/api/v1/mullvad/locations"
+
+
+async def wait_signal(wake: asyncio.Event, stop: asyncio.Event, timeout: float) -> str:
+    """Wait until ``wake``, ``stop``, or ``timeout``. Stop wins when both are set."""
+    if stop.is_set():
+        return "stop"
+    if wake.is_set():
+        return "wake"
+    wake_task = asyncio.create_task(wake.wait())
+    stop_task = asyncio.create_task(stop.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {wake_task, stop_task},
+            timeout=max(0.0, float(timeout)),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in (wake_task, stop_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(wake_task, stop_task, return_exceptions=True)
+    if stop.is_set():
+        return "stop"
+    if not done:
+        return "timeout"
+    return "wake"
 
 
 async def bounded_gather(
