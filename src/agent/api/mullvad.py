@@ -15,6 +15,62 @@ router = APIRouter(prefix="/mullvad", tags=["mullvad"])
 _RELAY_PING_LIMIT = 32
 _relay_ping_jobs: dict[str, dict[str, Any]] = {}
 _relay_ping_tasks: set[asyncio.Task[None]] = set()
+_location_ping_jobs: dict[str, dict[str, Any]] = {}
+_location_ping_tasks: set[asyncio.Task[None]] = set()
+
+
+def _remember_location_ping(ping_id: str, record: dict[str, Any]) -> None:
+    _location_ping_jobs[ping_id] = record
+    while len(_location_ping_jobs) > _RELAY_PING_LIMIT:
+        oldest = next(iter(_location_ping_jobs))
+        _location_ping_jobs.pop(oldest, None)
+
+
+async def _execute_location_ping(ping_id: str, service: MullvadService) -> None:
+    rows: list[dict[str, Any]] = []
+    try:
+        payload = await service.locations(ping=False, cached=True)
+        rows = [dict(row) for row in (payload.get("locations") or []) if isinstance(row, dict)]
+        relays, _fresh = await service.load_catalog()
+
+        def publish(status: str) -> None:
+            _remember_location_ping(
+                ping_id,
+                {
+                    "success": status != "error",
+                    "status": status,
+                    "ping_id": ping_id,
+                    "locations": [dict(row) for row in rows],
+                },
+            )
+
+        publish("running")
+        await service._attach_pings(rows, relays, on_progress=lambda: publish("running"))
+        publish("done")
+    except AgentError as exc:
+        log.warning("mullvad location ping failed ping_id=%s code=%s %s", ping_id, exc.code, exc.message)
+        _remember_location_ping(
+            ping_id,
+            {
+                "success": False,
+                "status": "error",
+                "ping_id": ping_id,
+                "locations": [dict(row) for row in rows],
+                "error": {"code": exc.code, "message": exc.message},
+            },
+        )
+    except Exception as exc:
+        log.exception("mullvad location ping failed ping_id=%s", ping_id)
+        _remember_location_ping(
+            ping_id,
+            {
+                "success": False,
+                "status": "error",
+                "ping_id": ping_id,
+                "locations": [dict(row) for row in rows],
+                "error": {"code": "INTERNAL_ERROR", "message": type(exc).__name__},
+            },
+        )
 
 
 def _remember_relay_ping(ping_id: str, record: dict[str, Any]) -> None:
@@ -92,16 +148,42 @@ def _service(request: Request) -> MullvadService:
     return service_from_app(request)
 
 
+@router.get("/locations/ping/{ping_id}")
+async def mullvad_location_ping(ping_id: str):
+    record = _location_ping_jobs.get(ping_id)
+    if not isinstance(record, dict):
+        raise_agent_error("NOT_FOUND", "Location ping was not found", 404)
+    return record
+
+
 @router.get("/locations")
 async def mullvad_locations(request: Request, force: bool = False, ping: bool = False):
     try:
         # Catalog refresh belongs to `agent work`. force is accepted so older
         # panels keep working, and still does not call Mullvad from this request.
         _ = force
-        payload = await _service(request).locations(ping=ping, cached=True)
+        service = _service(request)
+        payload = await service.locations(ping=False, cached=True)
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
-    return {"success": True, **payload}
+    if not ping:
+        return {"success": True, "ping_status": "idle", **payload}
+
+    ping_id = uuid.uuid4().hex
+    rows = [row for row in (payload.get("locations") or []) if isinstance(row, dict)]
+    _remember_location_ping(
+        ping_id,
+        {
+            "success": True,
+            "status": "running",
+            "ping_id": ping_id,
+            "locations": rows,
+        },
+    )
+    task = asyncio.create_task(_execute_location_ping(ping_id, service))
+    _location_ping_tasks.add(task)
+    task.add_done_callback(_location_ping_tasks.discard)
+    return {"success": True, "ping_status": "running", "ping_id": ping_id, **payload}
 
 
 @router.get("/locations/{country_code}/relays/ping/{ping_id}")

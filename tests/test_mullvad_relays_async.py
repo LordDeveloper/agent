@@ -100,3 +100,75 @@ def test_relay_list_returns_before_the_pings_finish(tmp_path: Path, monkeypatch)
             assert finished["relays"][0]["ping_ms"] == 4
     finally:
         _clear_env()
+
+
+def test_location_list_returns_before_the_pings_finish(tmp_path: Path, monkeypatch):
+    async def locations(self, *, force=False, ping=False, cached=False):
+        return {
+            "settings": {"relay_metric": "ping"},
+            "locations": [
+                {"country_code": "de", "country_name": "Germany", "iface": "de", "relay_count": 2, "ping_ms": None},
+                {"country_code": "se", "country_name": "Sweden", "iface": "sw", "relay_count": 1, "ping_ms": None},
+            ],
+        }
+
+    async def load_catalog(self):
+        return [], False
+
+    async def attach(self, rows, relays, *, on_progress=None):
+        await asyncio.sleep(0.6)
+        for row in rows:
+            if row.get("country_code") == "de":
+                row["ping_ms"] = 12
+        if on_progress is not None:
+            on_progress()
+        return rows
+
+    monkeypatch.setattr(MullvadService, "locations", locations)
+    monkeypatch.setattr(MullvadService, "load_catalog", load_catalog)
+    monkeypatch.setattr(MullvadService, "_attach_pings", attach)
+
+    _clear_env()
+    env = tmp_path / ".env"
+    data = tmp_path / "data"
+    env.write_text(
+        "\n".join(
+            [
+                "LISTEN=127.0.0.1:18445",
+                "AUTH_TOKEN=dev-token",
+                f"DATA_DIR={data.as_posix()}",
+                "ENABLED_CORES=xray",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    headers = {"Authorization": "Bearer dev-token"}
+    try:
+        with TestClient(create_app(str(env))) as client:
+            started = time.perf_counter()
+            accepted = client.get("/api/v1/mullvad/locations?ping=1", headers=headers)
+            assert accepted.status_code == 200, accepted.text
+            body = accepted.json()
+            assert time.perf_counter() - started < 0.4
+            assert body["success"] is True
+            assert body["ping_status"] == "running"
+            assert body["ping_id"]
+            assert [row["country_code"] for row in body["locations"]] == ["de", "se"]
+            assert all(row["ping_ms"] is None for row in body["locations"])
+
+            finished = None
+            deadline = time.perf_counter() + 3
+            while time.perf_counter() < deadline:
+                polled = client.get(f"/api/v1/mullvad/locations/ping/{body['ping_id']}", headers=headers)
+                assert polled.status_code == 200, polled.text
+                finished = polled.json()
+                if finished["status"] == "done":
+                    break
+                time.sleep(0.05)
+            assert finished is not None
+            assert finished["status"] == "done"
+            germany = next(row for row in finished["locations"] if row["country_code"] == "de")
+            assert germany["ping_ms"] == 12
+    finally:
+        _clear_env()

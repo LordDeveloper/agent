@@ -1028,7 +1028,36 @@ class MullvadService:
             payload["stale"] = True
         return payload
 
-    async def _attach_pings(self, locations: list[dict[str, Any]], relays: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _note_location_ping(
+        locations: list[dict[str, Any]],
+        country_code: str,
+        latency: int,
+        ip: str,
+        *,
+        via: str,
+    ) -> bool:
+        code = str(country_code or "")
+        for item in locations:
+            if str(item.get("country_code") or "") != code:
+                continue
+            current = item.get("ping_ms")
+            if isinstance(current, int) and current <= latency and item.get("ping_via") == via:
+                return False
+            item["ping_ms"] = latency
+            item["ping_ip"] = ip or None
+            item["reachable"] = True
+            item["ping_via"] = via
+            return True
+        return False
+
+    async def _attach_pings(
+        self,
+        locations: list[dict[str, Any]],
+        relays: list[dict[str, Any]],
+        *,
+        on_progress: Callable[[], Any] | None = None,
+    ) -> list[dict[str, Any]]:
         jobs: list[tuple[str, str]] = []
         for item in locations:
             iface = str(item.get("iface") or "")
@@ -1043,9 +1072,19 @@ class MullvadService:
                     jobs.append((code, ipv4))
 
         best: dict[str, tuple[int, str]] = {}
+
+        async def _probe(code: str, ip: str) -> tuple[bool, int | None]:
+            result = await ping_relay_ip(ip, runner=self.runner, tcp=self.probe)
+            ok, latency = result if isinstance(result, tuple) else (False, None)
+            if ok and latency is not None:
+                applied = self._note_location_ping(locations, code, int(latency), ip, via="relay")
+                if applied and on_progress is not None:
+                    await maybe_await(on_progress())
+            return bool(ok), latency if isinstance(latency, int) else None
+
         if jobs:
             pinged = await bounded_gather(
-                [lambda code=code, ip=ip: ping_relay_ip(ip, runner=self.runner, tcp=self.probe) for code, ip in jobs],
+                [lambda code=code, ip=ip: _probe(code, ip) for code, ip in jobs],
                 limit=min(32, max(1, len(jobs))),
             )
             for (code, ip), result in zip(jobs, pinged):
@@ -1065,9 +1104,25 @@ class MullvadService:
         ]
         tunnel_pings: dict[str, int] = {}
         if tunnel_ifaces:
-            probed = await gather_independent(
-                *(maybe_await(self.egress_probe(interface=iface, runner=self.runner)) for iface in tunnel_ifaces)
-            )
+            async def _probe_tunnel(iface: str) -> tuple[bool, str, int | None]:
+                result = await maybe_await(self.egress_probe(interface=iface, runner=self.runner))
+                if isinstance(result, tuple):
+                    tunnel_ok, _message, tunnel_ms = result
+                    if tunnel_ok and tunnel_ms:
+                        for item in locations:
+                            if str(item.get("iface") or "") != iface:
+                                continue
+                            item["ping_ms"] = int(tunnel_ms)
+                            item["ping_ip"] = None
+                            item["reachable"] = True
+                            item["ping_via"] = "tunnel"
+                            break
+                        if on_progress is not None:
+                            await maybe_await(on_progress())
+                    return bool(tunnel_ok), str(_message or ""), int(tunnel_ms) if tunnel_ms else None
+                return False, "", None
+
+            probed = await gather_independent(*(_probe_tunnel(iface) for iface in tunnel_ifaces))
             for iface, result in zip(tunnel_ifaces, probed):
                 if not isinstance(result, tuple):
                     continue
