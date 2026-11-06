@@ -1740,6 +1740,132 @@ def _show_mullvad_refresh() -> None:
         run_sync(runtime.close())
 
 
+def _bandwidth_menu() -> None:
+    while True:
+        render_header("Speed limits (bandwidth)")
+        picked = select(
+            [
+                Choice("status", "Status & last reconcile", CYAN, "1"),
+                Choice("clients", "List limited subscriptions", WHITE, "2"),
+                Choice("install", "Install dependencies (tc, IFB, modules)", GREEN, "3"),
+                Choice("reconcile", "Reconcile shaping rules now", YELLOW, "4"),
+                Choice("back", "Back", WHITE, "0"),
+            ]
+        )
+        if picked in {None, "back"}:
+            return
+        if picked == "status":
+            _run_action("Bandwidth status", _show_bandwidth_status)
+        elif picked == "clients":
+            _run_action("Limited subscriptions", _show_bandwidth_clients)
+        elif picked == "install":
+            if confirm("Install iproute2 and load kernel modules (requires root)?", default=True):
+                _run_action("Bandwidth dependencies", _show_bandwidth_install)
+        elif picked == "reconcile":
+            if confirm(
+                "Rebuild HTB/IFB rules from stored clients? WireGuard, Amnezia, OpenVPN, and L2TP only.",
+                default=True,
+            ):
+                _run_action("Bandwidth reconcile", _show_bandwidth_reconcile)
+
+
+def _show_bandwidth_status() -> None:
+    from agent.runtime import open_runtime
+    from agent.support.bandwidth import read_status
+
+    runtime = open_runtime()
+    try:
+        payload = read_status(runtime.settings.data_dir)
+    finally:
+        run_sync(runtime.close())
+
+    state = str(payload.get("state") or "unknown")
+    state_color = GREEN if state == "active" else (YELLOW if state in {"pending", "idle"} else RED)
+    _print(kv("State", state, state_color))
+    deps = payload.get("dependencies") if isinstance(payload.get("dependencies"), dict) else {}
+    _print(kv("tc", "yes" if deps.get("tc") else "no", GREEN if deps.get("tc") else RED))
+    _print(kv("IFB", "yes" if deps.get("ifb") else "no", GREEN if deps.get("ifb") else RED))
+    _print(kv("HTB", "yes" if deps.get("htb") else "no", GREEN if deps.get("htb") else RED))
+    _print(kv("Download mode", str(payload.get("download_mode") or "-"), CYAN))
+    _print(kv("Upload mode", str(payload.get("upload_mode") or "-"), CYAN))
+    clients = payload.get("clients") if isinstance(payload.get("clients"), dict) else {}
+    _print(kv("Limited clients", str(len(clients)), WHITE))
+    if payload.get("last_reconcile_at"):
+        _print(kv("Last reconcile", str(payload.get("last_reconcile_at")), DIM))
+    error = str(payload.get("last_error") or "").strip()
+    if error:
+        _print_block(error, max_lines=8, color=RED)
+
+
+def _show_bandwidth_clients() -> None:
+    from agent.runtime import open_runtime
+    from agent.support.bandwidth import read_status
+
+    runtime = open_runtime()
+    try:
+        payload = read_status(runtime.settings.data_dir)
+    finally:
+        run_sync(runtime.close())
+
+    clients = payload.get("clients") if isinstance(payload.get("clients"), dict) else {}
+    if not clients:
+        _print(paint("  No limited subscriptions in the last reconcile snapshot.", DIM))
+        _print(paint("  Limits are set in the panel (plan/subscription Mbps).", DIM))
+        return
+    for key, row in sorted(clients.items()):
+        if not isinstance(row, dict):
+            continue
+        down = row.get("download_mbps")
+        up = row.get("upload_mbps")
+        rate = f"{down or '-'}↓ / {up or '-'}↑ Mbps"
+        verified = row.get("verified")
+        tone = GREEN if verified else (YELLOW if row.get("state") == "pending" else RED)
+        iface = str(row.get("interface") or "-")
+        _print(paint(f"  {key}  {rate}  {row.get('state') or '-'}  {iface}", tone))
+        addresses = row.get("addresses") or []
+        if addresses:
+            _print(paint(f"    {', '.join(str(item) for item in addresses)}", DIM))
+        err = str(row.get("last_error") or "").strip()
+        if err and not verified:
+            _print(paint(f"    {err[:120]}", RED))
+
+
+def _show_bandwidth_install() -> None:
+    from agent.support.bandwidth import ensure_dependencies
+
+    result = run_sync(ensure_dependencies(install=True))
+    state = str(result.get("state") or "error")
+    _print(kv("State", state, GREEN if state == "active" else RED))
+    _print(kv("tc", "yes" if result.get("tc") else "no", GREEN if result.get("tc") else RED))
+    _print(kv("IFB", "yes" if result.get("ifb") else "no", GREEN if result.get("ifb") else RED))
+    _print(kv("HTB", "yes" if result.get("htb") else "no", GREEN if result.get("htb") else RED))
+    error = str(result.get("error") or "").strip()
+    if error:
+        _print_block(error, max_lines=6, color=RED)
+
+
+def _show_bandwidth_reconcile() -> None:
+    from agent.runtime import open_runtime
+    from agent.support.bandwidth import configure_runtime, reconcile_enabled
+
+    runtime = open_runtime()
+    try:
+        configure_runtime(runtime.registry, runtime.settings.data_dir)
+        result = run_sync(reconcile_enabled(runtime.registry, runtime.settings.data_dir))
+    finally:
+        run_sync(runtime.close())
+
+    state = str(result.get("state") or "unknown")
+    _print(kv("State", state, GREEN if state == "active" else RED))
+    clients = result.get("clients") if isinstance(result.get("clients"), dict) else {}
+    _print(kv("Clients", str(len(clients)), CYAN))
+    verified = sum(1 for row in clients.values() if isinstance(row, dict) and row.get("verified"))
+    _print(kv("Kernel verified", str(verified), GREEN if verified else YELLOW))
+    error = str(result.get("last_error") or "").strip()
+    if error:
+        _print_block(error, max_lines=10, color=RED)
+
+
 def _token_menu() -> None:
     while True:
         render_header("Token")
@@ -1785,11 +1911,12 @@ def run_interactive() -> int:
                     Choice("bbr", "BBR", MAGENTA, "5"),
                     Choice("dns_leak", "DNS leak & ads blocker", MAGENTA, "6"),
                     Choice("peer_diagnose", "Peer / client diagnose", CYAN, "7"),
-                    Choice("status", "Check status", WHITE, "8"),
-                    Choice("stats", "Stats", WHITE, "9"),
-                    Choice("update", "Update agent", WHITE, "10"),
-                    Choice("token", "Auth token", WHITE, "11"),
-                    Choice("mullvad", "Mullvad", GREEN, "12"),
+                    Choice("bandwidth", "Speed limits (bandwidth)", MAGENTA, "8"),
+                    Choice("status", "Check status", WHITE, "9"),
+                    Choice("stats", "Stats", WHITE, "10"),
+                    Choice("update", "Update agent", WHITE, "11"),
+                    Choice("token", "Auth token", WHITE, "12"),
+                    Choice("mullvad", "Mullvad", GREEN, "13"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]
             )
@@ -1814,6 +1941,8 @@ def run_interactive() -> int:
                 _dns_leak_menu()
             elif picked == "peer_diagnose":
                 _peer_diagnose_menu()
+            elif picked == "bandwidth":
+                _bandwidth_menu()
             elif picked == "status":
                 _status()
             elif picked == "stats":
