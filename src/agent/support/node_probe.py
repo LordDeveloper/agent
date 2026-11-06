@@ -1047,6 +1047,7 @@ async def probe_region_nodes(
     outbounds: list[dict[str, Any]] | None = None,
     *,
     runner: Runner | None = None,
+    on_row: Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(nodes, list) or not nodes:
         raise AgentError('VALIDATION_ERROR', 'nodes list is required')
@@ -1059,21 +1060,25 @@ async def probe_region_nodes(
             'summary': {'total': 0, 'passed': 0, 'failed': 0},
         }
 
-    # Parallel across nodes; each node starts on a different probe IP so /32 route
-    # locks rarely contend (Table=off Mullvad exits need host routes per dest).
+    async def _one(item: dict[str, Any], index: int) -> dict[str, Any]:
+        row = await probe_region_node(
+            node_id=item.get('id'),
+            outbound_tag=item.get('outbound_tag'),
+            exit_interface=item.get('exit_interface'),
+            outbounds=outbounds,
+            runner=runner,
+            start_index=index,
+        )
+        # Publish each node as it finishes so callers are not stuck on the slowest ping.
+        if on_row is not None and isinstance(row, dict):
+            await maybe_await(on_row(row))
+        return row
+
+    # One bulk batch, parallel across nodes. Each node starts on a different probe
+    # IP so /32 route locks rarely contend (Table=off Mullvad exits).
     limit = min(MAX_PROBE_WORKERS, len(PROBE_URLS), len(valid_nodes))
     rows = await bounded_gather(
-        [
-            lambda item=item, index=index: probe_region_node(
-                node_id=item.get('id'),
-                outbound_tag=item.get('outbound_tag'),
-                exit_interface=item.get('exit_interface'),
-                outbounds=outbounds,
-                runner=runner,
-                start_index=index,
-            )
-            for index, item in enumerate(valid_nodes)
-        ],
+        [lambda item=item, index=index: _one(item, index) for index, item in enumerate(valid_nodes)],
         limit=limit,
     )
 

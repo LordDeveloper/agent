@@ -430,6 +430,7 @@ async def score_relays(
     require_reachable: bool = False,
     prefer_measured: bool = True,
     metric: str = RELAY_METRIC_PING,
+    on_scored: Callable[[dict[str, Any], int | None, bool], Any] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
     """Rank relays for fallback/ensure.
 
@@ -455,9 +456,14 @@ async def score_relays(
         if require_reachable and not measured:
             return None
         if measured:
-            return int(latency or 0), row, True
-        # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
-        return (40_000 if row.get("owned") else 50_000), row, False
+            outcome = (int(latency or 0), row, True)
+        else:
+            # WireGuard is UDP; TCP/ICMP to :51820 often fails even when the relay is usable.
+            outcome = ((40_000 if row.get("owned") else 50_000), row, False)
+        if on_scored is not None:
+            reported = int(latency) if measured and latency is not None else None
+            await maybe_await(on_scored(row, reported, measured))
+        return outcome
 
     if not relays:
         return []
@@ -1268,11 +1274,27 @@ class MullvadService:
                 skipped.append(result)
         return {"changed": changed, "skipped": skipped, "failed": failed, "optimize": bool(optimize)}
 
-    async def country_relays(self, country_code: str, *, ping: bool = True) -> dict[str, Any]:
+    async def catalog_relays(self) -> list[dict[str, Any]]:
+        """Relays last saved by the worker. Live Mullvad is only a cold-cache fallback."""
+        rows, _fresh = await self.load_catalog()
+        if rows:
+            return rows
+        fetched = await maybe_await(self.fetch())
+        rows = [row for row in (fetched or []) if isinstance(row, dict)]
+        if rows:
+            await self.persist_catalog(rows)
+        return rows
+
+    async def country_relays(
+        self,
+        country_code: str,
+        *,
+        ping: bool = True,
+        on_row: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         code = require_country_code(country_code)
 
-        relays = await maybe_await(self.fetch())
-        await self.refresh_bindings(relays)
+        relays = await self.catalog_relays()
         candidates = active_relays(relays, code)
         if not candidates:
             raise AgentError("NOT_FOUND", f"No active Mullvad relays for {code}", 404)
@@ -1282,38 +1304,42 @@ class MullvadService:
         current_fixed = bool(bind.get("fixed") or bind.get("pinned"))
         metric = await self.relay_metric()
         mode = await self.relay_mode()
-        rows: list[dict[str, Any]] = []
 
-        ping_by_host: dict[str, int | None] = {}
-        if ping:
-            for score, row in await score_relays(
+        def present(row: dict[str, Any], ping_ms: int | None) -> dict[str, Any]:
+            host = str(row.get("hostname") or "").strip().lower()
+            is_current = host == current_host
+            return present_relay_row(
+                row,
+                ping_ms=ping_ms,
+                measured=ping_ms is not None,
+                current=is_current,
+                fixed=bool(is_current and current_fixed),
+            )
+
+        rows: list[dict[str, Any]] = []
+        if not ping:
+            rows = [present(row, None) for row in candidates]
+            rows.sort(key=lambda item: (0 if item.get("current") else 1, str(item.get("hostname") or "")))
+        else:
+            ping_by_host: dict[str, int | None] = {}
+
+            async def emit(row: dict[str, Any], latency: int | None, measured: bool) -> None:
+                ping_ms = int(latency) if measured and latency is not None and int(latency) < 40_000 else None
+                host = str(row.get("hostname") or "").strip().lower()
+                ping_by_host[host] = ping_ms
+                if on_row is not None:
+                    await maybe_await(on_row(present(row, ping_ms)))
+
+            scored = await score_relays(
                 candidates,
                 probe=self.probe,
                 prefer_measured=False,
-                metric=RELAY_METRIC_PING,
-            ):
-                host = str(row.get("hostname") or "").strip().lower()
-                ping_by_host[host] = score if score < 40_000 else None
-
-        scored = await score_relays(
-            candidates,
-            probe=self.probe,
-            prefer_measured=False,
-            metric=metric,
-        )
-        for _score, row in scored:
-            host = str(row.get("hostname") or "").strip().lower()
-            ping_ms = ping_by_host.get(host)
-            is_current = host == current_host
-            rows.append(
-                present_relay_row(
-                    row,
-                    ping_ms=ping_ms,
-                    measured=ping_ms is not None,
-                    current=is_current,
-                    fixed=bool(is_current and current_fixed),
-                )
+                metric=metric,
+                on_scored=emit,
             )
+            for _score, row in scored:
+                host = str(row.get("hostname") or "").strip().lower()
+                rows.append(present(row, ping_by_host.get(host)))
 
         return {
             "country_code": code,

@@ -7,6 +7,29 @@ from agent.support import node_probe
 from agent.support.node_probe import PROBE_TARGETS, _curl_probe
 
 
+def test_probe_region_nodes_publishes_each_finished_row():
+    async def fake_probe(**kwargs):
+        return {'id': kwargs['node_id'], 'ok': True, 'message': 'ok', 'latency_ms': 12}
+
+    published: list[int] = []
+
+    async def run():
+        with patch.object(node_probe, 'probe_region_node', side_effect=fake_probe):
+            return await node_probe.probe_region_nodes(
+                [
+                    {'id': 1, 'exit_interface': 'de'},
+                    {'id': 2, 'exit_interface': 'nl'},
+                ],
+                on_row=lambda row: published.append(int(row['id'])),
+            )
+
+    result = asyncio.run(run())
+
+    assert published == [1, 2]
+    assert [row['id'] for row in result['nodes']] == [1, 2]
+    assert result['summary'] == {'total': 2, 'passed': 2, 'failed': 0}
+
+
 def test_probe_targets_prefer_literal_ip():
     assert PROBE_TARGETS[0][0].startswith('http://1.1.1.1')
     assert PROBE_TARGETS[1][0].startswith('http://1.0.0.1')

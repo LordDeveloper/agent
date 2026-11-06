@@ -405,7 +405,7 @@ def _read_archive(path: Path) -> dict[str, Any]:
 def export_bundle(store: Any, settings: Any, raw_path: str | None, *, rewrite: bool) -> dict[str, Any]:
     from agent.asyncutil import run_sync
 
-    documents = run_sync(store.dump_documents())
+    documents = run_sync(store.list_doc_records(core="openvpn", kind="server"))
     if not isinstance(documents, list):
         documents = []
     attach_document_certificates(documents, settings)
@@ -493,7 +493,7 @@ def import_bundle(store: Any, settings: Any, raw_path: str, *, rewrite: bool) ->
     if version != BUNDLE_VERSION:
         raise AgentError("VALIDATION_ERROR", "Certificate bundle version is not supported", 422)
 
-    existing = run_sync(store.dump_documents())
+    existing = run_sync(store.list_doc_records(core="openvpn", kind="server"))
     if not isinstance(existing, list):
         existing = []
     documents = _bundle_documents(payload, existing)

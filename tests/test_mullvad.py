@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from agent.asyncutil import run_sync
+from agent.errors import AgentError
 from types import SimpleNamespace
 
 from agent.db import Store
@@ -740,3 +741,31 @@ def test_parse_ping_ms_from_linux_ping():
     assert parse_ping_ms("64 bytes from 1.1.1.1: icmp_seq=1 ttl=54 time=14.2 ms") == 14
     assert parse_ping_ms("time=8.04 ms") == 8
     assert parse_ping_ms("no rtt") is None
+
+
+def test_country_relays_use_saved_catalog_when_mullvad_api_fails(tmp_path: Path):
+    svc = _service(tmp_path)
+
+    def fail_fetch():
+        raise AgentError("UPSTREAM_ERROR", "Mullvad API blocked", 502)
+
+    run_sync(svc.persist_catalog(RELAYS))
+    svc.fetch = fail_fetch
+    listed = run_sync(svc.country_relays("de", ping=False))
+    assert {row["hostname"] for row in listed["relays"]} == {"de-fra-wg-001", "de-ber-wg-001"}
+
+
+def test_country_relays_ping_publishes_each_finished_relay(tmp_path: Path):
+    svc = _service(
+        tmp_path,
+        probe=lambda host, _port: (True, 5 if host == "2.2.2.2" else 90),
+    )
+    published: list[str] = []
+
+    def on_row(row):
+        published.append(row["hostname"])
+
+    listed = run_sync(svc.country_relays("de", ping=True, on_row=on_row))
+    assert set(published) == {"de-fra-wg-001", "de-ber-wg-001"}
+    assert listed["relays"][0]["hostname"] == "de-ber-wg-001"
+    assert listed["relays"][0]["ping_ms"] == 5

@@ -152,14 +152,14 @@ class Store:
                     data TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (core, kind, doc_id)
-                );
+                ) WITHOUT ROWID;
 
                 CREATE TABLE IF NOT EXISTS meta (
                     core TEXT NOT NULL,
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     PRIMARY KEY (core, key)
-                );
+                ) WITHOUT ROWID;
 
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +176,7 @@ class Store:
                     outgoing INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (core, client_key)
-                );
+                ) WITHOUT ROWID;
 
                 CREATE TABLE IF NOT EXISTS traffic_pending (
                     core TEXT NOT NULL,
@@ -187,12 +187,97 @@ class Store:
                     current_outgoing INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (core, client_key)
-                );
+                ) WITHOUT ROWID;
 
                 DROP TABLE IF EXISTS core_errors;
                 """
             )
+            await self._cluster_existing_tables(conn)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS documents_by_kind ON documents (kind, core, doc_id)"
+            )
+            await conn.execute("ANALYZE documents")
             await conn.commit()
+
+    async def _cluster_existing_tables(self, conn: aiosqlite.Connection) -> None:
+        """Move composite-key tables off the rowid heap.
+
+        A rowid table keeps the primary key in a separate index, so
+        ``ORDER BY core, kind, doc_id`` and ``WHERE core = ? AND kind = ?``
+        look up every JSON body by rowid. ``WITHOUT ROWID`` stores the row in
+        primary-key order. ``CREATE TABLE IF NOT EXISTS`` does not change a
+        table that was created by an older agent.
+        """
+        tables = {
+            "documents": (
+                """
+                CREATE TABLE documents__clustered (
+                    core TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (core, kind, doc_id)
+                ) WITHOUT ROWID
+                """,
+                "core, kind, doc_id, data, updated_at",
+            ),
+            "meta": (
+                """
+                CREATE TABLE meta__clustered (
+                    core TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (core, key)
+                ) WITHOUT ROWID
+                """,
+                "core, key, value",
+            ),
+            "traffic_ack": (
+                """
+                CREATE TABLE traffic_ack__clustered (
+                    core TEXT NOT NULL,
+                    client_key TEXT NOT NULL,
+                    incoming INTEGER NOT NULL DEFAULT 0,
+                    outgoing INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (core, client_key)
+                ) WITHOUT ROWID
+                """,
+                "core, client_key, incoming, outgoing, updated_at",
+            ),
+            "traffic_pending": (
+                """
+                CREATE TABLE traffic_pending__clustered (
+                    core TEXT NOT NULL,
+                    client_key TEXT NOT NULL,
+                    delta_incoming INTEGER NOT NULL DEFAULT 0,
+                    delta_outgoing INTEGER NOT NULL DEFAULT 0,
+                    current_incoming INTEGER NOT NULL DEFAULT 0,
+                    current_outgoing INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (core, client_key)
+                ) WITHOUT ROWID
+                """,
+                "core, client_key, delta_incoming, delta_outgoing, current_incoming, current_outgoing, updated_at",
+            ),
+        }
+        for name, (create_sql, columns) in tables.items():
+            cursor = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (name,),
+            )
+            row = await cursor.fetchone()
+            if row is None or "WITHOUT ROWID" in str(row[0] or "").upper():
+                continue
+            clustered = f"{name}__clustered"
+            await conn.execute(f"DROP TABLE IF EXISTS {clustered}")
+            await conn.execute(create_sql)
+            await conn.execute(
+                f"INSERT INTO {clustered} ({columns}) SELECT {columns} FROM {name}"
+            )
+            await conn.execute(f"DROP TABLE {name}")
+            await conn.execute(f"ALTER TABLE {clustered} RENAME TO {name}")
 
     async def list_docs(self, core: str, kind: str) -> list[dict[str, Any]]:
         rows = await self._fetch(
@@ -307,11 +392,40 @@ class Store:
             )
             await conn.commit()
 
-    async def dump_documents(self) -> list[dict[str, Any]]:
-        """Every stored document. Traffic and audit tables are not included."""
-        rows = await self._fetch(
-            "SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id"
-        )
+    async def list_doc_records(
+        self,
+        *,
+        core: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Document rows. Pass ``core`` and ``kind`` so the primary key can range-scan.
+
+        Filtering only by ``kind`` uses ``documents_by_kind``. An unfiltered
+        read walks the clustered primary key; callers that need one kind must
+        not use that.
+        """
+        if core is not None and kind is not None:
+            sql = (
+                "SELECT core, kind, doc_id, data FROM documents "
+                "WHERE core = ? AND kind = ? ORDER BY doc_id"
+            )
+            params: tuple[Any, ...] = (core, kind)
+        elif kind is not None:
+            sql = (
+                "SELECT core, kind, doc_id, data FROM documents "
+                "WHERE kind = ? ORDER BY core, doc_id"
+            )
+            params = (kind,)
+        elif core is not None:
+            sql = (
+                "SELECT core, kind, doc_id, data FROM documents "
+                "WHERE core = ? ORDER BY kind, doc_id"
+            )
+            params = (core,)
+        else:
+            sql = "SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id"
+            params = ()
+        rows = await self._fetch(sql, params)
         dumped: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -327,6 +441,10 @@ class Store:
                 "data": data,
             })
         return dumped
+
+    async def dump_documents(self) -> list[dict[str, Any]]:
+        """Every stored document. Traffic and audit tables are not included."""
+        return await self.list_doc_records()
 
     async def replace_all_documents(self, rows: list[dict[str, Any]]) -> int:
         """Replace the document table with a transferred snapshot."""

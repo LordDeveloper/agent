@@ -195,7 +195,7 @@ def plan_client_quota_migration(
 
 async def migrate_client_quota_identity(store: Store) -> int:
     """Rewrite quota documents in place. Returns how many documents were written."""
-    documents = await store.dump_documents()
+    documents = await store.list_doc_records(kind=_QUOTA_KIND)
     puts, deletes = plan_client_quota_migration(documents)
     if not puts and not deletes:
         return 0

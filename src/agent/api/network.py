@@ -183,9 +183,29 @@ async def _execute_probe_job(
     from agent.support.node_probe import probe_region_nodes as run_probe
 
     log.info("region probe started probe_id=%s", probe_id)
+    collected: list[dict[str, Any]] = []
+
+    def _publish_partial(row: dict[str, Any]) -> None:
+        collected.append(row)
+        passed = sum(1 for item in collected if item.get("ok"))
+        _remember_probe_job(
+            probe_id,
+            {
+                "success": True,
+                "status": "running",
+                "probe_id": probe_id,
+                "nodes": list(collected),
+                "summary": {
+                    "total": len(collected),
+                    "passed": passed,
+                    "failed": len(collected) - passed,
+                },
+            },
+        )
+
     try:
         outbounds = await _load_probe_outbounds(registry)
-        result = await run_probe(nodes, outbounds)
+        result = await run_probe(nodes, outbounds, on_row=_publish_partial)
         if schedule_fallback:
             failed = _failed_probe_ifaces(nodes, result)
             if failed:

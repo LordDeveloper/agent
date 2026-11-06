@@ -25,7 +25,7 @@ def _clear_env() -> None:
 
 
 def test_region_probe_returns_before_the_probes_finish(tmp_path: Path, monkeypatch):
-    async def slow_probe(nodes, outbounds=None, *, runner=None):
+    async def slow_probe(nodes, outbounds=None, *, runner=None, on_row=None):
         await asyncio.sleep(0.6)
         node_id = nodes[0]["id"]
         return {
