@@ -255,6 +255,71 @@ async def test_reconcile_core_egress_applies_and_cleans(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_drops_prohibit_and_foreign_lookup_for_one_peer(tmp_path, monkeypatch):
+    store = Store(tmp_path / "agent.db")
+    await store.open()
+    commands: list[list[str]] = []
+    table = table_id_for_interface("eth1")
+    lookups: set[tuple[str, int]] = {("10.80.0.2", table), ("10.80.0.2", 9), ("10.80.0.3", table)}
+    prohibits: set[str] = {"10.80.0.2"}
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:3] == ["ip", "rule", "add"] and "from" in args and "lookup" in args:
+            host = args[args.index("from") + 1].split("/", 1)[0]
+            lookups.add((host, int(args[args.index("lookup") + 1])))
+            return _Result()
+        if args[:3] == ["ip", "rule", "del"] and "prohibit" in args:
+            prohibits.discard(args[args.index("from") + 1].split("/", 1)[0])
+            return _Result()
+        if args[:3] == ["ip", "rule", "del"] and "lookup" in args:
+            host = args[args.index("from") + 1].split("/", 1)[0]
+            lookups.discard((host, int(args[args.index("lookup") + 1])))
+            return _Result()
+        if args[:3] == ["ip", "-j", "rule"]:
+            rows = [{"src": host, "table": known} for host, known in lookups]
+            rows.extend({"src": host, "type": "prohibit"} for host in prohibits)
+            return _Result(stdout=json.dumps(rows))
+        if args == ["ip", "-4", "route", "show"]:
+            return _Result(stdout="10.80.0.0/16 dev wg0 proto kernel scope link\n")
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout="default via 10.0.0.1 dev eth1 proto dhcp metric 100\n")
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr("agent.support.peer_egress.ensure_peer_egress_unit", _stub_peer_egress_unit)
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
+
+    peers = []
+    for host, peer_id in (("10.80.0.2", "broken"), ("10.80.0.3", "healthy")):
+        peers.append(
+            {
+                "id": peer_id,
+                "public_key": peer_id,
+                "address": host,
+                "exit_interface": "eth1",
+                "is_enabled": True,
+            }
+        )
+    report = await reconcile_core_egress(
+        store,
+        "wireguard",
+        [{"name": "wg0", "peers": peers}],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert report["ok"] is True
+    assert ["ip", "rule", "del", "from", "10.80.0.2/32", "prohibit"] in commands
+    assert ["ip", "rule", "del", "from", "10.80.0.2/32", "lookup", "9"] in commands
+    assert not any(cmd[:6] == ["ip", "rule", "del", "from", "10.80.0.3/32", "lookup"] for cmd in commands)
+    assert ["ip", "route", "replace", "10.80.0.2/32", "dev", "wg0"] not in commands
+    assert ["ip", "route", "replace", "10.80.0.3/32", "dev", "wg0"] not in commands
+    assert ["conntrack", "-D", "-s", "10.80.0.2"] in commands
+    assert ["conntrack", "-D", "-s", "10.80.0.3"] not in commands
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_switches_exit_atomically(tmp_path, monkeypatch):
     """Server change: add new exit rule before deleting the old one."""
     store = Store(tmp_path / "agent.db")

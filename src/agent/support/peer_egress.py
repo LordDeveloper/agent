@@ -1033,6 +1033,83 @@ async def repair_peer_egress(
     }
 
 
+def _peers_by_host(interfaces: list[dict[str, Any]]) -> dict[str, tuple[str, dict[str, Any]]]:
+    found: dict[str, tuple[str, dict[str, Any]]] = {}
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or "")
+        for peer in iface.get("peers") or []:
+            if not isinstance(peer, dict):
+                continue
+            cidr = peer_source_cidr(peer.get("address"))
+            if not cidr:
+                continue
+            found.setdefault(cidr.split("/", 1)[0], (name, peer))
+    return found
+
+
+async def _drop_conflicting_policy(
+    runner: Runner | None,
+    interfaces: list[dict[str, Any]],
+    applied: list[dict[str, str | int]],
+    cache: _EgressCache,
+    switched: list[str],
+) -> bool:
+    """Delete prohibit and foreign lookup rules that outrank the desired rule.
+
+    One failed address does not stop the others. The snapshot is not healthy
+    while a conflicting rule is still installed.
+    """
+    if cache.rules_failed:
+        return not applied
+    owners = _peers_by_host(interfaces)
+    ok = True
+    for row in applied:
+        addr = str(row.get("addr") or "")
+        if not addr:
+            continue
+        cidr = str(row.get("cidr") or f"{addr}/32")
+        action = str(row.get("action") or "lookup")
+        table = int(row.get("table") or 0)
+        pending: list[tuple[str, str, list[str]]] = []
+        if action == "lookup" and cache.has_prohibit(cidr):
+            pending.append(("policy_prohibit", "prohibit", ["rule", "del", "from", cidr, "prohibit"]))
+        for host, known in list(cache.lookups):
+            if host != addr or known <= 0:
+                continue
+            if action == "lookup" and known == table:
+                continue
+            pending.append(
+                ("policy_table", f"lookup {known}", ["rule", "del", "from", cidr, "lookup", str(known)])
+            )
+        if not pending:
+            continue
+        from agent.drivers.wireguard import _recovery_identity, log_peer_recovery
+
+        iface_name, peer = owners.get(addr, ("", {}))
+        for reason, before, args in pending:
+            deleted = await _mutate_rule(runner, args, cache)
+            if deleted:
+                switched.append(addr)
+            else:
+                ok = False
+            recovery = {
+                "peer_id": str(peer.get("id") or peer.get("email") or addr),
+                "public_key": str(peer.get("public_key") or ""),
+                "host": addr,
+                "reason": reason,
+                "live_allowed": before,
+                "action": "rule_del",
+            }
+            log_peer_recovery(
+                iface_name,
+                [recovery],
+                verified=set() if deleted else {_recovery_identity(recovery)},
+            )
+    return ok
+
+
 async def reconcile_core_egress(
     store: Store,
     core: str,
@@ -1235,6 +1312,10 @@ async def reconcile_core_egress(
             await _mutate_rule(runner, ["rule", "del", "from", cidr, "lookup", str(table)], cache)
             switched.append(addr)
 
+    # A stored "lookup" snapshot used to hide a leftover prohibit or a lookup
+    # in another table. Those rules win by priority and blackhole one peer.
+    conflicts_ok = await _drop_conflicting_policy(runner, interfaces, applied, cache, switched)
+
     # 4) Flush conntrack so old NAT paths do not stick after exit change/removal.
     for addr in dict.fromkeys(switched):
         await _flush_conntrack(runner, addr)
@@ -1320,8 +1401,14 @@ async def reconcile_core_egress(
     except Exception:
         log.exception("xray exit bind reapply failed")
     persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
+    route_ok = True
+    if core in {"wireguard", "amnezia"}:
+        from agent.drivers.wireguard import repair_tunnel_routes
+
+        route_report = await repair_tunnel_routes(interfaces, runner=runner)
+        route_ok = bool(route_report.get("ok", True))
     return {
-        "ok": True,
+        "ok": conflicts_ok and route_ok,
         "skipped": False,
         "rules": len(applied),
         "desired": len(desired),

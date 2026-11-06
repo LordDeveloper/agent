@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 
+from copy import deepcopy
+
 from agent.drivers.wireguard import (
     WireGuardDriver,
     _allowed_ip_set,
+    _apply_dump_counters,
     _dump_is_usable,
     _peer_kernel_drift,
+    parse_ipv4_routes,
+    peer_route_gaps,
+    repair_tunnel_routes,
 )
+from agent.support.interface_lifecycle import InterfaceLockRegistry
 
 
 def _peer(public_key: str, allowed: str, *, enabled: bool = True, peer_id: str = "p1") -> dict:
@@ -117,3 +124,161 @@ def test_repair_leaves_matching_peers_untouched_and_reinstalls_one() -> None:
     assert fake.calls[0] == [["peer", "bbb", "remove"]]
     assert fake.calls[1][0][:4] == ["peer", "bbb", "allowed-ips", "10.0.0.3/32"]
     assert all("aaa" not in group for group in fake.calls[0] + fake.calls[1])
+
+
+def test_counter_merge_keeps_a_peer_added_after_the_snapshot() -> None:
+    current = {
+        "peers": [
+            {
+                "id": "a",
+                "public_key": "aaa",
+                "allowed_ips": "10.0.0.2/32",
+                "address": "10.0.0.2",
+                "enable": True,
+                "incoming": 1,
+                "outgoing": 1,
+                "_raw_incoming": 1,
+                "_raw_outgoing": 1,
+            },
+            {
+                "id": "b",
+                "public_key": "bbb",
+                "allowed_ips": "10.0.0.9/32",
+                "address": "10.0.0.9",
+                "enable": True,
+            },
+        ]
+    }
+    changed = _apply_dump_counters(
+        current,
+        {"aaa": {"incoming": 5, "outgoing": 4, "handshake_at": 0, "endpoint": ""}},
+    )
+    assert changed is True
+    assert [peer["id"] for peer in current["peers"]] == ["a", "b"]
+    assert current["peers"][0]["allowed_ips"] == "10.0.0.2/32"
+    assert current["peers"][0]["incoming"] == 5
+    assert current["peers"][1]["allowed_ips"] == "10.0.0.9/32"
+
+
+def test_sync_peer_stats_does_not_write_the_stale_peer_list() -> None:
+    fresh = {
+        "id": "1",
+        "name": "wg0",
+        "peers": [
+            {
+                "id": "a",
+                "public_key": "aaa",
+                "allowed_ips": "10.0.0.2/32",
+                "address": "10.0.0.2",
+                "enable": True,
+                "incoming": 0,
+                "outgoing": 0,
+                "_raw_incoming": 0,
+                "_raw_outgoing": 0,
+            },
+            {
+                "id": "b",
+                "public_key": "bbb",
+                "allowed_ips": "10.0.0.9/32",
+                "address": "10.0.0.9",
+                "enable": True,
+            },
+        ],
+    }
+
+    class Fake:
+        key = "wireguard"
+        _kind = "interface"
+        _repair_noted: set[tuple[str, str, str]] = set()
+
+        def __init__(self) -> None:
+            self._iface_locks = InterfaceLockRegistry()
+            self.writes: list[dict] = []
+            self.repaired: dict | None = None
+            self.store = self
+
+        async def list_interfaces(self) -> list[dict]:
+            stale = deepcopy(fresh)
+            stale["peers"] = [stale["peers"][0]]
+            return [stale]
+
+        async def get_interface(self, _interface_id: str) -> dict:
+            return deepcopy(fresh)
+
+        async def _peer_dump(self, _name: str) -> dict:
+            return {"aaa": {"incoming": 8, "outgoing": 1, "handshake_at": 0, "endpoint": ""}}
+
+        async def put_doc(self, _key: str, _kind: str, _doc_id: str, data: dict) -> None:
+            self.writes.append(deepcopy(data))
+
+        async def _repair_kernel_peers(self, iface: dict, *, hold_lock: bool = True) -> bool:
+            self.repaired = deepcopy(iface)
+            return True
+
+        _log_peer_recovery = WireGuardDriver._log_peer_recovery
+        _iface_lock_key = WireGuardDriver._iface_lock_key
+
+    fake = Fake()
+    asyncio.run(WireGuardDriver.sync_peer_stats(fake))
+    assert fake.writes
+    saved_ids = [peer["id"] for peer in fake.writes[-1]["peers"]]
+    assert saved_ids == ["a", "b"]
+    assert fake.writes[-1]["peers"][0]["allowed_ips"] == "10.0.0.2/32"
+    assert fake.writes[-1]["peers"][0]["incoming"] == 8
+    assert fake.writes[-1]["peers"][1]["allowed_ips"] == "10.0.0.9/32"
+    assert fake.repaired is not None
+    assert [peer["id"] for peer in fake.repaired["peers"]] == ["a", "b"]
+
+
+def test_idle_peer_on_the_connected_route_is_not_repaired() -> None:
+    routes = parse_ipv4_routes("10.80.0.0/16 dev wg0 proto kernel scope link src 10.80.0.1\n")
+    peer = _peer("aaa", "10.80.0.2/32", peer_id="idle")
+    peer["address"] = "10.80.0.2"
+    peer["handshake_at"] = 0
+    peer["incoming"] = 0
+    peer["outgoing"] = 0
+    iface = _iface(peer)
+    iface["name"] = "wg0"
+    assert peer_route_gaps(iface, routes) == []
+
+
+def test_route_replace_touches_only_the_misrouted_peer() -> None:
+    routes = {"text": "10.80.0.0/16 dev wg0 proto kernel scope link\n10.0.0.5 dev eth0 scope link\n"}
+
+    class Runner:
+        def __call__(self, args, **_kwargs):
+            from types import SimpleNamespace
+
+            if args == ["ip", "-4", "route", "show"]:
+                return SimpleNamespace(returncode=0, stdout=routes["text"], stderr="")
+            if args[:3] == ["ip", "route", "replace"]:
+                self.replaced.append(list(args))
+                host = args[3].split("/", 1)[0]
+                kept = [
+                    line
+                    for line in routes["text"].splitlines()
+                    if line and not line.startswith(host + " ")
+                ]
+                kept.append(f"{host} dev {args[5]} scope link")
+                routes["text"] = "\n".join(kept) + "\n"
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(args)
+
+    runner = Runner()
+    runner.replaced = []
+    healthy = _peer("aaa", "10.80.0.2/32", peer_id="healthy")
+    healthy["address"] = "10.80.0.2"
+    healthy["handshake_at"] = 10
+    healthy["incoming"] = 0
+    broken = _peer("bbb", "10.0.0.5/32", peer_id="broken")
+    broken["address"] = "10.0.0.5"
+    broken["handshake_at"] = 10
+    broken["incoming"] = 20
+    report = asyncio.run(
+        repair_tunnel_routes(
+            [{"name": "wg0", "peers": [healthy, broken]}],
+            runner=runner,
+        )
+    )
+    assert report["ok"] is True
+    assert runner.replaced == [["ip", "route", "replace", "10.0.0.5/32", "dev", "wg0"]]

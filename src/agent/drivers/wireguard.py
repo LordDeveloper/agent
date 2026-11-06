@@ -841,6 +841,250 @@ def _allowed_ip_set(value: Any) -> frozenset[str]:
     return frozenset(found)
 
 
+def _apply_dump_counters(iface: dict[str, Any], dump: dict[str, Any] | None) -> bool:
+    """Copy kernel counters onto the current peer rows. Does not add, drop, or rewrite config."""
+    changed = False
+    live = dump or {}
+    for peer in iface.get("peers") or []:
+        if not isinstance(peer, dict):
+            continue
+        public_key = str(peer.get("public_key") or "")
+        stats = live.get(public_key)
+        if stats is None:
+            if peer.get("online"):
+                peer["online"] = False
+                changed = True
+            continue
+        before = (
+            peer.get("incoming"),
+            peer.get("outgoing"),
+            peer.get("_raw_incoming"),
+            peer.get("_raw_outgoing"),
+            peer.get("handshake_at"),
+            peer.get("online"),
+            peer.get("endpoint"),
+            str(peer.get("ip_logs") or []),
+        )
+        accumulate_transfer(
+            peer,
+            incoming=int(stats.get("incoming") or 0),
+            outgoing=int(stats.get("outgoing") or 0),
+            handshake_at=int(stats.get("handshake_at") or 0),
+            endpoint=stats.get("endpoint"),
+        )
+        after = (
+            peer.get("incoming"),
+            peer.get("outgoing"),
+            peer.get("_raw_incoming"),
+            peer.get("_raw_outgoing"),
+            peer.get("handshake_at"),
+            peer.get("online"),
+            peer.get("endpoint"),
+            str(peer.get("ip_logs") or []),
+        )
+        if before != after:
+            changed = True
+    return changed
+
+
+def parse_ipv4_routes(text: str) -> list[tuple[ipaddress.IPv4Network, str]]:
+    """Routes from one `ip -4 route show`. Lines without a device are ignored."""
+    found: list[tuple[ipaddress.IPv4Network, str]] = []
+    for raw in text.splitlines():
+        parts = raw.split()
+        if "dev" not in parts:
+            continue
+        dev_at = parts.index("dev")
+        if dev_at + 1 >= len(parts):
+            continue
+        dest = parts[0]
+        if dest in {"blackhole", "unreachable", "prohibit", "throw"}:
+            continue
+        if dest == "default":
+            dest = "0.0.0.0/0"
+        elif "/" not in dest:
+            dest = f"{dest}/32"
+        try:
+            network = ipaddress.ip_network(dest, strict=False)
+        except ValueError:
+            continue
+        if not isinstance(network, ipaddress.IPv4Network):
+            continue
+        found.append((network, parts[dev_at + 1]))
+    return found
+
+
+def winning_route_device(routes: list[tuple[ipaddress.IPv4Network, str]], host: str) -> str | None:
+    """Longest-prefix device for host. The first route wins a prefix-length tie."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if not isinstance(address, ipaddress.IPv4Address):
+        return None
+    best: ipaddress.IPv4Network | None = None
+    device: str | None = None
+    for network, dev in routes:
+        if address in network and (best is None or network.prefixlen > best.prefixlen):
+            best = network
+            device = dev
+    return device
+
+
+def peer_route_gaps(iface: dict[str, Any], routes: list[tuple[ipaddress.IPv4Network, str]]) -> list[dict[str, Any]]:
+    """Enabled peers whose tunnel IPv4 is not reached through this interface.
+
+    Handshake time and byte counters are not consulted. A peer covered by this
+    device's connected route is healthy and must not be rewritten.
+    """
+    name = str(iface.get("name") or "").strip()
+    if not name:
+        return []
+    gaps: list[dict[str, Any]] = []
+    for peer in iface.get("peers") or []:
+        if not isinstance(peer, dict) or not record_is_enabled(peer):
+            continue
+        host = _host_ip(peer.get("address"))
+        parsed = _ip_or_none(host)
+        if parsed is None or parsed.version != 4:
+            continue
+        device = winning_route_device(routes, host)
+        if device == name:
+            continue
+        gaps.append(
+            {
+                "peer": peer,
+                "peer_id": str(peer.get("id") or peer.get("email") or ""),
+                "public_key": str(peer.get("public_key") or ""),
+                "reason": "route_dev",
+                "live_allowed": device or "",
+                "action": "route_replace",
+                "host": host,
+            }
+        )
+    return gaps
+
+
+_recovery_notes: set[tuple[str, str, str]] = set()
+
+
+def _recovery_identity(row: dict[str, Any]) -> str:
+    return str(row.get("public_key") or row.get("peer_id") or row.get("host") or "")
+
+
+def log_peer_recovery(
+    iface_name: str,
+    rows: list[dict[str, Any]],
+    *,
+    verified: set[str],
+    noted: set[tuple[str, str, str]] | None = None,
+) -> None:
+    """One line per recovery. Repeated failures are logged once until they clear."""
+    notes = _recovery_notes if noted is None else noted
+    for row in rows:
+        public_key = str(row.get("public_key") or "")
+        reason = str(row.get("reason") or "")
+        identity = _recovery_identity(row)
+        note = (iface_name, identity, reason)
+        skipped = row.get("action") == "skip"
+        ok = not skipped and identity not in verified
+        if ok:
+            notes.discard(note)
+        elif note in notes:
+            continue
+        else:
+            notes.add(note)
+        before = str(row.get("live_allowed") or "")
+        if len(before) > 120:
+            before = before[:117] + "..."
+        log.info(
+            "peer recovery iface=%s peer=%s key=%s reason=%s before=%s action=%s result=%s verify=%s",
+            iface_name,
+            row.get("peer_id") or "",
+            public_key[:8],
+            reason,
+            before,
+            row.get("action") or "",
+            "skipped" if skipped else ("ok" if ok else "failed"),
+            "skipped" if skipped else ("ok" if ok else "still_drifted"),
+        )
+
+
+async def _ipv4_route_show(runner: Any) -> str | None:
+    from agent.support.process import execute
+
+    try:
+        result = await execute(runner, ["ip", "-4", "route", "show"], check=False, timeout=10)
+    except Exception:
+        return None
+    if int(getattr(result, "returncode", 1)) != 0:
+        return None
+    return str(getattr(result, "stdout", "") or "")
+
+
+async def _replace_host_route(runner: Any, host: str, device: str) -> bool:
+    from agent.support.process import execute
+
+    try:
+        result = await execute(
+            runner,
+            ["ip", "route", "replace", f"{host}/32", "dev", device],
+            check=False,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return int(getattr(result, "returncode", 1)) == 0
+
+
+async def repair_tunnel_routes(
+    interfaces: list[dict[str, Any]],
+    *,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Install missing host routes for peers that `wg syncconf` does not route.
+
+    One main-table dump covers every peer. An empty or failed dump is not
+    evidence that every peer is unrouted.
+    """
+    named = [
+        iface
+        for iface in interfaces
+        if isinstance(iface, dict) and str(iface.get("name") or "").strip()
+    ]
+    if not named:
+        return {"ok": True, "repaired": 0, "failed": 0}
+
+    shown = await _ipv4_route_show(runner)
+    if not shown or not shown.strip():
+        return {"ok": True, "skipped": True, "repaired": 0, "failed": 0}
+
+    routes = parse_ipv4_routes(shown)
+    work: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for iface in named:
+        for gap in peer_route_gaps(iface, routes):
+            work.append((iface, gap))
+    if not work:
+        return {"ok": True, "repaired": 0, "failed": 0}
+
+    for iface, gap in work:
+        gap["replaced"] = await _replace_host_route(runner, str(gap["host"]), str(iface.get("name") or ""))
+
+    verify_text = await _ipv4_route_show(runner)
+    verify_routes = parse_ipv4_routes(verify_text or "")
+    still: set[str] = set()
+    by_iface: dict[str, list[dict[str, Any]]] = {}
+    for iface, gap in work:
+        name = str(iface.get("name") or "")
+        by_iface.setdefault(name, []).append(gap)
+        if not gap.get("replaced") or not verify_text or winning_route_device(verify_routes, str(gap["host"])) != name:
+            still.add(_recovery_identity(gap))
+    for name, rows in by_iface.items():
+        log_peer_recovery(name, rows, verified=still)
+    failed = len(still)
+    return {"ok": failed == 0, "repaired": len(work) - failed, "failed": failed}
+
+
 def _dump_is_usable(iface: dict[str, Any], dump: dict[str, Any] | None) -> bool:
     """An empty dump is a failed `wg show`, not evidence that every peer is missing."""
     if dump:
@@ -2344,54 +2588,25 @@ class WireGuardDriver(CoreDriver):
             if not live and not iface.get("peers"):
                 continue
 
-            changed = False
-            for peer in iface.get("peers", []):
-                pub = str(peer.get("public_key") or "")
-                stats = live.get(pub)
-                if stats is None:
-                    if peer.get("online"):
-                        peer["online"] = False
-                        changed = True
+            # The dump was taken before this lock. Re-read so a peer added or
+            # edited in between cannot be overwritten by the stale snapshot.
+            async with self._iface_locks.lock(self._iface_lock_key(iface)):
+                current = iface
+                iface_id = iface.get("id")
+                if iface_id is not None:
+                    try:
+                        current = await self.get_interface(iface_id)
+                    except AgentError:
+                        current = iface
+                if not _dump_is_usable(current, live):
                     continue
-
-                before = (
-                    peer.get("incoming"),
-                    peer.get("outgoing"),
-                    peer.get("_raw_incoming"),
-                    peer.get("_raw_outgoing"),
-                    peer.get("handshake_at"),
-                    peer.get("online"),
-                    peer.get("endpoint"),
-                    str(peer.get("ip_logs") or []),
-                )
-                accumulate_transfer(
-                    peer,
-                    incoming=stats["incoming"],
-                    outgoing=stats["outgoing"],
-                    handshake_at=stats["handshake_at"],
-                    endpoint=stats.get("endpoint"),
-                )
-                after = (
-                    peer.get("incoming"),
-                    peer.get("outgoing"),
-                    peer.get("_raw_incoming"),
-                    peer.get("_raw_outgoing"),
-                    peer.get("handshake_at"),
-                    peer.get("online"),
-                    peer.get("endpoint"),
-                    str(peer.get("ip_logs") or []),
-                )
-                if before != after:
-                    changed = True
-
-            if changed:
-                await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
-            if _dump_is_usable(iface, live):
-                drift = _peer_kernel_drift(iface, live)
+                if _apply_dump_counters(current, live):
+                    await self.store.put_doc(self.key, self._kind, str(current.get("id")), current)
+                drift = _peer_kernel_drift(current, live)
                 if any(row["action"] != "skip" for row in drift):
-                    await self._repair_kernel_peers(iface, hold_lock=True)
+                    await self._repair_kernel_peers(current, hold_lock=False)
                 elif drift:
-                    self._log_peer_recovery(str(iface.get("name") or ""), drift, verified=set())
+                    self._log_peer_recovery(str(current.get("name") or ""), drift, verified=set())
 
     async def _client_dns(self, iface: dict[str, Any] | None = None) -> str:
         """AdGuard gateway when ads-block is on; otherwise a public resolver."""
@@ -2630,32 +2845,7 @@ class WireGuardDriver(CoreDriver):
         *,
         verified: set[str],
     ) -> None:
-        for row in rows:
-            public_key = str(row.get("public_key") or "")
-            reason = str(row.get("reason") or "")
-            note = (iface_name, public_key, reason)
-            skipped = row.get("action") == "skip"
-            ok = not skipped and public_key not in verified
-            if ok:
-                self._repair_noted.discard(note)
-            elif note in self._repair_noted:
-                continue
-            else:
-                self._repair_noted.add(note)
-            before = str(row.get("live_allowed") or "")
-            if len(before) > 120:
-                before = before[:117] + "..."
-            log.info(
-                "peer recovery iface=%s peer=%s key=%s reason=%s before=%s action=%s result=%s verify=%s",
-                iface_name,
-                row.get("peer_id") or "",
-                public_key[:8],
-                reason,
-                before,
-                row.get("action") or "",
-                "skipped" if skipped else ("ok" if ok else "failed"),
-                "skipped" if skipped else ("ok" if ok else "still_drifted"),
-            )
+        log_peer_recovery(iface_name, rows, verified=verified, noted=self._repair_noted)
 
     def _peer_add_argv(self, peer: dict[str, Any], public_key: str, psk_files: list[Path]) -> list[str]:
         allowed = str(peer.get("allowed_ips") or "").strip()
