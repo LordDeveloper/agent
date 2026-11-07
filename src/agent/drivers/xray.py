@@ -89,6 +89,30 @@ _UUID_RE = re.compile(
 _log = get_logger("xray")
 
 
+def resolve_xray_stats_email(key: str, clients: list[dict[str, Any]]) -> str:
+    """Map a panel key to the email Xray uses for online and traffic stats.
+
+    Counters are ``user>>>{email}>>>online``. A protocol UUID or panel primary
+    key is not that name. An email key is returned as itself. A UUID is
+    returned only when that string is the client's email. An unknown UUID is
+    empty so it is not sent to ``/api/stats/online/iplist``.
+    """
+    wanted = str(key or "").strip()
+    if wanted == "":
+        return ""
+    if not _UUID_RE.match(wanted):
+        return wanted
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        if wanted not in identity_lookup_keys(client) and wanted != str(client.get("uuid") or "").strip():
+            continue
+        email = str(client.get("email") or "").strip()
+        if email:
+            return email
+    return ""
+
+
 def _is_missing_user_error(exc: AgentError) -> bool:
     message = str(exc.message or "").lower()
     return int(exc.status or 0) == 404 or "not found" in message or "does not exist" in message or "doesn't exist" in message
@@ -2553,11 +2577,45 @@ class XrayDriver(CoreDriver):
     async def client_ips(self, email: str) -> list[str]:
         # Xray reports currently-online IPs, not an accumulating log.
         # Do not hide live addresses after a "clear" — the bot needs them for device lists.
-        return await self._api_call("online_ips", email)
+        stats_email = await self._stats_email(email)
+        if stats_email == "":
+            return []
+        return await self._api_call("online_ips", stats_email)
 
     async def client_ip_last_seen(self, email: str) -> dict[str, Any]:
         """``{ip: lastSeen}`` for sessions Xray still considers online."""
-        return await self._api_call("online_ip_last_seen", email)
+        stats_email = await self._stats_email(email)
+        if stats_email == "":
+            return {}
+        return await self._api_call("online_ip_last_seen", stats_email)
+
+    async def _stats_email(self, key: str) -> str:
+        """Email argument for Xray online/iplist. Never the protocol UUID."""
+        wanted = str(key or "").strip()
+        if wanted == "":
+            return ""
+        if not _UUID_RE.match(wanted):
+            return wanted
+        remembered = self._identity_email.get(wanted, "")
+        if remembered and remembered != wanted:
+            return remembered
+        email = resolve_xray_stats_email(wanted, await self._config_clients())
+        if email:
+            if email != wanted:
+                self._identity_email[wanted] = email
+            return email
+        return ""
+
+    async def _config_clients(self) -> list[dict[str, Any]]:
+        try:
+            config = await self._cached_config()
+        except Exception:
+            return []
+        rows: list[dict[str, Any]] = []
+        for inbound in config.get("inbounds") or []:
+            if isinstance(inbound, dict):
+                rows.extend(client for client in self._clients_of(inbound) if isinstance(client, dict))
+        return rows
 
     def clear_client_ips(self, email: str) -> bool:
         return True

@@ -92,9 +92,9 @@ def _find_config_clients_by_key(config: dict[str, Any], client_key: str) -> list
 def _client_identity_keys(*rows: dict[str, Any] | None) -> list[str]:
     """Email, protocol UUID, and node id, in lookup order.
 
-    Xray stats and the online-user list are keyed by email, while
-    ``XrayDriver.online_users()`` rewrites a known email to the protocol id.
-    Both identifiers have to be accepted. Comparison is case-insensitive.
+    The online-user list is keyed by email, and ``XrayDriver.online_users()``
+    rewrites a known email to the protocol id. Both identifiers have to be
+    accepted there. Comparison is case-insensitive.
     """
     ordered: list[str] = []
     seen: set[str] = set()
@@ -109,6 +109,29 @@ def _client_identity_keys(*rows: dict[str, Any] | None) -> list[str]:
             seen.add(folded)
             ordered.append(text)
     return ordered
+
+
+def _session_lookup_keys(*rows: dict[str, Any] | None) -> list[str]:
+    """Emails for ``/api/stats/online/iplist``.
+
+    That route's ``email`` parameter is the Xray stats name
+    (``user>>>{email}>>>online``). The protocol UUID and the panel primary key
+    are not that name. Querying them returns ``online not found``.
+    """
+    emails: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        email = str(row.get('email') or '').strip()
+        folded = email.casefold()
+        if not email or folded in seen:
+            continue
+        seen.add(folded)
+        emails.append(email)
+    if emails:
+        return emails
+    return _client_identity_keys(*rows)
 
 
 def _keys_overlap(left: list[str] | set[str], right: list[str] | set[str]) -> bool:
@@ -163,10 +186,9 @@ async def _load_fresh_session_ips(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Fresh session IPs for this client.
 
-    Tries each identity (email, then UUID) and stops at the first key that
-    still has a live address, so a stats entry stored under the other id is
-    not missed. A successful empty map means Xray answered and no session IP
-    is inside the freshness window. ``None`` means every lookup failed.
+    Keys are Xray stats emails. A successful empty map means Xray answered and
+    no session IP is inside the freshness window. ``None`` means every lookup
+    failed.
     """
     last_seen = getattr(driver, 'client_ip_last_seen', None)
     ips_only = getattr(driver, 'client_ips', None)
@@ -404,8 +426,9 @@ async def diagnose_client_match(
         )
 
     identities = _client_identity_keys(config_client, live)
-    if identities:
-        session_ips, session_error = await _load_fresh_session_ips(driver, identities)
+    session_keys = _session_lookup_keys(config_client, live)
+    if session_keys:
+        session_ips, session_error = await _load_fresh_session_ips(driver, session_keys)
     else:
         session_ips, session_error = None, 'client has no email or UUID to query'
     decision = _classify_online(

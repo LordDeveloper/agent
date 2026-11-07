@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -302,6 +307,26 @@ def repair_shadowsocks_settings(settings: dict[str, Any]) -> bool:
     return changed
 
 
+def _vless_protocol_id(row: dict[str, Any]) -> str:
+    """VLESS/VMess user id. This is the link UUID, not the panel primary key.
+
+    ``client_link_uuid`` wins. A protocol ``id`` that differs from ``node_id``
+    is kept. ``node_id`` is used only when it is the sole UUID (legacy rows
+    whose panel key and link uuid were the same value, or whose ``id`` is not
+    a UUID).
+    """
+    link = str(row.get("client_link_uuid") or "").strip()
+    if link:
+        return link
+    incoming = str(row.get("id") or "").strip()
+    node = str(row.get("node_id") or "").strip()
+    if incoming and _UUID_RE.match(incoming) and incoming != node:
+        return incoming
+    if node and _UUID_RE.match(node):
+        return node
+    return incoming or node
+
+
 def xray_protocol_user(
     protocol: str,
     client: dict[str, Any],
@@ -317,7 +342,7 @@ def xray_protocol_user(
 
     if protocol == "vless":
         user: dict[str, Any] = {}
-        link_id = str(row.get("client_link_uuid") or row.get("node_id") or "").strip()
+        link_id = _vless_protocol_id(row)
         if link_id:
             user["id"] = link_id
         else:
@@ -332,7 +357,7 @@ def xray_protocol_user(
 
     if protocol == "vmess":
         user = {}
-        link_id = str(row.get("client_link_uuid") or row.get("node_id") or "").strip()
+        link_id = _vless_protocol_id(row)
         if link_id:
             user["id"] = link_id
         else:

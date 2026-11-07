@@ -257,6 +257,17 @@ class XrayHttpClient:
                     raw_text=raw_text,
                 )
 
+            detail = message
+            message_lower = message.lower()
+            # Offline users: Xray iplist returns 404 "...>>>online not found" — not missing config.
+            if response.status_code == 404 and "online not found" in message_lower:
+                _log.debug(
+                    "xray user has no online session status=%s route=%s",
+                    response.status_code,
+                    resolved,
+                )
+                raise AgentError("USER_OFFLINE", detail, 404)
+
             if isinstance(body, dict):
                 _log.warning(
                     "xray api rejected request status=%s route=%s body=%s",
@@ -271,12 +282,6 @@ class XrayHttpClient:
                     resolved,
                     raw_text[:3000],
                 )
-
-            detail = message
-            message_lower = message.lower()
-            # Offline users: Xray iplist returns 404 "...>>>online not found" — not missing config.
-            if response.status_code == 404 and "online not found" in message_lower:
-                raise AgentError("USER_OFFLINE", detail, 404)
             # Bare Go mux 404s mean the custom HTTP API routes are missing (stock Xray).
             if response.status_code == 404 or "page not found" in message_lower:
                 raise AgentError("CONFIG_NOT_FOUND", detail, 404)

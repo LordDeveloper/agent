@@ -146,12 +146,12 @@ def test_online_when_user_list_contains_uuid_instead_of_email():
 
 def test_fresh_session_ip_is_online_even_when_user_list_misses_the_client():
     seen = time.time()
+    called: list[str] = []
 
     class Driver(_FakeXrayDriver):
         def client_ip_last_seen(self, key):
-            if key == "abc123":
-                return {}
-            assert key == "uuid-1"
+            called.append(key)
+            assert key == "abc123"
             return {"91.102.127.240": seen}
 
     report = asyncio.run(diagnose_xray_client(Driver(), 7, "abc123"))
@@ -166,6 +166,26 @@ def test_fresh_session_ip_is_online_even_when_user_list_misses_the_client():
     assert "online_ips" in rendered
     assert "91.102.127.240" in rendered
     assert "cumulative, not used as presence" in rendered
+    assert called == ["abc123"]
+
+
+def test_session_ip_lookup_does_not_query_iplist_with_the_protocol_uuid():
+    called: list[str] = []
+
+    class Driver(_FakeXrayDriver):
+        async def read_config(self):
+            config = await super().read_config()
+            config["inbounds"][0]["settings"]["clients"][0]["id"] = "7764fdcf-7773-4e64-bd3a-0ea4550c167f"
+            return config
+
+        def client_ip_last_seen(self, key):
+            called.append(key)
+            return {}
+
+    report = asyncio.run(diagnose_xray_client(Driver(), 7, "abc123"))
+    assert called == ["abc123"]
+    assert "7764fdcf-7773-4e64-bd3a-0ea4550c167f" not in called
+    assert report["matches"][0]["live"]["online"] is False
 
 
 def test_online_user_email_match_is_case_insensitive():

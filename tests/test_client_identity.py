@@ -29,6 +29,36 @@ def test_legacy_single_id_payload():
     assert row["node_id"] == legacy_id
 
 
+def test_vless_user_id_keeps_protocol_uuid_apart_from_panel_pk():
+    from agent.support import xray_protocol_user
+
+    link = "7764fdcf-7773-4e64-bd3a-0ea4550c167f"
+    panel_pk = "ad72524c-2513-4555-b451-2c1092068514"
+    user = xray_protocol_user(
+        "vless",
+        {
+            "id": link,
+            "node_id": panel_pk,
+            "email": "k9fddX",
+            "flow": "xtls-rprx-vision",
+        },
+    )
+    assert user["id"] == link
+    assert user["id"] != panel_pk
+    assert user["email"] == "k9fddX"
+    assert "node_id" not in user
+
+
+def test_stats_email_is_not_the_protocol_uuid():
+    from agent.drivers.xray import resolve_xray_stats_email
+
+    link = "7764fdcf-7773-4e64-bd3a-0ea4550c167f"
+    clients = [{"id": link, "email": "k9fddX", "node_id": link}]
+    assert resolve_xray_stats_email("k9fddX", clients) == "k9fddX"
+    assert resolve_xray_stats_email(link, clients) == "k9fddX"
+    assert resolve_xray_stats_email("11111111-1111-1111-1111-111111111111", clients) == ""
+
+
 def test_vless_user_id_is_panel_node_id_not_agent_pk():
     from agent.support import xray_protocol_user
 
