@@ -1811,14 +1811,13 @@ class WireGuardDriver(CoreDriver):
 
     async def add_peer(self, interface_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
         iface = await self.get_interface(interface_id)
-        peer = normalize_peer(payload)
-        peer.setdefault("id", str(uuid.uuid4()))
+        peer = apply_panel_identity(normalize_peer(payload), store_kind="agent")
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
 
         # Existing peer: never invent new keys/address. Sync/upsert must stay identity-stable.
         # Key rotation is delete + create (panel "change connection link").
         for existing in iface.get("peers", []):
-            if str(existing.get("id")) == str(peer["id"]) or str(existing.get("email")) == str(peer.get("email")):
+            if str(existing.get("id")) == str(peer["id"]):
                 return await self.update_peer(interface_id, str(existing.get("id") or peer["id"]), payload)
 
         used_ips = {str(p.get("address") or "") for p in iface.get("peers", []) if p.get("address")}
@@ -1942,6 +1941,8 @@ class WireGuardDriver(CoreDriver):
         email = str(peer.get("email") or "").strip()
         if peer_id and peer_id in by_id:
             return by_id[peer_id]
+        if peer_id:
+            return None
         if email and email in by_email:
             return by_email[email]
         return None
@@ -1962,8 +1963,7 @@ class WireGuardDriver(CoreDriver):
                 continue
             if str(raw.get("private_key") or "").strip() and str(raw.get("public_key") or "").strip():
                 continue
-            probe = normalize_peer(raw)
-            probe.setdefault("id", str(raw.get("id") or uuid.uuid4()))
+            probe = apply_panel_identity(normalize_peer(raw), store_kind="agent")
             if not probe.get("email"):
                 probe["email"] = probe.get("name") or str(probe["id"])[:8]
             if self._find_existing_peer(by_id, by_email, probe) is not None:
@@ -1984,8 +1984,7 @@ class WireGuardDriver(CoreDriver):
                 raw["_keypair_error"] = f"{type(keys).__name__}: {keys}"
 
     async def _spawn_peer(self, iface: dict[str, Any], payload: dict[str, Any], used_ips: set[str]) -> dict[str, Any]:
-        peer = normalize_peer(payload)
-        peer.setdefault("id", str(uuid.uuid4()))
+        peer = apply_panel_identity(normalize_peer(payload), store_kind="agent")
         peer.setdefault("email", peer.get("name") or str(peer["id"])[:8])
         _assign_peer_address_with_expand(iface, peer, used_ips)
         used_ips.add(str(peer["address"]))
@@ -2127,7 +2126,7 @@ class WireGuardDriver(CoreDriver):
                     if _peer_routing_changed(before, merged):
                         routing = True
                     for idx, row in enumerate(rows):
-                        if str(row.get("id")) == str(existing.get("id")) or str(row.get("email")) == str(existing.get("email")):
+                        if str(row.get("id")) == str(existing.get("id")):
                             rows[idx] = merged
                             break
                     peer_id = str(merged.get("id") or "")

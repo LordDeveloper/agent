@@ -21,6 +21,7 @@ from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.runtime import RuntimeTrace
 from agent.support import normalize_peer, record_is_enabled
+from agent.support.client_identity import apply_panel_identity
 from agent.support.l2tp_config import (
     normalize_templates,
     render_chap_secrets,
@@ -499,7 +500,7 @@ class L2tpDriver(CoreDriver):
         payload: dict[str, Any],
     ) -> tuple[dict[str, Any], list[_UserEgressTouch]]:
         server = await self.get_server(server_id)
-        payload_id = str(payload.get('id') or '').strip()
+        payload_id = str(payload.get('id') or payload.get('node_id') or '').strip()
         email = str(payload.get('email') or payload.get('name') or '').strip()
         touches: list[_UserEgressTouch] = []
 
@@ -542,11 +543,11 @@ class L2tpDriver(CoreDriver):
                 server = await self.get_server(server_id)
                 break
 
-        user = normalize_peer(payload)
+        user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         if payload_id:
             user['id'] = payload_id
-        else:
-            user.setdefault('id', str(uuid.uuid4()))
+            user['node_id'] = payload_id
+            user['agent_id'] = payload_id
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
         user.setdefault('username', _gen_username())
         user.setdefault('password', _gen_password())

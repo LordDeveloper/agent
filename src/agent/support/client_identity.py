@@ -15,98 +15,77 @@ def apply_panel_identity(
     *,
     store_kind: StoreKind = "xray",
 ) -> dict[str, Any]:
-    """Split panel upsert fields into agent route id vs core/link id.
+    """Keep the panel ``node_id`` as the only client primary key.
 
-    Panel contract:
-      - ``client_link_uuid``: identifier stored in the core (VLESS/VMess UUID)
-      - ``id``: Agent database primary key when it differs from the core id
-      - ``node_id``: legacy alias of the core id (still sent by the panel)
-
-    The Agent primary key is never written into the core when a distinct
-    ``client_link_uuid`` or legacy ``node_id`` is present.
+    ``client_link_uuid`` is the protocol id (VLESS/VMess UUID) and is the value
+    written into Xray. It is not a second client identity. A new primary key is
+    created only when the caller supplied none.
     """
     row = dict(client)
     prior_agent = _trim(row.get("agent_id"))
     explicit_core = _trim(row.pop("client_link_uuid", None))
-    panel_node_id = _trim(row.pop("node_id", None))
+    supplied_node = _trim(row.pop("node_id", None))
     incoming_id = _trim(row.get("id") or "")
 
-    if explicit_core:
+    # Older panels sent the protocol UUID as ``node_id`` and the stored primary
+    # key as ``id``. Keep that primary key. Do not mint another one.
+    legacy_split = bool(
+        explicit_core
+        and supplied_node
+        and incoming_id
+        and supplied_node == explicit_core
+        and incoming_id != explicit_core
+    )
+    if legacy_split:
+        primary_key = incoming_id
         protocol_id = explicit_core
-        panel_global = explicit_core
-        agent_hint = prior_agent
-        if incoming_id and incoming_id != explicit_core:
-            agent_hint = agent_hint or incoming_id
-        elif panel_node_id and panel_node_id != explicit_core:
-            agent_hint = agent_hint or panel_node_id
-        if agent_hint and agent_hint != explicit_core:
-            agent_id = agent_hint
-        elif incoming_id and incoming_id != explicit_core:
-            agent_id = incoming_id
-        else:
-            agent_id = str(uuid.uuid4())
-    elif panel_node_id and incoming_id and panel_node_id != incoming_id:
-        agent_id = prior_agent or incoming_id
-        protocol_id = panel_node_id
-        panel_global = panel_node_id
-    elif panel_node_id:
-        protocol_id = panel_node_id
-        panel_global = panel_node_id
-        if prior_agent and prior_agent != panel_node_id:
-            agent_id = prior_agent
-        elif incoming_id and incoming_id != panel_node_id:
-            agent_id = incoming_id
-        else:
-            agent_id = str(uuid.uuid4())
+    elif supplied_node:
+        primary_key = supplied_node
+        protocol_id = explicit_core or (incoming_id if incoming_id and incoming_id != supplied_node else supplied_node)
     elif incoming_id:
-        agent_id = incoming_id
-        protocol_id = incoming_id
-        panel_global = incoming_id
+        primary_key = incoming_id
+        protocol_id = explicit_core or incoming_id
+    elif prior_agent:
+        primary_key = prior_agent
+        protocol_id = explicit_core or prior_agent
     else:
-        agent_id = str(uuid.uuid4())
-        protocol_id = agent_id
-        panel_global = agent_id
+        primary_key = str(uuid.uuid4())
+        protocol_id = explicit_core or primary_key
 
-    row["agent_id"] = agent_id
-    row["node_id"] = panel_global
-    row["id"] = agent_id if store_kind == "agent" else protocol_id
+    row["node_id"] = primary_key
+    row["agent_id"] = primary_key
     if store_kind == "xray":
         row["client_link_uuid"] = protocol_id
+        row["id"] = protocol_id
+    else:
+        row["id"] = primary_key
+        if explicit_core:
+            row["client_link_uuid"] = explicit_core
     return row
 
 
 def panel_client_response(client: dict[str, Any]) -> dict[str, Any]:
-    """Batch upsert response row for the Laravel panel.
+    """Return the panel primary key as both ``id`` and ``node_id``.
 
-    ``id`` and, when a core id exists, ``node_id`` are the Agent primary key.
-    ``client_link_uuid`` is the identifier configured in the core.
-    Cores without that split keep ``node_id`` as the legacy panel global id.
+    ``client_link_uuid`` is included only so the core can keep its own protocol
+    id. It is not an alternate client key.
     """
-    agent_id = _trim(client.get("agent_id") or "")
-    panel_node_id = _trim(client.get("node_id") or "")
+    primary_key = _trim(client.get("node_id") or client.get("agent_id") or "")
     protocol_id = _trim(client.get("id") or "")
     core_id = _trim(client.get("client_link_uuid") or "")
     email = _trim(client.get("email") or "")
 
+    if not primary_key:
+        primary_key = protocol_id
+    if not core_id and protocol_id and protocol_id != primary_key:
+        core_id = protocol_id
+
+    out: dict[str, Any] = {
+        "id": primary_key,
+        "node_id": primary_key,
+    }
     if core_id:
-        if not agent_id:
-            agent_id = protocol_id or panel_node_id
-        if agent_id == core_id and panel_node_id and panel_node_id != core_id:
-            agent_id = panel_node_id
-        out: dict[str, Any] = {
-            "id": agent_id,
-            "node_id": agent_id,
-            "client_link_uuid": core_id,
-        }
-    else:
-        if not agent_id:
-            agent_id = protocol_id
-        if not panel_node_id:
-            panel_node_id = protocol_id
-        out = {
-            "id": agent_id,
-            "node_id": panel_node_id,
-        }
+        out["client_link_uuid"] = core_id
     if email:
         out["email"] = email
     core = _trim(client.get("core") or "")
@@ -121,6 +100,7 @@ def identity_lookup_keys(client: dict[str, Any]) -> set[str]:
         client.get("agent_id"),
         client.get("node_id"),
         client.get("id"),
+        client.get("client_link_uuid"),
         client.get("email"),
         client.get("password"),
     ):
@@ -131,15 +111,34 @@ def identity_lookup_keys(client: dict[str, Any]) -> set[str]:
 
 
 def billing_client_id(meta: dict[str, Any] | None, *, protocol_id: str, email: str) -> str:
-    """Panel ``subscribes.node_id`` (agent route id) for traffic rows."""
-    if isinstance(meta, dict):
-        link = _trim(meta.get("node_id") or "")
-        legacy = _trim(meta.get("agent_id") or meta.get("primary_key") or "")
-        stored_id = _trim(meta.get("id") or "")
-        if legacy and legacy != link:
-            return legacy
-        if stored_id and link and stored_id != link:
-            return stored_id
-        if stored_id:
-            return stored_id
-    return protocol_id or email
+    """Traffic rows are keyed only by the panel ``node_id`` primary key.
+
+    Email and the Xray UUID are never returned. Pre-migration quota documents
+    stored that primary key in ``id`` and the protocol UUID in ``node_id``.
+    """
+    del email
+    if not isinstance(meta, dict):
+        return ""
+
+    node_id = _trim(meta.get("node_id") or "")
+    stored_id = _trim(meta.get("id") or "")
+    link = _trim(meta.get("client_link_uuid") or "")
+    legacy = _trim(meta.get("agent_id") or meta.get("primary_key") or "")
+
+    if legacy and legacy not in {node_id, link, ""}:
+        return legacy
+    if link and stored_id and stored_id != link and (not node_id or node_id == link):
+        return stored_id
+    # Quota rows written before node_id was the primary key: ``id`` is the key
+    # and ``node_id`` still holds the protocol UUID.
+    if not link and stored_id and node_id and stored_id != node_id:
+        return stored_id
+    if node_id and link and node_id != link:
+        return node_id
+    if node_id:
+        return node_id
+    if stored_id and stored_id != _trim(protocol_id):
+        return stored_id
+    if stored_id:
+        return stored_id
+    return ""

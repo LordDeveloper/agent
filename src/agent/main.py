@@ -66,6 +66,11 @@ def create_app(env_file: str | None = None) -> FastAPI:
         migrated = await migrate_client_quota_identity(store)
         if migrated:
             app_log.info("client quota identity migrated docs=%s", migrated)
+        from agent.support.node_id_pk_migration import migrate_node_id_primary_key
+
+        moved = await migrate_node_id_primary_key(store)
+        if moved:
+            app_log.info("client node_id primary key migrated docs=%s", moved)
         app_log.info(
             "agent started version=%s listen=%s cores=%s log=%s local_volume_quota=%s",
             __version__,

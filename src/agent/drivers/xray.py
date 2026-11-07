@@ -1623,9 +1623,9 @@ class XrayDriver(CoreDriver):
                         client["email"] = str(client.get("id") or uuid.uuid4())[:8]
                     email = str(client.get("email") or "").strip()
                     cid = str(client.get("id") or "").strip()
-                    # Xray user id is panel ``node_id`` (link uuid). Match that id
-                    # first so a rotated credential never collides with a stale
-                    # row that still claims the same email alias.
+                    # ``id`` is the protocol UUID after apply_panel_identity.
+                    # Match that UUID so a stale row with the same email is not
+                    # treated as this client.
                     existing = by_id.get(cid) if cid else None
                     if existing is None and email:
                         existing = by_email.get(email)
@@ -1679,9 +1679,10 @@ class XrayDriver(CoreDriver):
                     )
                     native["enable"] = True
                     native["is_enabled"] = True
-                    link_uuid = str(client.get("client_link_uuid") or client.get("node_id") or "").strip()
+                    link_uuid = str(client.get("client_link_uuid") or client.get("id") or "").strip()
                     if link_uuid and str(protocol or "").strip().lower() in {"vless", "vmess"}:
-                        # Xray client UUID is the core id, never the Agent primary key.
+                        # Xray's user id stays the protocol UUID. node_id is the panel key
+                        # and is not written into the core.
                         native["id"] = link_uuid
                         cid = link_uuid
                     _keep_vless_flow(native, client, existing if isinstance(existing, dict) else None, inbound, protocol)
@@ -1790,8 +1791,8 @@ class XrayDriver(CoreDriver):
                     failed += 1
                     errors.append({
                         "email": replace_email,
-                        "id": str(client.get("agent_id") or ""),
-                        "node_id": str(client.get("agent_id") or ""),
+                        "id": str(client.get("node_id") or ""),
+                        "node_id": str(client.get("node_id") or ""),
                         "client_link_uuid": str(client.get("client_link_uuid") or native.get("id") or ""),
                         "message": "Xray client UUID was not updated to client_link_uuid",
                     })
@@ -1813,8 +1814,8 @@ class XrayDriver(CoreDriver):
                 errors.extend(add_errors)
                 errors.append({
                     "email": replace_email,
-                    "id": str(client.get("agent_id") or ""),
-                    "node_id": str(client.get("agent_id") or ""),
+                    "id": str(client.get("node_id") or ""),
+                    "node_id": str(client.get("node_id") or ""),
                     "client_link_uuid": str(native.get("id") or ""),
                     "message": "Xray client UUID was not updated to client_link_uuid",
                 })
@@ -2022,16 +2023,16 @@ class XrayDriver(CoreDriver):
             if not isinstance(client, dict):
                 continue
             meta = quota_meta_from_client(client)
-            doc_id = str(meta.get("id") or meta.get("email") or "").strip()
+            doc_id = str(meta.get("node_id") or meta.get("id") or "").strip()
             if not doc_id:
                 continue
             puts.append((doc_id, meta))
-            email = str(meta.get("email") or "").strip()
-            link_id = str(meta.get("node_id") or "").strip()
-            if email and email != doc_id:
-                deletes.append(email)
-            if link_id and link_id != doc_id:
-                deletes.append(link_id)
+            for alias in (
+                str(meta.get("email") or "").strip(),
+                str(meta.get("client_link_uuid") or "").strip(),
+            ):
+                if alias and alias != doc_id:
+                    deletes.append(alias)
         if not puts and not deletes:
             return
         self._quota_index_cache = None
@@ -2261,6 +2262,7 @@ class XrayDriver(CoreDriver):
             email = str(row.get("email") or "").strip()
             legacy_agent_id = str(row.get("agent_id") or "").strip()
             panel_node_id = str(row.get("node_id") or "").strip()
+            link_id = str(row.get("client_link_uuid") or "").strip()
             if cid:
                 index[f"i:{cid}"] = row
             if email:
@@ -2269,6 +2271,8 @@ class XrayDriver(CoreDriver):
                 index[f"a:{legacy_agent_id}"] = row
             if panel_node_id:
                 index[f"n:{panel_node_id}"] = row
+            if link_id:
+                index[f"l:{link_id}"] = row
         self._quota_index_cache = (now, index)
         return index
 
@@ -2289,15 +2293,19 @@ class XrayDriver(CoreDriver):
             meta = index.get(f"e:{email}")
         if meta:
             apply_quota_meta(client, meta, include_flags=include_flags)
+            primary_key = billing_client_id(meta, protocol_id=cid, email=email)
+            protocol_id = str(meta.get("client_link_uuid") or "").strip()
             stored_id = str(meta.get("id") or "").strip()
-            link_id = str(meta.get("node_id") or "").strip()
-            legacy_agent_id = str(meta.get("agent_id") or "").strip()
-            if legacy_agent_id:
-                client["agent_id"] = legacy_agent_id
-            elif stored_id and link_id and stored_id != link_id:
-                client["agent_id"] = stored_id
-            if link_id:
-                client["node_id"] = link_id
+            stored_node = str(meta.get("node_id") or "").strip()
+            if not protocol_id and stored_id and stored_node and stored_id != stored_node:
+                protocol_id = stored_node
+            elif not protocol_id:
+                protocol_id = stored_node or stored_id
+            if primary_key:
+                client["node_id"] = primary_key
+                client["agent_id"] = primary_key
+            if protocol_id:
+                client["client_link_uuid"] = protocol_id
         return client
 
     async def _overlay_quota(self, inbounds: list[dict[str, Any]], *, include_flags: bool) -> None:
@@ -2338,8 +2346,8 @@ class XrayDriver(CoreDriver):
         return await self.get_inbound(inbound_id)
 
     async def update_client(self, inbound_id: int | str, client_key: str, payload: dict[str, Any]) -> dict[str, Any]:
-        # Canonical key is panel ``node_id`` (Xray ``id``); always try it first,
-        # then fall back to the configured email alias from the payload.
+        # The route key is the panel node_id. Quota records expand it to the
+        # protocol UUID used by this core.
         inbound = await self.get_inbound(inbound_id)
         current = self._find_client(inbound, client_key)
         payload_email = ""
@@ -2366,8 +2374,8 @@ class XrayDriver(CoreDriver):
                 normalize_xray_client({**current, **payload}),
                 store_kind="xray",
             )
-            # Panel node_id is the link UUID. Do not pin the previous Xray id
-            # when that value is only the Agent route PK.
+            # node_id stays the panel primary key. The protocol UUID is id /
+            # client_link_uuid and is what Xray keeps.
             if not str(merged.get("agent_id") or "").strip():
                 merged["agent_id"] = str(client_key)
             if not str(merged.get("email") or "").strip():
@@ -3143,14 +3151,19 @@ class XrayDriver(CoreDriver):
                     seen.add(email)
                 if cid:
                     seen.add(cid)
-                meta = quota_index.get(f"n:{cid}") if cid else None
+                meta = quota_index.get(f"l:{cid}") if cid else None
                 if meta is None and cid:
-                    meta = quota_index.get(f"i:{cid}")
+                    meta = quota_index.get(f"n:{cid}") or quota_index.get(f"i:{cid}")
                 if meta is None and email:
                     meta = quota_index.get(f"e:{email}")
                 canonical = billing_client_id(meta, protocol_id=cid, email=email)
-                if canonical:
-                    seen.add(canonical)
+                if not canonical:
+                    continue
+                if email:
+                    seen.add(email)
+                if cid:
+                    seen.add(cid)
+                seen.add(canonical)
                 clients.append(
                     ClientUsageModel(
                         id=canonical,
@@ -3175,10 +3188,15 @@ class XrayDriver(CoreDriver):
             label = str(email or "").strip()
             if not label or label in seen or not isinstance(traffic, dict):
                 continue
+            meta = quota_index.get(f"e:{label}")
+            canonical = billing_client_id(meta, protocol_id="", email=label)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
             leftover.append(
                 ClientUsageModel(
-                    id=label,
-                    email=label,
+                    id=canonical,
+                    email=None if canonical == label else label,
                     incoming=int(traffic.get("downlink") or 0),
                     outgoing=int(traffic.get("uplink") or 0),
                 )

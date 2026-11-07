@@ -110,16 +110,13 @@ async def test_traffic_service_migrates_legacy_email_rows_to_client_id(store):
 
     await _sample(traffic, registry)
 
-    assert (await traffic.pending_payload())["users"]["uuid-new"] == {
+    payload = await traffic.pending_payload()
+    assert payload["users"]["uuid-new"] == {
         "core": "xray",
         "uplink": 100,
         "downlink": 200,
     }
-    assert (await traffic.pending_payload())["users"]["legacy@example.com"] == {
-        "core": "xray",
-        "uplink": 100,
-        "downlink": 200,
-    }
+    assert "legacy@example.com" not in payload["users"]
     assert await store.get_traffic_pending("xray", "legacy@example.com") is None
     assert await store.get_traffic_ack("xray", "legacy@example.com") is None
     assert await store.get_traffic_ack("xray", "uuid-new") == {
@@ -150,7 +147,41 @@ async def test_wireguard_stale_handshake_still_tracks_pending(store):
     assert stats["pending"] == 1
     payload = await traffic.pending_payload()
     assert payload["users"]["peer-1"]["downlink"] == 148
-    assert payload["users"]["wg@example.com"]["downlink"] == 148
+    assert "wg@example.com" not in payload["users"]
+
+
+async def test_pending_aliases_are_visible_to_another_process(store):
+    """agent serve and agent work do not share the in-memory alias map."""
+    writer = TrafficService(store)
+    client = ClientUsageModel(
+        id="vless-link-uuid",
+        email="s0NTPq",
+        incoming=1_000,
+        outgoing=500,
+    )
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(writer, registry)
+    client.incoming = 249_133_115
+    client.outgoing = 52_952_697
+    await _sample(writer, registry)
+
+    reader = TrafficService(store)
+    payload = await reader.pending_payload()
+    assert payload["users"]["vless-link-uuid"]["downlink"] == 249_133_115 - 1_000
+    assert payload["users"]["vless-link-uuid"]["uplink"] == 52_952_697 - 500
+    assert "s0NTPq" not in payload["users"]
+
+    acked, not_found = await reader.ack_clients(["s0NTPq"])
+    assert acked == []
+    assert not_found == ["s0NTPq"]
+    assert "vless-link-uuid" in (await reader.pending_payload())["users"]
+
+    acked, not_found = await reader.ack_clients(["vless-link-uuid"])
+    assert acked == ["vless-link-uuid"]
+    assert not_found == []
+    assert (await reader.pending_payload())["users"] == {}
 
 
 async def test_ack_clients_accepts_email_alias(store):
@@ -165,7 +196,12 @@ async def test_ack_clients_accepts_email_alias(store):
     await traffic.pending_payload()
 
     acked, not_found = await traffic.ack_clients(["alias@example.com"])
-    assert acked == ["alias@example.com"]
+    assert acked == []
+    assert not_found == ["alias@example.com"]
+    assert "uuid-mail" in (await traffic.pending_payload())["users"]
+
+    acked, not_found = await traffic.ack_clients(["uuid-mail"])
+    assert acked == ["uuid-mail"]
     assert not_found == []
     assert (await traffic.pending_payload())["users"] == {}
 

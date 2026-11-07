@@ -22,6 +22,7 @@ from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
+from agent.support.client_identity import apply_panel_identity
 from agent.support.openvpn_config import (
     AUTH_SCRIPT,
     ensure_server_pki,
@@ -747,14 +748,12 @@ class OpenVpnDriver(CoreDriver):
         apply: bool = True,
     ) -> dict[str, Any]:
         server = await self.get_server(server_id)
-        user = normalize_peer(payload)
-        user.setdefault('id', str(uuid.uuid4()))
+        user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
 
         for existing in list(server.get('users') or []):
             same_id = str(existing.get('id')) == str(user['id'])
-            same_email = str(existing.get('email') or '') == str(user.get('email') or '')
-            if same_id or same_email:
+            if same_id:
                 return await self.update_user(
                     server_id,
                     str(existing.get('id') or user['id']),

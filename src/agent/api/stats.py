@@ -169,8 +169,8 @@ async def stats_clients_traffic_pending(
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` keeps ``pending = current_cumulative - ack`` until POST ack.
       2. GET only reads that queue. It does not sample cores.
-      3. Panel bills those bytes, then POST ``/pending/ack`` with node_id and/or
-         email so only growth after the GET snapshot remains queued.
+      3. Panel bills those bytes, then POST ``/pending/ack`` with each
+         client node_id so only growth after the GET snapshot remains queued.
     """
     payload = await traffic.pending_payload()
 
@@ -194,11 +194,11 @@ async def stats_clients_traffic_pending_ack(
     Advances traffic_ack to the GET snapshot (not a later worker sample) so
     bytes that arrived between GET and ACK stay in the next queue cycle.
 
-    Body: ``{"clients": ["node-id-or-email", ...]}``.
+    Body: ``{"clients": ["<node_id>", ...]}``.
     """
     raw = body.get("clients")
     if raw is None:
-        raw = body.get("client_keys") or body.get("emails") or []
+        raw = body.get("client_keys") or []
 
     if not isinstance(raw, list):
         raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)

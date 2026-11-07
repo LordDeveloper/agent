@@ -189,6 +189,13 @@ class Store:
                     PRIMARY KEY (core, client_key)
                 ) WITHOUT ROWID;
 
+                CREATE TABLE IF NOT EXISTS traffic_identity (
+                    core TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    PRIMARY KEY (core, alias)
+                ) WITHOUT ROWID;
+
                 DROP TABLE IF EXISTS core_errors;
                 """
             )
@@ -347,6 +354,115 @@ class Store:
                     (core, kind, str(doc_id)),
                 )
             await conn.commit()
+
+    async def backup_database(self, dest: Path) -> None:
+        """Copy the open database. An existing destination is left untouched."""
+        import sqlite3
+
+        if dest.exists() and dest.stat().st_size > 0:
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        partial = dest.with_name(dest.name + ".partial")
+        if partial.exists():
+            partial.unlink()
+
+        def _copy() -> None:
+            source = sqlite3.connect(str(self.path))
+            try:
+                target = sqlite3.connect(str(partial))
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+            finally:
+                source.close()
+
+        try:
+            async with self._writing():
+                await asyncio.to_thread(_copy)
+            partial.replace(dest)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
+
+    async def apply_node_id_rewrite(
+        self,
+        *,
+        puts: list[tuple[str, str, dict[str, Any]]],
+        deletes: list[tuple[str, str]],
+        ack_upserts: list[tuple[str, str, int, int]],
+        ack_deletes: list[tuple[str, str]],
+        pending_upserts: list[tuple[str, str, int, int, int, int]],
+        pending_deletes: list[tuple[str, str]],
+    ) -> None:
+        """Rewrite quota documents and traffic keys in one transaction."""
+        encoded = [
+            (core, doc_id, await _encode_json(data))
+            for core, doc_id, data in puts
+        ]
+        async with self._writing() as conn:
+            try:
+                for core, doc_id, payload in encoded:
+                    await conn.execute(
+                        """
+                        INSERT INTO documents (core, kind, doc_id, data, updated_at)
+                        VALUES (?, 'client_quota', ?, ?, datetime('now'))
+                        ON CONFLICT(core, kind, doc_id) DO UPDATE SET
+                            data = excluded.data,
+                            updated_at = datetime('now')
+                        """,
+                        (core, doc_id, payload),
+                    )
+                for core, doc_id in deletes:
+                    await conn.execute(
+                        """
+                        DELETE FROM documents
+                        WHERE core = ? AND kind = 'client_quota' AND doc_id = ?
+                        """,
+                        (core, doc_id),
+                    )
+                for core, key, incoming, outgoing in ack_upserts:
+                    await conn.execute(
+                        """
+                        INSERT INTO traffic_ack (core, client_key, incoming, outgoing, updated_at)
+                        VALUES (?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(core, client_key) DO UPDATE SET
+                            incoming = excluded.incoming,
+                            outgoing = excluded.outgoing,
+                            updated_at = datetime('now')
+                        """,
+                        (core, key, incoming, outgoing),
+                    )
+                for core, key in ack_deletes:
+                    await conn.execute(
+                        "DELETE FROM traffic_ack WHERE core = ? AND client_key = ?",
+                        (core, key),
+                    )
+                for core, key, delta_in, delta_out, current_in, current_out in pending_upserts:
+                    await conn.execute(
+                        """
+                        INSERT INTO traffic_pending (
+                            core, client_key, delta_incoming, delta_outgoing,
+                            current_incoming, current_outgoing, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(core, client_key) DO UPDATE SET
+                            delta_incoming = excluded.delta_incoming,
+                            delta_outgoing = excluded.delta_outgoing,
+                            current_incoming = excluded.current_incoming,
+                            current_outgoing = excluded.current_outgoing,
+                            updated_at = datetime('now')
+                        """,
+                        (core, key, delta_in, delta_out, current_in, current_out),
+                    )
+                for core, key in pending_deletes:
+                    await conn.execute(
+                        "DELETE FROM traffic_pending WHERE core = ? AND client_key = ?",
+                        (core, key),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def replace_docs(
         self,
@@ -628,6 +744,16 @@ class Store:
         rows = await self._fetch("SELECT COUNT(*) AS c FROM traffic_pending")
         return int(rows[0]["c"]) if rows else 0
 
+    async def list_traffic_identity(self) -> list[dict[str, Any]]:
+        rows = await self._fetch(
+            """
+            SELECT core, alias, canonical_key
+            FROM traffic_identity
+            ORDER BY core, alias
+            """
+        )
+        return [dict(row) for row in rows]
+
     async def _traffic_books(self) -> tuple[
         dict[tuple[str, str], tuple[int, int]],
         dict[tuple[str, str], dict[str, int]],
@@ -726,6 +852,16 @@ class Store:
             await conn.execute(
                 "DELETE FROM traffic_pending WHERE core = ? AND client_key = ?",
                 (core, client_key),
+            )
+        for core, alias, canonical_key in writes.get("identity_upserts") or []:
+            await conn.execute(
+                """
+                INSERT INTO traffic_identity (core, alias, canonical_key)
+                VALUES (?, ?, ?)
+                ON CONFLICT(core, alias) DO UPDATE SET
+                    canonical_key = excluded.canonical_key
+                """,
+                (core, alias, canonical_key),
             )
         meta = writes.get("meta")
         if isinstance(meta, tuple) and len(meta) == 3:

@@ -4,9 +4,5 @@ from agent.models import ClientUsageModel
 
 
 def client_key(client: ClientUsageModel) -> str:
-    """Canonical billing key shared by Xray, WireGuard, and Amnezia (panel node_id)."""
-    for candidate in (client.id, client.email):
-        label = str(candidate or "").strip()
-        if label:
-            return label
-    return ""
+    """Billing key. Callers set ``id`` to the panel node_id and nothing else."""
+    return str(client.id or "").strip()

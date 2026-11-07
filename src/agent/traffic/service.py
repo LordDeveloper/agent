@@ -169,6 +169,7 @@ class TrafficService:
         ack_deletes: list[tuple[str, str]] = []
         pending_upserts: list[dict[str, Any]] = []
         pending_deletes: list[tuple[str, str]] = []
+        identity_upserts: list[tuple[str, str, str]] = []
 
         def set_ack(core: str, key: str, incoming: int, outgoing: int) -> None:
             acks[(core, key)] = (incoming, outgoing)
@@ -241,6 +242,7 @@ class TrafficService:
             "ack_deletes": ack_deletes,
             "pending_upserts": pending_upserts,
             "pending_deletes": pending_deletes,
+            "identity_upserts": identity_upserts,
             "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
         }
 
@@ -341,6 +343,16 @@ class TrafficService:
     def _canonical_key(self, label: str) -> str:
         return self._aliases.get(label, label)
 
+    async def _load_persisted_aliases(self) -> None:
+        """HTTP and worker are separate processes; aliases cannot live only in memory."""
+        for row in await self.store.list_traffic_identity():
+            alias = str(row.get("alias") or "").strip()
+            canonical = str(row.get("canonical_key") or "").strip()
+            if not alias or not canonical:
+                continue
+            self._aliases[alias] = canonical
+            self._aliases.setdefault(canonical, canonical)
+
     async def pending_payload(self) -> dict[str, Any]:
         rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
@@ -359,10 +371,6 @@ class TrafficService:
                 "downlink": int(row["delta_incoming"]),
             }
             users[label] = entry
-            email = self._emails.get(label, "")
-            if email and email != label and email not in users:
-                users[email] = entry
-                snapshot.setdefault(email, []).append(dict(row))
 
         self._fetch_snapshot = snapshot
 
@@ -387,7 +395,7 @@ class TrafficService:
         return acked
 
     async def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
-        """Ack provided ids: panel node_id and/or email."""
+        """Ack the panel node_id keys the panel says it has billed."""
         requested = []
         seen: set[str] = set()
         for raw in client_keys:
@@ -407,14 +415,7 @@ class TrafficService:
         to_ack: list[dict[str, Any]] = []
 
         for label in requested:
-            canonical = self._canonical_key(label)
-            rows = (
-                self._fetch_snapshot.get(label)
-                or self._fetch_snapshot.get(canonical)
-                or rows_by_key.get(canonical)
-                or rows_by_key.get(label)
-                or []
-            )
+            rows = self._fetch_snapshot.get(label) or rows_by_key.get(label) or []
             if not rows:
                 not_found.append(label)
                 continue

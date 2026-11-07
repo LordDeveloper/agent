@@ -80,6 +80,11 @@ async def serve_background(settings: AgentSettings, stop: asyncio.Event) -> None
         migrated = await migrate_client_quota_identity(store)
         if migrated:
             log.info("client quota identity migrated docs=%s", migrated)
+        from agent.support.node_id_pk_migration import migrate_node_id_primary_key
+
+        moved = await migrate_node_id_primary_key(store)
+        if moved:
+            log.info("client node_id primary key migrated docs=%s", moved)
         audit = AuditLog(store)
         registry = CoreRegistry(settings, audit, store)
         traffic = TrafficService(store)
