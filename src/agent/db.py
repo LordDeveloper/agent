@@ -631,6 +631,35 @@ class Store:
             await conn.commit()
             return len(prepared)
 
+    async def inspect_traffic_ack(self, client_key: str) -> dict[str, Any]:
+        """Read ack and pending rows for one client key. Does not write."""
+        key = str(client_key or "").strip()
+        if not key:
+            return {"ack_rows": [], "pending_rows": []}
+        ack_rows = await self._fetch(
+            """
+            SELECT core, client_key, incoming, outgoing, updated_at
+            FROM traffic_ack
+            WHERE client_key = ?
+            ORDER BY core
+            """,
+            (key,),
+        )
+        pending_rows = await self._fetch(
+            """
+            SELECT core, client_key, delta_incoming, delta_outgoing,
+                   current_incoming, current_outgoing, updated_at
+            FROM traffic_pending
+            WHERE client_key = ?
+            ORDER BY core
+            """,
+            (key,),
+        )
+        return {
+            "ack_rows": [dict(row) for row in ack_rows],
+            "pending_rows": [dict(row) for row in pending_rows],
+        }
+
     async def get_traffic_ack(self, core: str, client_key: str) -> dict[str, int] | None:
         rows = await self._fetch(
             """

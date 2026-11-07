@@ -183,6 +183,26 @@ async def stats_clients_traffic_pending(
     }
 
 
+@router.get("/stats/clients/ack")
+async def stats_clients_ack(
+    node_id: str = Query(""),
+    traffic: TrafficService = Depends(get_traffic),
+):
+    """Read the traffic_ack watermark for one panel node_id. Does not sample or write."""
+    label = str(node_id or "").strip()
+    if not label:
+        raise_agent_error("INVALID_PAYLOAD", "node_id is required", 400)
+    inspected = await traffic.store.inspect_traffic_ack(label)
+    ack_rows = inspected["ack_rows"]
+    return {
+        "success": True,
+        "node_id": label,
+        "ack_found": bool(ack_rows),
+        "ack_rows": ack_rows,
+        "pending_rows": inspected["pending_rows"],
+    }
+
+
 @router.post("/stats/clients/traffic/pending/ack")
 async def stats_clients_traffic_pending_ack(
     body: dict[str, Any],

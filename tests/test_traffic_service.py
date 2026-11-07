@@ -259,3 +259,20 @@ async def test_ack_uses_get_snapshot_so_later_growth_stays_queued(store):
     await _sample(traffic, registry)
     leftover = (await traffic.pending_payload())["users"]["uuid-snap"]
     assert leftover["downlink"] == 150
+
+
+async def test_inspect_traffic_ack_reads_only_the_node_id(store):
+    await store.set_traffic_ack("xray", "node-1", 10, 4)
+    await store.upsert_traffic_pending("xray", "node-1", 2, 1, 12, 5)
+    await store.set_traffic_ack("xray", "s0NTPq", 99, 88)
+
+    found = await store.inspect_traffic_ack("node-1")
+    assert [row["client_key"] for row in found["ack_rows"]] == ["node-1"]
+    assert found["ack_rows"][0]["incoming"] == 10
+    assert found["ack_rows"][0]["outgoing"] == 4
+    assert found["ack_rows"][0]["updated_at"]
+    assert found["pending_rows"][0]["delta_incoming"] == 2
+    assert found["pending_rows"][0]["delta_outgoing"] == 1
+
+    assert (await store.inspect_traffic_ack("missing-node"))["ack_rows"] == []
+    assert (await store.get_traffic_ack("xray", "s0NTPq")) == {"incoming": 99, "outgoing": 88}
