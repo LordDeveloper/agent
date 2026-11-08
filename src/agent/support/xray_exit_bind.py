@@ -107,6 +107,7 @@ def script_lines(ifaces: list[str]) -> list[str]:
                 f'if ip link show "{name}" >/dev/null 2>&1; then',
                 f'  sysctl -w "net.ipv4.conf.{name}.rp_filter=0" >/dev/null 2>&1 || true',
                 f'  ip route replace default dev "{name}" table {table} 2>/dev/null || true',
+                f'  ip rule del pref {pref} 2>/dev/null || true',
                 f'  ip rule del oif "{name}" lookup {table} 2>/dev/null || true',
                 f'  ip rule add oif "{name}" lookup {table} pref {pref} 2>/dev/null || true',
                 "fi",
@@ -122,6 +123,91 @@ def _stdout(result: Any) -> str:
 
 def _ok(result: Any) -> bool:
     return int(getattr(result, "returncode", 1) or 0) == 0
+
+
+def parse_ip_rule_line(line: str) -> dict[str, Any] | None:
+    """One ``ip rule show`` line: ``11042: from all oif uk lookup 15234``."""
+    raw = line.strip()
+    if not raw or ":" not in raw:
+        return None
+    pref_text, rest = raw.split(":", 1)
+    pref_text = pref_text.strip()
+    if not pref_text.isdigit():
+        return None
+    parts = rest.split()
+    oif = ""
+    table = ""
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token == "oif" and index + 1 < len(parts):
+            oif = parts[index + 1]
+            index += 2
+            continue
+        if token == "lookup" and index + 1 < len(parts):
+            table = parts[index + 1]
+            index += 2
+            continue
+        index += 1
+    if table == "":
+        return None
+    return {"pref": int(pref_text), "oif": oif, "table": table}
+
+
+def parse_ip_rules(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in str(text or "").splitlines():
+        row = parse_ip_rule_line(line)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _same_table(token: str, table: int) -> bool:
+    raw = str(token or "").strip()
+    if raw == str(table):
+        return True
+    try:
+        return int(raw, 10) == table
+    except ValueError:
+        return False
+
+
+def choose_bind_pref(iface: str, taken: set[int]) -> int:
+    """Preference in 11000–13999. A hash collision uses the next free slot."""
+    base = bind_pref(iface)
+    if base not in taken:
+        return base
+    origin = (base - 11000) % 3000
+    for offset in range(1, 3000):
+        candidate = 11000 + ((origin + offset) % 3000)
+        if candidate not in taken:
+            return candidate
+    raise AgentError(
+        "EXEC_ERROR",
+        f"No free ip-rule preference for exit interface [{iface}]",
+        500,
+    )
+
+
+def _rule_is_ours(row: dict[str, Any], name: str, table: int) -> bool:
+    return str(row.get("oif") or "") == name and _same_table(str(row.get("table") or ""), table)
+
+
+def _rule_to_drop(row: dict[str, Any], name: str, table: int, keep_pref: int | None) -> bool:
+    """Stale oif rules for this exit, plus a dead ifindex still holding our table."""
+    pref = int(row["pref"])
+    if keep_pref is not None and pref == keep_pref:
+        return False
+    oif = str(row.get("oif") or "")
+    if oif == name:
+        return True
+    return oif.isdigit() and _same_table(str(row.get("table") or ""), table)
+
+
+def _keeper(rows: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    preferred = bind_pref(name)
+    return min(rows, key=lambda row: (int(row["pref"]) != preferred, int(row["pref"])))
 
 
 async def _primary_ipv4(iface: str, runner: Runner | None) -> str:
@@ -150,7 +236,6 @@ async def ensure_interface_bind_route(iface: str, *, runner: Runner | None = Non
     table = table_id_for_interface(name)
     if table < 10000:
         raise AgentError("VALIDATION_ERROR", f"Refusing to install a main-table route for [{name}]", 422)
-    pref = bind_pref(name)
     source = await _primary_ipv4(name, runner)
 
     await execute(
@@ -173,12 +258,33 @@ async def ensure_interface_bind_route(iface: str, *, runner: Runner | None = Non
             500,
         )
 
-    await execute(
-        runner,
-        ["ip", "rule", "del", "oif", name, "lookup", str(table)],
-        check=False,
-        timeout=5,
-    )
+    # ``ip rule add pref N`` returns EEXIST when that priority is already taken.
+    # Re-sync hits this whenever the oif rule is already installed, or a previous
+    # ifindex still occupies N after the tunnel device was recreated. Delete only
+    # this interface's stale rules; leave another exit's rule on a shared pref.
+    rules = await _show_ip_rules(runner)
+    correct = [row for row in rules if _rule_is_ours(row, name, table)]
+    keep_pref = int(_keeper(correct, name)["pref"]) if correct else None
+    for row in rules:
+        if _rule_to_drop(row, name, table, keep_pref):
+            await _delete_rule_pref(runner, int(row["pref"]))
+
+    if keep_pref is not None:
+        save_bind_ifaces([name])
+        return {
+            "ok": True,
+            "interface": name,
+            "table": table,
+            "pref": keep_pref,
+            "source": source or None,
+        }
+
+    taken = {
+        int(row["pref"])
+        for row in rules
+        if not _rule_to_drop(row, name, table, None)
+    }
+    pref = choose_bind_pref(name, taken)
     added = await execute(
         runner,
         ["ip", "rule", "add", "oif", name, "lookup", str(table), "pref", str(pref)],
@@ -187,6 +293,18 @@ async def ensure_interface_bind_route(iface: str, *, runner: Runner | None = Non
     )
     if not _ok(added):
         detail = str(getattr(added, "stderr", "") or _stdout(added)).strip()
+        if "file exists" in detail.lower():
+            again = await _show_ip_rules(runner)
+            existing = next((row for row in again if _rule_is_ours(row, name, table)), None)
+            if existing is not None:
+                save_bind_ifaces([name])
+                return {
+                    "ok": True,
+                    "interface": name,
+                    "table": table,
+                    "pref": int(existing["pref"]),
+                    "source": source or None,
+                }
         raise AgentError(
             "EXEC_ERROR",
             f"Could not add oif rule for [{name}]"
@@ -202,6 +320,27 @@ async def ensure_interface_bind_route(iface: str, *, runner: Runner | None = Non
         "pref": pref,
         "source": source or None,
     }
+
+
+async def _show_ip_rules(runner: Runner | None) -> list[dict[str, Any]]:
+    result = await execute(runner, ["ip", "rule", "show"], check=False, timeout=5)
+    if not _ok(result):
+        detail = str(getattr(result, "stderr", "") or _stdout(result)).strip()
+        raise AgentError(
+            "EXEC_ERROR",
+            "Could not list ip rules" + (f": {detail[:180]}" if detail else ""),
+            500,
+        )
+    return parse_ip_rules(_stdout(result))
+
+
+async def _delete_rule_pref(runner: Runner | None, pref: int) -> None:
+    await execute(
+        runner,
+        ["ip", "rule", "del", "pref", str(pref)],
+        check=False,
+        timeout=5,
+    )
 
 
 async def reapply_saved_binds(*, runner: Runner | None = None) -> dict[str, Any]:

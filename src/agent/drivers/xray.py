@@ -71,6 +71,9 @@ _CLIENT_BATCH_MAX = 200
 _SMALL_CLIENT_BATCH = 8
 # Overlap per-client Xray writes. Wall time stays near one call, not N calls.
 _CLIENT_PARALLELISM = 32
+# users/add can return 200 before config.json shows the merged clients.
+_PERSIST_CONFIRM_ATTEMPTS = 6
+_PERSIST_CONFIRM_DELAY_SECONDS = 0.2
 
 
 def _drain_task(task: asyncio.Task) -> None:
@@ -657,6 +660,36 @@ class XrayDriver(CoreDriver):
                 return
         inbounds.append(inbound)
 
+    async def _confirm_persisted_or_repair(
+        self,
+        tag: str,
+        wire_users: list[dict[str, Any]],
+        drop_emails: list[str],
+        *,
+        protocol: str,
+        inbound_settings: dict[str, Any] | None,
+    ) -> None:
+        """Confirm config.json, and write the inbound once if parallel adds lost the merge."""
+        try:
+            await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
+            return
+        except AgentError as first:
+            if not wire_users:
+                raise
+            _log.warning(
+                "xray persistence repair core=xray inbound=%s upserts=%s error=%s",
+                tag,
+                len(wire_users),
+                first.message,
+            )
+        await self._commit_clients_to_inbound(
+            tag,
+            wire_users,
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
+        await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
+
     async def _confirm_httpapi_persisted(
         self,
         tag: str,
@@ -665,9 +698,8 @@ class XrayDriver(CoreDriver):
     ) -> None:
         """Read config.json after the HTTP API returns.
 
-        users/add, users/edit, users/upsert, users/remove, and rules/replace
-        write the startup file inside Xray before status 200. A second writer
-        in the agent races that merge and drops clients, so this only reads.
+        Overlapping users/add calls can return 200 before the startup file
+        shows every client. This re-reads the file and does not write it.
         """
         from agent.runtime import RuntimeTrace
 
@@ -684,8 +716,15 @@ class XrayDriver(CoreDriver):
                 operation_id,
             )
             return
-        self._invalidate_config_cache()
-        if not await self._config_contains_clients(tag, native, emails):
+        present = False
+        for attempt in range(_PERSIST_CONFIRM_ATTEMPTS):
+            self._invalidate_config_cache()
+            present = await self._config_contains_clients(tag, native, emails)
+            if present:
+                break
+            if attempt + 1 < _PERSIST_CONFIRM_ATTEMPTS:
+                await asyncio.sleep(_PERSIST_CONFIRM_DELAY_SECONDS)
+        if not present:
             _log.error(
                 "xray persistence verification failed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
                 tag,
@@ -2115,7 +2154,13 @@ class XrayDriver(CoreDriver):
                     drop_emails.append(email)
             if wire_users or drop_emails:
                 try:
-                    await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
+                    await self._confirm_persisted_or_repair(
+                        tag,
+                        wire_users,
+                        drop_emails,
+                        protocol=protocol,
+                        inbound_settings=inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None,
+                    )
                 except AgentError as exc:
                     rejected, reject_errors = self._reject_unpersisted(applied, exc)
                     succeeded = max(0, succeeded - rejected)
