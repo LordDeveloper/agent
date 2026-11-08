@@ -21,7 +21,7 @@ from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.runtime import RuntimeTrace
 from agent.support import normalize_peer, record_is_enabled
-from agent.support.client_identity import apply_panel_identity
+from agent.support.client_identity import apply_panel_identity, keep_stored_identity_fields
 from agent.support.l2tp_config import (
     normalize_templates,
     render_chap_secrets,
@@ -532,20 +532,9 @@ class L2tpDriver(CoreDriver):
                         touches.append(_UserEgressTouch(removed, remove=True))
                     server = await self.get_server(server_id)
                     break
-            if same_email and (not payload_id or payload_id == existing_id):
-                # Retry after a client timeout: the first create already stored this user.
-                # Keep credentials and address so a second POST cannot fork a duplicate.
-                return await self._update_user_locked(server_id, existing_id or existing_email, payload)
             if same_email:
-                # Explicit new id for the same email — peer identity rotate.
-                removed = await self._delete_user_locked(
-                    server_id,
-                    existing_id or existing_email,
-                )
-                if removed is not None:
-                    touches.append(_UserEgressTouch(removed, remove=True))
-                server = await self.get_server(server_id)
-                break
+                # The email already belongs to this user. Keep that primary key.
+                return await self._update_user_locked(server_id, existing_id or existing_email, payload)
 
         user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         if payload_id:
@@ -624,6 +613,7 @@ class L2tpDriver(CoreDriver):
                 else:
                     merged['address'] = user.get('address')
                     _note_l2tp_issued(server, str(merged.get('address') or ''))
+                keep_stored_identity_fields(merged, user)
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 

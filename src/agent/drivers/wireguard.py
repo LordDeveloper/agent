@@ -19,7 +19,7 @@ from agent.drivers.base import CoreDriver
 from agent.errors import AgentError
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
-from agent.support.client_identity import apply_panel_identity, panel_client_response
+from agent.support.client_identity import apply_panel_identity, keep_stored_identity_fields, panel_client_response
 from agent.support.config_validate import validate_wg_conf_stripped, validate_wg_iface
 from agent.asyncutil import bounded_gather, gather_independent
 from agent.support.interface_lifecycle import (
@@ -1922,6 +1922,7 @@ class WireGuardDriver(CoreDriver):
                         merged.pop("persistent_keepalive", None)
                         merged.pop("PersistentKeepalive", None)
                         merged.pop("keepalive", None)
+                keep_stored_identity_fields(merged, before)
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 
@@ -2098,6 +2099,7 @@ class WireGuardDriver(CoreDriver):
                 merged["exit_interface"] = normalized["exit_interface"]
             else:
                 merged.pop("exit_interface", None)
+        keep_stored_identity_fields(merged, before)
         self._preserve_cumulative_counters(merged, before)
         from agent.support.quota import reseed_baseline_if_stale
 

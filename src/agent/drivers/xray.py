@@ -35,6 +35,8 @@ from agent.support.client_identity import (
     billing_client_id,
     identity_lookup_keys,
     panel_client_response,
+    preserve_pushed_identity,
+    publish_document_identity,
     select_quota_meta,
 )
 from agent.support.disable_reason import mark_panel_disabled
@@ -1892,12 +1894,14 @@ class XrayDriver(CoreDriver):
             # (email, desired user, panel client, previous xray user)
             uuid_replacements: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
 
+            quota_index = await self._quota_index()
             for raw in clients:
                 if not isinstance(raw, dict):
                     failed += 1
                     errors.append({"email": "", "message": "client must be an object"})
                     continue
                 try:
+                    raw = preserve_pushed_identity(raw, quota_index)
                     client = apply_panel_identity(normalize_xray_client(raw), store_kind="xray")
                     if not client.get("email"):
                         client["email"] = str(client.get("id") or uuid.uuid4())[:8]
@@ -2590,30 +2594,14 @@ class XrayDriver(CoreDriver):
         email = str(client.get("email") or "").strip()
         agent_id = str(client.get("agent_id") or "").strip()
         panel_node_id = str(client.get("node_id") or "").strip()
-        meta = index.get(f"n:{cid}") if cid else None
+        meta = select_quota_meta(index, protocol_id=cid, email=email)
         if meta is None and panel_node_id:
             meta = index.get(f"n:{panel_node_id}")
-        if meta is None and cid:
-            meta = index.get(f"i:{cid}")
         if meta is None and agent_id:
             meta = index.get(f"a:{agent_id}") or index.get(f"i:{agent_id}")
-        if meta is None and email:
-            meta = index.get(f"e:{email}")
         if meta:
             apply_quota_meta(client, meta, include_flags=include_flags)
-            primary_key = billing_client_id(meta, protocol_id=cid, email=email)
-            protocol_id = str(meta.get("client_link_uuid") or "").strip()
-            stored_id = str(meta.get("id") or "").strip()
-            stored_node = str(meta.get("node_id") or "").strip()
-            if not protocol_id and stored_id and stored_node and stored_id != stored_node:
-                protocol_id = stored_node
-            elif not protocol_id:
-                protocol_id = stored_node or stored_id
-            if primary_key:
-                client["node_id"] = primary_key
-                client["agent_id"] = primary_key
-            if protocol_id:
-                client["client_link_uuid"] = protocol_id
+            publish_document_identity(client, meta, protocol_id=cid, email=email)
         return client
 
     async def _overlay_quota(self, inbounds: list[dict[str, Any]], *, include_flags: bool) -> None:
@@ -2624,11 +2612,10 @@ class XrayDriver(CoreDriver):
             for client in self._clients_of(inbound):
                 cid = str(client.get("id") or "").strip()
                 email = str(client.get("email") or "").strip()
-                meta = index.get(f"i:{cid}") if cid else None
-                if meta is None and email:
-                    meta = index.get(f"e:{email}")
+                meta = select_quota_meta(index, protocol_id=cid, email=email)
                 if meta:
                     apply_quota_meta(client, meta, include_flags=include_flags)
+                    publish_document_identity(client, meta, protocol_id=cid, email=email)
 
     async def _ensure_shadowsocks_method(self, inbound: dict[str, Any]) -> dict[str, Any]:
         """Repair blank Shadowsocks cipher keys left by legacy broken inbounds."""

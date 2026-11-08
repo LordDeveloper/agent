@@ -1,5 +1,13 @@
 from agent.support.client_diagnose import describe_traffic_accounting
-from agent.support.client_identity import apply_panel_identity, billing_client_id, select_quota_meta
+from agent.support.client_identity import (
+    apply_panel_identity,
+    billing_client_id,
+    keep_stored_identity_fields,
+    panel_client_response,
+    preserve_pushed_identity,
+    publish_document_identity,
+    select_quota_meta,
+)
 from agent.support.diagnose_format import format_diagnose_report
 
 
@@ -32,6 +40,109 @@ def test_panel_identity_keeps_node_id_and_does_not_mint_another():
     )
     assert updated["node_id"] == NODE_ID
     assert updated["client_link_uuid"] == XRAY_UUID
+
+
+def test_push_keeps_the_stored_document_pk_when_panel_sends_the_xray_uuid():
+    stored = {
+        "id": NODE_ID,
+        "node_id": NODE_ID,
+        "client_link_uuid": XRAY_UUID,
+        "email": "user@example.com",
+    }
+    index = {
+        f"l:{XRAY_UUID}": stored,
+        f"e:user@example.com": stored,
+        f"n:{NODE_ID}": stored,
+        f"n:{XRAY_UUID}": {
+            "id": XRAY_UUID,
+            "node_id": XRAY_UUID,
+            "client_link_uuid": XRAY_UUID,
+            "email": "user@example.com",
+        },
+    }
+    pushed = preserve_pushed_identity(
+        {
+            "id": XRAY_UUID,
+            "node_id": XRAY_UUID,
+            "client_link_uuid": XRAY_UUID,
+            "email": "user@example.com",
+        },
+        index,
+    )
+    applied = apply_panel_identity(pushed, store_kind="xray")
+
+    assert applied["node_id"] == NODE_ID
+    assert applied["agent_id"] == NODE_ID
+    assert applied["id"] == XRAY_UUID
+    assert applied["client_link_uuid"] == XRAY_UUID
+    assert panel_client_response(applied) == {
+        "id": NODE_ID,
+        "node_id": NODE_ID,
+        "client_link_uuid": XRAY_UUID,
+        "email": "user@example.com",
+    }
+
+
+def test_legacy_push_uses_id_as_document_pk_when_node_id_is_the_link():
+    stale = "11111111-2222-4333-8444-555555555555"
+    agent_pk = "ad72524c-2513-4555-b451-2c1092068514"
+    link = "77682cfe-dd5f-43c6-9688-8be48138e954"
+    stored = {
+        "id": stale,
+        "node_id": stale,
+        "client_link_uuid": stale,
+        "email": "LesYsl",
+    }
+    pushed = preserve_pushed_identity(
+        {
+            "id": agent_pk,
+            "node_id": link,
+            "client_link_uuid": link,
+            "email": "LesYsl",
+        },
+        {f"e:LesYsl": stored, f"n:{stale}": stored},
+    )
+    applied = apply_panel_identity(pushed, store_kind="xray")
+    assert applied["node_id"] == agent_pk
+    assert applied["id"] == link
+    assert applied["client_link_uuid"] == link
+
+
+def test_response_does_not_publish_the_protocol_uuid_as_node_id():
+    response = panel_client_response(
+        {"id": XRAY_UUID, "client_link_uuid": XRAY_UUID, "email": "user@example.com"}
+    )
+    assert response["node_id"] == ""
+    assert response["client_link_uuid"] == XRAY_UUID
+
+
+def test_listed_client_keeps_xray_id_and_publishes_document_pk():
+    client = {"id": XRAY_UUID, "email": "user@example.com"}
+    publish_document_identity(
+        client,
+        {
+            "id": NODE_ID,
+            "node_id": NODE_ID,
+            "client_link_uuid": XRAY_UUID,
+            "email": "user@example.com",
+        },
+        protocol_id=XRAY_UUID,
+        email="user@example.com",
+    )
+    assert client["id"] == XRAY_UUID
+    assert client["node_id"] == NODE_ID
+    assert client["client_link_uuid"] == XRAY_UUID
+
+
+def test_update_keeps_stored_identity_fields():
+    merged = keep_stored_identity_fields(
+        {"id": XRAY_UUID, "node_id": XRAY_UUID, "email": "user@example.com"},
+        {"id": NODE_ID, "node_id": NODE_ID, "client_link_uuid": XRAY_UUID, "email": "old@example.com"},
+    )
+    assert merged["id"] == NODE_ID
+    assert merged["node_id"] == NODE_ID
+    assert merged["client_link_uuid"] == XRAY_UUID
+    assert merged["email"] == "user@example.com"
 
 
 def test_quota_lookup_uses_distinct_node_id_not_the_xray_uuid():

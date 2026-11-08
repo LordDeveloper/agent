@@ -22,7 +22,7 @@ from agent.errors import AgentError
 from agent.logutil import get_logger
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.support import normalize_peer, record_is_enabled
-from agent.support.client_identity import apply_panel_identity
+from agent.support.client_identity import apply_panel_identity, keep_stored_identity_fields
 from agent.support.openvpn_config import (
     AUTH_SCRIPT,
     ensure_server_pki,
@@ -773,9 +773,11 @@ class OpenVpnDriver(CoreDriver):
         user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
 
+        email = str(user.get('email') or '').strip()
         for existing in list(server.get('users') or []):
             same_id = str(existing.get('id')) == str(user['id'])
-            if same_id:
+            same_email = bool(email) and str(existing.get('email') or '') == email
+            if same_id or same_email:
                 return await self.update_user(
                     server_id,
                     str(existing.get('id') or user['id']),
@@ -845,6 +847,7 @@ class OpenVpnDriver(CoreDriver):
                     )
                 else:
                     merged['address'] = user.get('address')
+                keep_stored_identity_fields(merged, user)
                 if record_is_enabled(merged):
                     from agent.support.disable_reason import clear_disabled_metadata
 
