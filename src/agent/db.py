@@ -300,10 +300,12 @@ class Store:
         return [await _decode_json(row["data"]) for row in rows]
 
     async def lookup_document_keys(self, doc_ids: list[str]) -> list[dict[str, Any]]:
-        """Read-only existence check by document primary key.
+        """Read-only existence check by client primary key.
 
-        Matches ``documents.doc_id`` only. Email and protocol UUIDs inside the
-        JSON body are returned for comparison and are never used as the key.
+        A direct ``documents.doc_id`` match is a quota row. WireGuard, Amnezia,
+        L2TP, and OpenVPN keep that same panel node_id on the peer or user
+        inside the interface or server document. Email and protocol UUIDs are
+        comparison fields and are never lookup keys.
         """
         cleaned: list[str] = []
         seen: set[str] = set()
@@ -329,15 +331,64 @@ class Store:
             tuple(cleaned),
         )
         found: list[dict[str, Any]] = []
+        matched: set[str] = set()
         for row in rows:
+            doc_id = str(row["doc_id"] or "")
+            matched.add(doc_id)
             found.append({
-                "doc_id": str(row["doc_id"] or ""),
+                "doc_id": doc_id,
                 "core": str(row["core"] or ""),
                 "kind": str(row["kind"] or ""),
                 "email": _json_text(row["email"]),
                 "client_link_uuid": _json_text(row["client_link_uuid"]),
                 "protocol_id": _json_text(row["protocol_id"]),
             })
+        if len(matched) < len(cleaned):
+            found.extend(await self._lookup_nested_client_keys(set(cleaned) - matched))
+        return found
+
+    async def _lookup_nested_client_keys(self, wanted: set[str]) -> list[dict[str, Any]]:
+        if not wanted:
+            return []
+        parents = await self._fetch(
+            """
+            SELECT core, kind, doc_id, data
+            FROM documents
+            WHERE kind IN ('interface', 'server')
+            ORDER BY core, doc_id
+            """,
+        )
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for parent in parents:
+            try:
+                data = json.loads(parent["data"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            peers = data.get("peers")
+            users = data.get("users")
+            members = peers if isinstance(peers, list) else users if isinstance(users, list) else []
+            kind = "peer" if isinstance(peers, list) else "user"
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                node_id = str(member.get("node_id") or "").strip()
+                member_id = str(member.get("id") or "").strip()
+                key = node_id if node_id in wanted else member_id if member_id in wanted else ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                found.append({
+                    "doc_id": key,
+                    "core": str(parent["core"] or ""),
+                    "kind": kind,
+                    "email": str(member.get("email") or "").strip(),
+                    "client_link_uuid": str(member.get("client_link_uuid") or "").strip(),
+                    "protocol_id": member_id,
+                    "parent_doc_id": str(parent["doc_id"] or ""),
+                })
         return found
 
     async def get_doc(self, core: str, kind: str, doc_id: str) -> dict[str, Any] | None:

@@ -97,3 +97,45 @@ def test_lookup_matches_document_primary_key_not_protocol_uuid(client: TestClien
 
     rejected = client.post("/api/v1/documents/lookup", headers=headers, json={"ids": "pk"})
     assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_lookup_matches_nested_peer_and_user_node_id(tmp_path):
+    from agent.db import Store
+
+    store = Store(tmp_path / "agent.db")
+    await store.open()
+    try:
+        peer_id = "ac7f244a-7070-42b2-9a6f-a3d0ee45e918"
+        user_id = "ea7d17b9-7313-477d-9a4e-5a821c3029a6"
+        await store.put_doc("wireguard", "interface", "11", {
+            "id": 11,
+            "peers": [{
+                "id": peer_id,
+                "node_id": peer_id,
+                "email": "Wu9SZbLs",
+                "password": "do-not-return",
+            }],
+        })
+        await store.put_doc("openvpn", "server", "2", {
+            "id": 2,
+            "users": [{
+                "id": user_id,
+                "node_id": user_id,
+                "email": "95et63sN",
+            }],
+        })
+
+        rows = await store.lookup_document_keys([peer_id, user_id, "Wu9SZbLs", "missing-pk"])
+    finally:
+        await store.close()
+
+    by_id = {row["doc_id"]: row for row in rows}
+    assert set(by_id) == {peer_id, user_id}
+    assert by_id[peer_id]["kind"] == "peer"
+    assert by_id[peer_id]["core"] == "wireguard"
+    assert by_id[peer_id]["email"] == "Wu9SZbLs"
+    assert by_id[peer_id]["parent_doc_id"] == "11"
+    assert by_id[user_id]["kind"] == "user"
+    assert by_id[user_id]["core"] == "openvpn"
+    assert "do-not-return" not in str(rows)

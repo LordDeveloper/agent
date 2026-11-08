@@ -215,6 +215,8 @@ async def stats_clients_traffic_pending_ack(
     bytes that arrived between GET and ACK stay in the next queue cycle.
 
     Body: ``{"clients": ["<node_id>", ...]}``.
+    Email and a protocol UUID may find the row. ``acked`` always lists the
+    panel node_id, which is the stored client key.
     """
     raw = body.get("clients")
     if raw is None:

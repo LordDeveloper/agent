@@ -244,8 +244,10 @@ class TrafficService:
             stats[outcome] = stats.get(outcome, 0) + 1
             for alias in (email, protocol_id):
                 alias_text = str(alias or "").strip()
-                if alias_text and alias_text != label:
-                    identity_upserts.append((core, alias_text, label))
+                # Another client's node_id is a primary key, not an alias of this one.
+                if not alias_text or alias_text == label or alias_text in protected:
+                    continue
+                identity_upserts.append((core, alias_text, label))
 
         return {
             "stats": stats,
@@ -453,6 +455,18 @@ class TrafficService:
     def _canonical_key(self, label: str) -> str:
         return self._aliases.get(label, label)
 
+    def _public_client_key(self, stored: str) -> str:
+        """Ack and pending responses publish the panel node_id.
+
+        Email and the Xray protocol UUID are lookup aliases. They are not the
+        client key returned to the panel.
+        """
+        label = str(stored or "").strip()
+        if not label:
+            return ""
+        canonical = str(self._canonical_key(label) or "").strip()
+        return canonical or label
+
     async def _load_persisted_aliases(self) -> None:
         """HTTP and worker are separate processes; aliases cannot live only in memory."""
         for row in await self.store.list_traffic_identity():
@@ -471,11 +485,17 @@ class TrafficService:
         linked_l2tp = await self._linked_l2tp_client_keys()
 
         for row in rows:
-            label = str(row["client_key"])
-            if str(row.get("core") or "") == "l2tp" and label in linked_l2tp:
+            stored = str(row["client_key"])
+            if str(row.get("core") or "") == "l2tp" and stored in linked_l2tp:
+                continue
+            label = self._public_client_key(stored)
+            if not label:
                 continue
 
-            snapshot.setdefault(label, []).append(dict(row))
+            published = dict(row)
+            snapshot.setdefault(label, []).append(published)
+            if stored != label:
+                snapshot.setdefault(stored, []).append(published)
             entry = {
                 "core": row["core"],
                 "uplink": int(row["delta_outgoing"]),
@@ -540,8 +560,10 @@ class TrafficService:
                 continue
 
             to_ack.extend(rows)
-            acked.append(label)
-            log.info("traffic ack client=%s rows=%s", label, len(rows))
+            published = self._public_client_key(str(rows[0].get("client_key") or "")) or self._public_client_key(label)
+            if published and published not in acked:
+                acked.append(published)
+            log.info("traffic ack client=%s rows=%s", published or label, len(rows))
 
         await self.store.ack_traffic_rows(to_ack)
         return acked, not_found

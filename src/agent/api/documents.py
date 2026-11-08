@@ -1,4 +1,4 @@
-"""Read-only document primary-key lookup. Does not create or change clients."""
+"""Read-only client primary-key lookup. Does not create or change clients."""
 
 from __future__ import annotations
 
