@@ -70,6 +70,20 @@ class _FakeXrayDriver:
     def client_ips(self, _email):
         return []
 
+    async def _quota_index(self):
+        row = {
+            "id": "node-1",
+            "node_id": "node-1",
+            "client_link_uuid": "uuid-1",
+            "email": "abc123",
+        }
+        return {
+            "l:uuid-1": row,
+            "n:node-1": row,
+            "i:node-1": row,
+            "e:abc123": row,
+        }
+
     def usage_snapshot(self):
         from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 

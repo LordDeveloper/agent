@@ -276,3 +276,108 @@ async def test_inspect_traffic_ack_reads_only_the_node_id(store):
 
     assert (await store.inspect_traffic_ack("missing-node"))["ack_rows"] == []
     assert (await store.get_traffic_ack("xray", "s0NTPq")) == {"incoming": 99, "outgoing": 88}
+
+
+async def test_counter_reset_keeps_unacked_bytes_and_does_not_rebill_them(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="node-1", email="user@example.com", incoming=1_000, outgoing=400)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 1_600
+    client.outgoing = 500
+    await _sample(traffic, registry)
+    assert (await traffic.pending_payload())["users"]["node-1"]["downlink"] == 600
+
+    client.incoming = 200
+    client.outgoing = 50
+    stats = await _sample(traffic, registry)
+    assert stats["regressed"] == 1
+    kept = (await traffic.pending_payload())["users"]["node-1"]
+    assert kept["downlink"] == 600
+    assert kept["uplink"] == 100
+
+    client.incoming = 250
+    client.outgoing = 80
+    await _sample(traffic, registry)
+    grown = (await traffic.pending_payload())["users"]["node-1"]
+    assert grown["downlink"] == 650
+    assert grown["uplink"] == 130
+
+    await traffic.ack_clients(["node-1"])
+    await _sample(traffic, registry)
+    assert (await traffic.pending_payload())["users"] == {}
+
+
+async def test_one_sided_reset_keeps_growth_on_the_other_direction(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="node-1", email="user@example.com", incoming=1_000, outgoing=400)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 1_600
+    client.outgoing = 500
+    await _sample(traffic, registry)
+
+    client.incoming = 200
+    client.outgoing = 550
+    stats = await _sample(traffic, registry)
+    assert stats["regressed"] == 1
+    kept = (await traffic.pending_payload())["users"]["node-1"]
+    assert kept["downlink"] == 600
+    assert kept["uplink"] == 150
+
+
+async def test_xray_uuid_pending_moves_to_node_id_without_double_billing(store):
+    traffic = TrafficService(store)
+    await store.set_traffic_ack("xray", "xray-uuid", 1_000, 500)
+    await store.upsert_traffic_pending("xray", "xray-uuid", 200, 100, 1_200, 600)
+    client = ClientUsageModel(
+        id="node-1",
+        email="user@example.com",
+        protocol_id="xray-uuid",
+        incoming=1_300,
+        outgoing=700,
+    )
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+
+    payload = await traffic.pending_payload()
+    assert payload["users"]["node-1"] == {
+        "core": "xray",
+        "uplink": 200,
+        "downlink": 300,
+    }
+    assert "xray-uuid" not in payload["users"]
+    assert await store.get_traffic_pending("xray", "xray-uuid") is None
+    assert await store.get_traffic_ack("xray", "node-1") == {"incoming": 1_000, "outgoing": 500}
+
+    acked, not_found = await traffic.ack_clients(["xray-uuid"])
+    assert acked == []
+    assert not_found == ["xray-uuid"]
+    acked, not_found = await traffic.ack_clients(["node-1"])
+    assert acked == ["node-1"]
+    assert not_found == []
+    assert (await traffic.pending_payload())["users"] == {}
+
+
+async def test_protocol_uuid_row_is_not_stolen_from_another_client(store):
+    traffic = TrafficService(store)
+    await store.upsert_traffic_pending("xray", "xray-uuid", 40, 10, 40, 10)
+    await store.set_traffic_ack("xray", "xray-uuid", 0, 0)
+    clients = [
+        ClientUsageModel(id="node-1", email="one@example.com", protocol_id="xray-uuid", incoming=90, outgoing=0),
+        ClientUsageModel(id="xray-uuid", email="two@example.com", incoming=40, outgoing=10),
+    ]
+    driver = FakeDriver(clients)
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+
+    payload = await traffic.pending_payload()
+    assert payload["users"]["xray-uuid"]["downlink"] == 40
+    assert "node-1" not in payload["users"]

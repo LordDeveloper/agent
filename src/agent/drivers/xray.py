@@ -35,6 +35,7 @@ from agent.support.client_identity import (
     billing_client_id,
     identity_lookup_keys,
     panel_client_response,
+    select_quota_meta,
 )
 from agent.support.disable_reason import mark_panel_disabled
 from agent.support.quota import apply_quota_meta, quota_meta_from_client
@@ -3485,21 +3486,13 @@ class XrayDriver(CoreDriver):
             for client in inbound.get("settings", {}).get("clients", []):
                 cid = str(client.get("id") or "").strip()
                 email = str(client.get("email") or "").strip()
-                # Xray runtime stats are keyed by email alias while the panel
-                # bills by canonical node_id. Keep both identifiers on the row
-                # and prefer the matching alias before summing to zero traffic.
+                # Xray runtime stats are keyed by email. The panel bills by
+                # node_id. The protocol UUID is recorded separately and is not
+                # used as the billing key when a distinct node_id exists.
                 traffic = dict(user_traffic.get(email) or {})
                 if not traffic and cid and cid in user_traffic:
                     traffic = dict(user_traffic.get(cid) or {})
-                if email:
-                    seen.add(email)
-                if cid:
-                    seen.add(cid)
-                meta = quota_index.get(f"l:{cid}") if cid else None
-                if meta is None and cid:
-                    meta = quota_index.get(f"n:{cid}") or quota_index.get(f"i:{cid}")
-                if meta is None and email:
-                    meta = quota_index.get(f"e:{email}")
+                meta = select_quota_meta(quota_index, protocol_id=cid, email=email)
                 canonical = billing_client_id(meta, protocol_id=cid, email=email)
                 if not canonical:
                     continue
@@ -3512,6 +3505,7 @@ class XrayDriver(CoreDriver):
                     ClientUsageModel(
                         id=canonical,
                         email=email or None,
+                        protocol_id=cid if cid and cid != canonical else None,
                         incoming=int(traffic.get("downlink") or 0),
                         outgoing=int(traffic.get("uplink") or 0),
                         inbound_id=inbound.get("id"),
@@ -3532,7 +3526,7 @@ class XrayDriver(CoreDriver):
             label = str(email or "").strip()
             if not label or label in seen or not isinstance(traffic, dict):
                 continue
-            meta = quota_index.get(f"e:{label}")
+            meta = select_quota_meta(quota_index, protocol_id="", email=label)
             canonical = billing_client_id(meta, protocol_id="", email=label)
             if not canonical or canonical in seen:
                 continue

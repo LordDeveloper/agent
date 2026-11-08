@@ -46,6 +46,67 @@ def _status_label(healthy: bool) -> str:
     return 'HEALTHY' if healthy else 'UNHEALTHY'
 
 
+def _id_or_unavailable(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return 'unavailable'
+    return text
+
+
+def _num_or_unavailable(value: Any) -> str:
+    if value is None or value == '':
+        return 'unavailable'
+    return str(value)
+
+
+def _format_accounting_section(match: dict[str, Any]) -> list[str]:
+    row = match.get('traffic_accounting') if isinstance(match.get('traffic_accounting'), dict) else {}
+    if not row.get('xray_uuid'):
+        row = {**row, 'xray_uuid': match.get('xray_uuid') or None}
+    if not row.get('node_id'):
+        row = {**row, 'node_id': match.get('node_id') or None}
+    status = str(row.get('status') or '')
+    status_label = {
+        'no_pending_ack': 'No pending ACK',
+        'pending': 'Pending ACK waiting to be processed',
+        'missing': 'Missing or inconsistent accounting state',
+        'inconsistent': 'Missing or inconsistent accounting state',
+        'reset': 'Missing or inconsistent accounting state',
+        'unavailable': 'unavailable',
+    }.get(status, 'unavailable')
+    lines = [
+        '',
+        'Traffic Accounting / Pending ACK',
+        f'  node_id:                 {_id_or_unavailable(row.get("node_id"))}',
+        f'  Xray UUID:               {_id_or_unavailable(row.get("xray_uuid"))}',
+        f'  Link UUID:               {_id_or_unavailable(match.get("client_link_uuid"))}',
+        f'  Last observed uplink:    {_num_or_unavailable(row.get("live_uplink"))}',
+        f'  Last observed downlink:  {_num_or_unavailable(row.get("live_downlink"))}',
+        f'  Previous uplink:         {_num_or_unavailable(row.get("previous_uplink"))}',
+        f'  Previous downlink:       {_num_or_unavailable(row.get("previous_downlink"))}',
+        f'  Delta uplink:            {_num_or_unavailable(row.get("delta_uplink"))}',
+        f'  Delta downlink:          {_num_or_unavailable(row.get("delta_downlink"))}',
+        f'  Pending uplink:          {_num_or_unavailable(row.get("pending_uplink"))}',
+        f'  Pending downlink:        {_num_or_unavailable(row.get("pending_downlink"))}',
+        f'  Pending ACK:             {_yes_no(row.get("pending_ack")) if row.get("pending_ack") is not None else "unavailable"}',
+        f'  Pending ACK identifier:  {_id_or_unavailable(row.get("pending_ack_id"))}',
+        f'  ACK status:              {status_label}',
+        f'  ACK processing:          unavailable',
+        f'  ACK retry count:         unavailable',
+        f'  Last ACK attempt:        unavailable',
+        f'  Last ACK error:          unavailable',
+        f'  Last successful ACK:     unavailable',
+        f'  Last persisted usage:    unavailable',
+    ]
+    if row.get('detail'):
+        lines.append(f'  Detail:                  {_truncate(str(row.get("detail")), 96)}')
+    if row.get('ack_watermark_updated_at'):
+        lines.append(f'  Watermark updated:       {row.get("ack_watermark_updated_at")}')
+    if row.get('pending_updated_at'):
+        lines.append(f'  Pending updated:         {row.get("pending_updated_at")}')
+    return lines
+
+
 def _check_result(ok: Any) -> str:
     if ok is True:
         return 'OK'
@@ -452,8 +513,9 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
         '',
         'Client (config)',
         f'  Email:        {client.get("email") or "-"}',
-        f'  id:           {_truncate(str(match.get("id") or "-"), 40)}',
-        f'  UUID:         {_truncate(str(client.get("id") or "-"), 40)}',
+        f'  node_id:      {_id_or_unavailable(match.get("node_id"))}',
+        f'  Xray UUID:    {_id_or_unavailable(match.get("xray_uuid") or client.get("id"))}',
+        f'  Link UUID:    {_id_or_unavailable(match.get("client_link_uuid"))}',
         f'  Enabled:      {_yes_no(client.get("is_enabled"))}',
         f'  Flow:         {client.get("flow") or "-"}',
         '',
@@ -479,6 +541,7 @@ def _format_client_match(match: dict[str, Any], *, index: int, total: int) -> li
     if live.get('online_reason'):
         lines.append(f'  Reason:       {_truncate(str(live.get("online_reason")), 96)}')
 
+    lines.extend(_format_accounting_section(match))
     lines.extend(_format_bandwidth_section(_xray_bandwidth_section(match)))
     lines.append('')
 

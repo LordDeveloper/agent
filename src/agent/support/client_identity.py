@@ -139,6 +139,55 @@ def billing_client_id(meta: dict[str, Any] | None, *, protocol_id: str, email: s
         return node_id
     if stored_id and stored_id != _trim(protocol_id):
         return stored_id
+    # A legacy row whose only stored key is the protocol UUID keeps that key.
+    # Callers must not invent a replacement, and must not prefer this row when
+    # another document has a distinct node_id for the same Xray user.
     if stored_id:
         return stored_id
     return ""
+
+
+def select_quota_meta(
+    index: dict[str, Any] | None,
+    *,
+    protocol_id: str,
+    email: str,
+) -> dict[str, Any] | None:
+    """Quota document for an Xray user.
+
+    ``l:`` is the protocol UUID and ``e:`` is the email. ``n:`` / ``i:`` are
+    primary keys. A hit on ``n:{protocol uuid}`` is only a legacy row whose
+    stored key still equals that UUID, or a pre-migration row that kept the
+    protocol UUID in ``node_id``. A document with a different ``node_id`` wins.
+    This does not create or rewrite identifiers.
+    """
+    if not isinstance(index, dict):
+        return None
+
+    protocol_id = _trim(protocol_id)
+    email = _trim(email)
+    ordered: list[dict[str, Any]] = []
+
+    def add(row: Any) -> None:
+        if isinstance(row, dict) and row not in ordered:
+            ordered.append(row)
+
+    if protocol_id:
+        add(index.get(f"l:{protocol_id}"))
+    if email:
+        add(index.get(f"e:{email}"))
+    if protocol_id:
+        add(index.get(f"i:{protocol_id}"))
+        add(index.get(f"n:{protocol_id}"))
+
+    distinct: dict[str, Any] | None = None
+    fallback: dict[str, Any] | None = None
+    for row in ordered:
+        key = billing_client_id(row, protocol_id=protocol_id, email=email)
+        if not key:
+            continue
+        if fallback is None:
+            fallback = row
+        if key != protocol_id and distinct is None:
+            distinct = row
+    return distinct or fallback

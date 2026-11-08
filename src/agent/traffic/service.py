@@ -104,6 +104,7 @@ class TrafficService:
 
                     email = str(getattr(client, "email", "") or "").strip()
                     client_id = str(getattr(client, "id", "") or "").strip()
+                    protocol_id = str(getattr(client, "protocol_id", "") or "").strip()
                     self._remember_identity(label, email, client_id)
                     samples.append(
                         {
@@ -111,6 +112,7 @@ class TrafficService:
                             "label": label,
                             "email": email,
                             "client_id": client_id,
+                            "protocol_id": protocol_id,
                             "incoming": int(client.incoming or 0),
                             "outgoing": int(client.outgoing or 0),
                         }
@@ -204,11 +206,13 @@ class TrafficService:
             del pending[(core, key)]
             pending_deletes.append((core, key))
 
+        protected = {str(sample["label"]) for sample in samples if str(sample["label"])}
         for sample in samples:
             core = str(sample["core"])
             label = str(sample["label"])
             email = str(sample["email"] or "")
             client_id = str(sample["client_id"] or "")
+            protocol_id = str(sample.get("protocol_id") or "")
             current_incoming = int(sample["incoming"])
             current_outgoing = int(sample["outgoing"])
             stats["clients_seen"] += 1
@@ -223,6 +227,8 @@ class TrafficService:
                 delete_pending=delete_pending,
                 acks=acks,
                 pending=pending,
+                protocol_id=protocol_id,
+                protected=protected,
             )
             outcome = self._classify_sample(
                 core,
@@ -230,6 +236,7 @@ class TrafficService:
                 current_incoming,
                 current_outgoing,
                 acks=acks,
+                pending=pending,
                 set_ack=set_ack,
                 set_pending=set_pending,
                 delete_pending=delete_pending,
@@ -259,29 +266,86 @@ class TrafficService:
         delete_pending,
         acks: dict[tuple[str, str], tuple[int, int]],
         pending: dict[tuple[str, str], dict[str, int]],
+        protocol_id: str = "",
+        protected: set[str] | None = None,
     ) -> None:
-        """Move pre-node_id traffic rows to the canonical client id."""
-        if not client_id or not email or client_id == email:
+        """Move email and Xray-UUID traffic rows onto the panel node_id.
+
+        Rows are moved, not added. Two aliases for one client are the same
+        bytes, so the larger pending total is kept and the other is dropped.
+        An alias that is another client's node_id in this sample is left alone.
+        """
+        del client_id
+        if not canonical_key:
+            return
+        protected = protected or set()
+        aliases: list[str] = []
+        for name in (email, protocol_id):
+            text = str(name or "").strip()
+            if not text or text == canonical_key or text in aliases:
+                continue
+            if text in protected:
+                continue
+            aliases.append(text)
+        if not aliases:
             return
 
-        legacy_pending = pending.get((core, email))
-        if legacy_pending is not None:
-            if (core, canonical_key) not in pending:
-                set_pending(
-                    core,
-                    canonical_key,
-                    int(legacy_pending["delta_incoming"]),
-                    int(legacy_pending["delta_outgoing"]),
-                    int(legacy_pending["current_incoming"]),
-                    int(legacy_pending["current_outgoing"]),
-                )
-            delete_pending(core, email)
+        best_pending = pending.get((core, canonical_key))
+        pending_changed = False
+        best_total = -1
+        if best_pending is not None:
+            best_total = int(best_pending["delta_incoming"]) + int(best_pending["delta_outgoing"])
+        for name in aliases:
+            alias_pending = pending.get((core, name))
+            if alias_pending is None:
+                continue
+            alias_total = int(alias_pending["delta_incoming"]) + int(alias_pending["delta_outgoing"])
+            if best_pending is None or alias_total > best_total:
+                best_pending = {
+                    "delta_incoming": int(alias_pending["delta_incoming"]),
+                    "delta_outgoing": int(alias_pending["delta_outgoing"]),
+                    "current_incoming": int(alias_pending["current_incoming"]),
+                    "current_outgoing": int(alias_pending["current_outgoing"]),
+                }
+                best_total = alias_total
+                pending_changed = True
+            delete_pending(core, name)
+        if pending_changed and best_pending is not None:
+            set_pending(
+                core,
+                canonical_key,
+                int(best_pending["delta_incoming"]),
+                int(best_pending["delta_outgoing"]),
+                int(best_pending["current_incoming"]),
+                int(best_pending["current_outgoing"]),
+            )
 
-        legacy_ack = acks.get((core, email))
-        if legacy_ack is not None:
-            if (core, canonical_key) not in acks:
-                set_ack(core, canonical_key, int(legacy_ack[0]), int(legacy_ack[1]))
-            delete_ack(core, email)
+        best_ack = acks.get((core, canonical_key))
+        ack_changed = False
+        for name in aliases:
+            alias_ack = acks.get((core, name))
+            if alias_ack is None:
+                continue
+            merged = alias_ack if best_ack is None else (
+                max(int(best_ack[0]), int(alias_ack[0])),
+                max(int(best_ack[1]), int(alias_ack[1])),
+            )
+            ack_changed = ack_changed or merged != best_ack
+            best_ack = merged
+            delete_ack(core, name)
+        if ack_changed and best_ack is not None:
+            set_ack(core, canonical_key, int(best_ack[0]), int(best_ack[1]))
+
+    @staticmethod
+    def _preserved_delta(
+        pending: dict[tuple[str, str], dict[str, int]],
+        core: str,
+        client_key_label: str,
+    ) -> tuple[int, int]:
+        row = pending.get((core, client_key_label))
+        if row is None:
+            return 0, 0
+        return int(row["delta_incoming"]), int(row["delta_outgoing"])
 
     @staticmethod
     def _classify_sample(
@@ -291,29 +355,71 @@ class TrafficService:
         current_outgoing: int,
         *,
         acks: dict[tuple[str, str], tuple[int, int]],
+        pending: dict[tuple[str, str], dict[str, int]],
         set_ack,
         set_pending,
         delete_pending,
     ) -> str:
+        preserved_in, preserved_out = TrafficService._preserved_delta(pending, core, client_key_label)
         ack = acks.get((core, client_key_label))
         if ack is None:
-            set_ack(core, client_key_label, current_incoming, current_outgoing)
+            # First sight anchors the cumulative counters. Bytes already queued
+            # under this key stay billable; the cumulative total is not queued.
+            set_ack(
+                core,
+                client_key_label,
+                current_incoming - preserved_in,
+                current_outgoing - preserved_out,
+            )
+            if preserved_in > 0 or preserved_out > 0:
+                set_pending(
+                    core,
+                    client_key_label,
+                    preserved_in,
+                    preserved_out,
+                    current_incoming,
+                    current_outgoing,
+                )
+                return "pending"
             delete_pending(core, client_key_label)
             return "initialized"
 
         ack_in, ack_out = int(ack[0]), int(ack[1])
         if current_incoming < ack_in or current_outgoing < ack_out:
             log.warning(
-                "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s)",
+                "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s) preserved=(%s,%s)",
                 core,
                 client_key_label,
                 ack_in,
                 ack_out,
                 current_incoming,
                 current_outgoing,
+                preserved_in,
+                preserved_out,
             )
-            set_ack(core, client_key_label, current_incoming, current_outgoing)
-            delete_pending(core, client_key_label)
+            # A direction that fell is a new counter epoch: keep the bytes
+            # already queued and anchor that direction. A direction that did
+            # not fall keeps its normal delta, including growth in this sample.
+            # Already-acked cumulative history is not queued again.
+            bill_in = preserved_in if current_incoming < ack_in else current_incoming - ack_in
+            bill_out = preserved_out if current_outgoing < ack_out else current_outgoing - ack_out
+            set_ack(
+                core,
+                client_key_label,
+                current_incoming - bill_in,
+                current_outgoing - bill_out,
+            )
+            if bill_in > 0 or bill_out > 0:
+                set_pending(
+                    core,
+                    client_key_label,
+                    bill_in,
+                    bill_out,
+                    current_incoming,
+                    current_outgoing,
+                )
+            else:
+                delete_pending(core, client_key_label)
             return "regressed"
 
         delta_in = current_incoming - ack_in

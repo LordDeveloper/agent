@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 class ClientUsageModel(BaseModel):
     id: str
     email: Optional[str] = None
+    # Xray protocol UUID when it is not the billing node_id. Not a client key.
+    protocol_id: Optional[str] = None
     incoming: int = 0
     outgoing: int = 0
     inbound_id: Optional[int | str] = None
