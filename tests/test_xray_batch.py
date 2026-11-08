@@ -345,31 +345,23 @@ def test_batch_upsert_writes_the_chunk_once_when_bulk_add_lies(client: TestClien
     )
     assert created.status_code == 200, created.text
     assert created.json()["failed"] == 0
-    assert sorted(sizes) == [1, 1]
+    assert sizes == [2]
     listed = client.get("/api/v1/cores/xray/inbounds/28", headers=headers)
     emails = [row["email"] for row in listed.json()["inbound"]["settings"]["clients"]]
     assert "one@x" in emails
     assert "two@x" in emails
 
 
-def test_batch_add_overlaps_client_writes(client: TestClient, fake_xray: FakeXrayHttpClient):
+def test_batch_add_is_one_users_call(client: TestClient, fake_xray: FakeXrayHttpClient):
     headers = {"Authorization": "Bearer dev-token"}
     assert client.post("/api/v1/cores/xray/inbounds", headers=headers, json=_sample_inbound(29, 3045)).status_code == 200
 
-    inflight = {"n": 0, "max": 0}
-    gate = threading.Lock()
+    sizes: list[int] = []
     real_add = fake_xray.add_users
 
     def add_users(tag, clients, **kwargs):
-        with gate:
-            inflight["n"] += 1
-            inflight["max"] = max(inflight["max"], inflight["n"])
-        try:
-            time.sleep(0.3)
-            return real_add(tag, clients, **kwargs)
-        finally:
-            with gate:
-                inflight["n"] -= 1
+        sizes.append(len(clients))
+        return real_add(tag, clients, **kwargs)
 
     fake_xray.add_users = add_users
     started = time.perf_counter()
@@ -387,7 +379,7 @@ def test_batch_add_overlaps_client_writes(client: TestClient, fake_xray: FakeXra
     elapsed = time.perf_counter() - started
     assert created.status_code == 200, created.text
     assert created.json()["failed"] == 0, created.text
-    assert inflight["max"] >= 2
+    assert sizes == [4]
     assert elapsed < 1.0
 
 

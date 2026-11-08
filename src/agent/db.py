@@ -28,6 +28,12 @@ def _loads(raw: str) -> Any:
     return json.loads(raw)
 
 
+def _json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _json_is_large(value: Any) -> bool:
     if isinstance(value, str):
         return len(value) >= _JSON_OFFLOAD_BYTES
@@ -292,6 +298,47 @@ class Store:
             (core, kind),
         )
         return [await _decode_json(row["data"]) for row in rows]
+
+    async def lookup_document_keys(self, doc_ids: list[str]) -> list[dict[str, Any]]:
+        """Read-only existence check by document primary key.
+
+        Matches ``documents.doc_id`` only. Email and protocol UUIDs inside the
+        JSON body are returned for comparison and are never used as the key.
+        """
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in doc_ids:
+            doc_id = str(raw or "").strip()
+            if not doc_id or doc_id in seen or len(doc_id) > 512:
+                continue
+            seen.add(doc_id)
+            cleaned.append(doc_id)
+        if not cleaned:
+            return []
+        placeholders = ",".join("?" for _ in cleaned)
+        rows = await self._fetch(
+            f"""
+            SELECT core, kind, doc_id,
+                   json_extract(data, '$.email') AS email,
+                   json_extract(data, '$.client_link_uuid') AS client_link_uuid,
+                   json_extract(data, '$.id') AS protocol_id
+            FROM documents
+            WHERE doc_id IN ({placeholders})
+            ORDER BY doc_id, core, kind
+            """,
+            tuple(cleaned),
+        )
+        found: list[dict[str, Any]] = []
+        for row in rows:
+            found.append({
+                "doc_id": str(row["doc_id"] or ""),
+                "core": str(row["core"] or ""),
+                "kind": str(row["kind"] or ""),
+                "email": _json_text(row["email"]),
+                "client_link_uuid": _json_text(row["client_link_uuid"]),
+                "protocol_id": _json_text(row["protocol_id"]),
+            })
+        return found
 
     async def get_doc(self, core: str, kind: str, doc_id: str) -> dict[str, Any] | None:
         rows = await self._fetch(

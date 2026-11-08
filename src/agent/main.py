@@ -11,6 +11,7 @@ from agent.auth import verify_auth
 from agent.config import load_settings
 from agent.db import Store
 from agent.api.cores import router as cores_router
+from agent.api.documents import router as documents_router
 from agent.api.stats import router as stats_router
 from agent.api.xray import router as xray_router
 from agent.api.wireguard import router as wireguard_router
@@ -110,6 +111,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
     auth = [Depends(verify_auth)]
     app.include_router(cores_router, prefix="/api/v1", dependencies=auth)
+    app.include_router(documents_router, prefix="/api/v1", dependencies=auth)
     app.include_router(stats_router, prefix="/api/v1", dependencies=auth)
     app.include_router(status_router, prefix="/api/v1", dependencies=auth)
 

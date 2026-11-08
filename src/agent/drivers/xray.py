@@ -35,6 +35,7 @@ from agent.support.client_identity import (
     billing_client_id,
     identity_lookup_keys,
     panel_client_response,
+    existing_quota_for_push,
     preserve_pushed_identity,
     publish_document_identity,
     select_quota_meta,
@@ -74,6 +75,15 @@ _CLIENT_PARALLELISM = 32
 # users/add can return 200 before config.json shows the merged clients.
 _PERSIST_CONFIRM_ATTEMPTS = 6
 _PERSIST_CONFIRM_DELAY_SECONDS = 0.2
+
+
+def _payload_requests_zero_baseline(raw: Any) -> bool:
+    """True only when the caller explicitly stored a zero traffic baseline."""
+    if not isinstance(raw, dict):
+        return False
+    if "_incoming" not in raw and "_outgoing" not in raw:
+        return False
+    return int(raw.get("_incoming") or 0) == 0 and int(raw.get("_outgoing") or 0) == 0
 
 
 def _drain_task(task: asyncio.Task) -> None:
@@ -911,6 +921,20 @@ class XrayDriver(CoreDriver):
             seen.add(email)
             emails.append(email)
 
+        if len(emails) > 1:
+            try:
+                rows = await self._api_call("list_users", tag)
+            except AgentError:
+                return {}, {}
+            wanted = set(emails)
+            return self._index_user_rows(
+                [
+                    normalize_xray_client(row)
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("email") or "").strip() in wanted
+                ]
+            )
+
         async def lookup(email: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
             try:
                 rows = await self._api_call("list_users", tag, email)
@@ -1554,9 +1578,12 @@ class XrayDriver(CoreDriver):
         tag: str,
         emails: list[str] | None = None,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-        """Users visible on this inbound. Prefer per-email lookups."""
+        """Users visible on this inbound. One list for a batch, one email for a single client."""
         wanted = [str(email).strip() for email in (emails or []) if str(email).strip()]
         try:
+            if len(wanted) > 1:
+                rows = await self._api_call("list_users", tag)
+                return self._index_user_rows([row for row in (rows or []) if isinstance(row, dict)])
             if wanted:
                 parts = await bounded_gather(
                     [lambda email=email: self._api_call("list_users", tag, email) for email in wanted],
@@ -1722,43 +1749,31 @@ class XrayDriver(CoreDriver):
         protocol: str,
         inbound_settings: Any,
     ) -> dict[int, str]:
-        """Write each client on its own request and overlap those requests."""
+        """One users/add or users/edit for the whole chunk.
+
+        A separate HTTP call per client rewrites config.json once per user.
+        Xray applies the list in a single merge.
+        """
         if not rows:
             return {}
         method = "edit_users" if op == "edit" else "add_users"
-        kwargs = {
-            "protocol": protocol,
-            "inbound_settings": inbound_settings,
-            "atomic": False,
-            "parallel": True,
-        }
-
-        async def one(index: int, row: dict[str, Any]) -> tuple[int, str | None, bool]:
-            try:
-                await self._api_call(method, tag, [row], **kwargs)
-            except AgentError as exc:
-                missing = XrayHttpClient._is_http_route_missing(exc)
-                return index, exc.message, missing
-            except Exception as exc:  # noqa: BLE001
-                return index, f"{type(exc).__name__}: {exc}", False
-            return index, None, False
-
-        outcomes = await bounded_gather(
-            [lambda index=index, row=row: one(index, row) for index, row in enumerate(rows)],
-            limit=_CLIENT_PARALLELISM,
-        )
-        typed: list[tuple[int, str | None, bool]] = [
-            item if isinstance(item, tuple) else (0, str(item), False)
-            for item in outcomes
-        ]
-        if any(route_missing for _index, _message, route_missing in typed):
-            await self._api_call(method, tag, rows, protocol=protocol, inbound_settings=inbound_settings, atomic=False, parallel=False)
-            return {}
-        return {
-            index: message
-            for index, message, _route_missing in typed
-            if message
-        }
+        try:
+            await self._api_call(
+                method,
+                tag,
+                rows,
+                protocol=protocol,
+                inbound_settings=inbound_settings,
+                atomic=False,
+                parallel=False,
+            )
+        except AgentError as exc:
+            if len(rows) == 1 or exc.status == 413:
+                return {index: exc.message for index in range(len(rows))}
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return {index: f"{type(exc).__name__}: {exc}" for index in range(len(rows))}
+        return {}
 
     async def _apply_clients_bulk(
         self,
@@ -1893,7 +1908,8 @@ class XrayDriver(CoreDriver):
         # so the next sync on the same inbound wrote nothing until every user
         # on the node had been counted.
         traffic_index: dict[str, dict[str, int]] = {}
-        if len(clients) > _SMALL_CLIENT_BATCH:
+        needs_live_baseline = any(_payload_requests_zero_baseline(raw) for raw in clients)
+        if needs_live_baseline and len(clients) > _SMALL_CLIENT_BATCH:
             _log.info(
                 "xray batch loading full user traffic index tag=%s clients=%s",
                 tag,
@@ -1916,12 +1932,12 @@ class XrayDriver(CoreDriver):
             by_id.update(live_id)
             # One client update does not need every user's counters.
             # New rows are not in the index, so a create does not query stats.
-            if len(clients) <= _SMALL_CLIENT_BATCH:
+            if needs_live_baseline and len(clients) <= _SMALL_CLIENT_BATCH:
                 traffic_index = {}
                 known = clients_already_on_inbound(clients, by_email, by_id)
                 if known:
                     await self._prefetch_zero_baselines(known)
-            elif not traffic_index:
+            elif needs_live_baseline and not traffic_index:
                 await self._prefetch_zero_baselines(clients)
 
             to_add: list[dict[str, Any]] = []
@@ -1942,6 +1958,15 @@ class XrayDriver(CoreDriver):
                 try:
                     raw = preserve_pushed_identity(raw, quota_index)
                     client = apply_panel_identity(normalize_xray_client(raw), store_kind="xray")
+                    stored_meta = existing_quota_for_push(quota_index, client)
+                    if isinstance(stored_meta, dict):
+                        for counter in ("_incoming", "_outgoing"):
+                            if counter in client or stored_meta.get(counter) is None:
+                                continue
+                            try:
+                                client[counter] = int(stored_meta.get(counter) or 0)
+                            except (TypeError, ValueError):
+                                continue
                     if not client.get("email"):
                         client["email"] = str(client.get("id") or uuid.uuid4())[:8]
                     email = str(client.get("email") or "").strip()
@@ -2094,11 +2119,9 @@ class XrayDriver(CoreDriver):
                     applied.append(client)
                 else:
                     failed += 1
-            # Adds and edits target disjoint emails, so they can overlap.
-            add_part, edit_part = await asyncio.gather(
-                _flush("add", to_add, add_meta),
-                _flush("edit", to_edit, edit_meta),
-            )
+            # One users/add and one users/edit. Overlapping them rewrites config.json twice.
+            add_part = await _flush("add", to_add, add_meta)
+            edit_part = await _flush("edit", to_edit, edit_meta)
             for part_ok, part_fail, part_errors, part_applied in (add_part, edit_part):
                 succeeded += part_ok
                 failed += part_fail
