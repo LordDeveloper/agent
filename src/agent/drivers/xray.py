@@ -2006,6 +2006,9 @@ class XrayDriver(CoreDriver):
                                 remove_email = await self._live_user_email(tag, cid, email)
                         prior = await self._find_disabled_client(cid or email)
                         if existing is None and prior is None and not remove_email:
+                            # Desired state is "not in Xray". Still persist the quota
+                            # document; the response must not claim the core user exists.
+                            client["core_persisted"] = False
                             succeeded += 1
                             applied.append(client)
                             continue
@@ -2014,6 +2017,7 @@ class XrayDriver(CoreDriver):
                             to_remove.append(remove_email)
                             remove_meta.append(client)
                         else:
+                            client["core_persisted"] = False
                             succeeded += 1
                             applied.append(client)
                         continue
@@ -2046,9 +2050,11 @@ class XrayDriver(CoreDriver):
                             previous,
                         ))
                     elif existing is not None:
+                        client["core_persisted"] = True
                         to_edit.append(native)
                         edit_meta.append(client)
                     else:
+                        client["core_persisted"] = True
                         to_add.append(native)
                         add_meta.append(client)
                 except Exception as exc:  # noqa: BLE001 — partial success per row
@@ -2192,7 +2198,23 @@ class XrayDriver(CoreDriver):
                     applied = []
 
             await self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
-            await self._save_client_quotas(applied)
+            try:
+                await self._save_client_quotas(applied)
+            except Exception as exc:  # noqa: BLE001 — a quota miss must not look like success
+                message = f"quota document was not stored: {type(exc).__name__}: {exc}"
+                errors.extend(
+                    {
+                        "email": str(client.get("email") or ""),
+                        "id": str(client.get("node_id") or ""),
+                        "node_id": str(client.get("node_id") or ""),
+                        "message": message,
+                    }
+                    for client in applied
+                    if isinstance(client, dict)
+                )
+                failed += len(applied)
+                succeeded = max(0, succeeded - len(applied))
+                applied = []
             self._remember_identities(applied)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)

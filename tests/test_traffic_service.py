@@ -174,12 +174,7 @@ async def test_pending_aliases_are_visible_to_another_process(store):
     assert "s0NTPq" not in payload["users"]
 
     acked, not_found = await reader.ack_clients(["s0NTPq"])
-    assert acked == []
-    assert not_found == ["s0NTPq"]
-    assert "vless-link-uuid" in (await reader.pending_payload())["users"]
-
-    acked, not_found = await reader.ack_clients(["vless-link-uuid"])
-    assert acked == ["vless-link-uuid"]
+    assert acked == ["s0NTPq"]
     assert not_found == []
     assert (await reader.pending_payload())["users"] == {}
 
@@ -196,9 +191,14 @@ async def test_ack_clients_accepts_email_alias(store):
     await traffic.pending_payload()
 
     acked, not_found = await traffic.ack_clients(["alias@example.com"])
-    assert acked == []
-    assert not_found == ["alias@example.com"]
-    assert "uuid-mail" in (await traffic.pending_payload())["users"]
+    assert acked == ["alias@example.com"]
+    assert not_found == []
+    assert (await traffic.pending_payload())["users"] == {}
+
+    await _sample(traffic, registry)
+    client.incoming = 700
+    await _sample(traffic, registry)
+    await traffic.pending_payload()
 
     acked, not_found = await traffic.ack_clients(["uuid-mail"])
     assert acked == ["uuid-mail"]
@@ -357,10 +357,7 @@ async def test_xray_uuid_pending_moves_to_node_id_without_double_billing(store):
     assert await store.get_traffic_ack("xray", "node-1") == {"incoming": 1_000, "outgoing": 500}
 
     acked, not_found = await traffic.ack_clients(["xray-uuid"])
-    assert acked == []
-    assert not_found == ["xray-uuid"]
-    acked, not_found = await traffic.ack_clients(["node-1"])
-    assert acked == ["node-1"]
+    assert acked == ["xray-uuid"]
     assert not_found == []
     assert (await traffic.pending_payload())["users"] == {}
 

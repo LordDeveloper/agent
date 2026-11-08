@@ -242,6 +242,10 @@ class TrafficService:
                 delete_pending=delete_pending,
             )
             stats[outcome] = stats.get(outcome, 0) + 1
+            for alias in (email, protocol_id):
+                alias_text = str(alias or "").strip()
+                if alias_text and alias_text != label:
+                    identity_upserts.append((core, alias_text, label))
 
         return {
             "stats": stats,
@@ -460,6 +464,7 @@ class TrafficService:
             self._aliases.setdefault(canonical, canonical)
 
     async def pending_payload(self) -> dict[str, Any]:
+        await self._load_persisted_aliases()
         rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
@@ -502,6 +507,7 @@ class TrafficService:
 
     async def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
         """Ack the panel node_id keys the panel says it has billed."""
+        await self._load_persisted_aliases()
         requested = []
         seen: set[str] = set()
         for raw in client_keys:
@@ -521,7 +527,14 @@ class TrafficService:
         to_ack: list[dict[str, Any]] = []
 
         for label in requested:
-            rows = self._fetch_snapshot.get(label) or rows_by_key.get(label) or []
+            canonical = self._canonical_key(label)
+            rows = (
+                self._fetch_snapshot.get(label)
+                or self._fetch_snapshot.get(canonical)
+                or rows_by_key.get(label)
+                or rows_by_key.get(canonical)
+                or []
+            )
             if not rows:
                 not_found.append(label)
                 continue

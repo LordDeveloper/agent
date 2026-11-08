@@ -81,6 +81,8 @@ def test_push_keeps_the_stored_document_pk_when_panel_sends_the_xray_uuid():
         "client_link_uuid": XRAY_UUID,
         "email": "user@example.com",
     }
+    applied["core_persisted"] = False
+    assert panel_client_response(applied)["core_persisted"] is False
 
 
 def test_legacy_push_uses_id_as_document_pk_when_node_id_is_the_link():

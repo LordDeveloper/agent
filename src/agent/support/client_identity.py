@@ -191,6 +191,8 @@ def panel_client_response(client: dict[str, Any]) -> dict[str, Any]:
     core = _trim(client.get("core") or "")
     if core:
         out["core"] = core
+    if "core_persisted" in client:
+        out["core_persisted"] = bool(client.get("core_persisted"))
     return out
 
 
