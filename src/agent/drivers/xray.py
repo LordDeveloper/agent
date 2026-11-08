@@ -371,6 +371,203 @@ class XrayDriver(CoreDriver):
 
         return await install_xray()
 
+    async def _reconcile_after_start(self) -> None:
+        try:
+            await self.reconcile_persisted_clients()
+        except Exception:
+            _log.exception("xray reconciliation failed core=xray")
+
+    async def reconcile_persisted_clients(self) -> dict[str, Any]:
+        """Make the running inbound users and config.json describe the same clients.
+
+        Disk clients missing from runtime are added through the HTTP API, which
+        persists them. Runtime clients missing from disk are upserted the same way.
+        Disabled records are removed through that API. A temporary API failure
+        skips that inbound and does not delete anyone.
+        """
+        from agent.runtime import RuntimeTrace
+
+        path = Path(self.settings.xray.config)
+        operation_id = RuntimeTrace.request_id() or "-"
+        report: dict[str, Any] = {
+            "ok": True,
+            "core": "xray",
+            "added_runtime": 0,
+            "persisted": 0,
+            "removed_disabled": 0,
+            "skipped": [],
+        }
+        if not await aiofiles.os.path.isfile(str(path)):
+            report["skipped"].append("no_config")
+            return report
+        _log.info("xray reconciliation started core=xray operation_id=%s", operation_id)
+        try:
+            config = json.loads(await aiofs.read_text(path))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.error(
+                "xray reconciliation skipped core=xray reason=invalid_config operation_id=%s error=%s",
+                operation_id,
+                exc,
+            )
+            report["ok"] = False
+            report["skipped"].append("invalid_config")
+            return report
+        if not isinstance(config, dict):
+            report["ok"] = False
+            report["skipped"].append("invalid_config")
+            return report
+
+        disabled_emails: set[str] = set()
+        for row in await self._disabled_docs():
+            email = str(row.get("email") or "").strip()
+            if email:
+                disabled_emails.add(email)
+
+        for inbound in list(config.get("inbounds") or []):
+            if not isinstance(inbound, dict) or self._is_api_inbound(inbound):
+                continue
+            tag = str(inbound.get("tag") or "").strip()
+            if not tag:
+                continue
+            protocol = self._protocol_of(inbound)
+            settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None
+            try:
+                live_rows = await self._api_call("list_users", tag)
+            except AgentError as exc:
+                _log.warning(
+                    "xray reconciliation skipped core=xray inbound=%s reason=api_unavailable operation_id=%s error=%s",
+                    tag,
+                    operation_id,
+                    exc.message,
+                )
+                report["skipped"].append(tag)
+                report["ok"] = False
+                continue
+            live = [row for row in (live_rows or []) if isinstance(row, dict)]
+            live_emails = {str(row.get("email") or "").strip() for row in live if str(row.get("email") or "").strip()}
+            disk = [row for row in xray_client_rows(inbound) if isinstance(row, dict)]
+            disk_emails = {str(row.get("email") or "").strip() for row in disk if str(row.get("email") or "").strip()}
+
+            drop = sorted(email for email in disabled_emails if email in live_emails or email in disk_emails)
+            if drop:
+                for email in drop:
+                    try:
+                        await self._api_call("remove_users", tag, [email])
+                    except AgentError as exc:
+                        if _is_missing_user_error(exc):
+                            continue
+                        _log.warning(
+                            "xray reconciliation disable failed core=xray inbound=%s operation_id=%s error=%s",
+                            tag,
+                            operation_id,
+                            exc.message,
+                        )
+                        report["ok"] = False
+                        continue
+                try:
+                    await self._confirm_httpapi_persisted(tag, [], drop)
+                    report["removed_disabled"] += len(drop)
+                    live_emails -= set(drop)
+                    disk_emails -= set(drop)
+                except AgentError as exc:
+                    _log.warning(
+                        "xray reconciliation disable persist failed core=xray inbound=%s operation_id=%s error=%s",
+                        tag,
+                        operation_id,
+                        exc.message,
+                    )
+                    report["ok"] = False
+
+            missing_runtime = [
+                row
+                for row in disk
+                if str(row.get("email") or "").strip()
+                and str(row.get("email") or "").strip() not in live_emails
+                and str(row.get("email") or "").strip() not in disabled_emails
+            ]
+            if missing_runtime:
+                try:
+                    await self._api_call(
+                        "add_users",
+                        tag,
+                        missing_runtime,
+                        protocol=protocol,
+                        inbound_settings=settings,
+                        atomic=False,
+                        parallel=False,
+                    )
+                    wanted = [str(row.get("email") or "").strip() for row in missing_runtime]
+                    seen, _by_id = await self._visible_user_index(tag, wanted)
+                    confirmed = [email for email in wanted if email in seen]
+                    report["added_runtime"] += len(confirmed)
+                    live_emails.update(confirmed)
+                    if len(confirmed) != len(wanted):
+                        report["ok"] = False
+                        _log.warning(
+                            "xray recovery incomplete core=xray inbound=%s added=%s wanted=%s operation_id=%s",
+                            tag,
+                            len(confirmed),
+                            len(wanted),
+                            operation_id,
+                        )
+                    else:
+                        _log.info(
+                            "xray recovery succeeded core=xray inbound=%s added_runtime=%s operation_id=%s",
+                            tag,
+                            len(confirmed),
+                            operation_id,
+                        )
+                except AgentError as exc:
+                    report["ok"] = False
+                    _log.warning(
+                        "xray recovery failed core=xray inbound=%s operation_id=%s error=%s",
+                        tag,
+                        operation_id,
+                        exc.message,
+                    )
+
+            extras = [
+                row
+                for row in live
+                if str(row.get("email") or "").strip()
+                and str(row.get("email") or "").strip() not in disk_emails
+                and str(row.get("email") or "").strip() not in disabled_emails
+            ]
+            if extras:
+                try:
+                    await self._api_call(
+                        "upsert_users",
+                        tag,
+                        extras,
+                        protocol=protocol,
+                        inbound_settings=settings,
+                    )
+                    await self._confirm_httpapi_persisted(tag, extras, [])
+                    report["persisted"] += len(extras)
+                    _log.info(
+                        "xray recovery persisted runtime clients core=xray inbound=%s persisted=%s operation_id=%s",
+                        tag,
+                        len(extras),
+                        operation_id,
+                    )
+                except AgentError as exc:
+                    report["ok"] = False
+                    _log.warning(
+                        "xray recovery persist failed core=xray inbound=%s operation_id=%s error=%s",
+                        tag,
+                        operation_id,
+                        exc.message,
+                    )
+
+        _log.info(
+            "xray reconciliation finished core=xray added_runtime=%s persisted=%s removed_disabled=%s operation_id=%s",
+            report["added_runtime"],
+            report["persisted"],
+            report["removed_disabled"],
+            operation_id,
+        )
+        return report
+
     async def enable(self) -> dict[str, Any]:
         from agent.ops import install_xray
         from agent.xray_service import binary_has_httpapi, ensure_xray_running
@@ -381,13 +578,15 @@ class XrayDriver(CoreDriver):
             await install_xray(force=True)
 
         # Keep-alive: start only when down; never bounce an already-running unit.
-        return await ensure_xray_running(
+        result = await ensure_xray_running(
             binary=xray.binary,
             config_path=xray.config,
             api_base=xray.api_base,
             username=xray.username,
             password=xray.password,
         )
+        await self._reconcile_after_start()
+        return result
 
     async def disable(self) -> dict[str, Any]:
         from agent.xray_service import stop_xray_service
@@ -399,13 +598,15 @@ class XrayDriver(CoreDriver):
         from agent.xray_service import restart_xray_service
 
         xray = self.settings.xray
-        return await restart_xray_service(
+        result = await restart_xray_service(
             binary=xray.binary,
             config_path=xray.config,
             api_base=xray.api_base,
             username=xray.username,
             password=xray.password,
         )
+        await self._reconcile_after_start()
+        return result
 
     def inbound_tag(self, inbound_id: int | str) -> str:
         if isinstance(inbound_id, str) and inbound_id.startswith("inbound-"):
@@ -453,52 +654,106 @@ class XrayDriver(CoreDriver):
                 return
         inbounds.append(inbound)
 
-    def _merge_client_in_config(self, config: dict[str, Any], tag: str, client: dict[str, Any]) -> None:
-        self._merge_clients_in_config(config, tag, [client])
+    async def _confirm_httpapi_persisted(
+        self,
+        tag: str,
+        upserts: list[dict[str, Any]],
+        remove_emails: list[str],
+    ) -> None:
+        """Read config.json after the HTTP API returns.
 
-    def _merge_clients_in_config(self, config: dict[str, Any], tag: str, clients: list[dict[str, Any]]) -> None:
-        for row in config.setdefault("inbounds", []):
-            if str(row.get("tag")) != tag:
-                continue
-            settings = row.setdefault("settings", {})
-            existing = list(settings.get("clients") or settings.get("users") or [])
-            by_key: dict[str, int] = {}
-            for idx, current in enumerate(existing):
-                email = str(current.get("email") or "").strip()
-                cid = str(current.get("id") or "").strip()
-                if email:
-                    by_key[f"e:{email}"] = idx
-                if cid:
-                    by_key[f"i:{cid}"] = idx
-            for client in clients:
-                email = str(client.get("email") or "").strip()
-                cid = str(client.get("id") or "").strip()
-                idx = by_key.get(f"e:{email}") if email else None
-                if idx is None and cid:
-                    idx = by_key.get(f"i:{cid}")
-                if idx is None:
-                    existing.append(client)
-                    idx = len(existing) - 1
-                else:
-                    existing[idx] = client
-                if email:
-                    by_key[f"e:{email}"] = idx
-                if cid:
-                    by_key[f"i:{cid}"] = idx
-            settings["clients"] = existing
-            if str(row.get("protocol") or "").lower() == "vless":
-                settings["users"] = existing
-                settings.setdefault("decryption", "none")
-            if str(row.get("protocol") or "").lower() in {"shadowsocks", "ss"}:
-                method = str(settings.get("method") or "").strip()
-                if method == "":
-                    if "method" in settings:
-                        settings.pop("method", None)
-                    if str(settings.get("password") or "").strip() == "":
-                        settings.pop("password", None)
-                settings.setdefault("network", "tcp,udp")
+        users/add, users/edit, users/upsert, users/remove, and rules/replace
+        write the startup file inside Xray before status 200. A second writer
+        in the agent races that merge and drops clients, so this only reads.
+        """
+        from agent.runtime import RuntimeTrace
+
+        emails = [str(email).strip() for email in remove_emails if str(email).strip()]
+        native = [row for row in upserts if isinstance(row, dict)]
+        if not native and not emails:
             return
-        raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{tag}] not found in Xray config", 404)
+        path = Path(self.settings.xray.config)
+        operation_id = RuntimeTrace.request_id() or "-"
+        if not await aiofiles.os.path.isfile(str(path)):
+            _log.info(
+                "xray persistence confirm skipped core=xray inbound=%s reason=no_config_file operation_id=%s",
+                tag,
+                operation_id,
+            )
+            return
+        self._invalidate_config_cache()
+        if not await self._config_contains_clients(tag, native, emails):
+            _log.error(
+                "xray persistence verification failed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
+                tag,
+                len(native),
+                len(emails),
+                operation_id,
+            )
+            raise AgentError(
+                "EXEC_ERROR",
+                "Xray HTTP API returned success but config.json does not contain the client",
+                500,
+            )
+        _log.info(
+            "xray persistence confirmed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
+            tag,
+            len(native),
+            len(emails),
+            operation_id,
+        )
+
+    async def _config_contains_clients(
+        self,
+        tag: str,
+        upserts: list[dict[str, Any]],
+        removed_emails: list[str],
+    ) -> bool:
+        try:
+            config = await self._cached_config()
+        except AgentError:
+            return False
+        rows: list[dict[str, Any]] = []
+        for inbound in config.get("inbounds") or []:
+            if isinstance(inbound, dict) and str(inbound.get("tag") or "") == tag:
+                rows = [row for row in xray_client_rows(inbound) if isinstance(row, dict)]
+                break
+        emails = {str(row.get("email") or "").strip() for row in rows}
+        ids = {str(row.get("id") or "").strip() for row in rows}
+        for email in removed_emails:
+            if email and email in emails:
+                return False
+        for client in upserts:
+            email = str(client.get("email") or "").strip()
+            cid = str(client.get("id") or "").strip()
+            if email and email in emails:
+                continue
+            if cid and cid in ids:
+                continue
+            return False
+        return True
+
+    def _wire_response(
+        self,
+        client: dict[str, Any],
+        native: dict[str, Any],
+        by_email: dict[str, dict[str, Any]],
+        by_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        response = self._response_client(client, by_email, by_id)
+        if isinstance(native, dict):
+            response["_wire_user"] = native
+        return response
+
+    def _reject_unpersisted(self, applied: list[dict[str, Any]], exc: AgentError) -> tuple[int, list[dict[str, str]]]:
+        errors: list[dict[str, str]] = []
+        for client in applied:
+            errors.append({
+                "email": str(client.get("email") or ""),
+                "id": str(client.get("node_id") or ""),
+                "message": exc.message,
+            })
+        return len(applied), errors
 
     def _protocol_of(self, inbound: dict[str, Any]) -> str:
         return str(inbound.get("protocol") or "vless").strip().lower()
@@ -1510,7 +1765,7 @@ class XrayDriver(CoreDriver):
         kept: list[dict[str, Any]] = []
         for row, client in pending:
             if self._client_uuid_visible(client, by_id, by_email):
-                kept.append(self._response_client(client, by_email, by_id))
+                kept.append(self._wire_response(client, row, by_email, by_id))
             else:
                 missing.append((row, client))
 
@@ -1529,10 +1784,10 @@ class XrayDriver(CoreDriver):
                 tag,
                 [str(client.get("email") or "").strip() for _row, client in missing],
             )
-            for _row, client in missing:
+            for row, client in missing:
                 email = str(client.get("email") or "")
                 if self._client_uuid_visible(client, by_id, by_email):
-                    kept.append(self._response_client(client, by_email, by_id))
+                    kept.append(self._wire_response(client, row, by_email, by_id))
                     continue
                 succeeded -= 1
                 failed += 1
@@ -1844,6 +2099,25 @@ class XrayDriver(CoreDriver):
                     "message": "Xray client UUID was not updated to client_link_uuid",
                 })
 
+            wire_users: list[dict[str, Any]] = []
+            drop_emails: list[str] = []
+            for row in applied:
+                wire = row.pop("_wire_user", None)
+                email = str(row.get("email") or "").strip()
+                if record_is_enabled(row) and isinstance(wire, dict):
+                    wire_users.append(wire)
+                elif email:
+                    drop_emails.append(email)
+            if wire_users or drop_emails:
+                try:
+                    await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
+                except AgentError as exc:
+                    rejected, reject_errors = self._reject_unpersisted(applied, exc)
+                    succeeded = max(0, succeeded - rejected)
+                    failed += rejected
+                    errors.extend(reject_errors)
+                    applied = []
+
             await self._forget_disabled_clients([row for row in applied if record_is_enabled(row)])
             await self._save_client_quotas(applied)
             self._remember_identities(applied)
@@ -1915,12 +2189,12 @@ class XrayDriver(CoreDriver):
                     seen.add(target)
                     remove_emails.append(target)
 
+            removed_now: list[str] = []
             if remove_emails:
                 try:
                     await self._api_call("remove_users", tag, remove_emails)
+                    removed_now = list(remove_emails)
                     succeeded = len(remove_emails)
-                    await self._forget_client_quotas(remove_emails + id_keys)
-                    await self._forget_disabled_keys(remove_emails + id_keys)
                 except AgentError as exc:
                     async def drop_one(email: str) -> tuple[str, str | None]:
                         try:
@@ -1944,11 +2218,20 @@ class XrayDriver(CoreDriver):
                         else:
                             failed += 1
                             errors.append({"email": email, "message": message})
-                    if forgotten:
-                        await self._forget_client_quotas(forgotten + id_keys)
-                        await self._forget_disabled_keys(forgotten + id_keys)
+                    removed_now = forgotten
                     if succeeded == 0 and not errors:
                         raise exc
+                if removed_now:
+                    try:
+                        await self._confirm_httpapi_persisted(tag, [], removed_now)
+                    except AgentError as exc:
+                        failed += len(removed_now)
+                        succeeded = max(0, succeeded - len(removed_now))
+                        errors.append({"email": "", "message": exc.message})
+                        removed_now = []
+                if removed_now:
+                    await self._forget_client_quotas(removed_now + id_keys)
+                    await self._forget_disabled_keys(removed_now + id_keys)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         await self.audit.record(
@@ -2504,6 +2787,7 @@ class XrayDriver(CoreDriver):
                     raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
                 raise
 
+        await self._confirm_httpapi_persisted(tag, [], [email])
         await self._forget_client_keys([key, email])
         await self._release_emails_from_other_inbounds([email], tag)
         await self.audit.record("delete", f"xray/inbound/{inbound_id}/clients/{key}", email)
@@ -3033,6 +3317,8 @@ class XrayDriver(CoreDriver):
         # and made region sync / panel ops feel stuck after v0.4.64.
         try:
             result = await self._api_call("replace_rules", list(rules), **extras)
+            # /api/rules/replace writes config.json before it returns 200.
+            # A second write here races that merge.
         except AgentError as exc:
             # Older/buggy Xray builds: missing replace route, or replace returns
             # invalid_json / empty body — fall back to config section write.

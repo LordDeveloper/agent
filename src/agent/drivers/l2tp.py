@@ -205,7 +205,11 @@ class L2tpDriver(CoreDriver):
         return {'enabled': True, 'servers': len(await self.list_servers())}
 
     async def reconcile_runtime(self, *, drop_keys: list[str] | None = None) -> None:
-        """Re-derive companion egress from WG peers without bouncing xl2tpd."""
+        """Rewrite chap-secrets from the store and refresh companion egress.
+
+        xl2tpd is not restarted. pppd reads chap-secrets on the next login.
+        """
+        await self._write_chap_secrets()
         await self._sync_peer_egress(drop_keys=drop_keys)
 
     async def disable(self) -> dict[str, Any]:
@@ -757,11 +761,13 @@ class L2tpDriver(CoreDriver):
                     current = None
                 if current == content:
                     continue
-                await aiofs.atomic_write(path, content, encoding='utf-8')
+                await aiofs.atomic_write(path, content, encoding='utf-8', mode=0o600)
                 try:
-                    await aiofs.chmod(path, 0o600)
-                except OSError:
-                    pass
+                    written = path.read_text(encoding='utf-8')
+                except OSError as exc:
+                    raise AgentError('EXEC_ERROR', f'L2TP chap-secrets could not be read back: {exc}', 500) from exc
+                if written != content:
+                    raise AgentError('EXEC_ERROR', 'L2TP chap-secrets does not match the stored users', 500)
 
     async def _apply_user_egress(self, touches: list[_UserEgressTouch]) -> None:
         from agent.support.peer_egress import apply_l2tp_user_egress

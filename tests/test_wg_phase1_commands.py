@@ -133,7 +133,7 @@ def test_delete_peer_passes_drop_keys_once(tmp_path):
     store, driver = _driver(tmp_path)
     calls: list[tuple] = []
 
-    async def update_interface(_interface_id, _payload, *, drop_keys=None):
+    async def update_interface(_interface_id, _payload, *, drop_keys=None, **_kwargs):
         calls.append(("update", list(drop_keys or [])))
         return _payload
 

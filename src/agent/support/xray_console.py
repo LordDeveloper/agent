@@ -93,3 +93,15 @@ def routing_without_rules(routing: dict[str, Any] | None) -> dict[str, Any]:
     payload = deepcopy(routing or {})
     payload.pop("rules", None)
     return payload
+
+
+def merge_routing_rules(config: dict[str, Any], rules: list[Any], extras: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Replace routing.rules in a config document. Other sections stay as they were read."""
+    updated = dict(config)
+    routing = dict(updated.get("routing") or {})
+    for key in ("domainStrategy", "domainMatcher", "balancers"):
+        if extras and key in extras and extras[key] is not None:
+            routing[key] = extras[key]
+    routing["rules"] = [row for row in rules if isinstance(row, dict)]
+    updated["routing"] = routing
+    return updated

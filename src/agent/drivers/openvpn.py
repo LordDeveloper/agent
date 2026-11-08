@@ -158,6 +158,7 @@ class OpenVpnDriver(CoreDriver):
         self.audit = audit
         self.store = store
         self._unit_locks = InterfaceLockRegistry()
+        self._server_locks = InterfaceLockRegistry()
 
     def capabilities(self) -> list[str]:
         return [
@@ -198,6 +199,23 @@ class OpenVpnDriver(CoreDriver):
             log.error('openvpn post-install apply failed: %s', exc)
             result = {**result, 'apply_error': str(exc)}
         return result
+
+    def _auth_root(self) -> Path:
+        return _SYSTEM_SERVER_ROOT
+
+    async def reconcile_runtime(self) -> None:
+        """Rewrite passwd and CCD from the store without restarting OpenVPN."""
+        from agent.runtime import RuntimeTrace
+
+        servers = await self.list_servers()
+        operation_id = RuntimeTrace.request_id() or '-'
+        for server in servers:
+            await self._apply_server_auth_files(server)
+        log.info(
+            'openvpn reconciliation finished core=openvpn servers=%s operation_id=%s',
+            len(servers),
+            operation_id,
+        )
 
     async def enable(self) -> dict[str, Any]:
         servers = await self.list_servers()
@@ -746,7 +764,11 @@ class OpenVpnDriver(CoreDriver):
         payload: dict[str, Any],
         *,
         apply: bool = True,
+        hold_lock: bool = True,
     ) -> dict[str, Any]:
+        if hold_lock:
+            async with self._server_locks.lock(str(server_id)):
+                return await self.add_user(server_id, payload, apply=apply, hold_lock=False)
         server = await self.get_server(server_id)
         user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         user.setdefault('email', user.get('name') or str(user['id'])[:8])
@@ -759,6 +781,7 @@ class OpenVpnDriver(CoreDriver):
                     str(existing.get('id') or user['id']),
                     payload,
                     apply=apply,
+                    hold_lock=False,
                 )
 
         user.setdefault('username', _gen_username())
@@ -789,7 +812,17 @@ class OpenVpnDriver(CoreDriver):
         payload: dict[str, Any],
         *,
         apply: bool = True,
+        hold_lock: bool = True,
     ) -> dict[str, Any]:
+        if hold_lock:
+            async with self._server_locks.lock(str(server_id)):
+                return await self.update_user(
+                    server_id,
+                    user_id,
+                    payload,
+                    apply=apply,
+                    hold_lock=False,
+                )
         server = await self.get_server(server_id)
         subnet_before = str(server.get('subnet') or '')
         for idx, user in enumerate(server.get('users') or []):
@@ -1398,50 +1431,92 @@ class OpenVpnDriver(CoreDriver):
         OpenVPN reads passwd via auth script and CCD on connect, so a full
         config rewrite is unnecessary for user CRUD.
         """
+        from agent.runtime import RuntimeTrace
+        from agent.support import aiofs
+
         instance = instance_name_for_server(server)
-        server_dir = _SYSTEM_SERVER_ROOT / instance
+        server_dir = self._auth_root() / instance
         ccd_dir = server_dir / 'ccd'
+        operation_id = RuntimeTrace.request_id() or '-'
+        server_id = server.get('id')
+        log.info(
+            'openvpn auth update started core=openvpn server_id=%s operation_id=%s',
+            server_id,
+            operation_id,
+        )
         try:
             server_dir.mkdir(parents=True, exist_ok=True)
             ccd_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log.warning('openvpn auth dir create failed: %s', exc)
-            return
+            log.error(
+                'openvpn auth dir create failed core=openvpn server_id=%s operation_id=%s error=%s',
+                server_id,
+                operation_id,
+                exc,
+            )
+            raise AgentError('EXEC_ERROR', f'OpenVPN auth directory was not created: {exc}', 500) from exc
 
-        passwd_path = server_dir / 'passwd'
-        try:
-            passwd_path.write_text(render_passwd([server]), encoding='utf-8')
-            passwd_path.chmod(0o640)
-        except OSError as exc:
-            log.warning('openvpn passwd write failed: %s', exc)
-        self._chown_openvpn_readable(passwd_path)
-
-        for stale in ccd_dir.glob('*'):
-            if stale.is_file():
-                try:
-                    stale.unlink()
-                except OSError:
-                    pass
-
+        enabled_names: list[str] = []
         subnet = str(server.get('subnet') or '')
+        ccd_bodies: dict[str, str] = {}
         for user in server.get('users') or []:
             if not isinstance(user, dict) or not record_is_enabled(user):
                 continue
             username = str(user.get('username') or '').strip()
             if not username:
                 continue
+            enabled_names.append(username)
             content = render_ccd_file(user, subnet=subnet)
             if content:
+                ccd_bodies[username] = content
+
+        passwd_body = render_passwd([server])
+        passwd_path = server_dir / 'passwd'
+        try:
+            await aiofs.atomic_write(passwd_path, passwd_body, mode=0o640)
+            for username, content in ccd_bodies.items():
+                await aiofs.atomic_write(ccd_dir / username, content, mode=0o644)
+        except OSError as exc:
+            log.error(
+                'openvpn auth write failed core=openvpn server_id=%s operation_id=%s error=%s',
+                server_id,
+                operation_id,
+                exc,
+            )
+            raise AgentError('EXEC_ERROR', f'OpenVPN auth files were not written: {exc}', 500) from exc
+
+        for stale in ccd_dir.glob('*'):
+            if stale.is_file() and stale.name not in ccd_bodies:
                 try:
-                    (ccd_dir / username).write_text(content, encoding='utf-8')
+                    stale.unlink()
                 except OSError as exc:
-                    log.warning('openvpn ccd write failed for %s: %s', username, exc)
+                    raise AgentError('EXEC_ERROR', f'OpenVPN CCD cleanup failed: {exc}', 500) from exc
 
         try:
             ccd_dir.chmod(0o755)
         except OSError:
             pass
+        self._chown_openvpn_readable(passwd_path)
         self._chown_openvpn_readable(ccd_dir)
+
+        try:
+            written = passwd_path.read_text(encoding='utf-8')
+        except OSError as exc:
+            raise AgentError('EXEC_ERROR', f'OpenVPN passwd could not be read back: {exc}', 500) from exc
+        for username in enabled_names:
+            if not any(line.startswith(username + ' ') or line == username for line in written.splitlines()):
+                log.error(
+                    'openvpn auth verification failed core=openvpn server_id=%s operation_id=%s',
+                    server_id,
+                    operation_id,
+                )
+                raise AgentError('EXEC_ERROR', 'OpenVPN passwd does not contain the user after write', 500)
+        log.info(
+            'openvpn persistent configuration updated core=openvpn server_id=%s users=%s operation_id=%s',
+            server_id,
+            len(enabled_names),
+            operation_id,
+        )
 
     async def _apply_all_configs(self) -> None:
         staging = self._staging_dir()

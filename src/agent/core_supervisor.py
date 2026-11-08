@@ -39,6 +39,10 @@ async def bootstrap_enabled_cores(
                         await maybe_await(driver.sync_proxy_protocol_forwarders())
                     except Exception as exc:
                         logger.warning("supervisor pp-forward sync failed core=%s: %s", key, exc)
+                    try:
+                        await maybe_await(driver.reconcile_persisted_clients())
+                    except Exception as exc:
+                        logger.warning("supervisor xray client reconcile failed: %s", exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
                 await maybe_await(driver.enable())
@@ -58,7 +62,11 @@ async def bootstrap_enabled_cores(
                 await maybe_await(driver.enable())
             elif key == "openvpn":
                 if await maybe_await(driver.running()):
-                    logger.info("supervisor core=%s already running", key)
+                    logger.info("supervisor core=%s already running; reconcile auth files", key)
+                    try:
+                        await maybe_await(driver.reconcile_runtime())
+                    except Exception as exc:
+                        logger.warning("supervisor openvpn reconcile failed: %s", exc)
                     continue
                 logger.info("supervisor starting core=%s", key)
                 await maybe_await(driver.enable())

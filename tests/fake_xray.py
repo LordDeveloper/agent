@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -27,9 +29,35 @@ class FakeXrayHttpClient:
         # Real Xray users/edit matches by email and keeps the previous UUID.
         self.edit_users_keeps_id = False
         self._hidden_users: dict[str, list[dict[str, Any]]] = {}
+        # When set, user mutations patch this file the way the HTTP API does.
+        self.config_path: Path | None = None
+        self.persist_config = True
 
     def close(self) -> None:
         return None
+
+    def _mirror_config(self) -> None:
+        """Copy runtime clients into config.json. The real HTTP API does this before 200."""
+        path = self.config_path
+        if path is None or not self.persist_config or not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        live = {str(row.get("tag") or ""): row for row in self._inbounds}
+        for inbound in data.get("inbounds") or []:
+            if not isinstance(inbound, dict):
+                continue
+            source = live.get(str(inbound.get("tag") or ""))
+            if source is None:
+                continue
+            settings = inbound.setdefault("settings", {})
+            clients = ((source.get("settings") or {}).get("clients") or [])
+            settings["clients"] = deepcopy(clients)
+        path.write_text(json.dumps(data), encoding="utf-8")
 
     def system(self) -> dict[str, Any]:
         return {"num_goroutine": 1}
@@ -95,6 +123,7 @@ class FakeXrayHttpClient:
             for inbound in self._inbounds:
                 if inbound.get("tag") == tag:
                     inbound.setdefault("settings", {}).setdefault("clients", []).extend(deepcopy(clients))
+                    self._mirror_config()
                     return {"succeeded": len(clients), "failed": 0, "added_users": len(clients)}
             raise RuntimeError(f"inbound {tag} missing")
 
@@ -114,6 +143,7 @@ class FakeXrayHttpClient:
                         existing[by_email[email]] = merged
                     else:
                         existing.append(deepcopy(client))
+                self._mirror_config()
                 return {"succeeded": len(clients), "failed": 0, "updated_users": len(clients)}
             raise RuntimeError(f"inbound {tag} missing")
 
@@ -132,6 +162,7 @@ class FakeXrayHttpClient:
             for key in ("clients", "users"):
                 rows = settings.get(key) or []
                 settings[key] = [c for c in rows if str(c.get("email")) not in email_set]
+            self._mirror_config()
             return {"succeeded": len(emails), "failed": 0, "removed_users": len(emails)}
         raise RuntimeError(f"inbound {tag} missing")
 

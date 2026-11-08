@@ -55,6 +55,7 @@ def _write_env(path: Path, data_dir: Path, cores: str = "xray,wireguard,amnezia"
                 f"ENABLED_CORES={cores}",
                 "XRAY_API_BASE=http://127.0.0.1:8080",
                 "XRAY_BINARY=/usr/local/bin/xray",
+                f"XRAY_CONFIG={(data_dir.parent / 'xray-config.json').as_posix()}",
                 "",
             ]
         ),
