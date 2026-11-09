@@ -175,6 +175,36 @@ def test_merge_peer_row_keeps_reserved_address():
     assert merged["public_key"] == "pub"
 
 
+def test_reenable_snaps_baseline_to_cumulative_so_quota_does_not_recut():
+    driver = WireGuardDriver.__new__(WireGuardDriver)
+    before = {
+        "id": "peer-1",
+        "email": "peer-1",
+        "address": "10.90.68.5",
+        "allowed_ips": "10.90.68.5/32",
+        "private_key": "priv",
+        "public_key": "pub",
+        "is_enabled": False,
+        "disabled_reason": "quota_exceeded",
+        "disabled_at": "2026-01-01T00:00:00Z",
+        "volume": 1_000_000_000,
+        "incoming": 500_000_000,
+        "outgoing": 218_710_826,
+        "_incoming": 100,
+        "_outgoing": 0,
+    }
+    merged = driver._merge_peer_row(
+        before,
+        {"is_enabled": True, "volume": 1_000_000_000},
+        {"subnet": "10.90.68.0/24", "peers": [before]},
+        [before],
+    )
+    assert merged["is_enabled"] is True
+    assert "disabled_reason" not in merged
+    assert merged["_incoming"] == 500_000_000
+    assert merged["_outgoing"] == 218_710_826
+
+
 def test_merge_writes_database_address_and_widens_subnet():
     driver = WireGuardDriver.__new__(WireGuardDriver)
     before = {

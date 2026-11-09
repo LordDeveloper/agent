@@ -2110,6 +2110,16 @@ class WireGuardDriver(CoreDriver):
             from agent.support.disable_reason import clear_disabled_metadata
 
             clear_disabled_metadata(merged)
+            # A panel re-enable must not be undone by usage that already happened
+            # while this peer was disabled. Cutoff after this point is billed by
+            # UpdateSubscribeStats, which then pushes is_enabled=false.
+            if not record_is_enabled(before):
+                cumulative_in = int(merged.get("incoming") or 0)
+                cumulative_out = int(merged.get("outgoing") or 0)
+                if cumulative_in > int(merged.get("_incoming") or 0):
+                    merged["_incoming"] = cumulative_in
+                if cumulative_out > int(merged.get("_outgoing") or 0):
+                    merged["_outgoing"] = cumulative_out
         return merged
 
     async def batch_peers(
