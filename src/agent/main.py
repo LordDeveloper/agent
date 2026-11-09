@@ -81,8 +81,9 @@ def create_app(env_file: str | None = None) -> FastAPI:
             settings.enforce_local_volume_quota,
         )
         if not settings.enforce_local_volume_quota:
-            app_log.warning(
-                "local volume quota enforcement disabled; panel sync must disable on is_exceeded",
+            app_log.info(
+                "volume quota cutoff is owned by the panel (UpdateSubscribeStats); "
+                "agent will not disable clients for quota",
             )
         # Request handlers enqueue routing and bandwidth. The worker process applies them.
         from agent.support.bandwidth import configure_runtime

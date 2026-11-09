@@ -5,7 +5,16 @@ from pathlib import Path
 
 import pytest
 
+from agent.config import AgentSettings
 from agent.db import Store
+from agent.support.quota import configure_quota_settings
+
+
+@pytest.fixture(autouse=True)
+def _enable_local_volume_quota_for_legacy_tests():
+    """Existing quota tests opt into the old enforcer. Production default is panel-owned cutoff."""
+    configure_quota_settings(AgentSettings(enforce_local_volume_quota=True))
+    yield
 
 
 @pytest.fixture

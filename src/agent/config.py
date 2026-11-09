@@ -81,10 +81,12 @@ class AgentSettings(BaseSettings):
     l2tp_config_dir: str = "/etc/agent/bin/l2tp"
     openvpn_config_dir: str = "/etc/agent/bin/openvpn"
     # Seconds between local volume-quota checks (0 disables the enforcer loop entirely).
+    # The loop still removes clients the panel already marked disabled. It does not
+    # decide volume cutoff unless ENFORCE_LOCAL_VOLUME_QUOTA=true.
     quota_enforce_interval: float = 10.0
-    # When false, positive client `volume` from the panel is stored for sync/diagnose but
-    # quota_exceeded / enforce_driver_quotas never cut traffic locally — Laravel owns caps.
-    enforce_local_volume_quota: bool = True
+    # Volume cutoff belongs to Laravel UpdateSubscribeStats. Positive `volume` is still
+    # stored for sync and diagnose. Set true only to restore the old local cut.
+    enforce_local_volume_quota: bool = False
     # Seconds between volume samples for panel billing (0 disables the background worker).
     # The worker attempts a sample on this cadence and never runs two at once.
     traffic_sample_interval: float = 15.0

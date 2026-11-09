@@ -278,6 +278,11 @@ async def _enforce_xray(driver: Any) -> int:
 
 
 async def _enforce_wireguard(driver: Any) -> int:
+    # Panel UpdateSubscribeStats sends is_enabled=false when billed volume is finished.
+    # A local cut here disables peers the database still treats as active.
+    if not local_volume_quota_enforced():
+        return 0
+
     await maybe_await(driver.sync_peer_stats())
     snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
@@ -343,6 +348,10 @@ async def _enforce_wireguard(driver: Any) -> int:
 
 
 async def _enforce_l2tp(driver: Any) -> int:
+    # Same rule as WireGuard: only the panel bills usage and disables the account.
+    if not local_volume_quota_enforced():
+        return 0
+
     await maybe_await(driver.sync_user_stats())
     snapshot = await maybe_await(driver.usage_snapshot())
     traffic_by_email: dict[str, tuple[int, int]] = {}
