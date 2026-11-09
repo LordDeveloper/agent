@@ -4,7 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from agent.logutil import get_logger
-from agent.traffic.service import TrafficService
+from agent.traffic.service import DEFAULT_SAMPLE_LOCK_SECONDS, TrafficService
 
 if TYPE_CHECKING:
     from agent.config import AgentSettings
@@ -19,27 +19,35 @@ async def traffic_worker_loop(
     settings: AgentSettings,
     stop_event: asyncio.Event,
 ) -> None:
+    """Sample volume every ``traffic_sample_interval`` seconds.
+
+    A cycle that is still running is left alone (no overlap). After
+    ``traffic_sample_lock_seconds`` it is cancelled so a stuck core walk
+    cannot block later samples.
+    """
     interval = max(1.0, float(settings.traffic_sample_interval))
-    log.info("traffic worker started interval=%ss", interval)
+    lock_seconds = max(
+        interval,
+        float(getattr(settings, "traffic_sample_lock_seconds", DEFAULT_SAMPLE_LOCK_SECONDS) or DEFAULT_SAMPLE_LOCK_SECONDS),
+    )
+    log.info(
+        "traffic worker started interval=%ss without_overlapping=%ss",
+        interval,
+        lock_seconds,
+    )
 
-    while not stop_event.is_set():
-        try:
-            stats = await traffic.sample_all(registry)
-            if stats.get("pending", 0) or stats.get("regressed", 0):
-                log.info(
-                    "traffic sample clients=%s pending=%s initialized=%s regressed=%s",
-                    stats.get("clients_seen", 0),
-                    stats.get("pending", 0),
-                    stats.get("initialized", 0),
-                    stats.get("regressed", 0),
-                )
-        except Exception:
-            log.exception("traffic sample cycle failed")
+    try:
+        while not stop_event.is_set():
+            try:
+                await traffic.sample_unless_overlapping(registry, lock_seconds=lock_seconds)
+            except Exception:
+                log.exception("traffic sample cycle failed")
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            break
-        except asyncio.TimeoutError:
-            continue
-
-    log.info("traffic worker stopped")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        traffic.cancel_inflight_sample()
+        log.info("traffic worker stopped")

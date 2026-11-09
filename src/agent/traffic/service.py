@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,9 @@ log = get_logger("traffic")
 
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
+# A volume sample may hold the worker exclusively for this long. After that
+# the next 15s tick cancels it and starts a new cycle.
+DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
 
 
 class TrafficService:
@@ -33,30 +37,89 @@ class TrafficService:
         self._fetch_snapshot: dict[str, list[dict[str, Any]]] = {}
         self._sample_lock = asyncio.Lock()
         self._sample_flight: asyncio.Task | None = None
+        self._sample_started_at = 0.0
+
+    def cancel_inflight_sample(self) -> None:
+        """Stop the volume sample that is still running, if any."""
+        flight = self._sample_flight
+        if flight is not None and not flight.done():
+            flight.cancel()
+
+    async def sample_unless_overlapping(
+        self,
+        registry: CoreRegistry,
+        *,
+        lock_seconds: float = DEFAULT_SAMPLE_LOCK_SECONDS,
+    ) -> dict[str, int] | None:
+        """Start one volume sample and return without waiting for it.
+
+        A sample that is still running and younger than ``lock_seconds`` is
+        left alone, so two cycles never read cores at the same time. Once the
+        lock window has passed, the stuck cycle is cancelled and a new one starts.
+        Returns None when this call did not start a cycle (the previous one is
+        still inside the window). The stats dict is produced by the background task.
+        """
+        doomed: asyncio.Task | None = None
+        async with self._sample_lock:
+            flight = self._sample_flight
+            if flight is not None and not flight.done():
+                age = time.monotonic() - self._sample_started_at
+                if age < lock_seconds:
+                    log.debug(
+                        "traffic sample skipped; in flight for %.1fs (lock %ss)",
+                        age,
+                        lock_seconds,
+                    )
+                    return None
+                log.warning(
+                    "traffic sample lock expired after %.1fs; cancelling",
+                    age,
+                )
+                flight.cancel()
+                self._sample_flight = None
+                doomed = flight
+
+        if doomed is not None:
+            # Wait until the stuck cycle has actually stopped, then start the
+            # next one. Awaiting while holding the lock would deadlock: the
+            # cancelled task needs that same lock to clear itself.
+            await asyncio.gather(doomed, return_exceptions=True)
+
+        async with self._sample_lock:
+            flight = self._sample_flight
+            if flight is not None and not flight.done():
+                return None
+            self._sample_started_at = time.monotonic()
+            self._sample_flight = asyncio.create_task(self._run_sample(registry))
+        return {"started": 1}
+
+    async def _run_sample(self, registry: CoreRegistry) -> dict[str, int] | None:
+        try:
+            stats = await self.sample_all(registry)
+            if stats.get("pending", 0) or stats.get("regressed", 0):
+                log.info(
+                    "traffic sample clients=%s pending=%s initialized=%s regressed=%s",
+                    stats.get("clients_seen", 0),
+                    stats.get("pending", 0),
+                    stats.get("initialized", 0),
+                    stats.get("regressed", 0),
+                )
+            return stats
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("traffic sample cycle failed")
+            return None
+        finally:
+            async with self._sample_lock:
+                current = asyncio.current_task()
+                if self._sample_flight is current:
+                    self._sample_flight = None
 
     def _schedule_sample_all(self, registry: CoreRegistry) -> None:
-        """Start a background ``sample_all`` if none is running (does not await)."""
-
-        async def _run() -> None:
-            try:
-                await self.sample_all(registry)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("traffic background sample failed")
-            finally:
-                async with self._sample_lock:
-                    if self._sample_flight is not None and self._sample_flight.done():
-                        self._sample_flight = None
-
-        async def _guard() -> None:
-            async with self._sample_lock:
-                if self._sample_flight is not None and not self._sample_flight.done():
-                    return
-                self._sample_flight = asyncio.create_task(_run())
-
+        """Start a background sample if none is inside the overlap window."""
         loop = asyncio.get_running_loop()
-        loop.create_task(_guard())
+        loop.create_task(self.sample_unless_overlapping(registry))
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from core counters (online not required)."""

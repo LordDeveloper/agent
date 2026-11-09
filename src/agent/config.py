@@ -85,8 +85,13 @@ class AgentSettings(BaseSettings):
     # When false, positive client `volume` from the panel is stored for sync/diagnose but
     # quota_exceeded / enforce_driver_quotas never cut traffic locally — Laravel owns caps.
     enforce_local_volume_quota: bool = True
-    # Seconds between traffic delta samples for panel billing (0 disables background worker).
-    traffic_sample_interval: float = 30.0
+    # Seconds between volume samples for panel billing (0 disables the background worker).
+    # The worker attempts a sample on this cadence and never runs two at once.
+    traffic_sample_interval: float = 15.0
+    # A sample still running after this many seconds is cancelled so the next
+    # cycle can start. Same idea as withoutOverlapping: one sample at a time,
+    # and a stuck sample cannot block volume calculation longer than this.
+    traffic_sample_lock_seconds: float = 120.0
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0
