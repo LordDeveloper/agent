@@ -679,17 +679,24 @@ class XrayDriver(CoreDriver):
         protocol: str,
         inbound_settings: dict[str, Any] | None,
     ) -> None:
-        """Confirm config.json, and write the inbound once if parallel adds lost the merge."""
+        """Confirm config.json, and rewrite the inbound once if the HTTP API left it behind.
+
+        users/remove updates settings.clients and can leave the same email in
+        settings.users. A disable-only batch has no wire users, but it still
+        needs that rewrite or the panel keeps retrying a client that is gone
+        from the running inbound.
+        """
         try:
-            await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
+            await self._confirm_httpapi_persisted(tag, wire_users, drop_emails, log_failure=False)
             return
         except AgentError as first:
-            if not wire_users:
+            if not wire_users and not drop_emails:
                 raise
             _log.warning(
-                "xray persistence repair core=xray inbound=%s upserts=%s error=%s",
+                "xray persistence repair core=xray inbound=%s upserts=%s removes=%s error=%s",
                 tag,
                 len(wire_users),
+                len(drop_emails),
                 first.message,
             )
         await self._commit_clients_to_inbound(
@@ -697,6 +704,7 @@ class XrayDriver(CoreDriver):
             wire_users,
             protocol=protocol,
             inbound_settings=inbound_settings,
+            drop_emails=drop_emails,
         )
         await self._confirm_httpapi_persisted(tag, wire_users, drop_emails)
 
@@ -705,6 +713,8 @@ class XrayDriver(CoreDriver):
         tag: str,
         upserts: list[dict[str, Any]],
         remove_emails: list[str],
+        *,
+        log_failure: bool = True,
     ) -> None:
         """Read config.json after the HTTP API returns.
 
@@ -727,26 +737,34 @@ class XrayDriver(CoreDriver):
             )
             return
         present = False
+        users_ghost = False
         for attempt in range(_PERSIST_CONFIRM_ATTEMPTS):
             self._invalidate_config_cache()
-            present = await self._config_contains_clients(tag, native, emails)
+            present, users_ghost = await self._config_contains_clients(tag, native, emails)
             if present:
+                break
+            # settings.users still lists an email that settings.clients already
+            # dropped. Another read will not change that; rewrite the inbound.
+            if users_ghost and not native:
                 break
             if attempt + 1 < _PERSIST_CONFIRM_ATTEMPTS:
                 await asyncio.sleep(_PERSIST_CONFIRM_DELAY_SECONDS)
         if not present:
-            _log.error(
-                "xray persistence verification failed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
-                tag,
-                len(native),
-                len(emails),
-                operation_id,
-            )
-            raise AgentError(
-                "EXEC_ERROR",
-                "Xray HTTP API returned success but config.json does not contain the client",
-                500,
-            )
+            if log_failure:
+                _log.error(
+                    "xray persistence verification failed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
+                    tag,
+                    len(native),
+                    len(emails),
+                    operation_id,
+                )
+            if emails and not native:
+                detail = "Xray HTTP API returned success but config.json still contains the client"
+            elif native and not emails:
+                detail = "Xray HTTP API returned success but config.json does not contain the client"
+            else:
+                detail = "Xray HTTP API returned success but config.json does not match the client change"
+            raise AgentError("EXEC_ERROR", detail, 500)
         _log.info(
             "xray persistence confirmed core=xray inbound=%s upserts=%s removes=%s operation_id=%s",
             tag,
@@ -760,21 +778,40 @@ class XrayDriver(CoreDriver):
         tag: str,
         upserts: list[dict[str, Any]],
         removed_emails: list[str],
-    ) -> bool:
+    ) -> tuple[bool, bool]:
+        """Return (matches, users_array_ghost).
+
+        users_array_ghost means every removed email is already gone from
+        settings.clients and at least one is still copied in settings.users.
+        """
         try:
             config = await self._cached_config()
         except AgentError:
-            return False
+            return False, False
         rows: list[dict[str, Any]] = []
+        client_emails: set[str] = set()
+        user_emails: set[str] = set()
         for inbound in config.get("inbounds") or []:
-            if isinstance(inbound, dict) and str(inbound.get("tag") or "") == tag:
-                rows = [row for row in xray_client_rows(inbound) if isinstance(row, dict)]
-                break
+            if not isinstance(inbound, dict) or str(inbound.get("tag") or "") != tag:
+                continue
+            rows = [row for row in xray_client_rows(inbound) if isinstance(row, dict)]
+            settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else {}
+            client_emails = self._row_emails(settings.get("clients") or [])
+            user_emails = self._row_emails(settings.get("users") or [])
+            break
         emails = {str(row.get("email") or "").strip() for row in rows}
         ids = {str(row.get("id") or "").strip() for row in rows}
-        for email in removed_emails:
-            if email and email in emails:
-                return False
+        removed = [email for email in removed_emails if email]
+        for email in removed:
+            if email not in emails:
+                continue
+            leftover_in_clients = any(item in client_emails for item in removed)
+            users_ghost = (
+                not upserts
+                and not leftover_in_clients
+                and any(item in user_emails for item in removed)
+            )
+            return False, users_ghost
         for client in upserts:
             email = str(client.get("email") or "").strip()
             cid = str(client.get("id") or "").strip()
@@ -782,8 +819,21 @@ class XrayDriver(CoreDriver):
                 continue
             if cid and cid in ids:
                 continue
-            return False
-        return True
+            return False, False
+        return True, False
+
+    @staticmethod
+    def _row_emails(rows: Any) -> set[str]:
+        found: set[str] = set()
+        if not isinstance(rows, list):
+            return found
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            email = str(row.get("email") or "").strip()
+            if email:
+                found.add(email)
+        return found
 
     def _wire_response(
         self,
@@ -1133,10 +1183,12 @@ class XrayDriver(CoreDriver):
         settings = payload.setdefault("settings", {})
         native = self._wire_clients(payload)
         settings["clients"] = native
+        # users/remove does not edit this duplicate. An empty list clears a
+        # copy left by older writes so a later disable can leave the file.
+        settings["users"] = []
         protocol = self._protocol_of(payload)
         if protocol == "vless":
             settings.setdefault("decryption", "none")
-            settings["users"] = native
         if protocol in {"shadowsocks", "ss"}:
             method = str(settings.get("method") or "").strip()
             clients = settings.get("clients") or settings.get("users") or []
@@ -1652,8 +1704,13 @@ class XrayDriver(CoreDriver):
         *,
         protocol: str,
         inbound_settings: dict[str, Any] | None,
+        drop_emails: list[str] | None = None,
     ) -> None:
-        """Write uuids into the inbound document when users/add leaves them out."""
+        """Write the inbound user list so config.json matches the HTTP API.
+
+        ``clients`` are rows that must be present. ``drop_emails`` are rows
+        that must be absent from both settings.clients and settings.users.
+        """
         current: dict[str, Any] | None = None
         for row in await self._api_call("list_inbounds", ):
             if str(row.get("tag") or "").strip() == tag:
@@ -1693,6 +1750,19 @@ class XrayDriver(CoreDriver):
             if cid:
                 by_id[cid] = native
 
+        drop = {str(email).strip() for email in (drop_emails or []) if str(email).strip()}
+        if drop:
+            for email in list(by_email):
+                if email not in drop:
+                    continue
+                row = by_email.pop(email)
+                cid = str(row.get("id") or "").strip() if isinstance(row, dict) else ""
+                if cid and by_id.get(cid) is row:
+                    by_id.pop(cid, None)
+            for cid, row in list(by_id.items()):
+                if str(row.get("email") or "").strip() in drop:
+                    by_id.pop(cid, None)
+
         deduped: list[dict[str, Any]] = []
         seen: set[int] = set()
         for row in list(by_email.values()) + list(by_id.values()):
@@ -1708,7 +1778,7 @@ class XrayDriver(CoreDriver):
                 if key not in {"clients", "users"}:
                     settings[key] = value
         settings["clients"] = deduped
-        settings["users"] = deduped
+        settings["users"] = []
         if str(protocol or "").lower() == "vless":
             settings.setdefault("decryption", "none")
 
@@ -2121,6 +2191,9 @@ class XrayDriver(CoreDriver):
             removed_emails = await self._remove_live_clients(tag, to_remove, errors)
             for email, client in zip(to_remove, remove_meta):
                 if email in removed_emails:
+                    panel_email = str(client.get("email") or "").strip()
+                    if email and email != panel_email:
+                        client["_persist_email"] = email
                     succeeded += 1
                     applied.append(client)
                 else:
@@ -2176,11 +2249,15 @@ class XrayDriver(CoreDriver):
             drop_emails: list[str] = []
             for row in applied:
                 wire = row.pop("_wire_user", None)
+                persist_email = str(row.pop("_persist_email", "") or "").strip()
                 email = str(row.get("email") or "").strip()
                 if record_is_enabled(row) and isinstance(wire, dict):
                     wire_users.append(wire)
-                elif email:
-                    drop_emails.append(email)
+                else:
+                    if persist_email:
+                        drop_emails.append(persist_email)
+                    if email and email != persist_email:
+                        drop_emails.append(email)
             if wire_users or drop_emails:
                 try:
                     await self._confirm_persisted_or_repair(

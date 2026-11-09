@@ -424,7 +424,8 @@ def xray_users_settings(
         for client in clients
     ]
     settings["clients"] = native
-    settings["users"] = native
+    # Do not copy the same rows into settings.users. users/remove only updates
+    # settings.clients, and the extra list stays in config.json after a disable.
     if protocol_key in {"shadowsocks", "ss"}:
         repair_shadowsocks_settings(settings)
     return settings

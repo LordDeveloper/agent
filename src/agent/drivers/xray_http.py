@@ -648,7 +648,7 @@ class XrayHttpClient:
             seen.add(marker)
             deduped.append(row)
         settings["clients"] = deduped
-        settings["users"] = deduped
+        settings["users"] = []
         if proto == "vless":
             settings.setdefault("decryption", "none")
 

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,15 @@ _sql_log = get_logger("sql")
 # A few dozen peers already produce a document large enough to stall the loop
 # if it is parsed inline. Smaller rows stay on the loop to avoid thread hops.
 _JSON_OFFLOAD_BYTES = 64 * 1024
+
+# The HTTP process and the worker each open this file. A traffic sample used to
+# hold the write lock longer than busy_timeout=2000, so quota saves failed with
+# "database is locked". Waiting here is cheaper than failing the panel sync.
+_BUSY_TIMEOUT_SECONDS = 15.0
+_BUSY_TIMEOUT_MS = 15_000
+_LOCK_ATTEMPTS = 4
+# Release the file lock between chunks so the other process can commit.
+_STATEMENTS_PER_COMMIT = 100
 
 
 def _dumps(value: Any) -> str:
@@ -66,12 +76,20 @@ async def _decode_json(raw: str) -> Any:
     return _loads(raw)
 
 
+def _is_db_locked(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
 class Store:
     """SQLite state for the agent.
 
     Writes use one connection and the write lock. Reads use a second connection
     and do not take that lock, so a large document commit cannot stall health
     and stats reads. WAL is enabled in ``open``.
+
+    The API process and the worker share this file. Writes wait for the other
+    process, retry a lock error, and always end the writer transaction so the
+    next save does not keep a stale snapshot.
     """
 
     def __init__(self, path: str | Path, *, slow_query_log_ms: float = 0.0):
@@ -89,17 +107,28 @@ class Store:
 
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(str(self.path))
+        self._conn = await aiosqlite.connect(str(self.path), timeout=_BUSY_TIMEOUT_SECONDS)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        journal = await self._conn.execute("PRAGMA journal_mode=WAL")
+        mode_row = await journal.fetchone()
+        journal_mode = str(mode_row[0]).lower() if mode_row else ""
+        if journal_mode != "wal":
+            _sql_log.warning(
+                "sqlite journal_mode=%s; concurrent writers will block each other",
+                journal_mode or "unknown",
+            )
         await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._conn.execute("PRAGMA busy_timeout=2000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._migrate()
-        self._read = await aiosqlite.connect(str(self.path), isolation_level=None)
+        self._read = await aiosqlite.connect(
+            str(self.path),
+            timeout=_BUSY_TIMEOUT_SECONDS,
+            isolation_level=None,
+        )
         self._read.row_factory = aiosqlite.Row
         await self._read.execute("PRAGMA query_only=ON")
-        await self._read.execute("PRAGMA busy_timeout=2000")
+        await self._read.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         await self._read.execute("PRAGMA foreign_keys=ON")
 
     async def close(self) -> None:
@@ -127,13 +156,48 @@ class Store:
         with RuntimeTrace.span("db.wait"):
             await self._lock.acquire()
         self._maybe_log_slow("db.wait_lock", (time.perf_counter() - wait_started) * 1000)
+        conn = self._writer()
         try:
             q_started = time.perf_counter()
             with RuntimeTrace.span("db.query"):
-                yield self._writer()
+                yield conn
             self._maybe_log_slow("db.write", (time.perf_counter() - q_started) * 1000)
         finally:
+            # A read left open on the writer (the post-commit pending count used
+            # to do this) pins a snapshot. The next insert then raises
+            # "database is locked" and busy_timeout cannot clear it.
+            await self._rollback_open(conn)
             self._lock.release()
+
+    async def _rollback_open(self, conn: aiosqlite.Connection) -> None:
+        try:
+            await conn.rollback()
+        except Exception:
+            _sql_log.debug("rollback after write failed", exc_info=True)
+
+    async def _retry_locked(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        delay = 0.05
+        for attempt in range(_LOCK_ATTEMPTS):
+            try:
+                return await operation()
+            except sqlite3.OperationalError as exc:
+                if not _is_db_locked(exc) or attempt + 1 >= _LOCK_ATTEMPTS:
+                    raise
+                _sql_log.warning(
+                    "sqlite locked; retrying attempt=%s/%s error=%s",
+                    attempt + 1,
+                    _LOCK_ATTEMPTS,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 0.5)
+        raise RuntimeError("sqlite lock retry exhausted")
+
+    async def _commit_chunk(self, conn: aiosqlite.Connection, pending: int) -> int:
+        if pending < _STATEMENTS_PER_COMMIT:
+            return pending
+        await conn.commit()
+        return 0
 
     async def _fetch(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
         q_started = time.perf_counter()
@@ -432,7 +496,18 @@ class Store:
         deletes: list[str] | None = None,
     ) -> None:
         encoded = [(str(doc_id), await _encode_json(data)) for doc_id, data in puts]
+        removed = [str(doc_id) for doc_id in (deletes or []) if str(doc_id).strip()]
+        await self._retry_locked(lambda: self._write_docs_once(core, kind, encoded, removed))
+
+    async def _write_docs_once(
+        self,
+        core: str,
+        kind: str,
+        encoded: list[tuple[str, str]],
+        deletes: list[str],
+    ) -> None:
         async with self._writing() as conn:
+            pending = 0
             for doc_id, payload in encoded:
                 await conn.execute(
                     """
@@ -444,13 +519,13 @@ class Store:
                     """,
                     (core, kind, doc_id, payload),
                 )
-            for doc_id in deletes or []:
-                if not str(doc_id).strip():
-                    continue
+                pending = await self._commit_chunk(conn, pending + 1)
+            for doc_id in deletes:
                 await conn.execute(
                     "DELETE FROM documents WHERE core = ? AND kind = ? AND doc_id = ?",
-                    (core, kind, str(doc_id)),
+                    (core, kind, doc_id),
                 )
+                pending = await self._commit_chunk(conn, pending + 1)
             await conn.commit()
 
     async def backup_database(self, dest: Path) -> None:
@@ -465,8 +540,9 @@ class Store:
             partial.unlink()
 
         def _copy() -> None:
-            source = sqlite3.connect(str(self.path))
+            source = sqlite3.connect(str(self.path), timeout=_BUSY_TIMEOUT_SECONDS)
             try:
+                source.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
                 target = sqlite3.connect(str(partial))
                 try:
                     source.backup(target)
@@ -919,6 +995,16 @@ class Store:
         # sample cannot stall other writers, and never on the HTTP process.
         acks, pending = await self._traffic_books()
         writes = plan(acks, pending)
+        await self._retry_locked(lambda: self._commit_traffic_plan(writes))
+        stats = dict(writes.get("stats") or {})
+        # Count on the read connection. A SELECT on the writer starts a
+        # transaction; leaving it open makes the next quota insert fail with
+        # "database is locked" after any other connection commits.
+        rows = await self._fetch("SELECT COUNT(*) AS c FROM traffic_pending")
+        stats["pending"] = int(rows[0]["c"]) if rows else 0
+        return stats
+
+    async def _commit_traffic_plan(self, writes: dict[str, Any]) -> None:
         async with self._writing() as conn:
             try:
                 await self._write_traffic_plan(conn, writes)
@@ -926,15 +1012,17 @@ class Store:
             except Exception:
                 await conn.rollback()
                 raise
-            stats = dict(writes.get("stats") or {})
-            counted = await conn.execute("SELECT COUNT(*) AS c FROM traffic_pending")
-            row = await counted.fetchone()
-            stats["pending"] = int(row["c"]) if row else 0
-            return stats
 
     async def _write_traffic_plan(self, conn: aiosqlite.Connection, writes: dict[str, Any]) -> None:
+        pending = 0
+
+        async def step(sql: str, params: tuple[Any, ...]) -> None:
+            nonlocal pending
+            await conn.execute(sql, params)
+            pending = await self._commit_chunk(conn, pending + 1)
+
         for core, client_key, incoming, outgoing in writes.get("ack_upserts") or []:
-            await conn.execute(
+            await step(
                 """
                 INSERT INTO traffic_ack (core, client_key, incoming, outgoing, updated_at)
                 VALUES (?, ?, ?, ?, datetime('now'))
@@ -946,12 +1034,12 @@ class Store:
                 (core, client_key, int(incoming), int(outgoing)),
             )
         for core, client_key in writes.get("ack_deletes") or []:
-            await conn.execute(
+            await step(
                 "DELETE FROM traffic_ack WHERE core = ? AND client_key = ?",
                 (core, client_key),
             )
         for item in writes.get("pending_upserts") or []:
-            await conn.execute(
+            await step(
                 """
                 INSERT INTO traffic_pending (
                     core, client_key,
@@ -976,12 +1064,12 @@ class Store:
                 ),
             )
         for core, client_key in writes.get("pending_deletes") or []:
-            await conn.execute(
+            await step(
                 "DELETE FROM traffic_pending WHERE core = ? AND client_key = ?",
                 (core, client_key),
             )
         for core, alias, canonical_key in writes.get("identity_upserts") or []:
-            await conn.execute(
+            await step(
                 """
                 INSERT INTO traffic_identity (core, alias, canonical_key)
                 VALUES (?, ?, ?)
@@ -993,7 +1081,7 @@ class Store:
         meta = writes.get("meta")
         if isinstance(meta, tuple) and len(meta) == 3:
             core, key, value = meta
-            await conn.execute(
+            await step(
                 """
                 INSERT INTO meta (core, key, value) VALUES (?, ?, ?)
                 ON CONFLICT(core, key) DO UPDATE SET value = excluded.value

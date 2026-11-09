@@ -106,6 +106,90 @@ def test_xray_runtime_success_without_persistence_is_not_success(tmp_path: Path)
     asyncio.run(run())
 
 
+def test_xray_disable_clears_client_left_in_config_users(tmp_path: Path):
+    """users/remove can clear settings.clients and leave the same row in settings.users."""
+
+    async def run() -> None:
+        import agent.drivers.xray as xray_mod
+
+        fake = FakeXrayHttpClient()
+        store, driver, config = await _xray(tmp_path, fake)
+        previous_delay = xray_mod._PERSIST_CONFIRM_DELAY_SECONDS
+        xray_mod._PERSIST_CONFIRM_DELAY_SECONDS = 0
+        try:
+            keep = {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "email": "keep@x",
+                "is_enabled": True,
+            }
+            stay = {
+                "id": "22222222-2222-4222-8222-222222222222",
+                "email": "stay@x",
+                "is_enabled": True,
+            }
+            created = await driver.batch_clients(1, [keep, stay])
+            assert created["failed"] == 0, created
+
+            data = json.loads(config.read_text(encoding="utf-8"))
+            copied = [dict(row) for row in data["inbounds"][0]["settings"]["clients"]]
+            data["inbounds"][0]["settings"]["users"] = copied
+            config.write_text(json.dumps(data), encoding="utf-8")
+            for inbound in fake._inbounds:
+                if inbound.get("tag") == "inbound-1":
+                    inbound.setdefault("settings", {})["users"] = [dict(row) for row in copied]
+
+            def remove_users(tag, emails, **_kwargs):
+                email_set = {str(email) for email in emails}
+                for inbound in fake._inbounds:
+                    if inbound.get("tag") != tag:
+                        continue
+                    settings = inbound.setdefault("settings", {})
+                    settings["clients"] = [
+                        row
+                        for row in (settings.get("clients") or [])
+                        if str(row.get("email")) not in email_set
+                    ]
+                    fake._mirror_config()
+                    return {"succeeded": len(emails), "failed": 0, "removed_users": len(emails)}
+                raise RuntimeError(f"inbound {tag} missing")
+
+            real_edit = fake.edit_inbounds
+
+            def edit_inbounds(inbounds, **kwargs):
+                result = real_edit(inbounds, **kwargs)
+                stored = json.loads(config.read_text(encoding="utf-8"))
+                live = {str(row.get("tag") or ""): row for row in fake._inbounds}
+                for inbound in stored.get("inbounds") or []:
+                    source = live.get(str(inbound.get("tag") or ""))
+                    if source is None:
+                        continue
+                    src = source.get("settings") or {}
+                    settings = inbound.setdefault("settings", {})
+                    settings["clients"] = json.loads(json.dumps(src.get("clients") or []))
+                    if "users" in src:
+                        settings["users"] = json.loads(json.dumps(src.get("users") or []))
+                config.write_text(json.dumps(stored), encoding="utf-8")
+                return result
+
+            fake.remove_users = remove_users
+            fake.edit_inbounds = edit_inbounds
+
+            disabled = await driver.batch_clients(1, [{**stay, "is_enabled": False}])
+            assert disabled["failed"] == 0, disabled
+            assert disabled["ok"] is True
+
+            stored = json.loads(config.read_text(encoding="utf-8"))
+            settings = stored["inbounds"][0]["settings"]
+            assert [row.get("email") for row in settings.get("clients") or []] == ["keep@x"]
+            assert settings.get("users") == []
+            assert [row["email"] for row in fake.list_users("inbound-1")] == ["keep@x"]
+        finally:
+            xray_mod._PERSIST_CONFIRM_DELAY_SECONDS = previous_delay
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_xray_persistence_is_not_written_when_runtime_rejects(tmp_path: Path):
     async def run() -> None:
         fake = FakeXrayHttpClient()
