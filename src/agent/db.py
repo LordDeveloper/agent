@@ -80,12 +80,13 @@ class Store:
             result = await session.execute(text(query), bind)
             return [tuple(row) for row in result.fetchall()]
 
-    async def open(self) -> None:
+    async def open(self, *, migrate: bool = True) -> None:
         if self._db_config.is_sqlite and self._db_config.sqlite_path is not None:
             self._db_config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         register_listeners()
+        if migrate:
+            await asyncio.to_thread(upgrade_head, self._db_config)
         await self._runtime.open()
-        await asyncio.to_thread(upgrade_head, self._db_config)
 
     async def close(self) -> None:
         await self._runtime.close()

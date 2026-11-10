@@ -2,6 +2,8 @@
 Description=Netinja node agent API
 After=network-online.target agent-worker.service
 Wants=network-online.target agent-worker.service
+# Migrations run in agent-worker; it must reach READY before this unit starts (Type=notify).
+Requires=agent-worker.service
 
 [Service]
 Type=simple

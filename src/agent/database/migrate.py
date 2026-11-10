@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import sys
+import time
 from pathlib import Path
 
 from alembic import command
@@ -35,26 +37,51 @@ def _alembic_config(config: DatabaseConfig) -> Config:
     return cfg
 
 
+_LOCK_WAIT_SECONDS = 600
+_LOCK_LOG_INTERVAL = 5.0
+
+
 def _acquire_migration_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+b")
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    last_log = 0.0
     try:
-        if sys.platform == "win32":
-            import msvcrt
+        while True:
+            if sys.platform == "win32":
+                import msvcrt
 
-            handle.seek(0)
-            handle.write(b"0")
-            handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    return handle, lock_path
+                except OSError:
+                    pass
+            else:
+                import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return handle, lock_path
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                        raise
+            now = time.monotonic()
+            if now - last_log >= _LOCK_LOG_INTERVAL:
+                _log.info("waiting for database migration lock path=%s", lock_path)
+                last_log = now
+            if now >= deadline:
+                handle.close()
+                raise RuntimeError(
+                    f"timed out waiting for migration lock ({_LOCK_WAIT_SECONDS}s): {lock_path}"
+                )
+            time.sleep(0.25)
     except Exception as exc:
         handle.close()
         raise RuntimeError(f"could not acquire migration lock: {exc}") from exc
-    return handle, lock_path
 
 
 def _release_migration_lock(handle, lock_path: Path) -> None:
@@ -109,8 +136,6 @@ def upgrade_head(config: DatabaseConfig) -> None:
         if config.sqlite_path is None:
             raise RuntimeError("sqlite_path missing for sqlite migration")
         cfg = _alembic_config(config)
-        resolved = config.sqlite_path.resolve().as_posix()
-        cfg.cmd_opts = type("opts", (), {"x": [f"dburl=sqlite+aiosqlite:///{resolved}"]})()
         _log.info("database migration starting path=%s", config.sqlite_path)
         command.upgrade(cfg, "head")
         _log.info("database migration complete path=%s", config.sqlite_path)

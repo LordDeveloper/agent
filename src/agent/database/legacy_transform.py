@@ -8,6 +8,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from agent.database.models.core import DEFAULT_CORE_KEYS
+from agent.logutil import get_logger
+
+_log = get_logger("migrate.legacy")
 
 ARTIFACT_KINDS = frozenset({"settings", "catalog", "location", "egress_state"})
 
@@ -244,6 +247,9 @@ def migrate_documents_to_relational(conn: Connection) -> int:
     rows = conn.execute(
         text("SELECT core, kind, doc_id, data FROM documents ORDER BY core, kind, doc_id")
     ).fetchall()
+    total = len(rows)
+    if total:
+        _log.info("legacy documents migration starting rows=%s", total)
     count = 0
     for row in rows:
         core = str(row[0] or "")
@@ -254,6 +260,8 @@ def migrate_documents_to_relational(conn: Connection) -> int:
             continue
         _ensure_core(conn, core)
         count += 1
+        if count == 1 or count % 500 == 0 or count == total:
+            _log.info("legacy documents migration progress=%s/%s", count, total)
 
         if kind == "interface":
             peers = data.pop("peers", None)
@@ -392,4 +400,6 @@ def migrate_documents_to_relational(conn: Connection) -> int:
 
     conn.execute(text("DROP TABLE IF EXISTS documents"))
     conn.execute(text("DROP INDEX IF EXISTS documents_by_kind"))
+    if total:
+        _log.info("legacy documents migration complete rows=%s", count)
     return count

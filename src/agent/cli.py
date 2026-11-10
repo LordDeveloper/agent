@@ -48,15 +48,15 @@ def _env_flag(parser: argparse.ArgumentParser) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
+    from agent.config import load_settings
     from agent.main import create_app
 
-    runtime = open_runtime(args.env_file)
-    host, port = runtime.settings.listen_host_port()
+    settings = load_settings(args.env_file)
+    host, port = settings.listen_host_port()
     if args.host:
         host = args.host
     if args.port:
         port = args.port
-    run_sync(runtime.close())
 
     env_path = args.env_file
     if env_path:

@@ -69,7 +69,18 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    url = _url_from_x_arg() or config.get_main_option("sqlalchemy.url") or ""
+    if "+aiosqlite" in url or url.startswith("sqlite+aiosqlite"):
+        asyncio.run(run_async_migrations())
+        return
+    from sqlalchemy import create_engine
+
+    connect_args: dict = {}
+    if url.startswith("sqlite"):
+        connect_args["timeout"] = 120
+    connectable = create_engine(url, poolclass=pool.NullPool, connect_args=connect_args)
+    with connectable.connect() as connection:
+        do_run_migrations(connection)
 
 
 if context.is_offline_mode():

@@ -66,7 +66,8 @@ def create_app(env_file: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await store.open()
+        # Schema upgrades run in agent-worker; avoid sqlite lock with worker WAL readers.
+        await store.open(migrate=False)
         from agent.support.quota_identity_migration import migrate_client_quota_identity
 
         migrated = await migrate_client_quota_identity(store)

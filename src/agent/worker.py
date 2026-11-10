@@ -85,7 +85,10 @@ async def serve_background(settings: AgentSettings, stop: asyncio.Event) -> None
         database_config_from_settings(settings),
         slow_query_log_ms=float(settings.slow_query_log_ms or 0.0),
     )
-    await store.open()
+    await store.open(migrate=True)
+    from agent.systemd_notify import systemd_notify
+
+    systemd_notify("READY=1")
     try:
         migrated = await migrate_client_quota_identity(store)
         if migrated:
