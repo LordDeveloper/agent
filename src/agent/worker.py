@@ -79,7 +79,12 @@ async def serve_background(settings: AgentSettings, stop: asyncio.Event) -> None
             "agent will not disable clients for quota",
         )
     setup_logging(settings)
-    store = Store(settings.resolve_db_path(), slow_query_log_ms=float(settings.slow_query_log_ms or 0.0))
+    from agent.database.config import database_config_from_settings
+
+    store = Store(
+        database_config_from_settings(settings),
+        slow_query_log_ms=float(settings.slow_query_log_ms or 0.0),
+    )
     await store.open()
     try:
         migrated = await migrate_client_quota_identity(store)

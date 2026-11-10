@@ -18,6 +18,7 @@ from agent.ops import (
     which,
     write_env_file,
 )
+from agent.database.config import database_status_from_settings
 from agent.runtime import open_runtime
 from agent.update import check_for_update, perform_update, resolve_token
 
@@ -105,7 +106,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "success": True,
                 "version": __version__,
                 "listen": runtime.settings.listen,
-                "db": str(runtime.settings.resolve_db_path()),
+                "db": database_status_from_settings(runtime.settings),
                 "enabled_cores": runtime.settings.cores(),
                 "cores": cores,
             }

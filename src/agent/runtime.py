@@ -37,7 +37,12 @@ def open_runtime(env_file: str | None = None) -> Runtime:
     from agent.registry import CoreRegistry
 
     settings = load_settings(env_file)
-    store = Store(settings.resolve_db_path(), slow_query_log_ms=float(settings.slow_query_log_ms or 0.0))
+    from agent.database.config import database_config_from_settings
+
+    store = Store(
+        database_config_from_settings(settings),
+        slow_query_log_ms=float(settings.slow_query_log_ms or 0.0),
+    )
     asyncio.run(store.open())
     from agent.support.quota_identity_migration import migrate_client_quota_identity
 

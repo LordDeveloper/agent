@@ -16,6 +16,11 @@ _hidden = [
     'agent.drivers.xray_http',
     # Async SQLite ORM stack (dialect driver is imported lazily from the URL).
     'aiosqlite',
+    'aiomysql',
+    'pymysql',
+    'sqlalchemy.dialects.mysql',
+    'sqlalchemy.dialects.mysql.aiomysql',
+    'sqlalchemy.dialects.mysql.pymysql',
     'greenlet',
     'sqlalchemy.ext.asyncio',
     'sqlalchemy.dialects.sqlite',

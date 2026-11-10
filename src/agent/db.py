@@ -7,6 +7,7 @@ from typing import Any
 
 from agent.database.events.listeners import register_listeners
 from agent.database.json_codec import JSON_OFFLOAD_BYTES, decode_json, encode_json, loads as _loads
+from agent.database.config import DatabaseConfig, database_config_from_path
 from agent.database.migrate import upgrade_head
 from agent.database.session import DatabaseRuntime
 from agent.services.document_store import DocumentStore
@@ -41,10 +42,20 @@ def _is_db_locked(exc: BaseException) -> bool:
 class Store:
     """SQLite state for the agent (async SQLAlchemy backend)."""
 
-    def __init__(self, path: str | Path, *, slow_query_log_ms: float = 0.0):
-        self.path = Path(path)
+    def __init__(
+        self,
+        config: DatabaseConfig | str | Path,
+        *,
+        slow_query_log_ms: float = 0.0,
+    ):
+        if isinstance(config, (str, Path)):
+            db_config = database_config_from_path(config)
+        else:
+            db_config = config
+        self._db_config = db_config
+        self.path = db_config.sqlite_path or Path(db_config.database)
         self._slow_query_log_ms = max(0.0, float(slow_query_log_ms))
-        self._runtime = DatabaseRuntime(self.path, slow_query_log_ms=slow_query_log_ms)
+        self._runtime = DatabaseRuntime(db_config, slow_query_log_ms=slow_query_log_ms)
         self._documents = DocumentStore(self._runtime)
         self._meta = MetaService(self._runtime)
         self._traffic = TrafficStoreService(self._runtime)
@@ -70,10 +81,11 @@ class Store:
             return [tuple(row) for row in result.fetchall()]
 
     async def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._db_config.is_sqlite and self._db_config.sqlite_path is not None:
+            self._db_config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         register_listeners()
         await self._runtime.open()
-        await asyncio.to_thread(upgrade_head, self.path)
+        await asyncio.to_thread(upgrade_head, self._db_config)
 
     async def close(self) -> None:
         await self._runtime.close()

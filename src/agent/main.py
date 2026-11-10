@@ -53,7 +53,12 @@ def create_app(env_file: str | None = None) -> FastAPI:
     setup_logging(settings)
     app_log = get_logger("app")
 
-    store = Store(settings.resolve_db_path(), slow_query_log_ms=float(settings.slow_query_log_ms or 0.0))
+    from agent.database.config import database_config_from_settings
+
+    store = Store(
+        database_config_from_settings(settings),
+        slow_query_log_ms=float(settings.slow_query_log_ms or 0.0),
+    )
     audit = AuditLog(store)
     errors = CoreErrorLog(resolve_log_path(settings))
     registry = CoreRegistry(settings, audit, store)
@@ -134,7 +139,7 @@ def create_app(env_file: str | None = None) -> FastAPI:
             "success": True,
             "service": "agent",
             "version": __version__,
-            "db": str(settings.resolve_db_path()),
+            "db": database_config_from_settings(settings).status_label(),
             "cores": [c.model_dump() for c in await reg.list_cores()],
         }
 

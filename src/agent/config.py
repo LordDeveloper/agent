@@ -61,6 +61,14 @@ class AgentSettings(BaseSettings):
     auth_username: str = ""
     auth_password: str = ""
     data_dir: str = "/var/lib/agent"
+    # Laravel-style database env (defaults keep the historical sqlite file in data_dir).
+    db_connection: str = "sqlite"
+    db_host: str = "127.0.0.1"
+    db_port: int = 3306
+    db_database: str = "agent.db"
+    db_username: str = ""
+    db_password: str = ""
+    # Legacy absolute sqlite path; when set, overrides db_database for sqlite only.
     db_path: str = ""
     enabled_cores: str = "xray"
     log_file: str = ""
@@ -149,9 +157,14 @@ class AgentSettings(BaseSettings):
         return [part.strip() for part in self.enabled_cores.split(",") if part.strip()]
 
     def resolve_db_path(self) -> Path:
+        """Sqlite database file path (ignored when DB_CONNECTION is not sqlite)."""
         if self.db_path:
             return Path(self.db_path)
-        return Path(self.data_dir) / "agent.db"
+        name = (self.db_database or "agent.db").strip()
+        path = Path(name)
+        if path.is_absolute():
+            return path
+        return Path(self.data_dir) / name
 
     def listen_host_port(self) -> tuple[str, int]:
         if ":" in self.listen:

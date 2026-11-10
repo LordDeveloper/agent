@@ -12,6 +12,7 @@ from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from agent.database.config import DatabaseConfig
 from agent.database.engine import configure_sqlite_pragmas, create_read_engine, create_write_engine
 from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
@@ -37,8 +38,9 @@ def _is_db_locked(exc: BaseException) -> bool:
 class DatabaseRuntime:
     """Async SQLAlchemy session management with write lock and read engine."""
 
-    def __init__(self, path: str | Path, *, slow_query_log_ms: float = 0.0):
-        self.path = Path(path)
+    def __init__(self, config: DatabaseConfig, *, slow_query_log_ms: float = 0.0):
+        self.config = config
+        self.path = config.sqlite_path if config.sqlite_path is not None else Path(".")
         self._slow_query_log_ms = max(0.0, float(slow_query_log_ms))
         self._lock = asyncio.Lock()
         self._write_engine = None
@@ -53,23 +55,26 @@ class DatabaseRuntime:
         _sql_log.warning("slow_sql phase=%s duration_ms=%.1f%s", phase, elapsed_ms, suffix)
 
     async def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_engine = create_write_engine(self.path)
-        self._read_engine = create_read_engine(self.path)
+        if self.config.is_sqlite and self.config.sqlite_path is not None:
+            self.config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_engine = create_write_engine(self.config)
+        self._read_engine = create_read_engine(self.config)
 
-        @event.listens_for(self._write_engine.sync_engine, "connect")
-        def _on_write_connect(dbapi_conn, _record):
-            dbapi_conn.execute(f"PRAGMA busy_timeout=15000")
-            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+        if self.config.is_sqlite:
 
-        @event.listens_for(self._read_engine.sync_engine, "connect")
-        def _on_read_connect(dbapi_conn, _record):
-            dbapi_conn.execute(f"PRAGMA busy_timeout=15000")
-            dbapi_conn.execute("PRAGMA query_only=ON")
-            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+            @event.listens_for(self._write_engine.sync_engine, "connect")
+            def _on_write_connect(dbapi_conn, _record):
+                dbapi_conn.execute("PRAGMA busy_timeout=15000")
+                dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
-        async with self._write_engine.connect() as conn:
-            await configure_sqlite_pragmas(conn, query_only=False)
+            @event.listens_for(self._read_engine.sync_engine, "connect")
+            def _on_read_connect(dbapi_conn, _record):
+                dbapi_conn.execute("PRAGMA busy_timeout=15000")
+                dbapi_conn.execute("PRAGMA query_only=ON")
+                dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+            async with self._write_engine.connect() as conn:
+                await configure_sqlite_pragmas(conn, query_only=False)
 
         self._write_factory = async_sessionmaker(
             self._write_engine,
@@ -151,7 +156,7 @@ class DatabaseRuntime:
             try:
                 return await operation()
             except (OperationalError, sqlite3.OperationalError) as exc:
-                if not _is_db_locked(exc) or attempt + 1 >= LOCK_ATTEMPTS:
+                if not self.config.is_sqlite or not _is_db_locked(exc) or attempt + 1 >= LOCK_ATTEMPTS:
                     raise
                 _sql_log.warning(
                     "sqlite locked; retrying attempt=%s/%s error=%s",
