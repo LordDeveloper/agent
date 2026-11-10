@@ -10,6 +10,7 @@ class TrafficAck(Base):
     __tablename__ = "traffic_ack"
     __table_args__ = {"sqlite_with_rowid": False}
 
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
     core: Mapped[str] = mapped_column(String(64), primary_key=True)
     client_key: Mapped[str] = mapped_column(String(512), primary_key=True)
     incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -25,6 +26,7 @@ class TrafficPending(Base):
     __tablename__ = "traffic_pending"
     __table_args__ = {"sqlite_with_rowid": False}
 
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
     core: Mapped[str] = mapped_column(String(64), primary_key=True)
     client_key: Mapped[str] = mapped_column(String(512), primary_key=True)
     delta_incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -42,6 +44,7 @@ class TrafficIdentity(Base):
     __tablename__ = "traffic_identity"
     __table_args__ = {"sqlite_with_rowid": False}
 
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
     core: Mapped[str] = mapped_column(String(64), primary_key=True)
     alias: Mapped[str] = mapped_column(String(512), primary_key=True)
     canonical_key: Mapped[str] = mapped_column(String(512), nullable=False)

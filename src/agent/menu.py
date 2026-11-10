@@ -1866,22 +1866,103 @@ def _show_bandwidth_reconcile() -> None:
         _print_block(error, max_lines=10, color=RED)
 
 
+def _token_call(action):
+    from agent.config import load_settings
+    from agent.database.config import database_config_from_settings
+    from agent.db import Store
+
+    store = Store(database_config_from_settings(load_settings()))
+
+    async def run():
+        await store.open(migrate=True)
+        try:
+            return await action(store)
+        finally:
+            await store.close()
+
+    return run_sync(run())
+
+
+def _list_auth_tokens() -> None:
+    from agent.config import load_settings
+
+    settings = load_settings()
+    primary = str(settings.auth_token or "").strip()
+    _print(kv("Primary (.env)", "scope default", CYAN))
+    _print(kv("Token", primary or "(not set)", YELLOW if primary else RED))
+    _print(paint("  Clients already on this agent stay on the primary token.", DIM))
+    rows = _token_call(lambda store: store.list_auth_tokens())
+    if not rows:
+        _print(paint("  No extra server tokens.", DIM))
+        return
+    for row in rows:
+        _print("")
+        _print(kv("Name", str(row.get("name") or ""), GREEN))
+        _print(kv("Scope", str(row.get("id") or ""), CYAN))
+        _print(kv("Token", str(row.get("token") or ""), YELLOW))
+
+
+def _create_server_token() -> None:
+    name = prompt_text("Server name", "")
+    if not str(name or "").strip():
+        _print(paint("  A name is required.", RED))
+        return
+    secret = generate_token()
+
+    async def create(store):
+        return await store.create_auth_token(name.strip(), secret)
+
+    created = _token_call(create)
+    _print(kv("Name", str(created.get("name") or name), GREEN))
+    _print(kv("Scope", str(created.get("id") or ""), CYAN))
+    _print(kv("Token", str(created.get("token") or secret), YELLOW))
+    _print(paint("  Put this token on that server in the panel.", DIM))
+    _print(paint("  Clients created with it keep their own pending queue.", DIM))
+    _print(paint("  Restart is not required.", DIM))
+
+
+def _revoke_server_token() -> None:
+    rows = _token_call(lambda store: store.list_auth_tokens())
+    if not rows:
+        _print(paint("  No extra server tokens.", DIM))
+        return
+    picked = select(
+        [
+            Choice(str(row.get("id") or ""), f"{row.get('name')}  {row.get('id')}", YELLOW, str(index + 1))
+            for index, row in enumerate(rows)
+        ]
+        + [Choice("back", "Back", WHITE, "0")]
+    )
+    if picked in {None, "back"}:
+        return
+    if not confirm(f"Revoke token {picked}?"):
+        return
+    removed = _token_call(lambda store: store.delete_auth_token(picked))
+    _print(paint("  Revoked." if removed else "  Token was already gone.", GREEN if removed else YELLOW))
+
+
 def _token_menu() -> None:
     while True:
-        render_header("Token")
+        render_header("Auth tokens")
         picked = select(
             [
-                Choice("print", "Generate token", CYAN, "1"),
-                Choice("write", "Generate and write to .env", GREEN, "2"),
+                Choice("list", "List tokens", CYAN, "1"),
+                Choice("create", "Create server token", GREEN, "2"),
+                Choice("revoke", "Revoke server token", RED, "3"),
+                Choice("write", "Rotate primary token in .env", YELLOW, "4"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
-        _run_action(
-            "Auth token",
-            lambda write=picked == "write": _show_token(write=write),
-        )
+        if picked == "list":
+            _run_action("Auth tokens", _list_auth_tokens)
+        elif picked == "create":
+            _run_action("Create server token", _create_server_token)
+        elif picked == "revoke":
+            _run_action("Revoke server token", _revoke_server_token)
+        elif picked == "write":
+            _run_action("Primary token", lambda: _show_token(write=True))
 
 
 def _status() -> None:
@@ -1915,7 +1996,7 @@ def run_interactive() -> int:
                     Choice("status", "Check status", WHITE, "9"),
                     Choice("stats", "Stats", WHITE, "10"),
                     Choice("update", "Update agent", WHITE, "11"),
-                    Choice("token", "Auth token", WHITE, "12"),
+                    Choice("token", "Auth tokens", WHITE, "12"),
                     Choice("mullvad", "Mullvad", GREEN, "13"),
                     Choice("exit", "Exit", WHITE, "0"),
                 ]

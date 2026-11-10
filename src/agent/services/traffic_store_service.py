@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import delete, func, select
 
+from agent.auth_scope import current_scope
 from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending
 from agent.database.session import DatabaseRuntime
 
@@ -19,14 +20,19 @@ class TrafficStoreService:
         if not key:
             return {"ack_rows": [], "pending_rows": []}
         async with self._runtime.reading() as session:
+            scope = current_scope()
             ack_rows = (
                 await session.execute(
-                    select(TrafficAck).where(TrafficAck.client_key == key).order_by(TrafficAck.core)
+                    select(TrafficAck)
+                    .where(TrafficAck.scope == scope, TrafficAck.client_key == key)
+                    .order_by(TrafficAck.core)
                 )
             ).scalars().all()
             pending_rows = (
                 await session.execute(
-                    select(TrafficPending).where(TrafficPending.client_key == key).order_by(TrafficPending.core)
+                    select(TrafficPending)
+                    .where(TrafficPending.scope == scope, TrafficPending.client_key == key)
+                    .order_by(TrafficPending.core)
                 )
             ).scalars().all()
             return {
@@ -56,17 +62,20 @@ class TrafficStoreService:
 
     async def get_traffic_ack(self, core: str, client_key: str) -> dict[str, int] | None:
         async with self._runtime.reading() as session:
-            row = await session.get(TrafficAck, (core, client_key))
+            scope = current_scope()
+            row = await session.get(TrafficAck, (scope, core, client_key))
             if row is None:
                 return None
             return {"incoming": int(row.incoming), "outgoing": int(row.outgoing)}
 
     async def set_traffic_ack(self, core: str, client_key: str, incoming: int, outgoing: int) -> None:
         async with self._runtime.writing() as session:
-            row = await session.get(TrafficAck, (core, client_key))
+            scope = current_scope()
+            row = await session.get(TrafficAck, (scope, core, client_key))
             if row is None:
                 session.add(
                     TrafficAck(
+                        scope=scope,
                         core=core,
                         client_key=client_key,
                         incoming=int(incoming),
@@ -82,8 +91,13 @@ class TrafficStoreService:
 
     async def delete_traffic_ack(self, core: str, client_key: str) -> None:
         async with self._runtime.writing() as session:
+            scope = current_scope()
             await session.execute(
-                delete(TrafficAck).where(TrafficAck.core == core, TrafficAck.client_key == client_key)
+                delete(TrafficAck).where(
+                    TrafficAck.scope == scope,
+                    TrafficAck.core == core,
+                    TrafficAck.client_key == client_key,
+                )
             )
             await session.commit()
 
@@ -97,10 +111,12 @@ class TrafficStoreService:
         current_outgoing: int,
     ) -> None:
         async with self._runtime.writing() as session:
-            row = await session.get(TrafficPending, (core, client_key))
+            scope = current_scope()
+            row = await session.get(TrafficPending, (scope, core, client_key))
             if row is None:
                 session.add(
                     TrafficPending(
+                        scope=scope,
                         core=core,
                         client_key=client_key,
                         delta_incoming=int(delta_incoming),
@@ -120,14 +136,20 @@ class TrafficStoreService:
 
     async def delete_traffic_pending(self, core: str, client_key: str) -> None:
         async with self._runtime.writing() as session:
+            scope = current_scope()
             await session.execute(
-                delete(TrafficPending).where(TrafficPending.core == core, TrafficPending.client_key == client_key)
+                delete(TrafficPending).where(
+                    TrafficPending.scope == scope,
+                    TrafficPending.core == core,
+                    TrafficPending.client_key == client_key,
+                )
             )
             await session.commit()
 
     async def get_traffic_pending(self, core: str, client_key: str) -> dict[str, Any] | None:
         async with self._runtime.reading() as session:
-            row = await session.get(TrafficPending, (core, client_key))
+            scope = current_scope()
+            row = await session.get(TrafficPending, (scope, core, client_key))
             if row is None:
                 return None
             return {
@@ -142,8 +164,13 @@ class TrafficStoreService:
 
     async def list_traffic_pending(self) -> list[dict[str, Any]]:
         async with self._runtime.reading() as session:
+            scope = current_scope()
             rows = (
-                await session.execute(select(TrafficPending).order_by(TrafficPending.core, TrafficPending.client_key))
+                await session.execute(
+                    select(TrafficPending)
+                    .where(TrafficPending.scope == scope)
+                    .order_by(TrafficPending.core, TrafficPending.client_key)
+                )
             ).scalars().all()
             return [
                 {
@@ -160,14 +187,18 @@ class TrafficStoreService:
 
     async def count_traffic_pending(self) -> int:
         async with self._runtime.reading() as session:
-            count = await session.scalar(select(func.count()).select_from(TrafficPending))
+            count = await session.scalar(
+                select(func.count()).select_from(TrafficPending).where(TrafficPending.scope == current_scope())
+            )
             return int(count or 0)
 
     async def list_traffic_identity(self) -> list[dict[str, Any]]:
         async with self._runtime.reading() as session:
             rows = (
                 await session.execute(
-                    select(TrafficIdentity).order_by(TrafficIdentity.core, TrafficIdentity.alias)
+                    select(TrafficIdentity)
+                    .where(TrafficIdentity.scope == current_scope())
+                    .order_by(TrafficIdentity.core, TrafficIdentity.alias)
                 )
             ).scalars().all()
             return [
@@ -175,17 +206,22 @@ class TrafficStoreService:
                 for row in rows
             ]
 
-    async def _traffic_books(self) -> tuple[
+    async def _traffic_books(self, scope: str | None = None) -> tuple[
         dict[tuple[str, str], tuple[int, int]],
         dict[tuple[str, str], dict[str, int]],
     ]:
+        scope = str(scope or current_scope())
         async with self._runtime.reading() as session:
-            ack_rows = (await session.execute(select(TrafficAck))).scalars().all()
+            ack_rows = (
+                await session.execute(select(TrafficAck).where(TrafficAck.scope == scope))
+            ).scalars().all()
             acks = {
                 (str(row.core), str(row.client_key)): (int(row.incoming), int(row.outgoing))
                 for row in ack_rows
             }
-            pending_rows = (await session.execute(select(TrafficPending))).scalars().all()
+            pending_rows = (
+                await session.execute(select(TrafficPending).where(TrafficPending.scope == scope))
+            ).scalars().all()
             pending = {
                 (str(row.core), str(row.client_key)): {
                     "delta_incoming": int(row.delta_incoming),
@@ -197,9 +233,12 @@ class TrafficStoreService:
             }
             return acks, pending
 
-    async def apply_traffic_sample(self, plan) -> dict[str, int]:
-        acks, pending = await self._traffic_books()
+    async def apply_traffic_sample(self, plan, scope: str | None = None) -> dict[str, int]:
+        scope = str(scope or current_scope())
+        acks, pending = await self._traffic_books(scope)
         writes = plan(acks, pending)
+        if isinstance(writes, dict):
+            writes["scope"] = scope
         await self._runtime.retry_locked(lambda: self._commit_traffic_plan(writes))
         stats = dict(writes.get("stats") or {})
         stats["pending"] = await self.count_traffic_pending()
@@ -223,15 +262,17 @@ class TrafficStoreService:
             await MetaService(self._runtime).set_meta(core, key, value)
 
     async def _write_traffic_plan(self, session, writes: dict[str, Any]) -> None:
+        scope = str(writes.get("scope") or current_scope())
         pending = 0
-        staged_ack: dict[tuple[str, str], TrafficAck] = {}
+        staged_ack: dict[tuple[str, str, str], TrafficAck] = {}
         for core, client_key, incoming, outgoing in writes.get("ack_upserts") or []:
-            key = (core, client_key)
+            key = (scope, core, client_key)
             row = staged_ack.get(key)
             if row is None:
                 row = await session.get(TrafficAck, key)
             if row is None:
                 row = TrafficAck(
+                    scope=scope,
                     core=core,
                     client_key=client_key,
                     incoming=int(incoming),
@@ -248,20 +289,25 @@ class TrafficStoreService:
 
         for core, client_key in writes.get("ack_deletes") or []:
             await session.execute(
-                delete(TrafficAck).where(TrafficAck.core == core, TrafficAck.client_key == client_key)
+                delete(TrafficAck).where(
+                    TrafficAck.scope == scope,
+                    TrafficAck.core == core,
+                    TrafficAck.client_key == client_key,
+                )
             )
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
-        staged_pending: dict[tuple[str, str], TrafficPending] = {}
+        staged_pending: dict[tuple[str, str, str], TrafficPending] = {}
         for item in writes.get("pending_upserts") or []:
             core = item["core"]
             client_key = item["client_key"]
-            key = (core, client_key)
+            key = (scope, core, client_key)
             row = staged_pending.get(key)
             if row is None:
                 row = await session.get(TrafficPending, key)
             if row is None:
                 row = TrafficPending(
+                    scope=scope,
                     core=core,
                     client_key=client_key,
                     delta_incoming=int(item["delta_incoming"]),
@@ -282,14 +328,18 @@ class TrafficStoreService:
 
         for core, client_key in writes.get("pending_deletes") or []:
             await session.execute(
-                delete(TrafficPending).where(TrafficPending.core == core, TrafficPending.client_key == client_key)
+                delete(TrafficPending).where(
+                    TrafficPending.scope == scope,
+                    TrafficPending.core == core,
+                    TrafficPending.client_key == client_key,
+                )
             )
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
         for core, alias, canonical_key in writes.get("identity_upserts") or []:
-            row = await session.get(TrafficIdentity, (core, alias))
+            row = await session.get(TrafficIdentity, (scope, core, alias))
             if row is None:
-                session.add(TrafficIdentity(core=core, alias=alias, canonical_key=canonical_key))
+                session.add(TrafficIdentity(scope=scope, core=core, alias=alias, canonical_key=canonical_key))
             else:
                 row.canonical_key = canonical_key
             pending = await self._runtime.commit_chunk(session, pending + 1)
@@ -304,12 +354,13 @@ class TrafficStoreService:
         if not rows:
             return
         async with self._runtime.writing() as session:
-            seen: set[tuple[str, str]] = set()
+            scope = current_scope()
+            seen: set[tuple[str, str, str]] = set()
             now = datetime.now(timezone.utc).isoformat()
             for snap in rows:
                 core = str(snap.get("core") or "")
                 client_key = str(snap.get("client_key") or "")
-                key = (core, client_key)
+                key = (scope, core, client_key)
                 if not core or not client_key or key in seen:
                     continue
                 seen.add(key)
@@ -342,6 +393,7 @@ class TrafficStoreService:
                 if ack is None:
                     session.add(
                         TrafficAck(
+                            scope=scope,
                             core=core,
                             client_key=client_key,
                             incoming=ack_in,
@@ -393,9 +445,10 @@ class TrafficStoreService:
         if not rows:
             return
         async with self._runtime.writing() as session:
-            seen: set[tuple[str, str]] = set()
+            scope = current_scope()
+            seen: set[tuple[str, str, str]] = set()
             for row in rows:
-                key = (str(row["core"]), str(row["client_key"]))
+                key = (scope, str(row["core"]), str(row["client_key"]))
                 if key in seen:
                     continue
                 seen.add(key)
@@ -403,8 +456,9 @@ class TrafficStoreService:
                 if existing is None:
                     session.add(
                         TrafficAck(
-                            core=key[0],
-                            client_key=key[1],
+                            scope=scope,
+                            core=key[1],
+                            client_key=key[2],
                             incoming=int(row["current_incoming"]),
                             outgoing=int(row["current_outgoing"]),
                             updated_at=datetime.now(timezone.utc).isoformat(),
@@ -416,8 +470,9 @@ class TrafficStoreService:
                     existing.updated_at = datetime.now(timezone.utc).isoformat()
                 await session.execute(
                     delete(TrafficPending).where(
-                        TrafficPending.core == key[0],
-                        TrafficPending.client_key == key[1],
+                        TrafficPending.scope == scope,
+                        TrafficPending.core == key[1],
+                        TrafficPending.client_key == key[2],
                     )
                 )
             await session.commit()
@@ -444,9 +499,11 @@ class TrafficStoreService:
                 for core, doc_id in deletes:
                     await session.execute(delete(Quota).where(Quota.core_id == core, Quota.client_id == doc_id))
                     await session.execute(delete(Client).where(Client.core_id == core, Client.id == doc_id))
+                scope = current_scope()
                 for core, key, incoming, outgoing in ack_upserts:
                     await session.merge(
                         TrafficAck(
+                            scope=scope,
                             core=core,
                             client_key=key,
                             incoming=incoming,
@@ -456,11 +513,16 @@ class TrafficStoreService:
                     )
                 for core, key in ack_deletes:
                     await session.execute(
-                        delete(TrafficAck).where(TrafficAck.core == core, TrafficAck.client_key == key)
+                        delete(TrafficAck).where(
+                            TrafficAck.scope == scope,
+                            TrafficAck.core == core,
+                            TrafficAck.client_key == key,
+                        )
                     )
                 for core, key, delta_in, delta_out, current_in, current_out in pending_upserts:
                     await session.merge(
                         TrafficPending(
+                            scope=scope,
                             core=core,
                             client_key=key,
                             delta_incoming=delta_in,
@@ -472,7 +534,11 @@ class TrafficStoreService:
                     )
                 for core, key in pending_deletes:
                     await session.execute(
-                        delete(TrafficPending).where(TrafficPending.core == core, TrafficPending.client_key == key)
+                        delete(TrafficPending).where(
+                            TrafficPending.scope == scope,
+                            TrafficPending.core == core,
+                            TrafficPending.client_key == key,
+                        )
                     )
                 await session.commit()
             except Exception:

@@ -35,7 +35,7 @@ class TrafficService:
         self.store = store
         self._aliases: dict[str, str] = {}
         self._emails: dict[str, str] = {}
-        self._fetch_snapshot: dict[str, list[dict[str, Any]]] = {}
+        self._fetch_snapshot: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self._sample_lock = asyncio.Lock()
         self._sample_flight: asyncio.Task | None = None
         self._sample_started_at = 0.0
@@ -183,8 +183,20 @@ class TrafficService:
                     )
 
         sampled_at = datetime.now(timezone.utc).isoformat()
-        stored = await self._commit_samples(samples, sampled_at)
-        stats.update(stored)
+        from agent.auth_scope import DEFAULT_SCOPE
+
+        owners = await self.store.client_scopes()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for sample in samples:
+            scope = owners.get((str(sample["core"]), str(sample["label"])), DEFAULT_SCOPE)
+            grouped.setdefault(scope, []).append(sample)
+        if not grouped:
+            grouped[DEFAULT_SCOPE] = []
+
+        for scope, group in grouped.items():
+            stored = await self._commit_samples(group, sampled_at, scope)
+            for key in stats:
+                stats[key] += int(stored.get(key, 0))
         return stats
 
     async def ensure_sample_fresh(
@@ -211,11 +223,18 @@ class TrafficService:
         self._schedule_sample_all(registry)
         return True
 
-    async def _commit_samples(self, samples: list[dict[str, Any]], sampled_at: str) -> dict[str, int]:
+    async def _commit_samples(
+        self,
+        samples: list[dict[str, Any]],
+        sampled_at: str,
+        scope: str | None = None,
+    ) -> dict[str, int]:
+        from agent.auth_scope import current_scope
+
         def plan(acks: dict, pending: dict) -> dict[str, Any]:
             return self._plan_sample(samples, acks, pending, sampled_at)
 
-        return await self.store.apply_traffic_sample(plan)
+        return await self.store.apply_traffic_sample(plan, scope or current_scope())
 
     def _plan_sample(
         self,
@@ -556,6 +575,21 @@ class TrafficService:
             self._aliases[alias] = canonical
             self._aliases.setdefault(canonical, canonical)
 
+    def _snapshot_meta_key(self) -> str:
+        from agent.auth_scope import current_scope
+
+        return f"{FETCH_SNAPSHOT_META_KEY}:{current_scope()}"
+
+    def _read_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        from agent.auth_scope import current_scope
+
+        return self._fetch_snapshot.get(current_scope(), {})
+
+    def _write_snapshot(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
+        from agent.auth_scope import current_scope
+
+        self._fetch_snapshot[current_scope()] = snapshot
+
     async def pending_payload(self) -> dict[str, Any]:
         await self._load_persisted_aliases()
         rows = await self._without_absent_clients(await self.store.list_traffic_pending())
@@ -582,7 +616,7 @@ class TrafficService:
             }
             users[label] = entry
 
-        self._fetch_snapshot = snapshot
+        self._write_snapshot(snapshot)
         await self._persist_fetch_snapshot(snapshot)
 
         return {
@@ -598,9 +632,8 @@ class TrafficService:
         rows = await self.store.list_traffic_pending()
         await self.store.ack_traffic_rows(rows)
         acked = len(rows)
-        self._fetch_snapshot = {}
-        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
-        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        self._write_snapshot({})
+        await self.store.set_meta(AGENT_META_CORE, self._snapshot_meta_key(), [])
 
         if acked:
             log.info("traffic ack applied clients=%s", acked)
@@ -619,7 +652,7 @@ class TrafficService:
             seen.add(label)
             requested.append(label)
 
-        if not self._fetch_snapshot:
+        if not self._read_snapshot():
             await self._load_persisted_snapshot()
 
         acked: list[str] = []
@@ -628,7 +661,7 @@ class TrafficService:
 
         for label in requested:
             canonical = self._canonical_key(label)
-            rows = self._fetch_snapshot.get(label) or self._fetch_snapshot.get(canonical) or []
+            rows = self._read_snapshot().get(label) or self._read_snapshot().get(canonical) or []
             if not rows:
                 not_found.append(label)
                 continue
@@ -653,7 +686,7 @@ class TrafficService:
         if not forget:
             return
         kept_memory: dict[str, list[dict[str, Any]]] = {}
-        for label, items in self._fetch_snapshot.items():
+        for label, items in self._read_snapshot().items():
             remaining = [
                 row
                 for row in items
@@ -661,8 +694,8 @@ class TrafficService:
             ]
             if remaining:
                 kept_memory[label] = remaining
-        self._fetch_snapshot = kept_memory
-        raw = await self.store.get_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        self._write_snapshot(kept_memory)
+        raw = await self.store.get_meta(AGENT_META_CORE, self._snapshot_meta_key(), [])
         if not isinstance(raw, list):
             return
         kept = [
@@ -671,7 +704,7 @@ class TrafficService:
             if isinstance(row, dict)
             and (str(row.get("core") or ""), str(row.get("client_key") or "")) not in forget
         ]
-        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, kept)
+        await self.store.set_meta(AGENT_META_CORE, self._snapshot_meta_key(), kept)
 
     async def _persist_fetch_snapshot(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
         """Remember the pending bytes returned by GET so a later ack can subtract only those."""
@@ -690,10 +723,10 @@ class TrafficService:
                     "current_incoming": int(row.get("current_incoming") or 0),
                     "current_outgoing": int(row.get("current_outgoing") or 0),
                 }
-        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, list(stored.values()))
+        await self.store.set_meta(AGENT_META_CORE, self._snapshot_meta_key(), list(stored.values()))
 
     async def _load_persisted_snapshot(self) -> None:
-        raw = await self.store.get_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        raw = await self.store.get_meta(AGENT_META_CORE, self._snapshot_meta_key(), [])
         snapshot: dict[str, list[dict[str, Any]]] = {}
         if isinstance(raw, list):
             for row in raw:
@@ -706,7 +739,7 @@ class TrafficService:
                     snapshot.setdefault(label, []).append(published)
                 if stored and stored != label:
                     snapshot.setdefault(stored, []).append(published)
-        self._fetch_snapshot = snapshot
+        self._write_snapshot(snapshot)
 
     async def _without_absent_clients(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop pending rows for clients the agent no longer stores.

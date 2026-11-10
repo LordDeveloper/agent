@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import selectinload
 
+from agent.auth_scope import DEFAULT_SCOPE, current_scope
 from agent.database.json_codec import decode_json, encode_json
 from agent.database.models.client import Client, PARENT_INTERFACE, PARENT_SERVER
 from agent.database.models.core import Core
@@ -78,6 +79,12 @@ class DocumentStore:
             iface.config = config
             iface.updated_at = _now()
         await session.flush()
+        kept_scopes = await self._scopes_for_parent(
+            session,
+            core=core,
+            parent_type=PARENT_INTERFACE,
+            parent_id=doc_id,
+        )
         await session.execute(
             delete(Client).where(
                 Client.core_id == core,
@@ -86,6 +93,7 @@ class DocumentStore:
             )
         )
         for peer in peers:
+            peer_id = str(peer.get("node_id") or peer.get("id") or "")
             await self._upsert_member(
                 session,
                 core=core,
@@ -94,6 +102,7 @@ class DocumentStore:
                 parent_core=core,
                 parent_id=doc_id,
                 role="peer",
+                scope=kept_scopes.get(peer_id),
             )
 
     async def _save_server(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
@@ -106,6 +115,12 @@ class DocumentStore:
             server.config = config
             server.updated_at = _now()
         await session.flush()
+        kept_scopes = await self._scopes_for_parent(
+            session,
+            core=core,
+            parent_type=PARENT_SERVER,
+            parent_id=doc_id,
+        )
         await session.execute(
             delete(Client).where(
                 Client.core_id == core,
@@ -114,6 +129,7 @@ class DocumentStore:
             )
         )
         for user in users:
+            user_id = str(user.get("node_id") or user.get("id") or "")
             await self._upsert_member(
                 session,
                 core=core,
@@ -122,7 +138,24 @@ class DocumentStore:
                 parent_core=core,
                 parent_id=doc_id,
                 role="user",
+                scope=kept_scopes.get(user_id),
             )
+
+    async def _scopes_for_parent(self, session, *, core: str, parent_type: str, parent_id: str) -> dict[str, str]:
+        if parent_type == PARENT_INTERFACE:
+            stmt = select(Client).where(
+                Client.core_id == core,
+                Client.parent_interface_core_id == core,
+                Client.parent_interface_id == parent_id,
+            )
+        else:
+            stmt = select(Client).where(
+                Client.core_id == core,
+                Client.parent_server_core_id == core,
+                Client.parent_server_id == parent_id,
+            )
+        rows = (await session.execute(stmt)).scalars().all()
+        return {str(row.id): str(row.scope or DEFAULT_SCOPE) for row in rows}
 
     async def _member_id(self, member: dict[str, Any], *, fallback: str = "") -> str:
         return str(member.get("node_id") or member.get("id") or fallback or "").strip()
@@ -138,6 +171,7 @@ class DocumentStore:
         parent_id: str | None,
         role: str,
         client_id: str | None = None,
+        scope: str | None = None,
     ) -> None:
         client_id = str(client_id or await self._member_id(member) or "").strip()
         if not client_id:
@@ -184,6 +218,7 @@ class DocumentStore:
                 disabled_reason=str(member.get("disabled_reason") or "").strip() or None,
                 disabled_at=str(member.get("disabled_at") or "").strip() or None,
                 role=role,
+                scope=str(scope or "").strip() or current_scope(),
                 meta=meta,
                 updated_at=_now(),
             )

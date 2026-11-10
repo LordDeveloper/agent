@@ -1,4 +1,5 @@
 from agent.database.models.audit import AuditLogEntry
+from agent.database.models.auth_token import AuthToken
 from agent.database.models.client import Client
 from agent.database.models.core import Core
 from agent.database.models.core_artifact import CoreArtifact
@@ -10,6 +11,7 @@ from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPe
 
 __all__ = [
     "AuditLogEntry",
+    "AuthToken",
     "Client",
     "Core",
     "CoreArtifact",

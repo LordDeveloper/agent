@@ -12,6 +12,7 @@ from agent.database.migrate import upgrade_head
 from agent.database.session import DatabaseRuntime
 from agent.services.document_store import DocumentStore
 from agent.services.meta_service import MetaService
+from agent.services.token_service import TokenService
 from agent.services.traffic_store_service import TrafficStoreService
 
 _JSON_OFFLOAD_BYTES = JSON_OFFLOAD_BYTES
@@ -58,6 +59,7 @@ class Store:
         self._runtime = DatabaseRuntime(db_config, slow_query_log_ms=slow_query_log_ms)
         self._documents = DocumentStore(self._runtime)
         self._meta = MetaService(self._runtime)
+        self._tokens = TokenService(self._runtime)
         self._traffic = TrafficStoreService(self._runtime)
 
     @property
@@ -248,8 +250,33 @@ class Store:
     ]:
         return await self._traffic._traffic_books()
 
-    async def apply_traffic_sample(self, plan) -> dict[str, int]:
-        return await self._traffic.apply_traffic_sample(plan)
+    async def apply_traffic_sample(self, plan, scope: str | None = None) -> dict[str, int]:
+        return await self._traffic.apply_traffic_sample(plan, scope)
+
+    async def client_scopes(self) -> dict[tuple[str, str], str]:
+        from sqlalchemy import select
+
+        from agent.auth_scope import DEFAULT_SCOPE
+        from agent.database.models.client import Client
+
+        async with self._runtime.reading() as session:
+            rows = (await session.execute(select(Client.core_id, Client.id, Client.scope))).all()
+        found: dict[tuple[str, str], str] = {}
+        for core_id, client_id, scope in rows:
+            found[(str(core_id), str(client_id))] = str(scope or DEFAULT_SCOPE)
+        return found
+
+    async def list_auth_tokens(self) -> list[dict[str, Any]]:
+        return await self._tokens.list_tokens()
+
+    async def create_auth_token(self, name: str, token: str) -> dict[str, Any]:
+        return await self._tokens.create_token(name, token)
+
+    async def delete_auth_token(self, token_id: str) -> bool:
+        return await self._tokens.delete_token(token_id)
+
+    async def scope_for_token(self, token: str) -> str | None:
+        return await self._tokens.scope_for_token(token)
 
     async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
         await self._traffic.ack_billed_snapshots(rows)

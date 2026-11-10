@@ -47,6 +47,7 @@ class Client(Base):
     disabled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     disabled_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="peer")
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, default="default", server_default="default")
     meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     updated_at: Mapped[str] = mapped_column(
         Text,
