@@ -17,7 +17,8 @@ from agent.logutil import get_logger, report_progress
 
 log = get_logger("transfer")
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION_LEGACY = 1
 _KNOWN_CORES = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
 _CERT_KEYS = {
     "certificateFile",
@@ -254,7 +255,7 @@ def _require_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         version = int(payload.get("version") or 0)
     except (TypeError, ValueError) as exc:
         raise AgentError("VALIDATION_ERROR", "transfer snapshot version is invalid", 422) from exc
-    if version != SNAPSHOT_VERSION:
+    if version not in (SNAPSHOT_VERSION, SNAPSHOT_VERSION_LEGACY):
         raise AgentError("VALIDATION_ERROR", "transfer snapshot version is not supported", 422)
     return payload
 

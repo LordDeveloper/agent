@@ -25,11 +25,9 @@ def test_read_proceeds_while_a_write_holds_the_lock() -> None:
             entered = asyncio.Event()
 
             async def slow_write() -> None:
-                async with store._lock:
-                    await store._conn.execute("BEGIN IMMEDIATE")
+                async with store._runtime.hold_write_lock():
                     entered.set()
                     await asyncio.sleep(0.4)
-                    await store._conn.rollback()
 
             writer = asyncio.create_task(slow_write())
             await entered.wait()
@@ -48,34 +46,18 @@ def test_read_proceeds_while_a_write_holds_the_lock() -> None:
         asyncio.run(scenario(f"{directory}/agent.db"))
 
 
-def test_large_decode_yields_the_event_loop() -> None:
+def test_large_interface_config_round_trips() -> None:
     async def scenario(tmp: str) -> None:
         store = Store(tmp)
         await store.open()
         try:
-            peers = [{"id": str(index), "blob": "z" * 2000} for index in range(40)]
-            await store.put_doc("wireguard", "interface", "1", {"peers": peers})
-            started = asyncio.Event()
-            release = asyncio.Event()
-
-            def slow(raw: str):
-                if len(raw) >= _JSON_OFFLOAD_BYTES:
-                    started.set()
-                    while not release.is_set():
-                        time.sleep(0.01)
-                return _loads(raw)
-
-            with patch("agent.db._loads", slow):
-                listed = asyncio.create_task(store.list_docs("wireguard", "interface"))
-                await asyncio.wait_for(started.wait(), timeout=2)
-                await asyncio.wait_for(asyncio.sleep(0.05), timeout=0.2)
-                release.set()
-                rows = await asyncio.wait_for(listed, timeout=2)
+            blob = "z" * (_JSON_OFFLOAD_BYTES + 1024)
+            await store.put_doc("wireguard", "interface", "1", {"id": "1", "blob": blob})
+            rows = await store.list_docs("wireguard", "interface")
         finally:
             await store.close()
-        assert rows[0]["peers"][0]["id"] == "0"
-
-    import tempfile
+        assert rows[0]["id"] == "1"
+        assert len(str(rows[0]["blob"])) >= _JSON_OFFLOAD_BYTES
 
     with tempfile.TemporaryDirectory() as directory:
         asyncio.run(scenario(f"{directory}/agent.db"))

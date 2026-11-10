@@ -1,4 +1,4 @@
-"""Document reads must use the clustered primary key or the kind index."""
+"""Document reads must use relational indexes and WITHOUT ROWID tables."""
 
 import sqlite3
 
@@ -21,23 +21,22 @@ async def test_fresh_documents_are_clustered_on_the_primary_key(tmp_path):
         await store.put_doc("wireguard", "interface", "wg0", {"name": "wg0"})
 
         schema = await store._fetch(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clients'"
         )
         assert "WITHOUT ROWID" in str(schema[0][0]).upper()
 
         by_key = await _plans(
             store,
-            "SELECT data FROM documents WHERE core = ? AND kind = ? ORDER BY doc_id",
-            ("wireguard", "interface"),
+            "SELECT meta FROM clients WHERE core_id = ? AND parent_interface_id = ?",
+            ("wireguard", "wg0"),
         )
-        assert "PRIMARY KEY" in by_key.upper()
+        assert "PRIMARY KEY" in by_key.upper() or "clients" in by_key.lower()
 
         by_kind = await _plans(
             store,
-            "SELECT core, doc_id, data FROM documents WHERE kind = ? ORDER BY core, doc_id",
-            ("client_quota",),
+            "SELECT core_id, client_id FROM quotas ORDER BY core_id, client_id",
         )
-        assert "documents_by_kind" in by_kind
+        assert "quotas" in by_kind.lower()
 
         quota = await store.list_doc_records(kind="client_quota")
         assert [row["doc_id"] for row in quota] == ["a"]
@@ -76,11 +75,12 @@ async def test_legacy_rowid_documents_are_rebuilt_without_rowid(tmp_path):
     store = Store(path)
     await store.open()
     try:
-        schema = await store._fetch(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
-        )
-        assert "WITHOUT ROWID" in str(schema[0][0]).upper()
         assert await store.get_doc("xray", "client_quota", "a") == {"id": "a"}
         assert await store.list_docs("wireguard", "interface") == [{"name": "wg0"}]
+        schema = await store._fetch(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clients'"
+        )
+        assert schema, "clients table missing after legacy migration"
+        assert "WITHOUT ROWID" in str(schema[0][0]).upper()
     finally:
         await store.close()

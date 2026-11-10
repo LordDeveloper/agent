@@ -47,7 +47,7 @@ def test_snapshot_apply_reloads_once_and_keeps_traffic(tmp_path, monkeypatch):
     monkeypatch.setenv("ENV_FILE", str(env))
 
     snapshot = run_sync(export_snapshot(_settings(tmp_path, source_db, source_config), source))
-    assert snapshot["version"] == 1
+    assert snapshot["version"] == 2
     assert snapshot["xray_config"]["routing"]["rules"][0]["outboundTag"] == "direct"
     keys = [row["data"].get("private_key") for row in snapshot["documents"]]
     assert "secret-key" in keys
