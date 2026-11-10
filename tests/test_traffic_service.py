@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.traffic.service import TrafficService
+from agent.traffic.service import PendingReadLocked, TrafficService
 
 
 class FakeDriver:
@@ -243,6 +245,43 @@ async def test_traffic_sample_writes_many_clients_in_one_plan(store):
     assert plans[1]["pending_upserts"] == []
     assert plans[1]["pending_deletes"] == []
     assert (await traffic.pending_payload())["users"] == {}
+
+
+async def test_pending_read_stays_locked_until_the_other_process_acks(store):
+    owner = TrafficService(store)
+    owner._pending_reader_id = "proc-a"
+    client = ClientUsageModel(id="locked-node", email="locked@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(owner, registry)
+    client.incoming = 500
+    await _sample(owner, registry)
+    payload = await owner.pending_payload()
+    assert payload["users"]["locked-node"]["downlink"] == 500
+
+    other = TrafficService(store)
+    other._pending_reader_id = "proc-b"
+    other._write_snapshot({
+        "stale-node": [{
+            "core": "xray",
+            "client_key": "stale-node",
+            "delta_incoming": 1,
+            "delta_outgoing": 0,
+            "current_incoming": 1,
+            "current_outgoing": 0,
+        }],
+    })
+
+    with pytest.raises(PendingReadLocked):
+        await other.pending_payload()
+
+    acked, not_found = await other.ack_clients(["locked-node"])
+    assert acked == ["locked-node"]
+    assert not_found == []
+
+    again = await other.pending_payload()
+    assert "locked-node" not in again["users"]
 
 
 async def test_ack_billed_amount_when_snapshot_is_missing_keeps_later_growth(store):

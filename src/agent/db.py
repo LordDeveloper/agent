@@ -179,6 +179,19 @@ class Store:
     async def set_meta(self, core: str, key: str, value: Any) -> None:
         await self._meta.set_meta(core, key, value)
 
+    async def delete_meta(self, core: str, key: str) -> None:
+        await self._meta.delete_meta(core, key)
+
+    async def claim_meta_lock(
+        self,
+        core: str,
+        key: str,
+        owner: str,
+        expires_at: float,
+        now: float,
+    ) -> bool:
+        return await self._meta.claim_meta_lock(core, key, owner, expires_at, now)
+
     async def list_doc_records(
         self,
         *,

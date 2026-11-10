@@ -31,6 +31,48 @@ class MetaService:
                 row.value = payload
             await session.commit()
 
+    async def delete_meta(self, core: str, key: str) -> None:
+        async with self._runtime.writing() as session:
+            await session.execute(
+                delete(CoreMeta).where(CoreMeta.core == core, CoreMeta.key == key)
+            )
+            await session.commit()
+
+    async def claim_meta_lock(
+        self,
+        core: str,
+        key: str,
+        owner: str,
+        expires_at: float,
+        now: float,
+    ) -> bool:
+        """Take a meta row unless a different owner still holds an unexpired claim."""
+        async with self._runtime.writing() as session:
+            row = await session.get(CoreMeta, (core, key))
+            current: Any = None
+            if row is not None:
+                try:
+                    current = await decode_json(row.value)
+                except (TypeError, json.JSONDecodeError):
+                    current = None
+            held_by = ""
+            held_until = 0.0
+            if isinstance(current, dict):
+                held_by = str(current.get("owner") or "")
+                try:
+                    held_until = float(current.get("expires_at") or 0)
+                except (TypeError, ValueError):
+                    held_until = 0.0
+            if held_by and held_by != owner and held_until > now:
+                return False
+            payload = await encode_json({"owner": owner, "expires_at": expires_at})
+            if row is None:
+                session.add(CoreMeta(core=core, key=key, value=payload))
+            else:
+                row.value = payload
+            await session.commit()
+            return True
+
     async def dump_meta(self) -> list[dict[str, Any]]:
         async with self._runtime.reading() as session:
             rows = (await session.execute(select(CoreMeta).order_by(CoreMeta.core, CoreMeta.key))).scalars().all()

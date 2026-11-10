@@ -6,7 +6,7 @@ from agent.asyncutil import maybe_await
 from agent.errors import AgentError, raise_agent_error
 from agent.registry import CoreRegistry
 from agent.routing import resolve_core_key
-from agent.traffic.service import TrafficService
+from agent.traffic.service import PendingReadLocked, TrafficService
 
 router = APIRouter(tags=["stats"])
 
@@ -172,7 +172,14 @@ async def stats_clients_traffic_pending(
       3. Panel bills those bytes, then POST ``/pending/ack`` with each
          client node_id so only growth after the GET snapshot remains queued.
     """
-    payload = await traffic.pending_payload()
+    try:
+        payload = await traffic.pending_payload()
+    except PendingReadLocked:
+        raise_agent_error(
+            "PENDING_LOCKED",
+            "pending was already read and is locked until those node ids are acked",
+            409,
+        )
 
     return {
         "success": True,

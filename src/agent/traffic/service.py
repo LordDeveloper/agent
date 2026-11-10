@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -17,9 +18,17 @@ log = get_logger("traffic")
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
+FETCH_LOCK_META_KEY = "traffic_fetch_lock"
+# How long a pending GET owns the snapshot. Another process cannot rebuild it
+# until ack, or until this window passes because the panel never acked.
+PENDING_READ_LOCK_SECONDS = 180.0
 # A volume sample may hold the worker exclusively for this long. After that
 # the next 15s tick cancels it and starts a new cycle.
 DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
+
+
+class PendingReadLocked(Exception):
+    """Another process already read pending and has not acked those node ids."""
 
 
 class TrafficService:
@@ -580,6 +589,40 @@ class TrafficService:
 
         return f"{FETCH_SNAPSHOT_META_KEY}:{current_scope()}"
 
+    def _pending_lock_meta_key(self) -> str:
+        from agent.auth_scope import current_scope
+
+        return f"{FETCH_LOCK_META_KEY}:{current_scope()}"
+
+    def _pending_reader_owner(self) -> str:
+        override = getattr(self, "_pending_reader_id", None)
+        if override:
+            return str(override)
+        return str(os.getpid())
+
+    async def _claim_pending_read(self) -> bool:
+        now = time.time()
+        return await self.store.claim_meta_lock(
+            AGENT_META_CORE,
+            self._pending_lock_meta_key(),
+            self._pending_reader_owner(),
+            now + PENDING_READ_LOCK_SECONDS,
+            now,
+        )
+
+    async def _pending_read_is_held(self) -> bool:
+        raw = await self.store.get_meta(AGENT_META_CORE, self._pending_lock_meta_key(), None)
+        if not isinstance(raw, dict):
+            return False
+        try:
+            expires_at = float(raw.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        return expires_at > time.time() and bool(str(raw.get("owner") or ""))
+
+    async def _release_pending_read(self) -> None:
+        await self.store.delete_meta(AGENT_META_CORE, self._pending_lock_meta_key())
+
     def _read_snapshot(self) -> dict[str, list[dict[str, Any]]]:
         from agent.auth_scope import current_scope
 
@@ -591,6 +634,8 @@ class TrafficService:
         self._fetch_snapshot[current_scope()] = snapshot
 
     async def pending_payload(self) -> dict[str, Any]:
+        if not await self._claim_pending_read():
+            raise PendingReadLocked()
         await self._load_persisted_aliases()
         rows = await self._without_absent_clients(await self.store.list_traffic_pending())
         users: dict[str, dict[str, Any]] = {}
@@ -618,6 +663,8 @@ class TrafficService:
 
         self._write_snapshot(snapshot)
         await self._persist_fetch_snapshot(snapshot)
+        if not users:
+            await self._release_pending_read()
 
         return {
             "sampled_at": await self.store.get_meta(
@@ -634,6 +681,7 @@ class TrafficService:
         acked = len(rows)
         self._write_snapshot({})
         await self.store.set_meta(AGENT_META_CORE, self._snapshot_meta_key(), [])
+        await self._release_pending_read()
 
         if acked:
             log.info("traffic ack applied clients=%s", acked)
@@ -662,7 +710,9 @@ class TrafficService:
             seen.add(label)
             requested.append(label)
 
-        if not self._read_snapshot():
+        # A different worker's memory snapshot is not the GET the panel billed.
+        # While the read lock is held, ack the snapshot that GET persisted.
+        if await self._pending_read_is_held() or not self._read_snapshot():
             await self._load_persisted_snapshot()
 
         acked: list[str] = []
@@ -690,6 +740,8 @@ class TrafficService:
 
         await self.store.ack_billed_snapshots(to_ack)
         await self._forget_acked_snapshot(to_ack)
+        if requested:
+            await self._release_pending_read()
         return acked, not_found
 
     async def _live_pending_index(self) -> dict[str, list[dict[str, Any]]]:
