@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.audit import AuditLog
+from agent.auth_scope import filter_visible, row_visible
 from agent.config import AgentSettings
 from agent.db import Store
 from agent.drivers.base import CoreDriver
@@ -1478,8 +1479,9 @@ class WireGuardDriver(CoreDriver):
         each parallel ``wg-quick`` call races nftables and lets one slow
         interface rewrite routes the others still own.
         """
-        ifaces = list(await self.list_interfaces())
-        by_id = {str(iface.get("id")): iface for iface in ifaces}
+        owned = filter_visible(list(await self.list_interfaces()), self.key)
+        all_ifaces = list(await self.list_interfaces())
+        by_id = {str(iface.get("id")): iface for iface in owned}
         limit, timeout = lifecycle_limits(self.settings)
 
         async def worker(interface_id: str, _interface_name: str, op: str) -> dict[str, Any]:
@@ -1489,7 +1491,7 @@ class WireGuardDriver(CoreDriver):
             return await self._bring_up(iface, sync_egress=False, hold_lock=False)
 
         report = await run_interface_operations(
-            [(str(iface.get("id")), str(iface.get("name") or "")) for iface in ifaces],
+            [(str(iface.get("id")), str(iface.get("name") or "")) for iface in owned],
             operation,
             worker,
             locks=self._iface_locks,
@@ -1497,7 +1499,7 @@ class WireGuardDriver(CoreDriver):
             timeout=timeout,
             logger=log,
         )
-        await self._reconcile_after_lifecycle(ifaces, list(report.get("results") or []), operation)
+        await self._reconcile_after_lifecycle(all_ifaces, list(report.get("results") or []), operation)
         return report
 
     async def _reconcile_after_lifecycle(
@@ -1541,7 +1543,7 @@ class WireGuardDriver(CoreDriver):
 
     async def peer_ips(self, email: str) -> list[str]:
         await self.sync_peer_stats()
-        for iface in await self.list_interfaces():
+        for iface in filter_visible(await self.list_interfaces(), self.key):
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     return recent_peer_ips(peer)
@@ -1574,7 +1576,7 @@ class WireGuardDriver(CoreDriver):
 
     async def clear_peer_ips(self, email: str) -> bool:
         changed = False
-        for iface in await self.list_interfaces():
+        for iface in filter_visible(await self.list_interfaces(), self.key):
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     peer["ip_logs"] = []
@@ -1641,7 +1643,7 @@ class WireGuardDriver(CoreDriver):
         return reset_peer
 
     async def backup(self) -> dict[str, Any]:
-        return {"interfaces": await self.list_interfaces(), "core": self.key}
+        return {"interfaces": filter_visible(await self.list_interfaces(), self.key), "core": self.key}
 
     async def restore(self, payload: dict[str, Any]) -> bool:
         """Replace interfaces in one apply per interface, not one apply per peer.
@@ -1655,7 +1657,7 @@ class WireGuardDriver(CoreDriver):
 
         total = len(interfaces)
         report_progress(0, total, f"{self.label}: {total} interface")
-        for existing in list(await self.list_interfaces()):
+        for existing in filter_visible(list(await self.list_interfaces()), self.key):
             await self.delete_interface(existing.get("id"))
         for index, row in enumerate(interfaces, start=1):
             peers = [peer for peer in (row.get("peers") or []) if isinstance(peer, dict)]
@@ -1711,9 +1713,11 @@ class WireGuardDriver(CoreDriver):
 
     async def get_interface(self, interface_id: int | str) -> dict[str, Any]:
         by_id = await self.store.get_doc(self.key, self._kind, str(interface_id))
-        if by_id:
+        if by_id and row_visible(self.key, by_id.get("scope")):
             return by_id
         for iface in await self.list_interfaces():
+            if not row_visible(self.key, iface.get("scope")):
+                continue
             if iface.get("name") == interface_id or str(iface.get("id")) == str(interface_id):
                 return iface
         raise AgentError("CONFIG_NOT_FOUND", f"Interface [{interface_id}] not found", 404)
@@ -2612,7 +2616,7 @@ class WireGuardDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_peer_stats()
         rows: list[InboundUsageModel] = []
-        for iface in await self.list_interfaces():
+        for iface in filter_visible(await self.list_interfaces(), self.key):
             clients = []
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
@@ -2646,7 +2650,7 @@ class WireGuardDriver(CoreDriver):
         companion = await live_linked_peer_keys(self.store)
         online: list[str] = []
         seen: set[str] = set()
-        for iface in await self.list_interfaces():
+        for iface in filter_visible(await self.list_interfaces(), self.key):
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
                     continue
@@ -2667,7 +2671,7 @@ class WireGuardDriver(CoreDriver):
         return await online_traffic_from_snapshot(self)
 
     async def sync_peer_stats(self) -> None:
-        ifaces = await self.list_interfaces()
+        ifaces = filter_visible(await self.list_interfaces(), self.key)
         dumps = await gather_independent(
             *(self._peer_dump(str(iface.get("name") or "")) for iface in ifaces)
         )

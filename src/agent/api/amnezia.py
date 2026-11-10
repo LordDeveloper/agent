@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.auth_scope import filter_visible
 from agent.support.egress_tasks import tunnel_provisioning
 
 
@@ -45,7 +46,7 @@ async def status(amnezia: AmneziaDriver = Depends(get_amnezia)):
 
 @router.get("/interfaces")
 async def list_interfaces(amnezia: AmneziaDriver = Depends(get_amnezia)):
-    return {"success": True, "interfaces": await amnezia.list_interfaces()}
+    return {"success": True, "interfaces": filter_visible(await amnezia.list_interfaces(), "amnezia")}
 
 
 @router.post("/interfaces")

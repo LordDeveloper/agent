@@ -17,6 +17,7 @@ import aiofiles
 import aiofiles.os
 
 from agent.audit import AuditLog
+from agent.auth_scope import DEFAULT_SCOPE, current_scope, scope_is_enforced
 from agent.config import AgentSettings, XraySettings
 from agent.db import Store
 from agent.drivers.base import CoreDriver
@@ -917,15 +918,35 @@ class XrayDriver(CoreDriver):
         except AgentError:
             copied = None
         if copied is not None:
+            await self._require_visible_inbound(copied)
             return copied
         for row in await self._api_call("list_inbounds", ):
             if not isinstance(row, dict):
                 continue
             if self._row_matches_inbound_id(row, inbound_id, tag):
-                if include_clients:
-                    return self._normalize(row)
-                return self._shell_from_row(row)
+                inbound = self._normalize(row) if include_clients else self._shell_from_row(row)
+                await self._require_visible_inbound(inbound)
+                return inbound
         raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound_id}] not found", 404)
+
+    async def _require_visible_inbound(self, inbound: dict[str, Any]) -> None:
+        if not scope_is_enforced("xray"):
+            return
+        tag = str(inbound.get("tag") or "")
+        scope = await self.store.resource_scope("xray", "inbound", tag)
+        if scope != current_scope():
+            raise AgentError("CONFIG_NOT_FOUND", f"Inbound [{inbound.get('id')}] not found", 404)
+
+    async def visible_inbounds(self, inbounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not scope_is_enforced("xray"):
+            return inbounds
+        scopes = await self.store.resource_scope_map("xray", "inbound")
+        owner = current_scope()
+        return [
+            row
+            for row in inbounds
+            if isinstance(row, dict) and scopes.get(str(row.get("tag") or ""), DEFAULT_SCOPE) == owner
+        ]
 
     async def _copy_inbound_from_disk(
         self,
@@ -1293,6 +1314,7 @@ class XrayDriver(CoreDriver):
             await self._api_call("add_inbounds", [api_payload])
         finally:
             await self._resume_proxy_forwarders()
+        await self.store.bind_resource_scope("xray", "inbound", str(inbound.get("tag") or ""))
         await self.audit.record("create", f"xray/inbound/{inbound_id}")
         return await self.get_inbound(inbound_id)
 
@@ -1380,6 +1402,7 @@ class XrayDriver(CoreDriver):
             await self._api_call("remove_inbounds", [str(inbound.get("tag"))])
         finally:
             await self._resume_proxy_forwarders()
+        await self.store.delete_resource_scope("xray", "inbound", str(inbound.get("tag") or ""))
         await self.audit.record("delete", f"xray/inbound/{inbound_id}")
         return True
 
@@ -3066,16 +3089,18 @@ class XrayDriver(CoreDriver):
             self._api_call("list_rules"),
         )
         return {
-            "inbounds": inbounds,
+            "inbounds": await self.visible_inbounds(inbounds),
             "outbounds": outbounds,
             "rules": rules,
         }
 
     async def restore(self, payload: dict[str, Any]) -> bool:
         desired = list(payload.get("inbounds") or [])
-        existing = await self.list_inbounds()
+        existing = await self.visible_inbounds(await self.list_inbounds())
         if existing:
             await self._api_call("remove_inbounds", [str(i.get("tag")) for i in existing if i.get("tag")])
+            for row in existing:
+                await self.store.delete_resource_scope("xray", "inbound", str(row.get("tag") or ""))
         cleaned = []
         for row in desired:
             item = deepcopy(row)
@@ -3085,6 +3110,8 @@ class XrayDriver(CoreDriver):
             cleaned.append(self._wire_inbound(item))
         if cleaned:
             await self._api_call("add_inbounds", cleaned)
+            for row in cleaned:
+                await self.store.bind_resource_scope("xray", "inbound", str(row.get("tag") or ""))
         if payload.get("outbounds"):
             try:
                 await self._api_call("add_outbounds", list(payload["outbounds"]))
@@ -3102,9 +3129,34 @@ class XrayDriver(CoreDriver):
         binary = self._binary()
         if binary:
             await validate_xray_config(binary, config)
+        foreign = await self._foreign_inbounds()
         result = await self._api_call("import_config", config, path=path)
+        if foreign:
+            latest = await self.read_config()
+            tags = {str(row.get("tag") or "") for row in foreign}
+            latest["inbounds"] = [
+                row
+                for row in latest.get("inbounds") or []
+                if isinstance(row, dict) and str(row.get("tag") or "") not in tags
+            ] + foreign
+            await self.apply_config(latest)
         await self.audit.record("import", "xray/config")
         return result
+
+    async def _foreign_inbounds(self) -> list[dict[str, Any]]:
+        if not scope_is_enforced("xray"):
+            return []
+        try:
+            current = await self.read_config()
+        except AgentError:
+            return []
+        scopes = await self.store.resource_scope_map("xray", "inbound")
+        owner = current_scope()
+        return [
+            row
+            for row in current.get("inbounds") or []
+            if isinstance(row, dict) and scopes.get(str(row.get("tag") or ""), DEFAULT_SCOPE) != owner
+        ]
 
     async def x25519(self) -> dict[str, str]:
         binary = self._binary()
@@ -3192,6 +3244,30 @@ class XrayDriver(CoreDriver):
     async def dumped_config(self) -> dict[str, Any]:
         return redact_secrets(await self.read_config())
 
+    async def _keep_foreign_inbounds(self, payload: dict[str, Any], current: dict[str, Any]) -> None:
+        """A token may replace its own inbounds. The other token's inbounds stay on disk."""
+        if not scope_is_enforced("xray"):
+            return
+        scopes = await self.store.resource_scope_map("xray", "inbound")
+        owner = current_scope()
+        foreign: list[dict[str, Any]] = []
+        foreign_tags: set[str] = set()
+        for row in current.get("inbounds") or []:
+            if not isinstance(row, dict):
+                continue
+            tag = str(row.get("tag") or "")
+            if scopes.get(tag, DEFAULT_SCOPE) == owner:
+                continue
+            foreign.append(row)
+            if tag:
+                foreign_tags.add(tag)
+        kept = [
+            row
+            for row in payload.get("inbounds") or []
+            if isinstance(row, dict) and str(row.get("tag") or "") not in foreign_tags
+        ]
+        payload["inbounds"] = kept + foreign
+
     async def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(config, dict) or not config:
             raise AgentError("VALIDATION_ERROR", "Xray config must be a non-empty object", 422)
@@ -3217,6 +3293,7 @@ class XrayDriver(CoreDriver):
 
         normalize_xray_config_shapes(payload)
         ensure_traffic_stats_in_config(payload)
+        await self._keep_foreign_inbounds(payload, current)
 
         binary = self._binary()
         if binary:
@@ -3574,17 +3651,29 @@ class XrayDriver(CoreDriver):
         interval = float(getattr(self.settings, "traffic_sample_interval", 15.0) or 15.0)
         return max(3.0, interval / 2.0)
 
+    async def _clip_usage_snapshot(self, snapshot: UsageSnapshotModel) -> UsageSnapshotModel:
+        if not scope_is_enforced("xray"):
+            return snapshot
+        scopes = await self.store.resource_scope_map("xray", "inbound")
+        owner = current_scope()
+        kept = [
+            row
+            for row in snapshot.inbounds
+            if str(row.tag or "") != "stats" and scopes.get(str(row.tag or ""), DEFAULT_SCOPE) == owner
+        ]
+        return snapshot.model_copy(update={"inbounds": kept})
+
     async def usage_snapshot(self) -> UsageSnapshotModel:
         max_age = self._usage_cache_max_age()
         cached = self.cached_usage_snapshot(max_age)
         if cached is not None:
-            return cached
+            return await self._clip_usage_snapshot(cached)
         if self._usage_gate is None:
             self._usage_gate = asyncio.Lock()
         async with self._usage_gate:
             cached = self.cached_usage_snapshot(max_age)
             if cached is not None:
-                return cached
+                return await self._clip_usage_snapshot(cached)
             flight = self._usage_flight
             if flight is None or flight.done():
                 flight = asyncio.create_task(self._load_usage_snapshot())
@@ -3592,7 +3681,7 @@ class XrayDriver(CoreDriver):
                 self._usage_waiters = 0
             self._usage_waiters += 1
         try:
-            return await flight
+            return await self._clip_usage_snapshot(await flight)
         finally:
             if self._usage_gate is not None:
                 async with self._usage_gate:
@@ -3710,7 +3799,25 @@ class XrayDriver(CoreDriver):
             return []
         users = await self._api_call("online_users", )
         alias = await self._client_email_aliases()
-        return [alias.get(str(item), str(item)) for item in users]
+        names = [alias.get(str(item), str(item)) for item in users]
+        allowed = await self._visible_client_labels()
+        if allowed is None:
+            return names
+        return [item for item in names if item in allowed]
+
+    async def _visible_client_labels(self) -> set[str] | None:
+        if not scope_is_enforced("xray"):
+            return None
+        allowed: set[str] = set()
+        for inbound in await self.visible_inbounds(await self.list_inbounds()):
+            for client in (inbound.get("settings") or {}).get("clients") or []:
+                if not isinstance(client, dict):
+                    continue
+                for key in (client.get("email"), client.get("id"), client.get("node_id")):
+                    label = str(key or "").strip()
+                    if label:
+                        allowed.add(label)
+        return allowed
 
     async def online_ips_map(self) -> dict[str, Any]:
         if not await self.running():
@@ -3743,7 +3850,10 @@ class XrayDriver(CoreDriver):
             cid = alias.get(email)
             if cid and cid != email:
                 out[cid] = ips
-        return out
+        allowed = await self._visible_client_labels()
+        if allowed is None:
+            return out
+        return {key: value for key, value in out.items() if key in allowed}
 
     async def _online_ips_map_from_iplist(self) -> dict[str, Any]:
         """Fallback when GET /api/stats/online/all is missing (localhost iplist loop)."""
@@ -3786,7 +3896,10 @@ class XrayDriver(CoreDriver):
             cid = alias.get(email)
             if cid and cid != email:
                 out[cid] = ips
-        return out
+        allowed = await self._visible_client_labels()
+        if allowed is None:
+            return out
+        return {key: value for key, value in out.items() if key in allowed}
 
     async def _usage_identity_rows(self) -> list[tuple[Any, str, list[tuple[str, str]]]]:
         config = await self._cached_config()

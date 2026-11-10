@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.audit import AuditLog
+from agent.auth_scope import filter_visible, row_visible
 from agent.config import AgentSettings
 from agent.db import Store
 from agent.drivers.base import CoreDriver
@@ -218,7 +219,7 @@ class OpenVpnDriver(CoreDriver):
         )
 
     async def enable(self) -> dict[str, Any]:
-        servers = await self.list_servers()
+        servers = filter_visible(await self.list_servers(), self.key)
         # Transfer enables the core before the snapshot lands. An empty store
         # is not a failure; reload starts the units once servers exist.
         if not servers:
@@ -229,17 +230,17 @@ class OpenVpnDriver(CoreDriver):
                 'running': False,
             }
         await self._apply_all_configs()
-        units = await self._ensure_services(start=True)
+        units = await self._ensure_services(start=True, only_ids=[row.get('id') for row in servers])
         await self._sync_peer_egress()
         return {
             'enabled': True,
-            'servers': len(await self.list_servers()),
+            'servers': len(servers),
             'units': units,
             'running': await self.running(),
         }
 
     async def disable(self) -> dict[str, Any]:
-        servers = await self.list_servers()
+        servers = filter_visible(await self.list_servers(), self.key)
         if not servers:
             return {'enabled': False, 'ok': True, 'units': [], 'summary': {'total': 0, 'successful': 0, 'failed': 0, 'timed_out': 0}}
         limit, timeout = lifecycle_limits(self.settings)
@@ -275,7 +276,7 @@ class OpenVpnDriver(CoreDriver):
         }
 
     async def restart(self) -> dict[str, Any]:
-        servers = await self.list_servers()
+        servers = filter_visible(await self.list_servers(), self.key)
         if not servers:
             return {
                 'restarted': True,
@@ -284,7 +285,11 @@ class OpenVpnDriver(CoreDriver):
                 'running': False,
             }
         await self._apply_all_configs()
-        units = await self._ensure_services(start=True, restart=True)
+        units = await self._ensure_services(
+            start=True,
+            restart=True,
+            only_ids=[row.get('id') for row in servers],
+        )
         return {'restarted': True, 'units': units, 'running': await self.running()}
 
     async def list_servers(self) -> list[dict[str, Any]]:
@@ -293,9 +298,11 @@ class OpenVpnDriver(CoreDriver):
 
     async def get_server(self, server_id: int | str) -> dict[str, Any]:
         doc = await self.store.get_doc(self.key, self._kind, str(server_id))
-        if doc:
+        if doc and row_visible(self.key, doc.get('scope')):
             return self._with_live_pki(doc)
         for row in await self.list_servers():
+            if not row_visible(self.key, row.get('scope')):
+                continue
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
                 return self._with_live_pki(row)
         raise AgentError('CONFIG_NOT_FOUND', f'OpenVPN server [{server_id}] not found', 404)
@@ -1047,7 +1054,7 @@ class OpenVpnDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
         rows: list[InboundUsageModel] = []
-        for server in await self.list_servers():
+        for server in filter_visible(await self.list_servers(), self.key):
             clients = []
             for user in server.get('users') or []:
                 if not record_is_enabled(user):
@@ -1077,7 +1084,7 @@ class OpenVpnDriver(CoreDriver):
         await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
-        for server in await self.list_servers():
+        for server in filter_visible(await self.list_servers(), self.key):
             for user in server.get('users') or []:
                 if not user.get('online') or not record_is_enabled(user):
                     continue
@@ -1190,13 +1197,13 @@ class OpenVpnDriver(CoreDriver):
             return None
 
     async def backup(self) -> dict[str, Any]:
-        return {'servers': await self.list_servers()}
+        return {'servers': filter_visible(await self.list_servers(), self.key)}
 
     async def restore(self, payload: dict[str, Any]) -> None:
         servers = payload.get('servers') if isinstance(payload, dict) else None
         if not isinstance(servers, list):
             raise AgentError('VALIDATION_ERROR', 'backup.servers must be a list', 422)
-        for row in list(await self.list_servers()):
+        for row in filter_visible(list(await self.list_servers()), self.key):
             await self.store.delete_doc(self.key, self._kind, str(row.get('id')))
         for row in servers:
             if not isinstance(row, dict) or row.get('id') is None:

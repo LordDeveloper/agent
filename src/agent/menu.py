@@ -1917,7 +1917,8 @@ def _create_server_token() -> None:
     _print(kv("Scope", str(created.get("id") or ""), CYAN))
     _print(kv("Token", str(created.get("token") or secret), YELLOW))
     _print(paint("  Put this token on that server in the panel.", DIM))
-    _print(paint("  Clients created with it keep their own pending queue.", DIM))
+    _print(paint("  Existing clients and inbounds stay on the .env token.", DIM))
+    _print(paint("  Mullvad exits stay one shared set and are not stored per token.", DIM))
     _print(paint("  Restart is not required.", DIM))
 
 

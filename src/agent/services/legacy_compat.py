@@ -38,6 +38,7 @@ def assemble_server(config: dict[str, Any], users: list[dict[str, Any]]) -> dict
 
 def split_interface_document(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     payload = dict(data)
+    payload.pop("scope", None)
     peers_raw = payload.pop("peers", None)
     peers = [dict(item) for item in peers_raw if isinstance(item, dict)] if isinstance(peers_raw, list) else []
     return payload, peers
@@ -45,6 +46,7 @@ def split_interface_document(data: dict[str, Any]) -> tuple[dict[str, Any], list
 
 def split_server_document(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     payload = dict(data)
+    payload.pop("scope", None)
     users_raw = payload.pop("users", None)
     users = [dict(item) for item in users_raw if isinstance(item, dict)] if isinstance(users_raw, list) else []
     return payload, users

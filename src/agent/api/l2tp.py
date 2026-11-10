@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.auth_scope import filter_visible
 from agent.support.bandwidth import with_provisioning
 from agent.drivers.l2tp import L2tpDriver
 from agent.errors import AgentError, raise_agent_error
@@ -41,7 +42,7 @@ async def status(l2tp: L2tpDriver = Depends(get_l2tp)):
 
 @router.get('/servers')
 async def list_servers(l2tp: L2tpDriver = Depends(get_l2tp)):
-    return {'success': True, 'servers': await l2tp.list_servers()}
+    return {'success': True, 'servers': filter_visible(await l2tp.list_servers(), 'l2tp')}
 
 
 @router.post('/servers')

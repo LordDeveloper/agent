@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.auth_scope import filter_visible
 from agent.support.egress_tasks import tunnel_provisioning as with_provisioning
 from agent.drivers.wireguard import WireGuardDriver
 from agent.errors import AgentError, raise_agent_error
@@ -41,7 +42,7 @@ async def status(wg: WireGuardDriver = Depends(get_wg)):
 
 @router.get("/interfaces")
 async def list_interfaces(wg: WireGuardDriver = Depends(get_wg)):
-    return {"success": True, "interfaces": await wg.list_interfaces()}
+    return {"success": True, "interfaces": filter_visible(await wg.list_interfaces(), "wireguard")}
 
 
 @router.post("/interfaces")

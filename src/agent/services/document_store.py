@@ -5,15 +5,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import delete, or_, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
-from agent.auth_scope import DEFAULT_SCOPE, current_scope
+from agent.auth_scope import DEFAULT_SCOPE, SHARED_CORES, current_scope, row_visible, storage_scope
 from agent.database.json_codec import decode_json, encode_json
 from agent.database.models.client import Client, PARENT_INTERFACE, PARENT_SERVER
 from agent.database.models.core import Core
 from agent.database.models.core_artifact import CoreArtifact
 from agent.database.models.interface import Interface
 from agent.database.models.quota import Quota
+from agent.database.models.resource_scope import ResourceScope
 from agent.database.models.server import Server
 from agent.database.session import DatabaseRuntime
 from agent.services.legacy_compat import (
@@ -72,19 +74,23 @@ class DocumentStore:
     async def _save_interface(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
         config, peers = split_interface_document(data)
         iface = await session.get(Interface, (core, doc_id))
+        if iface is not None and not row_visible(core, iface.scope):
+            return
         if iface is None:
-            iface = Interface(core_id=core, id=doc_id, config=config, updated_at=_now())
+            iface = Interface(
+                core_id=core,
+                id=doc_id,
+                scope=storage_scope(core),
+                config=config,
+                updated_at=_now(),
+            )
             session.add(iface)
         else:
+            if str(core) in SHARED_CORES:
+                iface.scope = DEFAULT_SCOPE
             iface.config = config
             iface.updated_at = _now()
         await session.flush()
-        kept_scopes = await self._scopes_for_parent(
-            session,
-            core=core,
-            parent_type=PARENT_INTERFACE,
-            parent_id=doc_id,
-        )
         await session.execute(
             delete(Client).where(
                 Client.core_id == core,
@@ -93,7 +99,6 @@ class DocumentStore:
             )
         )
         for peer in peers:
-            peer_id = str(peer.get("node_id") or peer.get("id") or "")
             await self._upsert_member(
                 session,
                 core=core,
@@ -102,25 +107,29 @@ class DocumentStore:
                 parent_core=core,
                 parent_id=doc_id,
                 role="peer",
-                scope=kept_scopes.get(peer_id),
+                scope=iface.scope,
             )
 
     async def _save_server(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
         config, users = split_server_document(data)
         server = await session.get(Server, (core, doc_id))
+        if server is not None and not row_visible(core, server.scope):
+            return
         if server is None:
-            server = Server(core_id=core, id=doc_id, config=config, updated_at=_now())
+            server = Server(
+                core_id=core,
+                id=doc_id,
+                scope=storage_scope(core),
+                config=config,
+                updated_at=_now(),
+            )
             session.add(server)
         else:
+            if str(core) in SHARED_CORES:
+                server.scope = DEFAULT_SCOPE
             server.config = config
             server.updated_at = _now()
         await session.flush()
-        kept_scopes = await self._scopes_for_parent(
-            session,
-            core=core,
-            parent_type=PARENT_SERVER,
-            parent_id=doc_id,
-        )
         await session.execute(
             delete(Client).where(
                 Client.core_id == core,
@@ -129,7 +138,6 @@ class DocumentStore:
             )
         )
         for user in users:
-            user_id = str(user.get("node_id") or user.get("id") or "")
             await self._upsert_member(
                 session,
                 core=core,
@@ -138,24 +146,8 @@ class DocumentStore:
                 parent_core=core,
                 parent_id=doc_id,
                 role="user",
-                scope=kept_scopes.get(user_id),
+                scope=server.scope,
             )
-
-    async def _scopes_for_parent(self, session, *, core: str, parent_type: str, parent_id: str) -> dict[str, str]:
-        if parent_type == PARENT_INTERFACE:
-            stmt = select(Client).where(
-                Client.core_id == core,
-                Client.parent_interface_core_id == core,
-                Client.parent_interface_id == parent_id,
-            )
-        else:
-            stmt = select(Client).where(
-                Client.core_id == core,
-                Client.parent_server_core_id == core,
-                Client.parent_server_id == parent_id,
-            )
-        rows = (await session.execute(stmt)).scalars().all()
-        return {str(row.id): str(row.scope or DEFAULT_SCOPE) for row in rows}
 
     async def _member_id(self, member: dict[str, Any], *, fallback: str = "") -> str:
         return str(member.get("node_id") or member.get("id") or fallback or "").strip()
@@ -218,12 +210,14 @@ class DocumentStore:
                 disabled_reason=str(member.get("disabled_reason") or "").strip() or None,
                 disabled_at=str(member.get("disabled_at") or "").strip() or None,
                 role=role,
-                scope=str(scope or "").strip() or current_scope(),
+                scope=str(scope or "").strip() or storage_scope(core),
                 meta=meta,
                 updated_at=_now(),
             )
             session.add(row)
         else:
+            if not row_visible(core, row.scope):
+                return
             row.parent_type = parent_type
             row.parent_interface_core_id = parent_core if parent_type == PARENT_INTERFACE else None
             row.parent_interface_id = parent_id if parent_type == PARENT_INTERFACE else None
@@ -241,6 +235,9 @@ class DocumentStore:
     async def _save_quota_doc(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
         client_id = str(doc_id or data.get("node_id") or data.get("id") or "").strip()
         if not client_id:
+            return
+        existing = await session.get(Client, (core, client_id))
+        if existing is not None and not row_visible(core, existing.scope):
             return
         quota_meta = {
             k: v
@@ -313,6 +310,9 @@ class DocumentStore:
             row.updated_at = _now()
 
     async def _save_disabled(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
+        existing = await session.get(Client, (core, str(doc_id)))
+        if existing is not None and not row_visible(core, existing.scope):
+            return
         payload = dict(data)
         payload["is_enabled"] = False
         await self._upsert_member(
@@ -345,7 +345,10 @@ class DocumentStore:
         async with self._runtime.writing() as session:
             removed = False
             if kind == "interface":
-                removed = (await session.get(Interface, (core, str(doc_id)))) is not None
+                iface = await session.get(Interface, (core, str(doc_id)))
+                if iface is None or not row_visible(core, iface.scope):
+                    return False
+                removed = True
                 await session.execute(delete(Interface).where(Interface.core_id == core, Interface.id == str(doc_id)))
                 await session.execute(
                     delete(Client).where(
@@ -355,7 +358,10 @@ class DocumentStore:
                     )
                 )
             elif kind == "server":
-                removed = (await session.get(Server, (core, str(doc_id)))) is not None
+                server = await session.get(Server, (core, str(doc_id)))
+                if server is None or not row_visible(core, server.scope):
+                    return False
+                removed = True
                 await session.execute(delete(Server).where(Server.core_id == core, Server.id == str(doc_id)))
                 await session.execute(
                     delete(Client).where(
@@ -365,11 +371,17 @@ class DocumentStore:
                     )
                 )
             elif kind == QUOTA_KIND:
+                client = await session.get(Client, (core, str(doc_id)))
+                if client is not None and not row_visible(core, client.scope):
+                    return False
                 removed = (await session.get(Quota, (core, str(doc_id)))) is not None
                 await session.execute(delete(Quota).where(Quota.core_id == core, Quota.client_id == str(doc_id)))
                 await session.execute(delete(Client).where(Client.core_id == core, Client.id == str(doc_id)))
             elif kind == DISABLED_KIND:
-                removed = (await session.get(Client, (core, str(doc_id)))) is not None
+                client = await session.get(Client, (core, str(doc_id)))
+                if client is None or not row_visible(core, client.scope):
+                    return False
+                removed = True
                 await session.execute(delete(Client).where(Client.core_id == core, Client.id == str(doc_id)))
             else:
                 removed = (await session.get(CoreArtifact, (core, kind, str(doc_id)))) is not None
@@ -430,7 +442,9 @@ class DocumentStore:
                     )
                 ).scalars().all()
                 peers = [client_row_to_member(row) for row in rows]
-                return assemble_interface(dict(iface.config or {}), peers)
+                doc = assemble_interface(dict(iface.config or {}), peers)
+                doc["scope"] = str(iface.scope or DEFAULT_SCOPE)
+                return doc
             if kind == "server":
                 server = await session.get(Server, (core, str(doc_id)))
                 if server is None:
@@ -445,7 +459,9 @@ class DocumentStore:
                     )
                 ).scalars().all()
                 users = [client_row_to_member(row) for row in rows]
-                return assemble_server(dict(server.config or {}), users)
+                doc = assemble_server(dict(server.config or {}), users)
+                doc["scope"] = str(server.scope or DEFAULT_SCOPE)
+                return doc
             if kind == QUOTA_KIND:
                 row = await session.get(Quota, (core, str(doc_id)))
                 if row is None:
@@ -477,7 +493,9 @@ class DocumentStore:
                             )
                         )
                     ).scalars().all()
-                    docs.append(assemble_interface(dict(iface.config or {}), [client_row_to_member(p) for p in peers]))
+                    doc = assemble_interface(dict(iface.config or {}), [client_row_to_member(p) for p in peers])
+                    doc["scope"] = str(iface.scope or DEFAULT_SCOPE)
+                    docs.append(doc)
                 return docs
             if kind == "server":
                 rows = (
@@ -493,7 +511,9 @@ class DocumentStore:
                             )
                         )
                     ).scalars().all()
-                    docs.append(assemble_server(dict(server.config or {}), [client_row_to_member(u) for u in users]))
+                    doc = assemble_server(dict(server.config or {}), [client_row_to_member(u) for u in users])
+                    doc["scope"] = str(server.scope or DEFAULT_SCOPE)
+                    docs.append(doc)
                 return docs
             if kind == QUOTA_KIND:
                 rows = (
@@ -621,6 +641,8 @@ class DocumentStore:
             matched: set[str] = set()
             stmt = select(Client).where(Client.id.in_(cleaned))
             for row in (await session.execute(stmt)).scalars().all():
+                if not row_visible(row.core_id, row.scope):
+                    continue
                 matched.add(row.id)
                 kind = "peer" if row.parent_type == PARENT_INTERFACE else "user"
                 if row.role == "quota":
@@ -643,6 +665,9 @@ class DocumentStore:
             quota_stmt = select(Quota).where(Quota.client_id.in_(cleaned))
             for row in (await session.execute(quota_stmt)).scalars().all():
                 if row.client_id in matched:
+                    continue
+                owner = await session.get(Client, (row.core_id, row.client_id))
+                if owner is not None and not row_visible(owner.core_id, owner.scope):
                     continue
                 matched.add(row.client_id)
                 found.append({
@@ -667,6 +692,8 @@ class DocumentStore:
             or_(Client.id.in_(wanted), Client.email.in_(wanted)),
         )
         for row in (await session.execute(stmt)).scalars().all():
+            if not row_visible(row.core_id, row.scope):
+                continue
             key = row.id
             if key not in wanted or key in seen:
                 continue
@@ -762,6 +789,69 @@ class DocumentStore:
                     "data": dict(item.data or {}),
                 })
         return rows
+
+    async def bind_resource_scope(
+        self,
+        core: str,
+        kind: str,
+        resource_id: str,
+        scope: str | None = None,
+    ) -> None:
+        resource_id = str(resource_id or "").strip()
+        if not resource_id:
+            return
+        owner = str(scope or "").strip() or current_scope()
+        try:
+            async with self._runtime.writing() as session:
+                row = await session.get(ResourceScope, (core, kind, resource_id))
+                if row is None:
+                    session.add(
+                        ResourceScope(core_id=core, kind=kind, resource_id=resource_id, scope=owner)
+                    )
+                else:
+                    row.scope = owner
+                await session.commit()
+        except OperationalError:
+            return
+
+    async def resource_scope(self, core: str, kind: str, resource_id: str) -> str:
+        try:
+            async with self._runtime.reading() as session:
+                row = await session.get(ResourceScope, (core, kind, str(resource_id)))
+            if row is None:
+                return DEFAULT_SCOPE
+            return str(row.scope or DEFAULT_SCOPE)
+        except OperationalError:
+            return DEFAULT_SCOPE
+
+    async def resource_scope_map(self, core: str, kind: str) -> dict[str, str]:
+        try:
+            async with self._runtime.reading() as session:
+                rows = (
+                    await session.execute(
+                        select(ResourceScope).where(
+                            ResourceScope.core_id == core,
+                            ResourceScope.kind == kind,
+                        )
+                    )
+                ).scalars().all()
+            return {str(row.resource_id): str(row.scope or DEFAULT_SCOPE) for row in rows}
+        except OperationalError:
+            return {}
+
+    async def delete_resource_scope(self, core: str, kind: str, resource_id: str) -> None:
+        try:
+            async with self._runtime.writing() as session:
+                await session.execute(
+                    delete(ResourceScope).where(
+                        ResourceScope.core_id == core,
+                        ResourceScope.kind == kind,
+                        ResourceScope.resource_id == str(resource_id),
+                    )
+                )
+                await session.commit()
+        except OperationalError:
+            return
 
     async def dump_documents(self) -> list[dict[str, Any]]:
         return await self.list_doc_records()

@@ -4,7 +4,7 @@ from collections import defaultdict
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 
-from agent.auth_scope import DEFAULT_SCOPE, set_current_scope
+from agent.auth_scope import DEFAULT_SCOPE, set_current_scope, set_request_isolation
 from agent.config import AgentSettings
 from agent.errors import error_body
 from agent.logutil import get_logger
@@ -54,12 +54,14 @@ async def verify_auth(
         if bearer and bearer.credentials:
             if token and bearer.credentials == token:
                 set_current_scope(DEFAULT_SCOPE)
+                set_request_isolation(True)
                 _clear_failures(client_key)
                 return
             store = getattr(request.app.state, "store", None)
             scope = await store.scope_for_token(bearer.credentials) if store is not None else None
             if scope:
                 set_current_scope(scope)
+                set_request_isolation(True)
                 _clear_failures(client_key)
                 return
             _record_failure(client_key)
@@ -69,6 +71,7 @@ async def verify_auth(
         if basic and settings.auth_username and settings.auth_password:
             if basic.username == settings.auth_username and basic.password == settings.auth_password:
                 set_current_scope(DEFAULT_SCOPE)
+                set_request_isolation(True)
                 _clear_failures(client_key)
                 return
             _record_failure(client_key)

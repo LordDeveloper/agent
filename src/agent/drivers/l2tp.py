@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.audit import AuditLog
+from agent.auth_scope import filter_visible, row_visible, scope_is_enforced
 from agent.config import AgentSettings
 from agent.db import Store
 from agent.drivers.base import CoreDriver
@@ -213,6 +214,13 @@ class L2tpDriver(CoreDriver):
         await self._sync_peer_egress(drop_keys=drop_keys)
 
     async def disable(self) -> dict[str, Any]:
+        if scope_is_enforced(self.key):
+            hidden = [
+                row for row in await self.list_servers()
+                if not row_visible(self.key, row.get('scope'))
+            ]
+            if hidden:
+                return {'enabled': True, 'shared': True}
         await run(['systemctl', 'stop', 'xl2tpd'], check=False, timeout=30)
         return {'enabled': False}
 
@@ -226,9 +234,11 @@ class L2tpDriver(CoreDriver):
 
     async def get_server(self, server_id: int | str) -> dict[str, Any]:
         doc = await self.store.get_doc(self.key, self._kind, str(server_id))
-        if doc:
+        if doc and row_visible(self.key, doc.get('scope')):
             return doc
         for row in await self.list_servers():
+            if not row_visible(self.key, row.get('scope')):
+                continue
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
                 return row
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
@@ -891,7 +901,7 @@ class L2tpDriver(CoreDriver):
     async def usage_snapshot(self) -> UsageSnapshotModel:
         await self.sync_user_stats()
         rows: list[InboundUsageModel] = []
-        for server in await self.list_servers():
+        for server in filter_visible(await self.list_servers(), self.key):
             clients = []
             for user in server.get('users') or []:
                 if not record_is_enabled(user):
@@ -924,7 +934,7 @@ class L2tpDriver(CoreDriver):
         await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
-        for server in await self.list_servers():
+        for server in filter_visible(await self.list_servers(), self.key):
             for user in server.get('users') or []:
                 if not user.get('online') or not record_is_enabled(user):
                     continue
@@ -1041,13 +1051,13 @@ class L2tpDriver(CoreDriver):
         return None
 
     async def backup(self) -> dict[str, Any]:
-        return {'servers': await self.list_servers()}
+        return {'servers': filter_visible(await self.list_servers(), self.key)}
 
     async def restore(self, payload: dict[str, Any]) -> None:
         servers = payload.get('servers')
         if not isinstance(servers, list):
             raise AgentError('VALIDATION_ERROR', 'backup.servers must be a list', 422)
-        for row in await self.store.list_docs(self.key, self._kind):
+        for row in filter_visible(await self.store.list_docs(self.key, self._kind), self.key):
             await self.store.delete_doc(self.key, self._kind, str(row.get('id')))
         for server in servers:
             if isinstance(server, dict) and server.get('id') is not None:

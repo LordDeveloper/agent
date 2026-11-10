@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 
 from agent.api.lifecycle import attach_lifecycle, health_payload
+from agent.auth_scope import filter_visible
 from agent.support.bandwidth import with_provisioning
 from agent.drivers.openvpn import OpenVpnDriver
 from agent.errors import AgentError, raise_agent_error
@@ -36,7 +37,7 @@ async def status(openvpn: OpenVpnDriver = Depends(get_openvpn)):
 
 @router.get('/servers')
 async def list_servers(openvpn: OpenVpnDriver = Depends(get_openvpn)):
-    return {'success': True, 'servers': await openvpn.list_servers()}
+    return {'success': True, 'servers': filter_visible(await openvpn.list_servers(), 'openvpn')}
 
 
 @router.post('/servers')

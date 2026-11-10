@@ -16,6 +16,7 @@ class Interface(Base):
         primary_key=True,
     )
     id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, default="default", server_default="default")
     config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     updated_at: Mapped[str] = mapped_column(
         Text,

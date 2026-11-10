@@ -278,6 +278,24 @@ class Store:
     async def scope_for_token(self, token: str) -> str | None:
         return await self._tokens.scope_for_token(token)
 
+    async def bind_resource_scope(
+        self,
+        core: str,
+        kind: str,
+        resource_id: str,
+        scope: str | None = None,
+    ) -> None:
+        await self._documents.bind_resource_scope(core, kind, resource_id, scope)
+
+    async def resource_scope(self, core: str, kind: str, resource_id: str) -> str:
+        return await self._documents.resource_scope(core, kind, resource_id)
+
+    async def resource_scope_map(self, core: str, kind: str) -> dict[str, str]:
+        return await self._documents.resource_scope_map(core, kind)
+
+    async def delete_resource_scope(self, core: str, kind: str, resource_id: str) -> None:
+        await self._documents.delete_resource_scope(core, kind, resource_id)
+
     async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
         await self._traffic.ack_billed_snapshots(rows)
 

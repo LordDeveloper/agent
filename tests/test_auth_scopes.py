@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent.auth_scope import set_current_scope
+from agent.auth_scope import filter_visible, set_current_scope, set_request_isolation
 from agent.database.models.client import Client
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
 from agent.traffic.service import TrafficService
@@ -56,3 +56,54 @@ async def test_each_token_keeps_its_own_pending_queue(store):
     region_users = (await traffic.pending_payload())["users"]
     assert region_users["region-node"]["downlink"] == 500
     assert "primary-node" not in region_users
+
+
+async def test_each_token_owns_its_interfaces_and_xray_inbounds(store):
+    created = await store.create_auth_token("region", "region-secret")
+    set_request_isolation(True)
+    try:
+        set_current_scope("default")
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "1",
+            {"id": 1, "name": "wg-primary", "peers": [{"id": "peer-primary", "node_id": "peer-primary"}]},
+        )
+        await store.put_doc("mullvad", "location", "de", {"id": "de", "country": "de"})
+        set_current_scope(created["id"])
+        await store.put_doc(
+            "wireguard",
+            "interface",
+            "2",
+            {"id": 2, "name": "wg-region", "peers": [{"id": "peer-region", "node_id": "peer-region"}]},
+        )
+        await store.bind_resource_scope("xray", "inbound", "inbound-9")
+        await store.put_doc(
+            "mullvad",
+            "interface",
+            "de-exit",
+            {"id": "de-exit", "name": "de", "peers": [{"id": "mv-peer", "node_id": "mv-peer"}]},
+        )
+
+        rows = await store.list_docs("wireguard", "interface")
+        visible = filter_visible(rows, "wireguard")
+        assert [row["name"] for row in visible] == ["wg-region"]
+        assert await store.get_doc("mullvad", "location", "de") is not None
+        mullvad = await store.get_doc("mullvad", "interface", "de-exit")
+        assert mullvad["scope"] == "default"
+        assert await store.resource_scope("xray", "inbound", "inbound-9") == created["id"]
+
+        scopes = await store.client_scopes()
+        assert scopes[("wireguard", "peer-region")] == created["id"]
+        assert scopes[("wireguard", "peer-primary")] == "default"
+        assert scopes[("mullvad", "mv-peer")] == "default"
+
+        set_current_scope("default")
+        await store.put_doc("wireguard", "interface", "2", {"id": 2, "name": "hijack"})
+        kept = await store.get_doc("wireguard", "interface", "2")
+        assert kept["name"] == "wg-region"
+        assert filter_visible(await store.list_docs("wireguard", "interface"), "wireguard")[0]["name"] == "wg-primary"
+        assert (await store.get_doc("mullvad", "interface", "de-exit"))["name"] == "de"
+    finally:
+        set_request_isolation(False)
+        set_current_scope("default")
