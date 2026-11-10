@@ -23,7 +23,7 @@ FETCH_LOCK_META_KEY = "traffic_fetch_lock"
 # until ack, or until this window passes because the panel never acked.
 PENDING_READ_LOCK_SECONDS = 180.0
 # A volume sample may hold the worker exclusively for this long. After that
-# the next 15s tick cancels it and starts a new cycle.
+# the next sample tick cancels it and starts a new cycle.
 DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
 
 

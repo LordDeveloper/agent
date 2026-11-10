@@ -3648,7 +3648,7 @@ class XrayDriver(CoreDriver):
         return snapshot
 
     def _usage_cache_max_age(self) -> float:
-        interval = float(getattr(self.settings, "traffic_sample_interval", 15.0) or 15.0)
+        interval = float(getattr(self.settings, "traffic_sample_interval", 2.0) or 2.0)
         return max(3.0, interval / 2.0)
 
     async def _clip_usage_snapshot(self, snapshot: UsageSnapshotModel) -> UsageSnapshotModel:
