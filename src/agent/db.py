@@ -19,7 +19,6 @@ _JSON_OFFLOAD_BYTES = JSON_OFFLOAD_BYTES
 _BUSY_TIMEOUT_SECONDS = 15.0
 _BUSY_TIMEOUT_MS = 15_000
 _LOCK_ATTEMPTS = 4
-_STATEMENTS_PER_COMMIT = 100
 
 
 def _dumps(value: Any) -> str:
@@ -257,14 +256,19 @@ class Store:
     async def list_traffic_identity(self) -> list[dict[str, Any]]:
         return await self._traffic.list_traffic_identity()
 
-    async def _traffic_books(self) -> tuple[
+    async def _traffic_books(self, scope: str | None = None, core: str | None = None) -> tuple[
         dict[tuple[str, str], tuple[int, int]],
         dict[tuple[str, str], dict[str, int]],
     ]:
-        return await self._traffic._traffic_books()
+        return await self._traffic._traffic_books(scope, core)
 
-    async def apply_traffic_sample(self, plan, scope: str | None = None) -> dict[str, int]:
-        return await self._traffic.apply_traffic_sample(plan, scope)
+    async def apply_traffic_sample(
+        self,
+        plan,
+        scope: str | None = None,
+        core: str | None = None,
+    ) -> dict[str, int]:
+        return await self._traffic.apply_traffic_sample(plan, scope, core)
 
     async def client_scopes(self) -> dict[tuple[str, str], str]:
         from sqlalchemy import select

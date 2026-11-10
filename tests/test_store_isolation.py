@@ -173,7 +173,7 @@ def test_quota_write_waits_out_another_process_lock() -> None:
         asyncio.run(scenario(f"{directory}/agent.db"))
 
 
-def test_quota_write_across_a_commit_chunk_keeps_every_row() -> None:
+def test_quota_write_keeps_every_row_in_one_commit() -> None:
     async def scenario(path: str) -> None:
         store = Store(path)
         await store.open()

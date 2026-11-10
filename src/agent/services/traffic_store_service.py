@@ -206,22 +206,24 @@ class TrafficStoreService:
                 for row in rows
             ]
 
-    async def _traffic_books(self, scope: str | None = None) -> tuple[
+    async def _traffic_books(self, scope: str | None = None, core: str | None = None) -> tuple[
         dict[tuple[str, str], tuple[int, int]],
         dict[tuple[str, str], dict[str, int]],
     ]:
         scope = str(scope or current_scope())
+        core_name = str(core or "").strip()
         async with self._runtime.reading() as session:
-            ack_rows = (
-                await session.execute(select(TrafficAck).where(TrafficAck.scope == scope))
-            ).scalars().all()
+            ack_query = select(TrafficAck).where(TrafficAck.scope == scope)
+            pending_query = select(TrafficPending).where(TrafficPending.scope == scope)
+            if core_name:
+                ack_query = ack_query.where(TrafficAck.core == core_name)
+                pending_query = pending_query.where(TrafficPending.core == core_name)
+            ack_rows = (await session.execute(ack_query)).scalars().all()
             acks = {
                 (str(row.core), str(row.client_key)): (int(row.incoming), int(row.outgoing))
                 for row in ack_rows
             }
-            pending_rows = (
-                await session.execute(select(TrafficPending).where(TrafficPending.scope == scope))
-            ).scalars().all()
+            pending_rows = (await session.execute(pending_query)).scalars().all()
             pending = {
                 (str(row.core), str(row.client_key)): {
                     "delta_incoming": int(row.delta_incoming),
@@ -233,9 +235,14 @@ class TrafficStoreService:
             }
             return acks, pending
 
-    async def apply_traffic_sample(self, plan, scope: str | None = None) -> dict[str, int]:
+    async def apply_traffic_sample(
+        self,
+        plan,
+        scope: str | None = None,
+        core: str | None = None,
+    ) -> dict[str, int]:
         scope = str(scope or current_scope())
-        acks, pending = await self._traffic_books(scope)
+        acks, pending = await self._traffic_books(scope, core)
         writes = plan(acks, pending)
         if isinstance(writes, dict):
             writes["scope"] = scope
@@ -252,7 +259,7 @@ class TrafficStoreService:
             try:
                 await self._write_traffic_plan(session, body)
                 await session.commit()
-            except Exception:
+            except BaseException:
                 await session.rollback()
                 raise
         if isinstance(meta, tuple) and len(meta) == 3:
@@ -263,7 +270,6 @@ class TrafficStoreService:
 
     async def _write_traffic_plan(self, session, writes: dict[str, Any]) -> None:
         scope = str(writes.get("scope") or current_scope())
-        pending = 0
         staged_ack: dict[tuple[str, str, str], TrafficAck] = {}
         for core, client_key, incoming, outgoing in writes.get("ack_upserts") or []:
             key = (scope, core, client_key)
@@ -285,8 +291,6 @@ class TrafficStoreService:
                 row.outgoing = int(outgoing)
                 row.updated_at = datetime.now(timezone.utc).isoformat()
             staged_ack[key] = row
-            pending = await self._runtime.commit_chunk(session, pending + 1)
-
         for core, client_key in writes.get("ack_deletes") or []:
             await session.execute(
                 delete(TrafficAck).where(
@@ -295,8 +299,6 @@ class TrafficStoreService:
                     TrafficAck.client_key == client_key,
                 )
             )
-            pending = await self._runtime.commit_chunk(session, pending + 1)
-
         staged_pending: dict[tuple[str, str, str], TrafficPending] = {}
         for item in writes.get("pending_upserts") or []:
             core = item["core"]
@@ -324,8 +326,6 @@ class TrafficStoreService:
                 row.current_outgoing = int(item["current_outgoing"])
                 row.updated_at = datetime.now(timezone.utc).isoformat()
             staged_pending[key] = row
-            pending = await self._runtime.commit_chunk(session, pending + 1)
-
         for core, client_key in writes.get("pending_deletes") or []:
             await session.execute(
                 delete(TrafficPending).where(
@@ -334,16 +334,12 @@ class TrafficStoreService:
                     TrafficPending.client_key == client_key,
                 )
             )
-            pending = await self._runtime.commit_chunk(session, pending + 1)
-
         for core, alias, canonical_key in writes.get("identity_upserts") or []:
             row = await session.get(TrafficIdentity, (scope, core, alias))
             if row is None:
                 session.add(TrafficIdentity(scope=scope, core=core, alias=alias, canonical_key=canonical_key))
             else:
                 row.canonical_key = canonical_key
-            pending = await self._runtime.commit_chunk(session, pending + 1)
-
     async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
         """Drop only the pending bytes the panel already billed.
 

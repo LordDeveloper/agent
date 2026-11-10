@@ -559,7 +559,6 @@ class DocumentStore:
     ) -> None:
         async with self._runtime.writing() as session:
             await self._ensure_core(session, core)
-            pending = 0
             for doc_id, data in puts:
                 if kind == QUOTA_KIND:
                     await self._save_quota_doc(session, core, str(doc_id), data)
@@ -571,7 +570,6 @@ class DocumentStore:
                     await self._save_disabled(session, core, str(doc_id), data)
                 else:
                     await self._save_artifact(session, core, kind, str(doc_id), data)
-                pending = await self._runtime.commit_chunk(session, pending + 1)
             for doc_id in deletes:
                 if kind == QUOTA_KIND:
                     await session.execute(delete(Quota).where(Quota.core_id == core, Quota.client_id == str(doc_id)))
@@ -590,7 +588,6 @@ class DocumentStore:
                             CoreArtifact.artifact_id == str(doc_id),
                         )
                     )
-                pending = await self._runtime.commit_chunk(session, pending + 1)
             await session.commit()
 
     async def replace_docs(

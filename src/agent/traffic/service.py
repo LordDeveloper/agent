@@ -20,8 +20,8 @@ LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 FETCH_LOCK_META_KEY = "traffic_fetch_lock"
 # How long a pending GET owns the snapshot. Another process cannot rebuild it
-# until ack, or until this window passes because the panel never acked.
-PENDING_READ_LOCK_SECONDS = 180.0
+# until ack, or until this window passes. Just longer than one 15s panel pass.
+PENDING_READ_LOCK_SECONDS = 20.0
 # A volume sample may hold the worker exclusively for this long. After that
 # the next sample tick cancels it and starts a new cycle.
 DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
@@ -292,7 +292,7 @@ class TrafficService:
             grouped[DEFAULT_SCOPE] = []
 
         for scope, group in grouped.items():
-            stored = await self._commit_samples(group, sampled_at, scope)
+            stored = await self._commit_samples(group, sampled_at, scope, core_key)
             for key in stats:
                 if key == "pending":
                     stats[key] = max(stats[key], int(stored.get(key, 0)))
@@ -360,13 +360,14 @@ class TrafficService:
         samples: list[dict[str, Any]],
         sampled_at: str,
         scope: str | None = None,
+        core: str | None = None,
     ) -> dict[str, int]:
         from agent.auth_scope import current_scope
 
         def plan(acks: dict, pending: dict) -> dict[str, Any]:
             return self._plan_sample(samples, acks, pending, sampled_at)
 
-        return await self.store.apply_traffic_sample(plan, scope or current_scope())
+        return await self.store.apply_traffic_sample(plan, scope or current_scope(), core)
 
     def _plan_sample(
         self,
@@ -760,7 +761,7 @@ class TrafficService:
         if not await self._claim_pending_read():
             raise PendingReadLocked()
         await self._load_persisted_aliases()
-        rows = await self._without_absent_clients(await self.store.list_traffic_pending())
+        rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()

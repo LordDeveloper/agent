@@ -20,7 +20,6 @@ from agent.runtime import RuntimeTrace
 _sql_log = get_logger("sql")
 
 LOCK_ATTEMPTS = 4
-STATEMENTS_PER_COMMIT = 100
 
 T = TypeVar("T")
 
@@ -167,9 +166,3 @@ class DatabaseRuntime:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 0.5)
         raise RuntimeError("sqlite lock retry exhausted")
-
-    async def commit_chunk(self, session: AsyncSession, pending: int) -> int:
-        if pending < STATEMENTS_PER_COMMIT:
-            return pending
-        await session.commit()
-        return 0
