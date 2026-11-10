@@ -7,13 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 BUSY_TIMEOUT_MS = 15_000
 
 
-def _sqlite_url(path: Path, *, read_only: bool = False) -> str:
+def _sqlite_url(path: Path) -> str:
+    """Absolute SQLite file URL for the aiosqlite driver."""
     resolved = path.resolve().as_posix()
-    mode = "&mode=ro" if read_only else ""
-    return f"sqlite+aiosqlite:///{resolved}?timeout=15.0{mode}"
+    return f"sqlite+aiosqlite:///{resolved}"
 
 
-def create_write_engine(path: Path) -> AsyncEngine:
+def _engine(path: Path) -> AsyncEngine:
     return create_async_engine(
         _sqlite_url(path),
         connect_args={"timeout": 15.0},
@@ -21,12 +21,13 @@ def create_write_engine(path: Path) -> AsyncEngine:
     )
 
 
+def create_write_engine(path: Path) -> AsyncEngine:
+    return _engine(path)
+
+
 def create_read_engine(path: Path) -> AsyncEngine:
-    return create_async_engine(
-        _sqlite_url(path, read_only=True),
-        connect_args={"timeout": 15.0},
-        pool_pre_ping=True,
-    )
+    # Read isolation uses PRAGMA query_only on connect (see session.DatabaseRuntime.open).
+    return _engine(path)
 
 
 async def configure_sqlite_pragmas(conn, *, query_only: bool = False) -> None:
