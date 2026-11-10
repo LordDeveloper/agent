@@ -221,11 +221,12 @@ async def stats_clients_traffic_pending_ack(
     Subtracts the GET snapshot from the live pending row. Bytes sampled onto
     the queue after that GET stay pending and are not cleared.
 
-    Body: ``{"clients": ["<node_id>", ...], "billed": {"<node_id>": {"incoming": 0, "outgoing": 0}}}``.
+    Body: ``{"clients": ["<node_id>", ...], "billed": {"<node_id>": {"incoming": 0, "outgoing": 0}}, "drop": ["<node_id>", ...]}``.
     ``billed`` is the raw queue the panel already applied. It is used when the
     GET snapshot no longer has that id, and only those bytes are subtracted.
-    Email and a protocol UUID may find the row. ``acked`` always lists the
-    panel node_id, which is the stored client key.
+    ``drop`` deletes keys the panel will never bill, including when the GET
+    snapshot no longer has that id. Email and a protocol UUID may find the row.
+    ``acked`` always lists the panel node_id, which is the stored client key.
     """
     raw = body.get("clients")
     if raw is None:
@@ -234,8 +235,17 @@ async def stats_clients_traffic_pending_ack(
     if not isinstance(raw, list):
         raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)
 
+    drop_raw = body.get("drop") or []
+    if not isinstance(drop_raw, list):
+        raise_agent_error("INVALID_PAYLOAD", "drop must be a list of client ids", 400)
+
     client_keys = [str(item).strip() for item in raw if str(item or "").strip()]
-    acked, not_found = await traffic.ack_clients(client_keys, _billed_amounts(body.get("billed")))
+    drop_keys = [str(item).strip() for item in drop_raw if str(item or "").strip()]
+    acked, not_found = await traffic.ack_clients(
+        client_keys,
+        _billed_amounts(body.get("billed")),
+        drop_keys,
+    )
 
     return {
         "success": True,

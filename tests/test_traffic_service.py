@@ -323,6 +323,37 @@ async def test_ack_billed_amount_when_snapshot_is_missing_keeps_later_growth(sto
     assert grown["delta_outgoing"] == 60
 
 
+async def test_drop_discards_pending_when_snapshot_is_missing_and_keeps_later_growth(store):
+    writer = TrafficService(store)
+    client = ClientUsageModel(id="ghost-node", email="ghost@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(writer, registry)
+    client.incoming = 800
+    client.outgoing = 50
+    await _sample(writer, registry)
+
+    reader = TrafficService(store)
+    acked, not_found = await reader.ack_clients([], drop=["ghost-node"])
+    assert acked == ["ghost-node"]
+    assert not_found == []
+    assert await store.get_traffic_pending("xray", "ghost-node") is None
+
+    await _sample(writer, registry)
+    assert "ghost-node" not in (await writer.pending_payload())["users"]
+
+    client.incoming = 900
+    await _sample(writer, registry)
+    grown = await store.get_traffic_pending("xray", "ghost-node")
+    assert grown["delta_incoming"] == 100
+    assert grown["delta_outgoing"] == 0
+
+    missing_acked, missing = await TrafficService(store).ack_clients([], drop=["ghost-node"])
+    assert "ghost-node" in missing_acked
+    assert missing == []
+
+
 async def test_ack_uses_get_snapshot_so_later_growth_stays_queued(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-snap", email="snap@example.com", incoming=1_000, outgoing=0)

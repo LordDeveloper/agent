@@ -692,12 +692,17 @@ class TrafficService:
         self,
         client_keys: list[str],
         billed: dict[str, tuple[int, int]] | None = None,
+        drop: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
         """Ack the panel node_id keys the panel says it has billed.
 
         ``billed`` is the raw queue the panel already applied, keyed by the
         requested id. It is used only when that id is missing from the GET
         snapshot, and only those bytes are subtracted. Later samples stay queued.
+
+        ``drop`` deletes the live pending row and moves the baseline to the
+        current counter. The panel sends keys it will never bill. Bytes sampled
+        after this call stay queued.
         """
         await self._load_persisted_aliases()
         billed = billed or {}
@@ -709,6 +714,15 @@ class TrafficService:
                 continue
             seen.add(label)
             requested.append(label)
+
+        drop_labels: list[str] = []
+        drop_seen: set[str] = set()
+        for raw in drop or []:
+            label = str(raw or "").strip()
+            if not label or label in drop_seen:
+                continue
+            drop_seen.add(label)
+            drop_labels.append(label)
 
         # A different worker's memory snapshot is not the GET the panel billed.
         # While the read lock is held, ack the snapshot that GET persisted.
@@ -740,9 +754,66 @@ class TrafficService:
 
         await self.store.ack_billed_snapshots(to_ack)
         await self._forget_acked_snapshot(to_ack)
-        if requested:
+
+        acked_ids = set(acked)
+        to_drop: list[str] = []
+        for label in drop_labels:
+            canonical = self._canonical_key(label)
+            if label in acked_ids or canonical in acked_ids:
+                continue
+            to_drop.append(label)
+        if to_drop:
+            dropped, _missing = await self._drop_pending_keys(to_drop)
+            for key in dropped:
+                if key not in acked_ids:
+                    acked.append(key)
+                    acked_ids.add(key)
+            not_found = [
+                label
+                for label in not_found
+                if label not in acked_ids and self._canonical_key(label) not in acked_ids
+            ]
+            for label in to_drop:
+                canonical = self._canonical_key(label)
+                if label in acked_ids or canonical in acked_ids:
+                    continue
+                if label not in not_found:
+                    not_found.append(label)
+
+        if requested or drop_labels:
             await self._release_pending_read()
         return acked, not_found
+
+    async def _drop_pending_keys(self, labels: list[str]) -> tuple[list[str], list[str]]:
+        """Discard a pending queue the panel will not bill.
+
+        The ack baseline moves to the current counter, so the next sample only
+        queues bytes that arrive after this drop.
+        """
+        index = await self._live_pending_index()
+        dropped: list[str] = []
+        missing: list[str] = []
+        rows_to_ack: list[dict[str, Any]] = []
+        seen_rows: set[tuple[str, str]] = set()
+        for label in labels:
+            canonical = self._canonical_key(label)
+            rows = index.get(label) or index.get(canonical) or []
+            if not rows:
+                missing.append(label)
+                continue
+            for row in rows:
+                identity = (str(row.get("core") or ""), str(row.get("client_key") or ""))
+                if not identity[0] or not identity[1] or identity in seen_rows:
+                    continue
+                seen_rows.add(identity)
+                rows_to_ack.append(row)
+            published = self._public_client_key(str(rows[0].get("client_key") or "")) or label
+            if published not in dropped:
+                dropped.append(published)
+        if rows_to_ack:
+            await self.store.ack_traffic_rows(rows_to_ack)
+            await self._forget_acked_snapshot(rows_to_ack)
+        return dropped, missing
 
     async def _live_pending_index(self) -> dict[str, list[dict[str, Any]]]:
         index: dict[str, list[dict[str, Any]]] = {}
