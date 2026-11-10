@@ -18,8 +18,18 @@ def _agent_root() -> Path:
 
 
 def _alembic_config(db_path: Path) -> Config:
-    ini = _agent_root() / "alembic.ini"
+    root = _agent_root()
+    ini = root / "alembic.ini"
+    scripts = root / "alembic"
+    if not scripts.is_dir():
+        raise RuntimeError(f"alembic scripts missing at {scripts}")
     cfg = Config(str(ini))
+    # ini uses a relative script_location; PyInstaller cwd is not the bundle root.
+    cfg.set_main_option("script_location", str(scripts.resolve()))
+    if getattr(sys, "frozen", False):
+        cfg.set_main_option("prepend_sys_path", ".")
+    else:
+        cfg.set_main_option("prepend_sys_path", str((root / "src").resolve()))
     resolved = db_path.resolve().as_posix()
     cfg.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{resolved}")
     return cfg
