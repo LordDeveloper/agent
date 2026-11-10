@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
@@ -690,3 +692,97 @@ async def test_xray_restart_adds_the_new_counter_to_pending(store):
     grown = (await traffic.pending_payload())["users"]["node-1"]
     assert grown["downlink"] == 260
     assert grown["uplink"] == 70
+
+
+async def test_fast_core_samples_while_another_core_is_still_reading(store):
+    release = asyncio.Event()
+
+    class FastDriver:
+        key = "xray"
+
+        def __init__(self) -> None:
+            self.incoming = 1_000
+
+        def usage_snapshot(self) -> UsageSnapshotModel:
+            return UsageSnapshotModel(
+                inbounds=[
+                    InboundUsageModel(
+                        id=1,
+                        tag="xray",
+                        clients=[
+                            ClientUsageModel(
+                                id="fast",
+                                email="fast@example.com",
+                                incoming=self.incoming,
+                                outgoing=0,
+                            )
+                        ],
+                    )
+                ]
+            )
+
+    class SlowDriver:
+        key = "wireguard"
+
+        async def usage_snapshot(self) -> UsageSnapshotModel:
+            await release.wait()
+            return UsageSnapshotModel(
+                inbounds=[
+                    InboundUsageModel(
+                        id=1,
+                        tag="wg0",
+                        clients=[
+                            ClientUsageModel(
+                                id="slow",
+                                email="slow@example.com",
+                                incoming=50,
+                                outgoing=0,
+                            )
+                        ],
+                    )
+                ]
+            )
+
+    fast = FastDriver()
+    slow = SlowDriver()
+
+    class Registry:
+        def __init__(self) -> None:
+            self.settings = type("S", (), {"cores": lambda self: ["xray", "wireguard"]})()
+            self._drivers = {"xray": fast, "wireguard": slow}
+
+        def get(self, core: str):
+            return self._drivers[core]
+
+    traffic = TrafficService(store)
+    registry = Registry()
+    started = await traffic.sample_unless_overlapping(registry, lock_seconds=30)
+    assert started == {"started": 2}
+
+    for _ in range(100):
+        flight = traffic._core_flights.get("xray")
+        if flight is None or flight[0].done():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("xray sample did not finish while wireguard was blocked")
+
+    slow_flight = traffic._core_flights["wireguard"][0]
+    assert not slow_flight.done()
+
+    fast.incoming = 1_500
+    again = await traffic.sample_unless_overlapping(registry, lock_seconds=30)
+    assert again == {"started": 1}
+
+    for _ in range(100):
+        flight = traffic._core_flights.get("xray")
+        if flight is None or flight[0].done():
+            break
+        await asyncio.sleep(0.01)
+
+    payload = await traffic.pending_payload()
+    assert payload["users"]["fast"]["downlink"] == 500
+    assert "slow" not in payload["users"]
+
+    release.set()
+    await slow_flight

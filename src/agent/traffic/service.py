@@ -48,12 +48,28 @@ class TrafficService:
         self._sample_lock = asyncio.Lock()
         self._sample_flight: asyncio.Task | None = None
         self._sample_started_at = 0.0
+        # One in-flight sample per core. A slow core must not hold the others.
+        self._core_flights: dict[str, tuple[asyncio.Task, float]] = {}
 
     def cancel_inflight_sample(self) -> None:
-        """Stop the volume sample that is still running, if any."""
+        """Stop every volume sample that is still running."""
         flight = self._sample_flight
         if flight is not None and not flight.done():
             flight.cancel()
+        for core_flight, _started in list(self._core_flights.values()):
+            if not core_flight.done():
+                core_flight.cancel()
+
+    def _listed_cores(self, registry: CoreRegistry) -> list[str] | None:
+        settings = getattr(registry, "settings", None)
+        cores = getattr(settings, "cores", None)
+        if not callable(cores):
+            return None
+        try:
+            names = [str(key) for key in cores() if str(key or "").strip()]
+        except Exception:
+            return None
+        return names
 
     async def sample_unless_overlapping(
         self,
@@ -61,14 +77,72 @@ class TrafficService:
         *,
         lock_seconds: float = DEFAULT_SAMPLE_LOCK_SECONDS,
     ) -> dict[str, int] | None:
-        """Start one volume sample and return without waiting for it.
+        """Start volume sampling and return without waiting for it.
 
-        A sample that is still running and younger than ``lock_seconds`` is
-        left alone, so two cycles never read cores at the same time. Once the
-        lock window has passed, the stuck cycle is cancelled and a new one starts.
-        Returns None when this call did not start a cycle (the previous one is
-        still inside the window). The stats dict is produced by the background task.
+        Each core runs on its own task. A core that is still inside
+        ``lock_seconds`` is left alone; the other cores still sample. Once a
+        core's lock window has passed, that task is cancelled and a new one
+        starts. Returns None when every core was already inside its window.
         """
+        cores = self._listed_cores(registry)
+        if not cores:
+            return await self._start_combined_sample(registry, lock_seconds=lock_seconds)
+
+        doomed: list[asyncio.Task] = []
+        async with self._sample_lock:
+            now = time.monotonic()
+            for core_key in cores:
+                flight, started_at = self._core_flights.get(core_key, (None, 0.0))
+                if flight is None or flight.done():
+                    continue
+                age = now - started_at
+                if age < lock_seconds:
+                    log.debug(
+                        "traffic sample skipped core=%s; in flight for %.1fs (lock %ss)",
+                        core_key,
+                        age,
+                        lock_seconds,
+                    )
+                    continue
+                log.warning(
+                    "traffic sample lock expired core=%s after %.1fs; cancelling",
+                    core_key,
+                    age,
+                )
+                flight.cancel()
+                self._core_flights.pop(core_key, None)
+                doomed.append(flight)
+
+        if doomed:
+            # Wait until the stuck core has actually stopped, then start the
+            # next one. Awaiting while holding the lock would deadlock: the
+            # cancelled task needs that same lock to clear itself.
+            await asyncio.gather(*doomed, return_exceptions=True)
+
+        started: list[str] = []
+        async with self._sample_lock:
+            now = time.monotonic()
+            for core_key in cores:
+                flight, _started_at = self._core_flights.get(core_key, (None, 0.0))
+                if flight is not None and not flight.done():
+                    continue
+                self._core_flights[core_key] = (
+                    asyncio.create_task(self._run_core_sample(registry, core_key)),
+                    now,
+                )
+                started.append(core_key)
+        if not started:
+            return None
+        log.debug("traffic sample scheduled cores=%s", ",".join(started))
+        return {"started": len(started)}
+
+    async def _start_combined_sample(
+        self,
+        registry: CoreRegistry,
+        *,
+        lock_seconds: float,
+    ) -> dict[str, int] | None:
+        """One flight for callers that do not name their cores (tests)."""
         doomed: asyncio.Task | None = None
         async with self._sample_lock:
             flight = self._sample_flight
@@ -90,9 +164,6 @@ class TrafficService:
                 doomed = flight
 
         if doomed is not None:
-            # Wait until the stuck cycle has actually stopped, then start the
-            # next one. Awaiting while holding the lock would deadlock: the
-            # cancelled task needs that same lock to clear itself.
             await asyncio.gather(doomed, return_exceptions=True)
 
         async with self._sample_lock:
@@ -126,14 +197,43 @@ class TrafficService:
                 if self._sample_flight is current:
                     self._sample_flight = None
 
+    async def _run_core_sample(self, registry: CoreRegistry, core_key: str) -> dict[str, int] | None:
+        try:
+            stats = await self._sample_core(registry, core_key)
+            if stats.get("pending", 0) or stats.get("regressed", 0):
+                log.info(
+                    "traffic sample core=%s clients=%s pending=%s initialized=%s regressed=%s",
+                    core_key,
+                    stats.get("clients_seen", 0),
+                    stats.get("pending", 0),
+                    stats.get("initialized", 0),
+                    stats.get("regressed", 0),
+                )
+            return stats
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("traffic sample failed core=%s", core_key)
+            return None
+        finally:
+            async with self._sample_lock:
+                current = asyncio.current_task()
+                flight, _started = self._core_flights.get(core_key, (None, 0.0))
+                if flight is current:
+                    self._core_flights.pop(core_key, None)
+
     def _schedule_sample_all(self, registry: CoreRegistry) -> None:
         """Start a background sample if none is inside the overlap window."""
         loop = asyncio.get_running_loop()
         loop.create_task(self.sample_unless_overlapping(registry))
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
-        """Refresh pending deltas from core counters (online not required)."""
-        from agent.asyncutil import gather_independent, maybe_await
+        """Refresh pending deltas from every core at once (online not required).
+
+        Each core reads its counters and writes its own pending rows without
+        waiting for the other cores to finish their snapshot.
+        """
+        from agent.asyncutil import gather_independent
 
         stats = {
             "clients_seen": 0,
@@ -142,58 +242,47 @@ class TrafficService:
             "regressed": 0,
         }
 
-        cores = list(registry.settings.cores())
+        cores = self._listed_cores(registry) or []
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
 
-        async def snapshot_of(core_key: str):
-            driver = registry.get(core_key)
-            if core_key == "l2tp":
-                await self._drop_linked_l2tp_billing(driver)
-            return core_key, await maybe_await(driver.usage_snapshot())
-
         sampled = await gather_independent(
-            *(snapshot_of(core_key) for core_key in cores),
+            *(self._sample_core(registry, core_key) for core_key in cores),
             return_exceptions=True,
         )
 
-        samples: list[dict[str, Any]] = []
         for item in sampled:
             if isinstance(item, Exception):
                 log.exception("traffic sample failed: %s", item)
                 continue
-            core_key, snapshot = item
-            try:
-                inbounds = snapshot.inbounds
-            except Exception:
-                log.exception("traffic sample failed core=%s", core_key)
-                continue
+            for key in stats:
+                if key == "pending":
+                    # Each core reports the whole queue size after its commit.
+                    stats[key] = max(stats[key], int(item.get(key, 0)))
+                else:
+                    stats[key] += int(item.get(key, 0))
+        return stats
 
-            for inbound in inbounds:
-                for client in inbound.clients:
-                    label = client_key(client)
-                    if not label:
-                        continue
+    async def _sample_core(self, registry: CoreRegistry, core_key: str) -> dict[str, int]:
+        from agent.asyncutil import maybe_await
 
-                    email = str(getattr(client, "email", "") or "").strip()
-                    client_id = str(getattr(client, "id", "") or "").strip()
-                    protocol_id = str(getattr(client, "protocol_id", "") or "").strip()
-                    self._remember_identity(label, email, client_id)
-                    samples.append(
-                        {
-                            "core": core_key,
-                            "label": label,
-                            "email": email,
-                            "client_id": client_id,
-                            "protocol_id": protocol_id,
-                            "incoming": int(client.incoming or 0),
-                            "outgoing": int(client.outgoing or 0),
-                        }
-                    )
+        driver = registry.get(core_key)
+        if core_key == "l2tp":
+            await self._drop_linked_l2tp_billing(driver)
+        snapshot = await maybe_await(driver.usage_snapshot())
+        return await self._store_core_samples(core_key, snapshot)
 
-        sampled_at = datetime.now(timezone.utc).isoformat()
+    async def _store_core_samples(self, core_key: str, snapshot: Any) -> dict[str, int]:
         from agent.auth_scope import DEFAULT_SCOPE
 
+        stats = {
+            "clients_seen": 0,
+            "pending": 0,
+            "initialized": 0,
+            "regressed": 0,
+        }
+        samples = self._usage_rows(core_key, snapshot)
+        sampled_at = datetime.now(timezone.utc).isoformat()
         owners = await self.store.client_scopes()
         grouped: dict[str, list[dict[str, Any]]] = {}
         for sample in samples:
@@ -205,8 +294,42 @@ class TrafficService:
         for scope, group in grouped.items():
             stored = await self._commit_samples(group, sampled_at, scope)
             for key in stats:
-                stats[key] += int(stored.get(key, 0))
+                if key == "pending":
+                    stats[key] = max(stats[key], int(stored.get(key, 0)))
+                else:
+                    stats[key] += int(stored.get(key, 0))
         return stats
+
+    def _usage_rows(self, core_key: str, snapshot: Any) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        try:
+            inbounds = snapshot.inbounds
+        except Exception:
+            log.exception("traffic sample failed core=%s", core_key)
+            return samples
+
+        for inbound in inbounds:
+            for client in inbound.clients:
+                label = client_key(client)
+                if not label:
+                    continue
+
+                email = str(getattr(client, "email", "") or "").strip()
+                client_id = str(getattr(client, "id", "") or "").strip()
+                protocol_id = str(getattr(client, "protocol_id", "") or "").strip()
+                self._remember_identity(label, email, client_id)
+                samples.append(
+                    {
+                        "core": core_key,
+                        "label": label,
+                        "email": email,
+                        "client_id": client_id,
+                        "protocol_id": protocol_id,
+                        "incoming": int(client.incoming or 0),
+                        "outgoing": int(client.outgoing or 0),
+                    }
+                )
+        return samples
 
     async def ensure_sample_fresh(
         self,

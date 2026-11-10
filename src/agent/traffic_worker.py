@@ -19,11 +19,11 @@ async def traffic_worker_loop(
     settings: AgentSettings,
     stop_event: asyncio.Event,
 ) -> None:
-    """Sample volume every ``traffic_sample_interval`` seconds.
+    """Sample each core on its own task every ``traffic_sample_interval`` seconds.
 
-    A cycle that is still running is left alone (no overlap). After
-    ``traffic_sample_lock_seconds`` it is cancelled so a stuck core walk
-    cannot block later samples.
+    A core that is still running is left alone. The other cores keep sampling.
+    After ``traffic_sample_lock_seconds`` a stuck core is cancelled so it cannot
+    block its own later samples.
     """
     interval = max(1.0, float(settings.traffic_sample_interval))
     lock_seconds = max(
