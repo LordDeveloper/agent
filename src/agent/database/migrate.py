@@ -11,11 +11,14 @@ from agent.logutil import get_logger
 
 _log = get_logger("migrate")
 
-AGENT_ROOT = Path(__file__).resolve().parents[3]
+def _agent_root() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parents[3]
 
 
 def _alembic_config(db_path: Path) -> Config:
-    ini = AGENT_ROOT / "alembic.ini"
+    ini = _agent_root() / "alembic.ini"
     cfg = Config(str(ini))
     resolved = db_path.resolve().as_posix()
     cfg.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{resolved}")
