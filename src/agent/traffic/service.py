@@ -542,7 +542,7 @@ class TrafficService:
 
     async def pending_payload(self) -> dict[str, Any]:
         await self._load_persisted_aliases()
-        rows = await self.store.list_traffic_pending()
+        rows = await self._without_absent_clients(await self.store.list_traffic_pending())
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()
@@ -630,6 +630,137 @@ class TrafficService:
 
         await self.store.ack_traffic_rows(to_ack)
         return acked, not_found
+
+    async def _without_absent_clients(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop pending rows for clients the agent no longer stores.
+
+        A deleted subscribe leaves its last pending row behind, often still keyed
+        by email from before node_id billing. Nothing samples that client again,
+        so the row would otherwise be returned on every GET. Email of a client
+        that is still stored is rewritten onto that client's node_id.
+        """
+        index = await self._stored_client_index()
+        if not index:
+            return rows
+
+        changed = False
+        dropped = 0
+        for row in rows:
+            core = str(row.get("core") or "")
+            stored = str(row.get("client_key") or "")
+            table = index.get(core)
+            if table is None:
+                continue
+            target = table.get(stored) or table.get(self._public_client_key(stored))
+            if not target:
+                await self.store.delete_traffic_pending(core, stored)
+                dropped += 1
+                changed = True
+                continue
+            if stored == target:
+                continue
+            await self._fold_pending_onto(core, stored, target, row)
+            changed = True
+
+        if dropped:
+            log.info("traffic pending dropped absent clients=%s", dropped)
+        if not changed:
+            return rows
+        return await self.store.list_traffic_pending()
+
+    async def _fold_pending_onto(
+        self,
+        core: str,
+        stored: str,
+        target: str,
+        row: dict[str, Any],
+    ) -> None:
+        """Move one legacy pending key onto the live node_id without adding the bytes twice."""
+        current = await self.store.get_traffic_pending(core, target)
+        incoming = int(row.get("delta_incoming") or 0)
+        outgoing = int(row.get("delta_outgoing") or 0)
+        current_in = int(row.get("current_incoming") or 0)
+        current_out = int(row.get("current_outgoing") or 0)
+        if current is not None:
+            other = int(current["delta_incoming"]) + int(current["delta_outgoing"])
+            if incoming + outgoing <= other:
+                await self.store.delete_traffic_pending(core, stored)
+                return
+        await self.store.upsert_traffic_pending(
+            core,
+            target,
+            incoming,
+            outgoing,
+            current_in,
+            current_out,
+        )
+        await self.store.delete_traffic_pending(core, stored)
+
+    async def _stored_client_index(self) -> dict[str, dict[str, str]]:
+        """Map every stored id and email to the client's node_id, per core.
+
+        A core is omitted when it has no stored clients, so an empty or unread
+        core cannot wipe a pending queue that still belongs to live users.
+        """
+        index: dict[str, dict[str, str]] = {}
+        nested = (
+            ("wireguard", "interface", "peers"),
+            ("amnezia", "interface", "peers"),
+            ("l2tp", "server", "users"),
+            ("openvpn", "server", "users"),
+        )
+        for core, kind, field in nested:
+            docs = await self.store.list_docs(core, kind)
+            rows = [
+                row
+                for doc in docs
+                if isinstance(doc, dict)
+                for row in (doc.get(field) or [])
+                if isinstance(row, dict)
+            ]
+            table = self._index_client_rows(rows)
+            if table:
+                index[core] = table
+
+        xray_rows: list[dict[str, Any]] = []
+        for kind in ("client_quota", "xray_disabled_client"):
+            for row in await self.store.list_docs("xray", kind):
+                if isinstance(row, dict):
+                    xray_rows.append(row)
+        xray = self._index_client_rows(xray_rows)
+        if xray:
+            index["xray"] = xray
+        return index
+
+    @staticmethod
+    def _index_client_rows(rows: list[dict[str, Any]]) -> dict[str, str]:
+        ids: set[str] = set()
+        emails: list[tuple[str, str]] = []
+        for row in rows:
+            node = str(row.get("node_id") or row.get("id") or "").strip()
+            if not node:
+                continue
+            ids.add(node)
+            for key in (row.get("id"), row.get("node_id"), row.get("client_link_uuid")):
+                text = str(key or "").strip()
+                if text:
+                    ids.add(text)
+            email = str(row.get("email") or "").strip()
+            if email:
+                emails.append((email, node))
+
+        table = {item: item for item in ids}
+        ambiguous: set[str] = set()
+        for email, node in emails:
+            if email in ids or email in ambiguous:
+                continue
+            previous = table.get(email)
+            if previous is not None and previous != node:
+                table.pop(email, None)
+                ambiguous.add(email)
+                continue
+            table[email] = node
+        return table
 
     async def _linked_l2tp_client_keys(self) -> set[str]:
         """Canonical ids/emails of L2TP users linked to a WireGuard/Amnezia peer."""

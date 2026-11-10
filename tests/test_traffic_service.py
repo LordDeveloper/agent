@@ -378,3 +378,102 @@ async def test_protocol_uuid_row_is_not_stolen_from_another_client(store):
     payload = await traffic.pending_payload()
     assert payload["users"]["xray-uuid"]["downlink"] == 40
     assert "node-1" not in payload["users"]
+
+
+async def test_pending_omits_clients_the_agent_no_longer_stores(store):
+    """Deleted peers and legacy email keys must not stay in GET pending forever."""
+    await store.put_doc(
+        "wireguard",
+        "interface",
+        "wg1",
+        {
+            "id": "wg1",
+            "peers": [
+                {
+                    "id": "live-node",
+                    "node_id": "live-node",
+                    "email": "0wPo9T",
+                    "is_enabled": False,
+                }
+            ],
+        },
+    )
+    await store.upsert_traffic_pending("wireguard", "0wPo9T", 400, 50, 500, 80)
+    await store.upsert_traffic_pending("wireguard", "live-node", 10, 5, 10, 5)
+    await store.upsert_traffic_pending(
+        "wireguard",
+        "56a3e781-fe73-456e-80cf-4027ca3e52d9",
+        9,
+        1,
+        9,
+        1,
+    )
+    await store.upsert_traffic_pending("xray", "still-unlisted", 3, 1, 3, 1)
+
+    traffic = TrafficService(store)
+    payload = await traffic.pending_payload()
+
+    assert set(payload["users"]) == {"live-node", "still-unlisted"}
+    assert payload["users"]["live-node"] == {
+        "core": "wireguard",
+        "uplink": 50,
+        "downlink": 400,
+    }
+    assert "0wPo9T" not in payload["users"]
+    assert await store.get_traffic_pending("wireguard", "0wPo9T") is None
+    assert await store.get_traffic_pending("wireguard", "56a3e781-fe73-456e-80cf-4027ca3e52d9") is None
+    kept = await store.get_traffic_pending("wireguard", "live-node")
+    assert int(kept["delta_incoming"]) == 400
+    assert int(kept["delta_outgoing"]) == 50
+    assert await store.get_traffic_pending("xray", "still-unlisted") is not None
+
+    acked, not_found = await traffic.ack_clients(["live-node"])
+    assert acked == ["live-node"]
+    assert not_found == []
+    assert "live-node" not in (await traffic.pending_payload())["users"]
+
+
+async def test_pending_email_does_not_replace_a_larger_node_id_row(store):
+    await store.put_doc(
+        "wireguard",
+        "interface",
+        "wg1",
+        {
+            "id": "wg1",
+            "peers": [{"id": "live-node", "node_id": "live-node", "email": "0wPo9T"}],
+        },
+    )
+    await store.upsert_traffic_pending("wireguard", "0wPo9T", 5, 5, 5, 5)
+    await store.upsert_traffic_pending("wireguard", "live-node", 80, 20, 80, 20)
+
+    payload = await TrafficService(store).pending_payload()
+
+    assert payload["users"]["live-node"] == {
+        "core": "wireguard",
+        "uplink": 20,
+        "downlink": 80,
+    }
+    assert "0wPo9T" not in payload["users"]
+    assert await store.get_traffic_pending("wireguard", "0wPo9T") is None
+
+
+async def test_xray_pending_uses_quota_node_id_and_drops_removed_clients(store):
+    await store.put_doc(
+        "xray",
+        "client_quota",
+        "node-a",
+        {"id": "node-a", "node_id": "node-a", "email": "iEhV1M"},
+    )
+    await store.upsert_traffic_pending("xray", "iEhV1M", 30, 7, 30, 7)
+    await store.upsert_traffic_pending("xray", "deleted-uuid", 4, 4, 4, 4)
+
+    payload = await TrafficService(store).pending_payload()
+
+    assert set(payload["users"]) == {"node-a"}
+    assert payload["users"]["node-a"] == {
+        "core": "xray",
+        "uplink": 7,
+        "downlink": 30,
+    }
+    assert await store.get_traffic_pending("xray", "iEhV1M") is None
+    assert await store.get_traffic_pending("xray", "deleted-uuid") is None
