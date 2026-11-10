@@ -245,6 +245,45 @@ async def test_traffic_sample_writes_many_clients_in_one_plan(store):
     assert (await traffic.pending_payload())["users"] == {}
 
 
+async def test_ack_billed_amount_when_snapshot_is_missing_keeps_later_growth(store):
+    writer = TrafficService(store)
+    client = ClientUsageModel(id="uuid-replay", email="replay@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(writer, registry)
+    client.incoming = 1_000
+    client.outgoing = 200
+    await _sample(writer, registry)
+    client.incoming = 1_250
+    client.outgoing = 260
+    await _sample(writer, registry)
+
+    plain, missing = await TrafficService(store).ack_clients(["uuid-replay"])
+    assert plain == []
+    assert missing == ["uuid-replay"]
+    assert (await store.get_traffic_pending("xray", "uuid-replay"))["delta_incoming"] == 1_250
+
+    acked, not_found = await TrafficService(store).ack_clients(
+        ["uuid-replay"],
+        {"uuid-replay": (1_000, 200)},
+    )
+    assert acked == ["uuid-replay"]
+    assert not_found == []
+    kept = await store.get_traffic_pending("xray", "uuid-replay")
+    assert kept["delta_incoming"] == 250
+    assert kept["delta_outgoing"] == 60
+    ack = await store.get_traffic_ack("xray", "uuid-replay")
+    assert ack["incoming"] == 1_000
+    assert ack["outgoing"] == 200
+
+    client.incoming = 1_400
+    await _sample(writer, registry)
+    grown = await store.get_traffic_pending("xray", "uuid-replay")
+    assert grown["delta_incoming"] == 400
+    assert grown["delta_outgoing"] == 60
+
+
 async def test_ack_uses_get_snapshot_so_later_growth_stays_queued(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-snap", email="snap@example.com", incoming=1_000, outgoing=0)

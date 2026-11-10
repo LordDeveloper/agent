@@ -214,7 +214,9 @@ async def stats_clients_traffic_pending_ack(
     Subtracts the GET snapshot from the live pending row. Bytes sampled onto
     the queue after that GET stay pending and are not cleared.
 
-    Body: ``{"clients": ["<node_id>", ...]}``.
+    Body: ``{"clients": ["<node_id>", ...], "billed": {"<node_id>": {"incoming": 0, "outgoing": 0}}}``.
+    ``billed`` is the raw queue the panel already applied. It is used when the
+    GET snapshot no longer has that id, and only those bytes are subtracted.
     Email and a protocol UUID may find the row. ``acked`` always lists the
     panel node_id, which is the stored client key.
     """
@@ -226,10 +228,31 @@ async def stats_clients_traffic_pending_ack(
         raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)
 
     client_keys = [str(item).strip() for item in raw if str(item or "").strip()]
-    acked, not_found = await traffic.ack_clients(client_keys)
+    acked, not_found = await traffic.ack_clients(client_keys, _billed_amounts(body.get("billed")))
 
     return {
         "success": True,
         "acked": acked,
         "not_found": not_found,
+        # Lets the panel tell a settled miss from an older agent that reports
+        # not_found while the billed bytes are still queued.
+        "billed_ack": True,
     }
+
+
+def _billed_amounts(raw: Any) -> dict[str, tuple[int, int]]:
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[str, tuple[int, int]] = {}
+    for key, value in raw.items():
+        label = str(key or "").strip()
+        if not label or not isinstance(value, dict):
+            continue
+        try:
+            incoming = max(0, int(value.get("incoming") or value.get("downlink") or 0))
+            outgoing = max(0, int(value.get("outgoing") or value.get("uplink") or 0))
+        except (TypeError, ValueError):
+            continue
+        if incoming or outgoing:
+            parsed[label] = (incoming, outgoing)
+    return parsed

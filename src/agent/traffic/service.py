@@ -640,9 +640,19 @@ class TrafficService:
 
         return acked
 
-    async def ack_clients(self, client_keys: list[str]) -> tuple[list[str], list[str]]:
-        """Ack the panel node_id keys the panel says it has billed."""
+    async def ack_clients(
+        self,
+        client_keys: list[str],
+        billed: dict[str, tuple[int, int]] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Ack the panel node_id keys the panel says it has billed.
+
+        ``billed`` is the raw queue the panel already applied, keyed by the
+        requested id. It is used only when that id is missing from the GET
+        snapshot, and only those bytes are subtracted. Later samples stay queued.
+        """
         await self._load_persisted_aliases()
+        billed = billed or {}
         requested = []
         seen: set[str] = set()
         for raw in client_keys:
@@ -658,10 +668,16 @@ class TrafficService:
         acked: list[str] = []
         not_found: list[str] = []
         to_ack: list[dict[str, Any]] = []
+        live_index: dict[str, list[dict[str, Any]]] | None = None
 
         for label in requested:
             canonical = self._canonical_key(label)
             rows = self._read_snapshot().get(label) or self._read_snapshot().get(canonical) or []
+            if not rows:
+                if live_index is None:
+                    live_index = await self._live_pending_index()
+                amounts = billed.get(label) or billed.get(canonical)
+                rows = self._rows_for_billed_amount(live_index, label, canonical, amounts)
             if not rows:
                 not_found.append(label)
                 continue
@@ -675,6 +691,72 @@ class TrafficService:
         await self.store.ack_billed_snapshots(to_ack)
         await self._forget_acked_snapshot(to_ack)
         return acked, not_found
+
+    async def _live_pending_index(self) -> dict[str, list[dict[str, Any]]]:
+        index: dict[str, list[dict[str, Any]]] = {}
+        for row in await self.store.list_traffic_pending():
+            stored = str(row.get("client_key") or "")
+            public = self._public_client_key(stored)
+            identity = (str(row.get("core") or ""), stored)
+            for key in {stored, public}:
+                if not key:
+                    continue
+                bucket = index.setdefault(key, [])
+                if all(
+                    (str(item.get("core") or ""), str(item.get("client_key") or "")) != identity
+                    for item in bucket
+                ):
+                    bucket.append(row)
+        return index
+
+    def _rows_for_billed_amount(
+        self,
+        live_index: dict[str, list[dict[str, Any]]],
+        label: str,
+        canonical: str,
+        amounts: tuple[int, int] | None,
+    ) -> list[dict[str, Any]]:
+        """Build snapshot rows that subtract only the bytes the panel applied."""
+        if not amounts:
+            return []
+        left_in, left_out = max(0, int(amounts[0])), max(0, int(amounts[1]))
+        if left_in == 0 and left_out == 0:
+            return []
+
+        synthetic: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in live_index.get(label) or live_index.get(canonical) or []:
+            identity = (str(row.get("core") or ""), str(row.get("client_key") or ""))
+            if not identity[0] or not identity[1] or identity in seen:
+                continue
+            seen.add(identity)
+            if left_in == 0 and left_out == 0:
+                break
+            snap = self._snapshot_row_for_billed(row, left_in, left_out)
+            used_in = int(snap["delta_incoming"])
+            used_out = int(snap["delta_outgoing"])
+            if used_in == 0 and used_out == 0:
+                continue
+            left_in -= used_in
+            left_out -= used_out
+            synthetic.append(snap)
+        return synthetic
+
+    @staticmethod
+    def _snapshot_row_for_billed(row: dict[str, Any], billed_in: int, billed_out: int) -> dict[str, Any]:
+        live_in = max(0, int(row.get("delta_incoming") or 0))
+        live_out = max(0, int(row.get("delta_outgoing") or 0))
+        current_in = max(0, int(row.get("current_incoming") or 0))
+        current_out = max(0, int(row.get("current_outgoing") or 0))
+        take_in = min(live_in, max(0, billed_in))
+        take_out = min(live_out, max(0, billed_out))
+        snap = dict(row)
+        snap["delta_incoming"] = take_in
+        snap["delta_outgoing"] = take_out
+        # Counter at the billed queue, so the baseline moves there and later growth stays.
+        snap["current_incoming"] = max(0, current_in - (live_in - take_in))
+        snap["current_outgoing"] = max(0, current_out - (live_out - take_out))
+        return snap
 
     async def _forget_acked_snapshot(self, rows: list[dict[str, Any]]) -> None:
         """A repeated POST of the same GET must not subtract the billed delta again."""
