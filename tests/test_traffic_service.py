@@ -91,7 +91,15 @@ async def test_traffic_service_regression_resets_baseline(store):
     client.outgoing = 50
     stats = await _sample(traffic, registry)
     assert stats["regressed"] == 1
-    assert (await traffic.pending_payload())["users"] == {}
+    reset = (await traffic.pending_payload())["users"]["uuid-2"]
+    assert reset["downlink"] == 200
+    assert reset["uplink"] == 50
+
+    client.incoming = 230
+    await _sample(traffic, registry)
+    grown = (await traffic.pending_payload())["users"]["uuid-2"]
+    assert grown["downlink"] == 230
+    assert grown["uplink"] == 50
 
 
 async def test_traffic_service_migrates_legacy_email_rows_to_client_id(store):
@@ -295,15 +303,15 @@ async def test_counter_reset_keeps_unacked_bytes_and_does_not_rebill_them(store)
     stats = await _sample(traffic, registry)
     assert stats["regressed"] == 1
     kept = (await traffic.pending_payload())["users"]["node-1"]
-    assert kept["downlink"] == 600
-    assert kept["uplink"] == 100
+    assert kept["downlink"] == 800
+    assert kept["uplink"] == 150
 
     client.incoming = 250
     client.outgoing = 80
     await _sample(traffic, registry)
     grown = (await traffic.pending_payload())["users"]["node-1"]
-    assert grown["downlink"] == 650
-    assert grown["uplink"] == 130
+    assert grown["downlink"] == 850
+    assert grown["uplink"] == 180
 
     await traffic.ack_clients(["node-1"])
     await _sample(traffic, registry)
@@ -326,7 +334,7 @@ async def test_one_sided_reset_keeps_growth_on_the_other_direction(store):
     stats = await _sample(traffic, registry)
     assert stats["regressed"] == 1
     kept = (await traffic.pending_payload())["users"]["node-1"]
-    assert kept["downlink"] == 600
+    assert kept["downlink"] == 800
     assert kept["uplink"] == 150
 
 
@@ -477,3 +485,55 @@ async def test_xray_pending_uses_quota_node_id_and_drops_removed_clients(store):
     }
     assert await store.get_traffic_pending("xray", "iEhV1M") is None
     assert await store.get_traffic_pending("xray", "deleted-uuid") is None
+
+
+async def test_pending_is_only_the_growth_above_the_stored_baseline(store):
+    """100MB/3MB recorded, then 105MB/3.5MB, queues 5MB/0.5MB and not the whole counter."""
+    mb = 1024 * 1024
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="peer-1", email="wg@example.com", incoming=100 * mb, outgoing=3 * mb)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["wireguard"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 105 * mb
+    client.outgoing = int(3.5 * mb)
+    await _sample(traffic, registry)
+
+    payload = await traffic.pending_payload()
+    assert payload["users"]["peer-1"]["downlink"] == 5 * mb
+    assert payload["users"]["peer-1"]["uplink"] == int(0.5 * mb)
+
+    await store.delete_traffic_pending("wireguard", "peer-1")
+    await _sample(traffic, registry)
+    restored = (await traffic.pending_payload())["users"]["peer-1"]
+    assert restored["downlink"] == 5 * mb
+    assert restored["uplink"] == int(0.5 * mb)
+
+
+async def test_xray_restart_adds_the_new_counter_to_pending(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="node-1", email="user@example.com", incoming=1_000, outgoing=400)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 1_600
+    client.outgoing = 500
+    await _sample(traffic, registry)
+    await traffic.ack_pending()
+
+    client.incoming = 200
+    client.outgoing = 50
+    stats = await _sample(traffic, registry)
+    assert stats["regressed"] == 1
+    pending = (await traffic.pending_payload())["users"]["node-1"]
+    assert pending["downlink"] == 200
+    assert pending["uplink"] == 50
+
+    client.incoming = 260
+    client.outgoing = 70
+    await _sample(traffic, registry)
+    grown = (await traffic.pending_payload())["users"]["node-1"]
+    assert grown["downlink"] == 260
+    assert grown["uplink"] == 70

@@ -430,15 +430,16 @@ class TrafficService:
         delete_pending,
     ) -> str:
         preserved_in, preserved_out = TrafficService._preserved_delta(pending, core, client_key_label)
+        last = pending.get((core, client_key_label))
         ack = acks.get((core, client_key_label))
         if ack is None:
-            # First sight anchors the cumulative counters. Bytes already queued
-            # under this key stay billable; the cumulative total is not queued.
+            # First sight anchors the counters. Existing history is not queued.
+            # A pending row that already existed stays billable.
             set_ack(
                 core,
                 client_key_label,
-                current_incoming - preserved_in,
-                current_outgoing - preserved_out,
+                current_incoming,
+                current_outgoing,
             )
             if preserved_in > 0 or preserved_out > 0:
                 set_pending(
@@ -454,7 +455,25 @@ class TrafficService:
             return "initialized"
 
         ack_in, ack_out = int(ack[0]), int(ack[1])
-        if current_incoming < ack_in or current_outgoing < ack_out:
+        has_last = last is not None
+        last_in = int(last["current_incoming"]) if has_last else ack_in
+        last_out = int(last["current_outgoing"]) if has_last else ack_out
+        bill_in, base_in = TrafficService._direction_delta(
+            current_incoming,
+            ack_in,
+            preserved_in,
+            last_in,
+            has_last,
+        )
+        bill_out, base_out = TrafficService._direction_delta(
+            current_outgoing,
+            ack_out,
+            preserved_out,
+            last_out,
+            has_last,
+        )
+        reset = current_incoming < ack_in or current_outgoing < ack_out
+        if reset:
             log.warning(
                 "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s) preserved=(%s,%s)",
                 core,
@@ -466,46 +485,42 @@ class TrafficService:
                 preserved_in,
                 preserved_out,
             )
-            # A direction that fell is a new counter epoch: keep the bytes
-            # already queued and anchor that direction. A direction that did
-            # not fall keeps its normal delta, including growth in this sample.
-            # Already-acked cumulative history is not queued again.
-            bill_in = preserved_in if current_incoming < ack_in else current_incoming - ack_in
-            bill_out = preserved_out if current_outgoing < ack_out else current_outgoing - ack_out
-            set_ack(
-                core,
-                client_key_label,
-                current_incoming - bill_in,
-                current_outgoing - bill_out,
-            )
-            if bill_in > 0 or bill_out > 0:
-                set_pending(
-                    core,
-                    client_key_label,
-                    bill_in,
-                    bill_out,
-                    current_incoming,
-                    current_outgoing,
-                )
-            else:
-                delete_pending(core, client_key_label)
-            return "regressed"
-
-        delta_in = current_incoming - ack_in
-        delta_out = current_outgoing - ack_out
-        if delta_in > 0 or delta_out > 0:
+        if base_in != ack_in or base_out != ack_out:
+            set_ack(core, client_key_label, base_in, base_out)
+        if bill_in > 0 or bill_out > 0:
             set_pending(
                 core,
                 client_key_label,
-                delta_in,
-                delta_out,
+                bill_in,
+                bill_out,
                 current_incoming,
                 current_outgoing,
             )
-            return "pending"
+            return "regressed" if reset else "pending"
 
         delete_pending(core, client_key_label)
-        return "unchanged"
+        return "regressed" if reset else "unchanged"
+
+    @staticmethod
+    def _direction_delta(
+        current: int,
+        baseline: int,
+        preserved: int,
+        last_observed: int,
+        has_last: bool,
+    ) -> tuple[int, int]:
+        """Usage since the stored baseline, plus any pending the baseline does not cover.
+
+        A counter that fell below the baseline is a new epoch (Xray restart,
+        interface down/up). Its whole value is new usage and the baseline moves
+        to it. Otherwise only the growth since the last observation is added,
+        so a lost pending row is rebuilt from the baseline instead of the full counter.
+        """
+        if current < baseline:
+            return preserved + current, current
+        if has_last and last_observed >= baseline:
+            return preserved + (current - last_observed), baseline
+        return max(0, current - baseline), baseline
 
     def _remember_identity(self, canonical: str, email: str, client_id: str) -> None:
         self._aliases[canonical] = canonical
