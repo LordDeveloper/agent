@@ -216,13 +216,13 @@ async def test_ack_clients_accepts_email_alias(store):
 
 async def test_traffic_sample_writes_many_clients_in_one_plan(store):
     plans: list[dict] = []
-    real_write = store._write_traffic_plan
+    real_write = store._traffic._write_traffic_plan
 
-    async def wrapped_write(conn, writes):
+    async def wrapped_write(session, writes):
         plans.append(writes)
-        return await real_write(conn, writes)
+        return await real_write(session, writes)
 
-    store._write_traffic_plan = wrapped_write
+    store._traffic._write_traffic_plan = wrapped_write
     clients = [
         ClientUsageModel(id=f"id-{index}", email=f"user{index}@example.com", incoming=10, outgoing=1)
         for index in range(40)
@@ -264,9 +264,53 @@ async def test_ack_uses_get_snapshot_so_later_growth_stays_queued(store):
     assert acked == ["uuid-snap"]
     assert not_found == []
 
+    kept = await store.get_traffic_pending("xray", "uuid-snap")
+    assert kept["delta_incoming"] == 150
+    assert (await store.get_traffic_ack("xray", "uuid-snap"))["incoming"] == 1_100
+
+    other = TrafficService(store)
+    again, missing = await other.ack_clients(["uuid-snap"])
+    assert again == []
+    assert missing == ["uuid-snap"]
+    assert (await store.get_traffic_pending("xray", "uuid-snap"))["delta_incoming"] == 150
+
+    client.incoming = 1_400
     await _sample(traffic, registry)
-    leftover = (await traffic.pending_payload())["users"]["uuid-snap"]
-    assert leftover["downlink"] == 150
+    grown = await store.get_traffic_pending("xray", "uuid-snap")
+    assert grown["delta_incoming"] == 300
+
+
+async def test_ack_keeps_usage_that_arrived_after_the_read_when_the_counter_resets(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="uuid-reset", email="reset@example.com", incoming=1_000, outgoing=400)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 1_100
+    client.outgoing = 450
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
+    assert payload["users"]["uuid-reset"]["downlink"] == 100
+    assert payload["users"]["uuid-reset"]["uplink"] == 50
+
+    client.incoming = 1_180
+    client.outgoing = 470
+    await _sample(traffic, registry)
+    client.incoming = 30
+    client.outgoing = 10
+    await _sample(traffic, registry)
+
+    acked, not_found = await traffic.ack_clients(["uuid-reset"])
+    assert acked == ["uuid-reset"]
+    assert not_found == []
+
+    pending = await store.get_traffic_pending("xray", "uuid-reset")
+    assert pending["delta_incoming"] == 110
+    assert pending["delta_outgoing"] == 30
+    ack = await store.get_traffic_ack("xray", "uuid-reset")
+    assert ack["incoming"] == 30
+    assert ack["outgoing"] == 10
 
 
 async def test_inspect_traffic_ack_reads_only_the_node_id(store):

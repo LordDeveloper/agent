@@ -251,6 +251,9 @@ class Store:
     async def apply_traffic_sample(self, plan) -> dict[str, int]:
         return await self._traffic.apply_traffic_sample(plan)
 
+    async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
+        await self._traffic.ack_billed_snapshots(rows)
+
     async def ack_traffic_rows(self, rows: list[dict[str, Any]]) -> None:
         await self._traffic.ack_traffic_rows(rows)
 

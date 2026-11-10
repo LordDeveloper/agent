@@ -16,6 +16,7 @@ log = get_logger("traffic")
 
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
+FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 # A volume sample may hold the worker exclusively for this long. After that
 # the next 15s tick cancels it and starts a new cycle.
 DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
@@ -582,6 +583,7 @@ class TrafficService:
             users[label] = entry
 
         self._fetch_snapshot = snapshot
+        await self._persist_fetch_snapshot(snapshot)
 
         return {
             "sampled_at": await self.store.get_meta(
@@ -597,6 +599,8 @@ class TrafficService:
         await self.store.ack_traffic_rows(rows)
         acked = len(rows)
         self._fetch_snapshot = {}
+        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
 
         if acked:
             log.info("traffic ack applied clients=%s", acked)
@@ -615,10 +619,8 @@ class TrafficService:
             seen.add(label)
             requested.append(label)
 
-        rows_by_key: dict[str, list[dict[str, Any]]] = {}
-        for row in await self.store.list_traffic_pending():
-            label = str(row["client_key"])
-            rows_by_key.setdefault(label, []).append(row)
+        if not self._fetch_snapshot:
+            await self._load_persisted_snapshot()
 
         acked: list[str] = []
         not_found: list[str] = []
@@ -626,13 +628,7 @@ class TrafficService:
 
         for label in requested:
             canonical = self._canonical_key(label)
-            rows = (
-                self._fetch_snapshot.get(label)
-                or self._fetch_snapshot.get(canonical)
-                or rows_by_key.get(label)
-                or rows_by_key.get(canonical)
-                or []
-            )
+            rows = self._fetch_snapshot.get(label) or self._fetch_snapshot.get(canonical) or []
             if not rows:
                 not_found.append(label)
                 continue
@@ -643,8 +639,74 @@ class TrafficService:
                 acked.append(published)
             log.info("traffic ack client=%s rows=%s", published or label, len(rows))
 
-        await self.store.ack_traffic_rows(to_ack)
+        await self.store.ack_billed_snapshots(to_ack)
+        await self._forget_acked_snapshot(to_ack)
         return acked, not_found
+
+    async def _forget_acked_snapshot(self, rows: list[dict[str, Any]]) -> None:
+        """A repeated POST of the same GET must not subtract the billed delta again."""
+        forget = {
+            (str(row.get("core") or ""), str(row.get("client_key") or ""))
+            for row in rows
+            if row.get("core") and row.get("client_key")
+        }
+        if not forget:
+            return
+        kept_memory: dict[str, list[dict[str, Any]]] = {}
+        for label, items in self._fetch_snapshot.items():
+            remaining = [
+                row
+                for row in items
+                if (str(row.get("core") or ""), str(row.get("client_key") or "")) not in forget
+            ]
+            if remaining:
+                kept_memory[label] = remaining
+        self._fetch_snapshot = kept_memory
+        raw = await self.store.get_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        if not isinstance(raw, list):
+            return
+        kept = [
+            row
+            for row in raw
+            if isinstance(row, dict)
+            and (str(row.get("core") or ""), str(row.get("client_key") or "")) not in forget
+        ]
+        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, kept)
+
+    async def _persist_fetch_snapshot(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
+        """Remember the pending bytes returned by GET so a later ack can subtract only those."""
+        stored: dict[tuple[str, str], dict[str, Any]] = {}
+        for rows in snapshot.values():
+            for row in rows:
+                core = str(row.get("core") or "")
+                client_key = str(row.get("client_key") or "")
+                if not core or not client_key:
+                    continue
+                stored[(core, client_key)] = {
+                    "core": core,
+                    "client_key": client_key,
+                    "delta_incoming": int(row.get("delta_incoming") or 0),
+                    "delta_outgoing": int(row.get("delta_outgoing") or 0),
+                    "current_incoming": int(row.get("current_incoming") or 0),
+                    "current_outgoing": int(row.get("current_outgoing") or 0),
+                }
+        await self.store.set_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, list(stored.values()))
+
+    async def _load_persisted_snapshot(self) -> None:
+        raw = await self.store.get_meta(AGENT_META_CORE, FETCH_SNAPSHOT_META_KEY, [])
+        snapshot: dict[str, list[dict[str, Any]]] = {}
+        if isinstance(raw, list):
+            for row in raw:
+                if not isinstance(row, dict):
+                    continue
+                stored = str(row.get("client_key") or "")
+                label = self._public_client_key(stored)
+                published = dict(row)
+                if label:
+                    snapshot.setdefault(label, []).append(published)
+                if stored and stored != label:
+                    snapshot.setdefault(stored, []).append(published)
+        self._fetch_snapshot = snapshot
 
     async def _without_absent_clients(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop pending rows for clients the agent no longer stores.

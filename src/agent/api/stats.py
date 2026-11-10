@@ -211,8 +211,8 @@ async def stats_clients_traffic_pending_ack(
     """
     Reset pending for clients the panel already persisted.
 
-    Advances traffic_ack to the GET snapshot (not a later worker sample) so
-    bytes that arrived between GET and ACK stay in the next queue cycle.
+    Subtracts the GET snapshot from the live pending row. Bytes sampled onto
+    the queue after that GET stay pending and are not cleared.
 
     Body: ``{"clients": ["<node_id>", ...]}``.
     Email and a protocol UUID may find the row. ``acked`` always lists the

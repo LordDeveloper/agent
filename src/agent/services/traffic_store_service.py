@@ -206,32 +206,44 @@ class TrafficStoreService:
         return stats
 
     async def _commit_traffic_plan(self, writes: dict[str, Any]) -> None:
+        meta = writes.get("meta")
+        body = dict(writes)
+        body["meta"] = None
         async with self._runtime.writing() as session:
             try:
-                await self._write_traffic_plan(session, writes)
+                await self._write_traffic_plan(session, body)
                 await session.commit()
             except Exception:
                 await session.rollback()
                 raise
+        if isinstance(meta, tuple) and len(meta) == 3:
+            from agent.services.meta_service import MetaService
+
+            core, key, value = meta
+            await MetaService(self._runtime).set_meta(core, key, value)
 
     async def _write_traffic_plan(self, session, writes: dict[str, Any]) -> None:
         pending = 0
+        staged_ack: dict[tuple[str, str], TrafficAck] = {}
         for core, client_key, incoming, outgoing in writes.get("ack_upserts") or []:
-            row = await session.get(TrafficAck, (core, client_key))
+            key = (core, client_key)
+            row = staged_ack.get(key)
             if row is None:
-                session.add(
-                    TrafficAck(
-                        core=core,
-                        client_key=client_key,
-                        incoming=int(incoming),
-                        outgoing=int(outgoing),
-                        updated_at=datetime.now(timezone.utc).isoformat(),
-                    )
+                row = await session.get(TrafficAck, key)
+            if row is None:
+                row = TrafficAck(
+                    core=core,
+                    client_key=client_key,
+                    incoming=int(incoming),
+                    outgoing=int(outgoing),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
                 )
+                session.add(row)
             else:
                 row.incoming = int(incoming)
                 row.outgoing = int(outgoing)
                 row.updated_at = datetime.now(timezone.utc).isoformat()
+            staged_ack[key] = row
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
         for core, client_key in writes.get("ack_deletes") or []:
@@ -240,28 +252,32 @@ class TrafficStoreService:
             )
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
+        staged_pending: dict[tuple[str, str], TrafficPending] = {}
         for item in writes.get("pending_upserts") or []:
             core = item["core"]
             client_key = item["client_key"]
-            row = await session.get(TrafficPending, (core, client_key))
+            key = (core, client_key)
+            row = staged_pending.get(key)
             if row is None:
-                session.add(
-                    TrafficPending(
-                        core=core,
-                        client_key=client_key,
-                        delta_incoming=int(item["delta_incoming"]),
-                        delta_outgoing=int(item["delta_outgoing"]),
-                        current_incoming=int(item["current_incoming"]),
-                        current_outgoing=int(item["current_outgoing"]),
-                        updated_at=datetime.now(timezone.utc).isoformat(),
-                    )
+                row = await session.get(TrafficPending, key)
+            if row is None:
+                row = TrafficPending(
+                    core=core,
+                    client_key=client_key,
+                    delta_incoming=int(item["delta_incoming"]),
+                    delta_outgoing=int(item["delta_outgoing"]),
+                    current_incoming=int(item["current_incoming"]),
+                    current_outgoing=int(item["current_outgoing"]),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
                 )
+                session.add(row)
             else:
                 row.delta_incoming = int(item["delta_incoming"])
                 row.delta_outgoing = int(item["delta_outgoing"])
                 row.current_incoming = int(item["current_incoming"])
                 row.current_outgoing = int(item["current_outgoing"])
                 row.updated_at = datetime.now(timezone.utc).isoformat()
+            staged_pending[key] = row
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
         for core, client_key in writes.get("pending_deletes") or []:
@@ -278,13 +294,100 @@ class TrafficStoreService:
                 row.canonical_key = canonical_key
             pending = await self._runtime.commit_chunk(session, pending + 1)
 
-        meta = writes.get("meta")
-        if isinstance(meta, tuple) and len(meta) == 3:
-            from agent.services.meta_service import MetaService
+    async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
+        """Drop only the pending bytes the panel already billed.
 
-            core, key, value = meta
-            meta_svc = MetaService(self._runtime)
-            await meta_svc.set_meta(core, key, value)
+        Usage sampled after that read stays queued. A counter reset after the
+        read keeps the baseline the sampler already moved; it is not rewound
+        to the old snapshot.
+        """
+        if not rows:
+            return
+        async with self._runtime.writing() as session:
+            seen: set[tuple[str, str]] = set()
+            now = datetime.now(timezone.utc).isoformat()
+            for snap in rows:
+                core = str(snap.get("core") or "")
+                client_key = str(snap.get("client_key") or "")
+                key = (core, client_key)
+                if not core or not client_key or key in seen:
+                    continue
+                seen.add(key)
+                live = await session.get(TrafficPending, key)
+                ack = await session.get(TrafficAck, key)
+                billed_in = int(snap.get("delta_incoming") or 0)
+                billed_out = int(snap.get("delta_outgoing") or 0)
+                snap_in = int(snap.get("current_incoming") or 0)
+                snap_out = int(snap.get("current_outgoing") or 0)
+                previous_in = int(ack.incoming) if ack is not None else None
+                previous_out = int(ack.outgoing) if ack is not None else None
+                if live is None:
+                    ack_in, remain_in = self._settle_billed_direction(None, 0, snap_in, billed_in, previous_in)
+                    ack_out, remain_out = self._settle_billed_direction(None, 0, snap_out, billed_out, previous_out)
+                else:
+                    ack_in, remain_in = self._settle_billed_direction(
+                        int(live.current_incoming),
+                        int(live.delta_incoming),
+                        snap_in,
+                        billed_in,
+                        previous_in,
+                    )
+                    ack_out, remain_out = self._settle_billed_direction(
+                        int(live.current_outgoing),
+                        int(live.delta_outgoing),
+                        snap_out,
+                        billed_out,
+                        previous_out,
+                    )
+                if ack is None:
+                    session.add(
+                        TrafficAck(
+                            core=core,
+                            client_key=client_key,
+                            incoming=ack_in,
+                            outgoing=ack_out,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    ack.incoming = ack_in
+                    ack.outgoing = ack_out
+                    ack.updated_at = now
+                if live is None:
+                    continue
+                if remain_in or remain_out:
+                    live.delta_incoming = remain_in
+                    live.delta_outgoing = remain_out
+                    live.updated_at = now
+                else:
+                    await session.delete(live)
+            await session.commit()
+
+    @staticmethod
+    def _settle_billed_direction(
+        live_current: int | None,
+        live_delta: int,
+        snap_current: int,
+        snap_delta: int,
+        previous_ack: int | None,
+    ) -> tuple[int, int]:
+        """Return the baseline and the pending bytes that must stay queued.
+
+        A still-monotonic counter moves the baseline to the billed snapshot and
+        keeps only the bytes above it. A counter that reset, or climbed back
+        past the snapshot after a reset, keeps the sampler baseline and drops
+        only the billed delta.
+        """
+        if live_current is None:
+            if previous_ack is None or previous_ack <= snap_current:
+                return snap_current, 0
+            return previous_ack, 0
+        growth = live_current - snap_current
+        if live_current >= snap_current and live_delta == snap_delta + growth:
+            baseline = snap_current if previous_ack is None or previous_ack <= snap_current else previous_ack
+            return baseline, growth
+        baseline = previous_ack if previous_ack is not None else live_current
+        return baseline, max(0, live_delta - snap_delta)
 
     async def ack_traffic_rows(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
