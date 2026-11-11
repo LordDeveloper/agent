@@ -165,10 +165,19 @@ def render_volume_billing_frame(
         flush=True,
     )
     interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
-    if isinstance(lag, int) and lag > max(3000, int(interval_s * 2500)):
+    stale_ms = max(30_000, int(interval_s * 15_000))
+    if isinstance(lag, int) and lag > stale_ms:
         print(
-            "  hint: sample_lag high — agent work may be stuck on a slow Xray stats dump "
-            "or not running; pending bytes stay until the panel POST ack clears them.",
+            f"  hint: sample_lag>{stale_ms // 1000}s — worker may be stuck; "
+            "pending still grows only when a sample finishes.",
+            flush=True,
+        )
+    unacked = int(snapshot.get("pending_bytes") or 0)
+    clients = int(snapshot.get("pending_clients") or 0)
+    if unacked >= 256 * 1024 * 1024 or clients >= 80:
+        print(
+            f"  hint: backlog {snapshot.get('pending_bytes_label')} / {clients} clients — "
+            "panel must POST ack after billing; until then this queue does not shrink.",
             flush=True,
         )
     print(

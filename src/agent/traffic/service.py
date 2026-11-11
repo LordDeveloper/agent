@@ -227,6 +227,18 @@ class TrafficService:
         loop = asyncio.get_running_loop()
         loop.create_task(self.sample_unless_overlapping(registry))
 
+    def _schedule_persist_fetch_snapshot(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
+        """Persist ack snapshot off the hot GET path (large nodes hold the write lock)."""
+        loop = asyncio.get_running_loop()
+
+        async def _persist() -> None:
+            try:
+                await self._persist_fetch_snapshot(snapshot)
+            except Exception:
+                log.exception("traffic pending snapshot persist failed")
+
+        loop.create_task(_persist())
+
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from every core at once (online not required).
 
@@ -765,13 +777,12 @@ class TrafficService:
 
         self._fetch_snapshot[current_scope()] = snapshot
 
-    async def pending_payload(self) -> dict[str, Any]:
-        """Return unacked pending deltas and persist a fetch snapshot for POST ack.
+    async def pending_payload(self, *, persist_snapshot: bool = True) -> dict[str, Any]:
+        """Return unacked pending deltas and optionally persist a fetch snapshot for POST ack.
 
         The panel runs a single billing writer per node (UpdateSubscribeStats
-        withoutOverlapping). Blocking a second GET until ack only delayed billing
-        when the first pass was still applying rows. Correctness comes from the
-        persisted snapshot plus the ``billed`` map on ack, not from an exclusive lock.
+        withoutOverlapping). ``persist_snapshot=False`` keeps GET off the write lock;
+        the in-memory snapshot is enough until a background meta write finishes.
         """
         await self._load_persisted_aliases()
         rows = await self.store.list_traffic_pending()
@@ -799,7 +810,10 @@ class TrafficService:
             users[label] = entry
 
         self._write_snapshot(snapshot)
-        await self._persist_fetch_snapshot(snapshot)
+        if persist_snapshot:
+            await self._persist_fetch_snapshot(snapshot)
+        else:
+            self._schedule_persist_fetch_snapshot(snapshot)
 
         return {
             "sampled_at": await self.store.get_meta(
