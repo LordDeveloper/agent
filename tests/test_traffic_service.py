@@ -883,3 +883,19 @@ async def test_ack_chunk_ids_clears_billed_chunks(store):
     assert deleted == len(chunk_ids)
     assert missing == []
     assert (await traffic.pending_payload())["users"] == {}
+
+
+async def test_clear_pending_queue_wipes_chunks(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="clear-me", email="clear@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 50_000
+    await _sample(traffic, registry)
+    assert (await traffic.pending_payload())["users"]
+
+    cleared = await traffic.clear_pending_queue()
+    assert int(cleared["chunks_deleted"]) >= 1
+    assert (await traffic.pending_payload())["users"] == {}

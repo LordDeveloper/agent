@@ -248,6 +248,47 @@ class TrafficStoreService:
             )
             return max(int(count or 0), int(legacy or 0))
 
+    async def clear_pending_traffic_queue(self, scope: str | None = None) -> dict[str, int]:
+        """Delete all unacked pending chunks and legacy aggregate rows (panel will not bill them)."""
+        scope = str(scope or current_scope())
+        async with self._runtime.writing() as session:
+            chunks_before = int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(TrafficPendingChunk)
+                        .where(TrafficPendingChunk.scope == scope)
+                    )
+                ).scalar_one()
+                or 0
+            )
+            legacy_before = int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(TrafficPending).where(TrafficPending.scope == scope)
+                    )
+                ).scalar_one()
+                or 0
+            )
+            clients_before = int(
+                (
+                    await session.execute(
+                        select(func.count(func.distinct(TrafficPendingChunk.client_key)))
+                        .select_from(TrafficPendingChunk)
+                        .where(TrafficPendingChunk.scope == scope)
+                    )
+                ).scalar_one()
+                or 0
+            )
+            await session.execute(delete(TrafficPendingChunk).where(TrafficPendingChunk.scope == scope))
+            await session.execute(delete(TrafficPending).where(TrafficPending.scope == scope))
+            await session.commit()
+        return {
+            "chunks_deleted": chunks_before,
+            "legacy_rows_deleted": legacy_before,
+            "clients_cleared": clients_before,
+        }
+
     async def list_traffic_pending_chunks(self) -> list[dict[str, Any]]:
         scope = current_scope()
         async with self._runtime.reading() as session:

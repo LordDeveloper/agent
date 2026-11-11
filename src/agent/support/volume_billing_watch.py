@@ -204,6 +204,29 @@ def _unchanged_note(snapshot: dict[str, Any]) -> str:
     return "unchanged — queue empty or idle"
 
 
+def print_pending_queue_summary(snapshot: dict[str, Any], *, limit: int = 30) -> None:
+    """Print the same pending rows as the live watch (for reset preview)."""
+    total = int(snapshot.get("pending_clients") or 0)
+    if total <= 0:
+        print("  (no unacked pending rows)", flush=True)
+        return
+    top = snapshot.get("top_pending") or []
+    shown = len(top)
+    if limit > 0 and total > shown:
+        print(f"  (showing {shown} of {total} clients)", flush=True)
+    for row in top[: max(1, limit) if limit > 0 else len(top)]:
+        key = str(row.get("client_key") or "")[:48]
+        core = str(row.get("core") or "")
+        down = _format_bytes(int(row.get("downlink") or 0))
+        up = _format_bytes(int(row.get("uplink") or 0))
+        chunk_count = int(row.get("chunk_count") or 0)
+        extra = f"  ({chunk_count} chunks)" if chunk_count > 0 else ""
+        ahead = int(row.get("kernel_ahead") or 0)
+        if ahead > 0:
+            extra += f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
+        print(f"    {core:8} {key:48}  ↓{down}  ↑{up}{extra}", flush=True)
+
+
 def render_volume_billing_frame(
     snapshot: dict[str, Any],
     log_lines: list[str],

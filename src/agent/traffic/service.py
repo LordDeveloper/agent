@@ -1151,6 +1151,22 @@ class TrafficService:
         await self.store.delete_traffic_ack(core, client_key_label)
         await self.store.delete_traffic_pending(core, client_key_label)
 
+    async def clear_pending_queue(self) -> dict[str, int]:
+        """Wipe the unacked pending queue. Does not change clients.incoming/outgoing cursors."""
+        result = await self.store.clear_pending_traffic_queue()
+        await self._release_pending_read()
+        self._write_snapshot({})
+        from agent.auth_scope import current_scope
+
+        await self.store.delete_meta(AGENT_META_CORE, f"{FETCH_SNAPSHOT_META_KEY}:{current_scope()}")
+        log.warning(
+            "pending queue cleared chunks=%s clients=%s legacy=%s",
+            result.get("chunks_deleted"),
+            result.get("clients_cleared"),
+            result.get("legacy_rows_deleted"),
+        )
+        return result
+
     async def reset_client_record(
         self,
         core: str,

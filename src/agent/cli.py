@@ -134,6 +134,42 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats_volume_reset(args: argparse.Namespace) -> int:
+    from agent.support.volume_billing_watch import collect_volume_billing_snapshot, print_pending_queue_summary
+    from agent.traffic.service import TrafficService
+
+    runtime = open_runtime(args.env_file)
+    try:
+        traffic = TrafficService(runtime.store)
+        snapshot = run_sync(
+            collect_volume_billing_snapshot(
+                traffic,
+                runtime.settings,
+                pending_limit=0,
+                registry=runtime.registry,
+            )
+        )
+        chunks = int(snapshot.get("pending_chunks") or 0)
+        clients = int(snapshot.get("pending_clients") or 0)
+        if chunks <= 0 and clients <= 0:
+            _print_json({"success": True, "message": "pending queue already empty", "cleared": {}})
+            return 0
+        if not getattr(args, "yes", False):
+            sys.stderr.write(
+                f"Pending queue: {clients} clients, {chunks} chunks, "
+                f"{snapshot.get('pending_bytes_label')} unacked.\n"
+                "The panel will NOT bill this volume after reset.\n"
+                "Re-run with --yes to confirm.\n"
+            )
+            print_pending_queue_summary(snapshot, limit=int(getattr(args, "show", 25)))
+            return 1
+        cleared = run_sync(traffic.clear_pending_queue())
+        _print_json({"success": True, "cleared": cleared})
+        return 0
+    finally:
+        run_sync(runtime.close())
+
+
 def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
     from agent.support.volume_billing_watch import run_volume_billing_watch
 
@@ -865,6 +901,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max traffic/ack log lines per tick (default 40)",
     )
     p_stats_vol.set_defaults(func=cmd_stats_volume_watch)
+
+    p_stats_vol_reset = sub.add_parser(
+        "stats-volume-reset",
+        help="Clear unacked pending volume queue (requires --yes)",
+    )
+    _env_flag(p_stats_vol_reset)
+    p_stats_vol_reset.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm: delete all pending chunks (panel will not bill them)",
+    )
+    p_stats_vol_reset.add_argument(
+        "--all-pending",
+        action="store_true",
+        help="Include full client list in preview when confirmation is missing",
+    )
+    p_stats_vol_reset.add_argument(
+        "--show",
+        type=int,
+        default=25,
+        help="Max clients to print in preview without --yes (default 25)",
+    )
+    p_stats_vol_reset.set_defaults(func=cmd_stats_volume_reset)
 
     p_core = sub.add_parser("core", help="Manage VPN cores")
     core_sub = p_core.add_subparsers(dest="core_command", required=True)

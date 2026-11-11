@@ -913,6 +913,56 @@ def _service_menu() -> None:
         _run_action(f"Service {picked}", lambda action=picked: _show_service_action(action))
 
 
+def _reset_pending_volume_queue() -> None:
+    from agent.runtime import open_runtime
+    from agent.support.volume_billing_watch import collect_volume_billing_snapshot, print_pending_queue_summary
+    from agent.traffic.service import TrafficService
+    from agent.tui import confirm
+
+    runtime = open_runtime()
+    try:
+        traffic = TrafficService(runtime.store)
+        snapshot = run_sync(
+            collect_volume_billing_snapshot(
+                traffic,
+                runtime.settings,
+                pending_limit=0,
+                registry=runtime.registry,
+            )
+        )
+        chunks = int(snapshot.get("pending_chunks") or 0)
+        clients = int(snapshot.get("pending_clients") or 0)
+        if chunks <= 0 and clients <= 0:
+            _print(paint("  Pending queue is already empty.", GREEN))
+            return
+        _print(
+            kv(
+                "Unacked",
+                f"{clients} clients · {chunks} chunks · {snapshot.get('pending_bytes_label')}",
+                YELLOW,
+            )
+        )
+        _print(paint("  Preview:", DIM))
+        print_pending_queue_summary(snapshot, limit=0)
+        _print()
+        if not confirm(
+            "Clear ALL pending volume rows? The panel will not bill this traffic.",
+            default=False,
+        ):
+            _print(paint("  Cancelled.", DIM))
+            return
+        cleared = run_sync(traffic.clear_pending_queue())
+        _print(
+            kv(
+                "Cleared",
+                f"{cleared.get('chunks_deleted')} chunks · {cleared.get('clients_cleared')} clients",
+                GREEN,
+            )
+        )
+    finally:
+        run_sync(runtime.close())
+
+
 def _show_volume_billing_watch() -> None:
     from agent.cli import cmd_stats_volume_watch
 
@@ -937,6 +987,7 @@ def _stats_menu() -> None:
                 Choice("snapshot", "Usage snapshot", CYAN, "1"),
                 Choice("online", "Online users", GREEN, "2"),
                 Choice("volume_watch", "Volume billing (live)", YELLOW, "3"),
+                Choice("pending_reset", "Reset pending volume queue", RED, "4"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
@@ -944,6 +995,9 @@ def _stats_menu() -> None:
             return
         if picked == "volume_watch":
             _run_action("Volume billing (live)", _show_volume_billing_watch)
+            continue
+        if picked == "pending_reset":
+            _run_action("Reset pending queue", _reset_pending_volume_queue)
             continue
         _run_action(
             "Online users" if picked == "online" else "Usage snapshot",
