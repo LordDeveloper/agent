@@ -132,7 +132,20 @@ class _AgentLogTail:
         return lines[-max(1, limit) :]
 
 
-def render_volume_billing_frame(snapshot: dict[str, Any], log_lines: list[str]) -> None:
+def _snapshot_fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        snapshot.get("pending_clients"),
+        snapshot.get("pending_bytes"),
+        snapshot.get("last_sample_at"),
+    )
+
+
+def render_volume_billing_frame(
+    snapshot: dict[str, Any],
+    log_lines: list[str],
+    *,
+    note: str | None = None,
+) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lag = snapshot.get("worker_lag_ms")
     lag_label = f"{lag} ms" if lag is not None else "—"
@@ -141,13 +154,23 @@ def render_volume_billing_frame(snapshot: dict[str, Any], log_lines: list[str]) 
     if owner:
         lock += f" (pid {owner})"
 
-    print(f"--- volume billing · {ts} ---", flush=True)
+    header = f"--- volume billing · {ts} ---"
+    if note:
+        header += f"  ({note})"
+    print(header, flush=True)
     print(
         f"  pending_clients={snapshot.get('pending_clients')}  "
         f"unacked={snapshot.get('pending_bytes_label')}  "
         f"sample_lag={lag_label}  panel_read_lock={lock}",
         flush=True,
     )
+    interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
+    if isinstance(lag, int) and lag > max(3000, int(interval_s * 2500)):
+        print(
+            "  hint: sample_lag high — agent work may be stuck on a slow Xray stats dump "
+            "or not running; pending bytes stay until the panel POST ack clears them.",
+            flush=True,
+        )
     print(
         f"  sample_interval={snapshot.get('traffic_sample_interval_s')}s  "
         f"quota_interval={snapshot.get('quota_enforce_interval_s')}s  "
@@ -194,23 +217,29 @@ def run_volume_billing_watch(
             flush=True,
         )
 
+    prev_fp: tuple[Any, ...] | None = None
     try:
         while True:
             snapshot = run_sync(collect_volume_billing_snapshot(traffic, runtime.settings))
             log_lines, log_cursor = _filtered_activity_lines(log_cursor)
             log_lines.extend(file_tail.poll())
+            fp = _snapshot_fingerprint(snapshot)
+            note = None
+            if prev_fp is not None and fp == prev_fp:
+                note = "unchanged since last tick — not re-billed; queue still on agent until panel ack"
+            prev_fp = fp
 
             if as_json:
                 print(
                     json.dumps(
-                        {**snapshot, "log_lines": log_lines},
+                        {**snapshot, "unchanged": note is not None, "log_lines": log_lines},
                         ensure_ascii=False,
                         default=str,
                     ),
                     flush=True,
                 )
             else:
-                render_volume_billing_frame(snapshot, log_lines)
+                render_volume_billing_frame(snapshot, log_lines, note=note)
 
             if once:
                 return 0

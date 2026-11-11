@@ -210,19 +210,21 @@ def test_usage_snapshot_does_not_list_live_inbounds(client: TestClient, fake_xra
 def test_pending_get_skips_resample_when_fresh(client: TestClient, monkeypatch):
     headers = {"Authorization": "Bearer dev-token"}
     traffic = client.app.state.traffic
-    samples = {"n": 0}
-    real = traffic.sample_all
+    scheduled = {"n": 0}
 
-    async def counted(registry):
-        samples["n"] += 1
-        return await real(registry)
+    async def fresh_age() -> int:
+        return 0
 
-    monkeypatch.setattr(traffic, "sample_all", counted)
+    def capture_schedule(registry):
+        scheduled["n"] += 1
+
+    monkeypatch.setattr(traffic, "last_sample_age_ms", fresh_age)
+    monkeypatch.setattr(traffic, "_schedule_sample_all", capture_schedule)
     first = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
     second = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
     assert first.status_code == 200
     assert second.status_code == 200
-    assert samples["n"] == 0
+    assert scheduled["n"] == 0
 
 
 def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, monkeypatch):
@@ -244,8 +246,15 @@ def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, mon
             "regressed": 0,
         }
 
+    scheduled = {"n": 0}
+
+    def capture_schedule(registry):
+        scheduled["n"] += 1
+        loop = __import__("asyncio").get_event_loop()
+        loop.create_task(slow_sample(registry))
+
     monkeypatch.setattr(traffic, "last_sample_age_ms", stale_age)
-    monkeypatch.setattr(traffic, "sample_all", slow_sample)
+    monkeypatch.setattr(traffic, "_schedule_sample_all", capture_schedule)
 
     started = time.perf_counter()
     response = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
@@ -253,7 +262,7 @@ def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, mon
 
     assert response.status_code == 200
     body = response.json()
-    assert body.get("sample_refresh_scheduled") is False
+    assert body.get("sample_refresh_scheduled") is True
     assert body.get("success") is True
     assert isinstance(body.get("users"), dict)
     assert samples["n"] == 0

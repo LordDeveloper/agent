@@ -350,20 +350,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Branch:             {branch}")
     print(f"Commit:             {subject}")
 
-    if not payload_paths():
-        if args.dry_run:
-            print("Dry run. No edited files — a real release would abort.")
-            return 1
-        ensure_payload_changes()
-
-    if args.dry_run:
-        print("Dry run. Version files and git are unchanged.")
-        status = worktree_status()
-        if status:
-            print("Worktree that would be included:")
-            print(status)
-        return 0
-
     on_origin = any(item.tag == tag for item in published)
     if on_origin:
         die(f"{tag} is already on origin.")
@@ -386,11 +372,28 @@ def main(argv: list[str] | None = None) -> int:
                 f"  git push origin HEAD:refs/heads/{branch}\n"
                 f"  git push origin refs/tags/{tag}"
             )
+        if args.dry_run:
+            print(f"Dry run. {tag} is already on HEAD; a real run would push it.")
+            return 0
         print(f"{tag} is already on HEAD. Pushing the previous attempt.")
         push_release(branch, tag)
         print(f"Pushed {tag}.")
         print("GitHub Actions builds the binaries and creates the release from this tag.")
         print(release_page(tag))
+        return 0
+
+    if not payload_paths():
+        if args.dry_run:
+            print("Dry run. No edited files — a real release would abort.")
+            return 1
+        ensure_payload_changes()
+
+    if args.dry_run:
+        print("Dry run. Version files and git are unchanged.")
+        status = worktree_status()
+        if status:
+            print("Worktree that would be included:")
+            print(status)
         return 0
 
     write_version(version)

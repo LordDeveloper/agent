@@ -162,16 +162,22 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 @router.get("/stats/clients/traffic/pending")
 async def stats_clients_traffic_pending(
     traffic: TrafficService = Depends(get_traffic),
+    registry: CoreRegistry = Depends(get_registry),
 ):
     """
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` keeps ``pending = current_cumulative - ack`` until POST ack.
-      2. GET only reads that queue. It does not sample cores.
-      3. Panel bills those bytes, then POST ``/pending/ack`` with each
+      2. GET returns the queue immediately; it never waits on core I/O.
+      3. When the last sample is older than ~1.5× ``traffic_sample_interval``, GET
+         schedules a background sample so counters catch up before the next poll.
+      4. Panel bills those bytes, then POST ``/pending/ack`` with each
          client node_id so only growth after the GET snapshot remains queued.
     """
+    interval_ms = int(max(500.0, float(registry.settings.traffic_sample_interval) * 1000.0))
+    max_sample_age_ms = max(interval_ms, int(interval_ms * 1.5))
+    scheduled = await traffic.ensure_sample_fresh(registry, max_sample_age_ms=max_sample_age_ms)
     payload = await traffic.pending_payload()
 
     return {
@@ -179,7 +185,7 @@ async def stats_clients_traffic_pending(
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
-        "sample_refresh_scheduled": False,
+        "sample_refresh_scheduled": bool(scheduled),
     }
 
 
