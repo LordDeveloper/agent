@@ -234,8 +234,13 @@ def run_volume_billing_watch(
             log_lines.extend(file_tail.poll())
             fp = _snapshot_fingerprint(snapshot)
             note = None
+            compact = False
             if prev_fp is not None and fp == prev_fp:
-                note = "unchanged since last tick — not re-billed; queue still on agent until panel ack"
+                note = (
+                    "unchanged — panel has not POST ack; worker/sample values are the same as last tick "
+                    "(watch does not bill; only the panel shrinks this queue)"
+                )
+                compact = not as_json
             prev_fp = fp
 
             if as_json:
@@ -247,6 +252,22 @@ def run_volume_billing_watch(
                     ),
                     flush=True,
                 )
+            elif compact:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                lag = snapshot.get("worker_lag_ms")
+                lag_label = f"{lag} ms" if lag is not None else "—"
+                print(
+                    f"--- volume billing · {ts} ---  ({note})",
+                    flush=True,
+                )
+                print(
+                    f"  pending_clients={snapshot.get('pending_clients')}  "
+                    f"unacked={snapshot.get('pending_bytes_label')}  "
+                    f"sample_lag={lag_label}",
+                    flush=True,
+                )
+                for line in log_lines:
+                    print(f"  log | {line}", flush=True)
             else:
                 render_volume_billing_frame(snapshot, log_lines, note=note)
 

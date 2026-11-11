@@ -281,6 +281,7 @@ class TrafficService:
         driver = registry.get(core_key)
         if core_key == "l2tp":
             await self._drop_linked_l2tp_billing(driver)
+        # One bulk snapshot per core (Xray user>>> grouped, WireGuard peer dump, …).
         snapshot = await maybe_await(driver.usage_snapshot())
         return await self._store_core_samples(core_key, snapshot)
 
