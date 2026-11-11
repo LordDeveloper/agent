@@ -100,6 +100,8 @@ class AgentSettings(BaseSettings):
     # Pending bytes are invisible to the panel until the next sample, so this
     # is the lower bound on how fast a new connection shows up in the database.
     traffic_sample_interval: float = 5.0
+    # Comma-separated cores excluded from volume sampling (L2TP bills via linked WG peers).
+    traffic_sample_skip_cores: str = "l2tp"
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0
@@ -153,6 +155,10 @@ class AgentSettings(BaseSettings):
 
     def cores(self) -> list[str]:
         return [part.strip() for part in self.enabled_cores.split(",") if part.strip()]
+
+    def traffic_billing_cores(self) -> list[str]:
+        skip = {part.strip() for part in self.traffic_sample_skip_cores.split(",") if part.strip()}
+        return [core for core in self.cores() if core not in skip]
 
     def resolve_db_path(self) -> Path:
         """Sqlite database file path (ignored when DB_CONNECTION is not sqlite)."""

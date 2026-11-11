@@ -259,19 +259,32 @@ class TrafficService:
         self,
         registry: CoreRegistry,
     ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
-        """Parallel core snapshots, then a single SQLite commit (avoids write lock pile-up)."""
-        from agent.asyncutil import gather_independent
+        """Thread-pool core snapshots, then a single SQLite commit (one writer)."""
+        from agent.traffic.sample_parallel import gather_core_snapshots
 
         cycle_started = time.monotonic()
-        cores = self._listed_cores(registry) or []
-        if "l2tp" in cores:
-            cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+        all_cores = self._listed_cores(registry) or []
+        settings = registry.settings
+        if hasattr(settings, "traffic_billing_cores") and callable(settings.traffic_billing_cores):
+            billing = set(settings.traffic_billing_cores())
+        else:
+            billing = set(all_cores)
+        cores = [key for key in all_cores if key in billing]
+        if "l2tp" in all_cores and "l2tp" not in cores:
+            await self._drop_linked_l2tp_billing(registry.get("l2tp"))
 
         owners_task = asyncio.create_task(self.store.client_scopes())
-        captured = await gather_independent(
-            *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
-            return_exceptions=True,
-        )
+        from agent.config import AgentSettings
+
+        if isinstance(settings, AgentSettings) and cores:
+            captured = await gather_core_snapshots(settings, cores)
+        else:
+            from agent.asyncutil import gather_independent
+
+            captured = await gather_independent(
+                *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
+                return_exceptions=True,
+            )
         owners = await owners_task
         core_snapshots: list[tuple[str, Any, int]] = []
         core_timings: dict[str, dict[str, int]] = {}
@@ -370,7 +383,7 @@ class TrafficService:
             }
 
         try:
-            return await self.store.apply_traffic_sample(plan, current_scope())
+            return await self.store.apply_traffic_sample(plan, current_scope(), fast_stats=True)
         except Exception:
             log.exception("traffic merged sqlite commit failed")
             return {

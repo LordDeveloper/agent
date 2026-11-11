@@ -488,6 +488,8 @@ class TrafficStoreService:
         plan,
         scope: str | None = None,
         core: str | None = None,
+        *,
+        fast_stats: bool = False,
     ) -> dict[str, int]:
         scope = str(scope or current_scope())
         cursors = await self.load_client_traffic_cursors(scope, core)
@@ -496,7 +498,8 @@ class TrafficStoreService:
             writes["scope"] = scope
         await self._runtime.retry_locked(lambda: self._commit_traffic_plan(writes))
         stats = dict(writes.get("stats") or {})
-        stats["pending"] = await self.count_traffic_pending()
+        if not fast_stats:
+            stats["pending"] = await self.count_traffic_pending()
         return stats
 
     async def _commit_traffic_plan(self, writes: dict[str, Any]) -> None:
@@ -571,18 +574,20 @@ class TrafficStoreService:
                 row.canonical_key = canonical_key
         cursor_upserts = writes.get("client_cursor_upserts") or []
         await self._apply_client_cursor_upserts(session, scope, cursor_upserts)
-        for item in writes.get("chunk_inserts") or []:
-            session.add(
-                TrafficPendingChunk(
-                    scope=scope,
-                    chunk_id=str(item["chunk_id"]),
-                    core=str(item["core"]),
-                    client_key=str(item["client_key"]),
-                    incoming=int(item["incoming"]),
-                    outgoing=int(item["outgoing"]),
-                    sampled_at=str(item["sampled_at"]),
-                )
+        chunk_rows = [
+            TrafficPendingChunk(
+                scope=scope,
+                chunk_id=str(item["chunk_id"]),
+                core=str(item["core"]),
+                client_key=str(item["client_key"]),
+                incoming=int(item["incoming"]),
+                outgoing=int(item["outgoing"]),
+                sampled_at=str(item["sampled_at"]),
             )
+            for item in writes.get("chunk_inserts") or []
+        ]
+        if chunk_rows:
+            session.add_all(chunk_rows)
 
     async def _apply_client_cursor_upserts(
         self,
