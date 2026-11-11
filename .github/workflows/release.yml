@@ -24,10 +24,9 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: agent-release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+# A run that GitHub leaves queued with zero jobs cannot be cancelled, and it
+# keeps this ref's concurrency group forever. Later runs of that tag then wait
+# behind it. Each tag push starts on its own.
 jobs:
   build:
     name: build-${{ matrix.asset }}
