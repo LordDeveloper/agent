@@ -38,15 +38,17 @@ class _LiveScreen:
     def draw(self, lines: list[str]) -> None:
         if not lines:
             return
-        block = "\n".join(lines)
         if self._tty:
             if self._lines > 0:
-                self._stream.write(f"\033[{self._lines}A\033[J")
-            self._stream.write(block + "\n")
+                self._stream.write(f"\033[{self._lines}A")
+            for line in lines:
+                self._stream.write("\033[2K\r" + line + "\n")
+            for _ in range(max(0, self._lines - len(lines))):
+                self._stream.write("\033[2K\n")
             self._stream.flush()
             self._lines = len(lines)
             return
-        print(block, flush=True)
+        print("\n".join(lines), flush=True)
 
     def reset(self) -> None:
         self._lines = 0
@@ -92,6 +94,13 @@ async def collect_volume_billing_snapshot(
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
     chunks = await traffic.store.list_traffic_pending_chunks()
+    panel_id_by_stored: dict[tuple[str, str], str] = {}
+    for ident in await traffic.store.list_traffic_identity():
+        core_name = str(ident.get("core") or "").strip()
+        alias = str(ident.get("alias") or "").strip()
+        canonical = str(ident.get("canonical_key") or "").strip()
+        if core_name and alias and canonical:
+            panel_id_by_stored[(core_name, alias)] = canonical
     chunks_by_client: dict[tuple[str, str], int] = {}
     pending_bytes = 0
     wg_chunk_clients: set[str] = set()
@@ -154,9 +163,11 @@ async def collect_volume_billing_snapshot(
     for row in rows_sorted[:slice_end]:
         core = str(row.get("core") or "")
         client_key = str(row.get("client_key") or "")
+        panel_node_id = panel_id_by_stored.get((core, client_key), client_key)
         item: dict[str, Any] = {
             "core": core,
             "client_key": client_key,
+            "panel_node_id": panel_node_id,
             "downlink": int(row.get("delta_incoming") or 0),
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
@@ -273,18 +284,26 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         return lines
     lines.append(f"  Top unacked by volume (showing {len(top)} of {total_clients} clients)")
     lines.append(
-        f"  {'#':>3}  {'core':8}  {'client (node_id)':32}  {'down':>10}  {'up':>10}  {'total':>10}  chunks"
+        "  panel node_id = Laravel subscribe id; stored = SQLite traffic_pending_chunk.client_key"
     )
-    lines.append(f"  {'-' * 3}  {'-' * 8}  {'-' * 32}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ------")
+    lines.append(
+        f"  {'#':>3}  {'core':8}  {'panel node_id':14}  {'stored key':36}  {'down':>9}  {'up':>9}  {'total':>9}  ck"
+    )
+    lines.append(
+        f"  {'-' * 3}  {'-' * 8}  {'-' * 14}  {'-' * 36}  {'-' * 9}  {'-' * 9}  {'-' * 9}  ---"
+    )
     for index, row in enumerate(top, start=1):
         core = str(row.get("core") or "")[:8]
-        client_key = str(row.get("client_key") or "")[:32]
+        stored = str(row.get("client_key") or "")
+        panel = str(row.get("panel_node_id") or stored)
+        panel_col = panel if len(panel) <= 14 else panel[:11] + "..."
+        stored_col = stored if len(stored) <= 36 else stored[:33] + "..."
         down = _format_bytes(int(row.get("downlink") or 0))
         up = _format_bytes(int(row.get("uplink") or 0))
         total = _format_bytes(int(row.get("total") or 0))
         chunks = int(row.get("chunk_count") or 0)
         lines.append(
-            f"  {index:3d}  {core:8}  {client_key:32}  {down:>10}  {up:>10}  {total:>10}  {chunks:5d}"
+            f"  {index:3d}  {core:8}  {panel_col:14}  {stored_col:36}  {down:>9}  {up:>9}  {total:>9}  {chunks:3d}"
         )
     return lines
 
