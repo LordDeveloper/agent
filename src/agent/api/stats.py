@@ -161,6 +161,7 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 
 @router.get("/stats/clients/traffic/pending")
 async def stats_clients_traffic_pending(
+    registry: CoreRegistry = Depends(get_registry),
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
@@ -175,12 +176,20 @@ async def stats_clients_traffic_pending(
     """
     payload = await traffic.pending_payload(persist_snapshot=False)
 
+    settings = getattr(registry, "settings", None)
+    interval_s = float(getattr(settings, "traffic_sample_interval", 5.0) or 5.0)
+    max_sample_age_ms = max(1000, int(interval_s * 1000 * 2))
+    sample_refresh_scheduled = await traffic.ensure_sample_fresh(
+        registry,
+        max_sample_age_ms=max_sample_age_ms,
+    )
+
     return {
         "success": True,
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
-        "sample_refresh_scheduled": False,
+        "sample_refresh_scheduled": sample_refresh_scheduled,
     }
 
 

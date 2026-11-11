@@ -217,11 +217,17 @@ def test_pending_get_skips_resample_when_fresh(client: TestClient, monkeypatch):
         samples["n"] += 1
         return await real(registry)
 
+    async def fresh_age() -> int:
+        return 0
+
     monkeypatch.setattr(traffic, "sample_all", counted)
+    monkeypatch.setattr(traffic, "last_sample_age_ms", fresh_age)
     first = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
     second = client.get("/api/v1/stats/clients/traffic/pending", headers=headers)
     assert first.status_code == 200
     assert second.status_code == 200
+    assert first.json().get("sample_refresh_scheduled") is False
+    assert second.json().get("sample_refresh_scheduled") is False
     assert samples["n"] == 0
 
 
@@ -253,8 +259,9 @@ def test_pending_get_returns_before_slow_sample_finishes(client: TestClient, mon
 
     assert response.status_code == 200
     body = response.json()
-    assert body.get("sample_refresh_scheduled") is False
+    assert body.get("sample_refresh_scheduled") is True
     assert body.get("success") is True
     assert isinstance(body.get("users"), dict)
+    assert elapsed < 1.0
     assert samples["n"] == 0
     assert elapsed < 1.0

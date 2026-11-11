@@ -99,7 +99,7 @@ class AgentSettings(BaseSettings):
     # The worker attempts a sample on this cadence and never runs two at once.
     # Pending bytes are invisible to the panel until the next sample, so this
     # is the lower bound on how fast a new connection shows up in the database.
-    traffic_sample_interval: float = 2.0
+    traffic_sample_interval: float = 5.0
     # A sample still running after this many seconds is cancelled so the next
     # cycle can start. Same idea as withoutOverlapping: one sample at a time,
     # and a stuck sample cannot block volume calculation longer than this.
