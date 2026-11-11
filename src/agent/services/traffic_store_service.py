@@ -9,6 +9,7 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent.auth_scope import current_scope
+from agent.database.models.client import Client
 from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending, TrafficPendingChunk
 from agent.database.session import DatabaseRuntime
 
@@ -153,6 +154,36 @@ class TrafficStoreService:
         )
         await session.execute(stmt)
 
+    async def _upsert_sample_cursor(
+        self,
+        session,
+        scope: str,
+        core: str,
+        client_key: str,
+        current_incoming: int,
+        current_outgoing: int,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        key = (scope, str(core), str(client_key))
+        row = await session.get(TrafficPending, key)
+        if row is None:
+            session.add(
+                TrafficPending(
+                    scope=scope,
+                    core=str(core),
+                    client_key=str(client_key),
+                    delta_incoming=0,
+                    delta_outgoing=0,
+                    current_incoming=int(current_incoming),
+                    current_outgoing=int(current_outgoing),
+                    updated_at=now,
+                )
+            )
+            return
+        row.current_incoming = int(current_incoming)
+        row.current_outgoing = int(current_outgoing)
+        row.updated_at = now
+
     async def delete_traffic_pending(self, core: str, client_key: str) -> None:
         async with self._runtime.writing() as session:
             scope = current_scope()
@@ -232,10 +263,8 @@ class TrafficStoreService:
                     "chunk_id": str(row.chunk_id),
                     "core": row.core,
                     "client_key": row.client_key,
-                    "delta_incoming": int(row.delta_incoming),
-                    "delta_outgoing": int(row.delta_outgoing),
-                    "current_incoming": int(row.current_incoming),
-                    "current_outgoing": int(row.current_outgoing),
+                    "incoming": int(row.incoming),
+                    "outgoing": int(row.outgoing),
                     "sampled_at": row.sampled_at,
                 }
                 for row in rows
@@ -246,7 +275,6 @@ class TrafficStoreService:
         if not ids:
             return 0, []
         scope = current_scope()
-        now = datetime.now(timezone.utc).isoformat()
         deleted = 0
         async with self._runtime.writing() as session:
             rows = (
@@ -260,34 +288,29 @@ class TrafficStoreService:
             if not rows:
                 return 0, ids
             found = {str(row.chunk_id) for row in rows}
-            per_client: dict[tuple[str, str], tuple[int, int]] = {}
+            touched: set[tuple[str, str]] = set()
             for row in rows:
-                key = (str(row.core), str(row.client_key))
-                current = per_client.get(key, (0, 0))
-                per_client[key] = (
-                    max(current[0], int(row.current_incoming)),
-                    max(current[1], int(row.current_outgoing)),
-                )
-            for row in rows:
+                touched.add((str(row.core), str(row.client_key)))
                 await session.delete(row)
                 deleted += 1
-            for (core, client_key), (incoming, outgoing) in per_client.items():
-                ack = await session.get(TrafficAck, (scope, core, client_key))
-                if ack is None:
-                    session.add(
-                        TrafficAck(
-                            scope=scope,
-                            core=core,
-                            client_key=client_key,
-                            incoming=int(incoming),
-                            outgoing=int(outgoing),
-                            updated_at=now,
+            for core, client_key in touched:
+                left = await session.scalar(
+                    select(func.count())
+                    .select_from(TrafficPendingChunk)
+                    .where(
+                        TrafficPendingChunk.scope == scope,
+                        TrafficPendingChunk.core == core,
+                        TrafficPendingChunk.client_key == client_key,
+                    )
+                )
+                if int(left or 0) == 0:
+                    await session.execute(
+                        delete(TrafficPending).where(
+                            TrafficPending.scope == scope,
+                            TrafficPending.core == core,
+                            TrafficPending.client_key == client_key,
                         )
                     )
-                else:
-                    ack.incoming = max(int(ack.incoming), int(incoming))
-                    ack.outgoing = max(int(ack.outgoing), int(outgoing))
-                    ack.updated_at = now
             await session.commit()
         missing = [item for item in ids if item not in found]
         return deleted, missing
@@ -325,6 +348,18 @@ class TrafficStoreService:
             }
             chunk_rows = (await session.execute(chunk_query)).scalars().all()
             pending: dict[tuple[str, str], dict[str, int]] = {}
+            cursor_map: dict[tuple[str, str], tuple[int, int]] = {}
+            client_query = select(Client).where(Client.scope == scope)
+            if core_name:
+                client_query = client_query.where(Client.core_id == core_name)
+            for row in (await session.execute(client_query)).scalars().all():
+                pair = (str(row.core_id), str(row.id))
+                if row.incoming is None and row.outgoing is None:
+                    continue
+                cursor_map[pair] = (
+                    int(row.incoming or 0),
+                    int(row.outgoing or 0),
+                )
             for row in chunk_rows:
                 key = (str(row.core), str(row.client_key))
                 agg = pending.setdefault(
@@ -334,18 +369,14 @@ class TrafficStoreService:
                         "delta_outgoing": 0,
                         "current_incoming": 0,
                         "current_outgoing": 0,
-                        "_latest_sampled_at": "",
                     },
                 )
-                agg["delta_incoming"] += int(row.delta_incoming)
-                agg["delta_outgoing"] += int(row.delta_outgoing)
-                sampled = str(row.sampled_at or "")
-                if sampled >= agg["_latest_sampled_at"]:
-                    agg["_latest_sampled_at"] = sampled
-                    agg["current_incoming"] = int(row.current_incoming)
-                    agg["current_outgoing"] = int(row.current_outgoing)
-            for key, agg in list(pending.items()):
-                agg.pop("_latest_sampled_at", None)
+                agg["delta_incoming"] += int(row.incoming)
+                agg["delta_outgoing"] += int(row.outgoing)
+            for key, agg in pending.items():
+                cursor = cursor_map.get(key, (0, 0))
+                agg["current_incoming"] = int(cursor[0])
+                agg["current_outgoing"] = int(cursor[1])
             legacy_query = select(TrafficPending).where(TrafficPending.scope == scope)
             if core_name:
                 legacy_query = legacy_query.where(TrafficPending.core == core_name)
@@ -358,19 +389,36 @@ class TrafficStoreService:
                     "current_outgoing": int(row.current_outgoing),
                 }
                 if key in pending:
-                    pending[key]["delta_incoming"] += legacy["delta_incoming"]
-                    pending[key]["delta_outgoing"] += legacy["delta_outgoing"]
-                    pending[key]["current_incoming"] = max(
-                        int(pending[key]["current_incoming"]),
-                        legacy["current_incoming"],
-                    )
-                    pending[key]["current_outgoing"] = max(
-                        int(pending[key]["current_outgoing"]),
-                        legacy["current_outgoing"],
-                    )
+                    if legacy["delta_incoming"] or legacy["delta_outgoing"]:
+                        pending[key]["delta_incoming"] += legacy["delta_incoming"]
+                        pending[key]["delta_outgoing"] += legacy["delta_outgoing"]
+                    pending[key]["current_incoming"] = int(legacy["current_incoming"])
+                    pending[key]["current_outgoing"] = int(legacy["current_outgoing"])
                     continue
                 pending[key] = legacy
             return acks, pending
+
+    async def load_client_traffic_cursors(
+        self,
+        scope: str | None = None,
+        core: str | None = None,
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        scope = str(scope or current_scope())
+        core_name = str(core or "").strip()
+        found: dict[tuple[str, str], tuple[int, int]] = {}
+        async with self._runtime.reading() as session:
+            client_query = select(Client).where(Client.scope == scope)
+            if core_name:
+                client_query = client_query.where(Client.core_id == core_name)
+            for row in (await session.execute(client_query)).scalars().all():
+                pair = (str(row.core_id), str(row.id))
+                if row.incoming is None and row.outgoing is None:
+                    continue
+                found[pair] = (
+                    int(row.incoming or 0),
+                    int(row.outgoing or 0),
+                )
+        return found
 
     async def apply_traffic_sample(
         self,
@@ -379,8 +427,8 @@ class TrafficStoreService:
         core: str | None = None,
     ) -> dict[str, int]:
         scope = str(scope or current_scope())
-        acks, pending = await self._traffic_books(scope, core)
-        writes = plan(acks, pending)
+        cursors = await self.load_client_traffic_cursors(scope, core)
+        writes = plan(cursors)
         if isinstance(writes, dict):
             writes["scope"] = scope
         await self._runtime.retry_locked(lambda: self._commit_traffic_plan(writes))
@@ -458,6 +506,16 @@ class TrafficStoreService:
                 session.add(TrafficIdentity(scope=scope, core=core, alias=alias, canonical_key=canonical_key))
             else:
                 row.canonical_key = canonical_key
+        cursor_upserts = writes.get("client_cursor_upserts") or []
+        for core, client_key, current_incoming, current_outgoing in cursor_upserts:
+            await self._update_client_traffic_cursor(
+                session,
+                scope,
+                str(core),
+                str(client_key),
+                int(current_incoming),
+                int(current_outgoing),
+            )
         for item in writes.get("chunk_inserts") or []:
             session.add(
                 TrafficPendingChunk(
@@ -465,172 +523,93 @@ class TrafficStoreService:
                     chunk_id=str(item["chunk_id"]),
                     core=str(item["core"]),
                     client_key=str(item["client_key"]),
-                    delta_incoming=int(item["delta_incoming"]),
-                    delta_outgoing=int(item["delta_outgoing"]),
-                    current_incoming=int(item["current_incoming"]),
-                    current_outgoing=int(item["current_outgoing"]),
+                    incoming=int(item["incoming"]),
+                    outgoing=int(item["outgoing"]),
                     sampled_at=str(item["sampled_at"]),
                 )
             )
-    async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
-        """Drop only the pending bytes the panel already billed.
 
-        Usage sampled after that read stays queued. A counter reset after the
-        read keeps the baseline the sampler already moved; it is not rewound
-        to the old snapshot.
-        """
+    async def _update_client_traffic_cursor(
+        self,
+        session,
+        scope: str,
+        core: str,
+        client_key: str,
+        incoming: int,
+        outgoing: int,
+    ) -> None:
+        from agent.database.models.core import Core
+
+        if not core or not client_key:
+            return
+        if await session.get(Core, core) is None:
+            session.add(Core(id=core))
+        client = await session.get(Client, (core, client_key))
+        if client is None:
+            session.add(
+                Client(
+                    core_id=core,
+                    id=client_key,
+                    scope=scope,
+                    incoming=int(incoming),
+                    outgoing=int(outgoing),
+                )
+            )
+            return
+        if str(client.scope) == scope:
+            client.incoming = int(incoming)
+            client.outgoing = int(outgoing)
+
+    async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
+        """Remove billed bytes from chunk rows (panel also sends chunk_ids)."""
         if not rows:
             return
         async with self._runtime.writing() as session:
             scope = current_scope()
-            seen: set[tuple[str, str, str]] = set()
-            unique_snaps: list[dict[str, Any]] = []
-            pending_filters: list[Any] = []
-            ack_filters: list[Any] = []
-            now = datetime.now(timezone.utc).isoformat()
+            seen: set[tuple[str, str]] = set()
             for snap in rows:
                 core = str(snap.get("core") or "")
                 client_key = str(snap.get("client_key") or "")
-                key = (scope, core, client_key)
-                if not core or not client_key or key in seen:
-                    continue
-                seen.add(key)
-                unique_snaps.append(snap)
-                pending_filters.append(
-                    and_(TrafficPending.core == core, TrafficPending.client_key == client_key)
-                )
-                ack_filters.append(
-                    and_(TrafficAck.core == core, TrafficAck.client_key == client_key)
-                )
-
-            live_map: dict[tuple[str, str], TrafficPending] = {}
-            chunk_map: dict[tuple[str, str], list[TrafficPendingChunk]] = {}
-            ack_map: dict[tuple[str, str], TrafficAck] = {}
-            if pending_filters:
-                pending_rows = (
-                    await session.execute(
-                        select(TrafficPending).where(
-                            TrafficPending.scope == scope,
-                            or_(*pending_filters),
-                        )
-                    )
-                ).scalars().all()
-                for row in pending_rows:
-                    live_map[(str(row.core), str(row.client_key))] = row
-                chunk_filters = [
-                    and_(
-                        TrafficPendingChunk.core == str(snap.get("core") or ""),
-                        TrafficPendingChunk.client_key == str(snap.get("client_key") or ""),
-                    )
-                    for snap in unique_snaps
-                ]
-                chunk_rows = (
-                    await session.execute(
-                        select(TrafficPendingChunk).where(
-                            TrafficPendingChunk.scope == scope,
-                            or_(*chunk_filters),
-                        )
-                    )
-                ).scalars().all()
-                for row in chunk_rows:
-                    pair = (str(row.core), str(row.client_key))
-                    chunk_map.setdefault(pair, []).append(row)
-                for pair in chunk_map:
-                    chunk_map[pair].sort(key=lambda item: str(item.sampled_at or ""))
-                ack_rows = (
-                    await session.execute(
-                        select(TrafficAck).where(
-                            TrafficAck.scope == scope,
-                            or_(*ack_filters),
-                        )
-                    )
-                ).scalars().all()
-                for row in ack_rows:
-                    ack_map[(str(row.core), str(row.client_key))] = row
-
-            for snap in unique_snaps:
-                core = str(snap.get("core") or "")
-                client_key = str(snap.get("client_key") or "")
                 pair = (core, client_key)
-                live = live_map.get(pair)
-                chunks = chunk_map.get(pair, [])
-                if live is None and chunks:
-                    live = self._chunk_pending_view(chunks)
-                ack = ack_map.get(pair)
-                if "billed_incoming" in snap or "billed_outgoing" in snap:
-                    billed_in = max(0, int(snap.get("billed_incoming") or 0))
-                    billed_out = max(0, int(snap.get("billed_outgoing") or 0))
-                else:
-                    billed_in = int(snap.get("delta_incoming") or 0)
-                    billed_out = int(snap.get("delta_outgoing") or 0)
-                snap_in = int(snap.get("current_incoming") or 0)
-                snap_out = int(snap.get("current_outgoing") or 0)
-                previous_in = int(ack.incoming) if ack is not None else None
-                previous_out = int(ack.outgoing) if ack is not None else None
-                if live is None:
-                    ack_in, remain_in = self._settle_billed_direction(None, 0, snap_in, billed_in, previous_in)
-                    ack_out, remain_out = self._settle_billed_direction(None, 0, snap_out, billed_out, previous_out)
-                else:
-                    ack_in, remain_in = self._settle_billed_direction(
-                        int(live.current_incoming),
-                        int(live.delta_incoming),
-                        snap_in,
-                        billed_in,
-                        previous_in,
-                    )
-                    ack_out, remain_out = self._settle_billed_direction(
-                        int(live.current_outgoing),
-                        int(live.delta_outgoing),
-                        snap_out,
-                        billed_out,
-                        previous_out,
-                    )
-                if ack is None:
-                    session.add(
-                        TrafficAck(
-                            scope=scope,
-                            core=core,
-                            client_key=client_key,
-                            incoming=ack_in,
-                            outgoing=ack_out,
-                            updated_at=now,
-                        )
-                    )
-                else:
-                    ack.incoming = ack_in
-                    ack.outgoing = ack_out
-                    ack.updated_at = now
-                if live is None:
+                if not core or not client_key or pair in seen:
                     continue
-                if isinstance(live, TrafficPending):
-                    if remain_in or remain_out:
-                        live.delta_incoming = remain_in
-                        live.delta_outgoing = remain_out
-                        live.updated_at = now
-                    else:
-                        await session.delete(live)
-                if chunks:
-                    if remain_in == 0 and remain_out == 0:
-                        for item in chunks:
-                            await session.delete(item)
-                        chunk_map[pair] = []
-                    else:
-                        if live is not None and not isinstance(live, TrafficPending):
-                            removed_in = int(live.delta_incoming) - remain_in
-                            removed_out = int(live.delta_outgoing) - remain_out
-                        elif isinstance(live, TrafficPending):
-                            removed_in = int(live.delta_incoming) - remain_in
-                            removed_out = int(live.delta_outgoing) - remain_out
-                        else:
-                            removed_in = billed_in
-                            removed_out = billed_out
-                        chunk_map[pair] = await self._consume_chunks_fifo(
-                            session,
-                            chunks,
-                            max(0, removed_in),
-                            max(0, removed_out),
+                seen.add(pair)
+                if "billed_incoming" in snap or "billed_outgoing" in snap:
+                    take_in = max(0, int(snap.get("billed_incoming") or 0))
+                    take_out = max(0, int(snap.get("billed_outgoing") or 0))
+                else:
+                    take_in = max(
+                        0,
+                        int(snap.get("incoming") or snap.get("delta_incoming") or 0),
+                    )
+                    take_out = max(
+                        0,
+                        int(snap.get("outgoing") or snap.get("delta_outgoing") or 0),
+                    )
+                if take_in == 0 and take_out == 0:
+                    continue
+                chunks = (
+                    await session.execute(
+                        select(TrafficPendingChunk)
+                        .where(
+                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.core == core,
+                            TrafficPendingChunk.client_key == client_key,
                         )
-                if remain_in == 0 and remain_out == 0:
+                        .order_by(TrafficPendingChunk.sampled_at)
+                    )
+                ).scalars().all()
+                await self._consume_chunks_fifo(session, chunks, take_in, take_out)
+                left = await session.scalar(
+                    select(func.count())
+                    .select_from(TrafficPendingChunk)
+                    .where(
+                        TrafficPendingChunk.scope == scope,
+                        TrafficPendingChunk.core == core,
+                        TrafficPendingChunk.client_key == client_key,
+                    )
+                )
+                if int(left or 0) == 0:
                     await session.execute(
                         delete(TrafficPending).where(
                             TrafficPending.scope == scope,
@@ -639,18 +618,6 @@ class TrafficStoreService:
                         )
                     )
             await session.commit()
-
-    @staticmethod
-    def _chunk_pending_view(chunks: list[TrafficPendingChunk]) -> SimpleNamespace:
-        delta_in = sum(int(item.delta_incoming) for item in chunks)
-        delta_out = sum(int(item.delta_outgoing) for item in chunks)
-        latest = max(chunks, key=lambda item: str(item.sampled_at or ""))
-        return SimpleNamespace(
-            delta_incoming=delta_in,
-            delta_outgoing=delta_out,
-            current_incoming=int(latest.current_incoming),
-            current_outgoing=int(latest.current_outgoing),
-        )
 
     @staticmethod
     async def _consume_chunks_fifo(
@@ -666,8 +633,8 @@ class TrafficStoreService:
             if remaining_in <= 0 and remaining_out <= 0:
                 keep.append(chunk)
                 continue
-            chunk_in = int(chunk.delta_incoming)
-            chunk_out = int(chunk.delta_outgoing)
+            chunk_in = int(chunk.incoming)
+            chunk_out = int(chunk.outgoing)
             if chunk_in <= remaining_in and chunk_out <= remaining_out:
                 remaining_in -= chunk_in
                 remaining_out -= chunk_out

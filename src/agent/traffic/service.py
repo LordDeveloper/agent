@@ -376,16 +376,15 @@ class TrafficService:
     ) -> dict[str, int]:
         from agent.auth_scope import current_scope
 
-        def plan(acks: dict, pending: dict) -> dict[str, Any]:
-            return self._plan_sample(samples, acks, pending, sampled_at)
+        def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
+            return self._plan_sample(samples, cursors, sampled_at)
 
         return await self.store.apply_traffic_sample(plan, scope or current_scope(), core)
 
     def _plan_sample(
         self,
         samples: list[dict[str, Any]],
-        acks: dict[tuple[str, str], tuple[int, int]],
-        pending: dict[tuple[str, str], dict[str, int]],
+        sample_cursors: dict[tuple[str, str], tuple[int, int]],
         sampled_at: str,
     ) -> dict[str, Any]:
         stats = {
@@ -395,104 +394,9 @@ class TrafficService:
             "regressed": 0,
             "unchanged": 0,
         }
-        ack_upserts: list[tuple[str, str, int, int]] = []
-        ack_deletes: list[tuple[str, str]] = []
-        # One pending entry per client. Later samples in this batch replace it.
-        pending_upserts: dict[tuple[str, str], dict[str, Any]] = {}
-        pending_deletes: set[tuple[str, str]] = set()
-        chunk_inserts: list[dict[str, Any]] = []
         identity_upserts: list[tuple[str, str, str]] = []
-
-        def set_ack(core: str, key: str, incoming: int, outgoing: int) -> None:
-            acks[(core, key)] = (incoming, outgoing)
-            ack_upserts.append((core, key, incoming, outgoing))
-
-        def delete_ack(core: str, key: str) -> None:
-            if (core, key) not in acks:
-                return
-            del acks[(core, key)]
-            ack_deletes.append((core, key))
-
-        def set_pending(
-            core: str,
-            key: str,
-            delta_incoming: int,
-            delta_outgoing: int,
-            current_incoming: int,
-            current_outgoing: int,
-        ) -> None:
-            # Update the client's single pending. Do not append another row.
-            row = {
-                "delta_incoming": delta_incoming,
-                "delta_outgoing": delta_outgoing,
-                "current_incoming": current_incoming,
-                "current_outgoing": current_outgoing,
-            }
-            pending[(core, key)] = row
-            pending_upserts[(core, key)] = {"core": core, "client_key": key, **row}
-            pending_deletes.discard((core, key))
-
-        def delete_pending(core: str, key: str) -> None:
-            if (core, key) not in pending:
-                return
-            del pending[(core, key)]
-            pending_upserts.pop((core, key), None)
-            pending_deletes.add((core, key))
-
-        def insert_chunk(
-            core: str,
-            key: str,
-            delta_incoming: int,
-            delta_outgoing: int,
-            current_incoming: int,
-            current_outgoing: int,
-        ) -> None:
-            if delta_incoming <= 0 and delta_outgoing <= 0:
-                return
-            chunk_inserts.append(
-                {
-                    "chunk_id": str(uuid.uuid4()),
-                    "core": core,
-                    "client_key": key,
-                    "delta_incoming": int(delta_incoming),
-                    "delta_outgoing": int(delta_outgoing),
-                    "current_incoming": int(current_incoming),
-                    "current_outgoing": int(current_outgoing),
-                    "sampled_at": sampled_at,
-                }
-            )
-            row = pending.get((core, key))
-            if row is None:
-                pending[(core, key)] = {
-                    "delta_incoming": int(delta_incoming),
-                    "delta_outgoing": int(delta_outgoing),
-                    "current_incoming": int(current_incoming),
-                    "current_outgoing": int(current_outgoing),
-                }
-                return
-            row["delta_incoming"] = int(row["delta_incoming"]) + int(delta_incoming)
-            row["delta_outgoing"] = int(row["delta_outgoing"]) + int(delta_outgoing)
-            row["current_incoming"] = int(current_incoming)
-            row["current_outgoing"] = int(current_outgoing)
-
-        def sync_pending_state(
-            core: str,
-            key: str,
-            bill_in: int,
-            bill_out: int,
-            current_incoming: int,
-            current_outgoing: int,
-        ) -> None:
-            if bill_in <= 0 and bill_out <= 0:
-                if (core, key) not in pending:
-                    return
-                return
-            pending[(core, key)] = {
-                "delta_incoming": int(bill_in),
-                "delta_outgoing": int(bill_out),
-                "current_incoming": int(current_incoming),
-                "current_outgoing": int(current_outgoing),
-            }
+        chunk_inserts: list[dict[str, Any]] = []
+        client_cursor_upserts: list[tuple[str, str, int, int]] = []
 
         protected = {str(sample["label"]) for sample in samples if str(sample["label"])}
         for sample in samples:
@@ -504,269 +408,121 @@ class TrafficService:
             current_incoming = int(sample["incoming"])
             current_outgoing = int(sample["outgoing"])
             stats["clients_seen"] += 1
-            self._migrate_legacy_keys(
+            self._migrate_legacy_sample_cursors(
                 core,
                 label,
                 email,
-                client_id,
-                set_ack=set_ack,
-                delete_ack=delete_ack,
-                set_pending=set_pending,
-                delete_pending=delete_pending,
-                acks=acks,
-                pending=pending,
                 protocol_id=protocol_id,
                 protected=protected,
+                sample_cursors=sample_cursors,
             )
-            outcome = self._classify_sample(
+            outcome = self._classify_interval_sample(
                 core,
                 label,
                 current_incoming,
                 current_outgoing,
-                acks=acks,
-                pending=pending,
-                set_ack=set_ack,
-                set_pending=set_pending,
-                delete_pending=delete_pending,
-                insert_chunk=insert_chunk,
-                sync_pending_state=sync_pending_state,
+                sample_cursors=sample_cursors,
+                chunk_inserts=chunk_inserts,
+                client_cursor_upserts=client_cursor_upserts,
+                sampled_at=sampled_at,
             )
             stats[outcome] = stats.get(outcome, 0) + 1
             for alias in (email, protocol_id):
                 alias_text = str(alias or "").strip()
-                # Another client's node_id is a primary key, not an alias of this one.
                 if not alias_text or alias_text == label or alias_text in protected:
                     continue
                 identity_upserts.append((core, alias_text, label))
 
+        stats["pending"] = len(chunk_inserts)
         return {
             "stats": stats,
-            "ack_upserts": ack_upserts,
-            "ack_deletes": ack_deletes,
-            "pending_upserts": list(pending_upserts.values()),
-            "pending_deletes": list(pending_deletes),
             "chunk_inserts": chunk_inserts,
+            "client_cursor_upserts": client_cursor_upserts,
             "identity_upserts": identity_upserts,
             "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
         }
 
     @staticmethod
-    def _migrate_legacy_keys(
+    def _migrate_legacy_sample_cursors(
         core: str,
         canonical_key: str,
         email: str,
-        client_id: str,
         *,
-        set_ack,
-        delete_ack,
-        set_pending,
-        delete_pending,
-        acks: dict[tuple[str, str], tuple[int, int]],
-        pending: dict[tuple[str, str], dict[str, int]],
         protocol_id: str = "",
         protected: set[str] | None = None,
+        sample_cursors: dict[tuple[str, str], tuple[int, int]],
     ) -> None:
-        """Move email and Xray-UUID traffic rows onto the panel node_id.
-
-        Rows are moved, not added. Two aliases for one client are the same
-        bytes, so the larger pending total is kept and the other is dropped.
-        An alias that is another client's node_id in this sample is left alone.
-        """
-        del client_id
         if not canonical_key:
             return
         protected = protected or set()
         aliases: list[str] = []
         for name in (email, protocol_id):
             text = str(name or "").strip()
-            if not text or text == canonical_key or text in aliases:
-                continue
-            if text in protected:
+            if not text or text == canonical_key or text in aliases or text in protected:
                 continue
             aliases.append(text)
-        if not aliases:
-            return
-
-        best_pending = pending.get((core, canonical_key))
-        pending_changed = False
-        best_total = -1
-        if best_pending is not None:
-            best_total = int(best_pending["delta_incoming"]) + int(best_pending["delta_outgoing"])
+        best = sample_cursors.get((core, canonical_key))
         for name in aliases:
-            alias_pending = pending.get((core, name))
-            if alias_pending is None:
+            alias_cursor = sample_cursors.pop((core, name), None)
+            if alias_cursor is None:
                 continue
-            alias_total = int(alias_pending["delta_incoming"]) + int(alias_pending["delta_outgoing"])
-            if best_pending is None or alias_total > best_total:
-                best_pending = {
-                    "delta_incoming": int(alias_pending["delta_incoming"]),
-                    "delta_outgoing": int(alias_pending["delta_outgoing"]),
-                    "current_incoming": int(alias_pending["current_incoming"]),
-                    "current_outgoing": int(alias_pending["current_outgoing"]),
-                }
-                best_total = alias_total
-                pending_changed = True
-            delete_pending(core, name)
-        if pending_changed and best_pending is not None:
-            set_pending(
-                core,
-                canonical_key,
-                int(best_pending["delta_incoming"]),
-                int(best_pending["delta_outgoing"]),
-                int(best_pending["current_incoming"]),
-                int(best_pending["current_outgoing"]),
-            )
-
-        best_ack = acks.get((core, canonical_key))
-        ack_changed = False
-        for name in aliases:
-            alias_ack = acks.get((core, name))
-            if alias_ack is None:
+            if best is None:
+                best = alias_cursor
                 continue
-            merged = alias_ack if best_ack is None else (
-                max(int(best_ack[0]), int(alias_ack[0])),
-                max(int(best_ack[1]), int(alias_ack[1])),
+            best = (
+                max(best[0], alias_cursor[0]),
+                max(best[1], alias_cursor[1]),
             )
-            ack_changed = ack_changed or merged != best_ack
-            best_ack = merged
-            delete_ack(core, name)
-        if ack_changed and best_ack is not None:
-            set_ack(core, canonical_key, int(best_ack[0]), int(best_ack[1]))
+        if best is not None:
+            sample_cursors[(core, canonical_key)] = best
 
     @staticmethod
-    def _preserved_delta(
-        pending: dict[tuple[str, str], dict[str, int]],
+    def _classify_interval_sample(
         core: str,
-        client_key_label: str,
-    ) -> tuple[int, int]:
-        row = pending.get((core, client_key_label))
-        if row is None:
-            return 0, 0
-        return int(row["delta_incoming"]), int(row["delta_outgoing"])
-
-    @staticmethod
-    def _classify_sample(
-        core: str,
-        client_key_label: str,
+        client_key: str,
         current_incoming: int,
         current_outgoing: int,
         *,
-        acks: dict[tuple[str, str], tuple[int, int]],
-        pending: dict[tuple[str, str], dict[str, int]],
-        set_ack,
-        set_pending,
-        delete_pending,
-        insert_chunk,
-        sync_pending_state,
+        sample_cursors: dict[tuple[str, str], tuple[int, int]],
+        chunk_inserts: list[dict[str, Any]],
+        client_cursor_upserts: list[tuple[str, str, int, int]],
+        sampled_at: str,
     ) -> str:
-        preserved_in, preserved_out = TrafficService._preserved_delta(pending, core, client_key_label)
-        last = pending.get((core, client_key_label))
-        ack = acks.get((core, client_key_label))
-        if ack is None:
-            # First sight anchors the counters. Existing history is not queued.
-            # A pending row that already existed stays billable.
-            set_ack(
-                core,
-                client_key_label,
-                current_incoming,
-                current_outgoing,
-            )
-            if preserved_in > 0 or preserved_out > 0:
-                sync_pending_state(
-                    core,
-                    client_key_label,
-                    preserved_in,
-                    preserved_out,
-                    current_incoming,
-                    current_outgoing,
-                )
-                return "pending"
-            delete_pending(core, client_key_label)
+        pair = (core, client_key)
+        last = sample_cursors.get(pair)
+        client_cursor_upserts.append((core, client_key, current_incoming, current_outgoing))
+        sample_cursors[pair] = (current_incoming, current_outgoing)
+        if last is None:
             return "initialized"
-
-        ack_in, ack_out = int(ack[0]), int(ack[1])
-        has_last = last is not None
-        last_in = int(last["current_incoming"]) if has_last else ack_in
-        last_out = int(last["current_outgoing"]) if has_last else ack_out
-        bill_in, base_in = TrafficService._direction_delta(
-            current_incoming,
-            ack_in,
-            preserved_in,
-            last_in,
-            has_last,
-        )
-        bill_out, base_out = TrafficService._direction_delta(
-            current_outgoing,
-            ack_out,
-            preserved_out,
-            last_out,
-            has_last,
-        )
+        last_in, last_out = last
         reset = current_incoming < last_in or current_outgoing < last_out
         if reset:
+            tick_in, tick_out = current_incoming, current_outgoing
             log.warning(
-                "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s) preserved=(%s,%s)",
+                "traffic counter regression core=%s client=%s last=(%s,%s) current=(%s,%s)",
                 core,
-                client_key_label,
-                ack_in,
-                ack_out,
-                current_incoming,
-                current_outgoing,
-                preserved_in,
-                preserved_out,
-            )
-        if base_in != ack_in or base_out != ack_out:
-            set_ack(core, client_key_label, base_in, base_out)
-        tick_in = max(0, bill_in - preserved_in)
-        tick_out = max(0, bill_out - preserved_out)
-        if tick_in > 0 or tick_out > 0:
-            insert_chunk(
-                core,
-                client_key_label,
-                tick_in,
-                tick_out,
+                client_key,
+                last_in,
+                last_out,
                 current_incoming,
                 current_outgoing,
             )
-        sync_pending_state(
-            core,
-            client_key_label,
-            bill_in,
-            bill_out,
-            current_incoming,
-            current_outgoing,
-        )
-        if bill_in > 0 or bill_out > 0:
-            return "regressed" if reset else "pending"
-        if preserved_in > 0 or preserved_out > 0:
+        else:
+            tick_in = max(0, current_incoming - last_in)
+            tick_out = max(0, current_outgoing - last_out)
+        if tick_in <= 0 and tick_out <= 0:
             return "unchanged"
-        delete_pending(core, client_key_label)
-        return "regressed" if reset else "unchanged"
-
-    @staticmethod
-    def _direction_delta(
-        current: int,
-        baseline: int,
-        preserved: int,
-        last_observed: int,
-        has_last: bool,
-    ) -> tuple[int, int]:
-        """Add this tick onto the client's one pending row.
-
-        Tick matches the classic counter delta against the last stored counter
-        (the pending row's current value, or the ack when there is no pending):
-
-            tick = current if current < last else current - last
-
-        Until a reset, that tick is added onto the pending already queued.
-        A reset (current < last) still adds the whole new counter onto the
-        unacked pending, then moves the baseline to the new counter. The
-        same row is updated; a sample never inserts a second pending.
-        """
-        last = last_observed if has_last else baseline
-        if current < last:
-            return preserved + current, current
-        return preserved + (current - last), baseline
+        chunk_inserts.append(
+            {
+                "chunk_id": str(uuid.uuid4()),
+                "core": core,
+                "client_key": client_key,
+                "incoming": int(tick_in),
+                "outgoing": int(tick_out),
+                "sampled_at": sampled_at,
+            }
+        )
+        return "regressed" if reset else "pending"
 
     def _remember_identity(self, canonical: str, email: str, client_id: str) -> None:
         self._aliases[canonical] = canonical
@@ -846,11 +602,15 @@ class TrafficService:
             label = self._public_client_key(stored)
             if not label:
                 continue
+            incoming = int(chunk["incoming"])
+            outgoing = int(chunk["outgoing"])
             chunks_by_label.setdefault(label, []).append(
                 {
                     "id": str(chunk["chunk_id"]),
-                    "downlink": int(chunk["delta_incoming"]),
-                    "uplink": int(chunk["delta_outgoing"]),
+                    "incoming": incoming,
+                    "outgoing": outgoing,
+                    "downlink": incoming,
+                    "uplink": outgoing,
                     "sampled_at": chunk.get("sampled_at"),
                 }
             )
@@ -862,14 +622,17 @@ class TrafficService:
             label = self._public_client_key(stored)
             if not label:
                 continue
-            chunk_list = chunks_by_label.pop(label, [])
+            if int(row["delta_incoming"]) == 0 and int(row["delta_outgoing"]) == 0:
+                chunk_list = chunks_by_label.pop(label, [])
+                if not chunk_list:
+                    continue
+            else:
+                chunk_list = chunks_by_label.pop(label, [])
             published = {
                 "core": str(row["core"]),
                 "client_key": stored,
-                "delta_incoming": int(row["delta_incoming"]),
-                "delta_outgoing": int(row["delta_outgoing"]),
-                "current_incoming": int(row["current_incoming"]),
-                "current_outgoing": int(row["current_outgoing"]),
+                "incoming": int(row["delta_incoming"]),
+                "outgoing": int(row["delta_outgoing"]),
             }
             snapshot.setdefault(label, []).append(published)
             if stored != label:
@@ -888,15 +651,11 @@ class TrafficService:
                 continue
             stored = label
             core = "xray"
-            current_incoming = 0
-            current_outgoing = 0
             for chunk in chunks:
                 if self._public_client_key(str(chunk["client_key"])) != label:
                     continue
                 stored = str(chunk["client_key"])
                 core = str(chunk["core"])
-                current_incoming = int(chunk["current_incoming"])
-                current_outgoing = int(chunk["current_outgoing"])
             users[label] = {
                 "core": core,
                 "uplink": uplink,
@@ -906,10 +665,8 @@ class TrafficService:
             published = {
                 "core": core,
                 "client_key": stored,
-                "delta_incoming": downlink,
-                "delta_outgoing": uplink,
-                "current_incoming": current_incoming,
-                "current_outgoing": current_outgoing,
+                "incoming": downlink,
+                "outgoing": uplink,
             }
             snapshot.setdefault(label, []).append(published)
 

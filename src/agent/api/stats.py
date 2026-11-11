@@ -171,7 +171,7 @@ async def stats_clients_traffic_pending(
       1. ``agent work`` samples on an interval and appends one pending **chunk**
          per client when counters grow. Chunks are not held until panel ack.
       2. GET returns ``users[node_id]`` with summed ``downlink``/``uplink`` and
-         ``chunks: [{id, downlink, uplink, sampled_at}, ...]``.
+         ``chunks: [{id, incoming, outgoing, sampled_at}, ...]``.
       3. Panel bills the summed totals, then POST ``/pending/ack`` with
          ``chunk_ids`` (processed chunk rows) plus optional ``clients``/``billed``
          for baseline settlement. GET does not take a write lock.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, ForeignKey, ForeignKeyConstraint, Index, JSON, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from agent.database.base import Base
@@ -48,6 +48,8 @@ class Client(Base):
     disabled_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="peer")
     scope: Mapped[str] = mapped_column(String(64), nullable=False, default="default", server_default="default")
+    incoming: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    outgoing: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     updated_at: Mapped[str] = mapped_column(
         Text,
