@@ -36,9 +36,10 @@ def _planned_steps(registry: Any) -> list[str]:
 
 
 def _tick(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
-    report_progress(done, total, label)
+    step = min(max(1, int(done)), max(1, int(total)))
+    report_progress(step, total, label)
     if progress is not None:
-        progress(label, done, total)
+        progress(label, step, total)
 
 
 async def reload_stored_services(
@@ -49,38 +50,37 @@ async def reload_stored_services(
     progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """Regenerate stored cores, sync runtime, and start whatever is down."""
-    steps = _planned_steps(registry)
-    total = max(1, len(steps))
+    total = max(1, len(_planned_steps(registry)))
     enabled = {key for key, _driver in registry.enabled_drivers()}
     cores: dict[str, Any] = {}
-    step = 0
+    index = 0
     for key in _CORE_ORDER:
         if key not in enabled:
             cores[key] = {"ok": True, "skipped": True, "reason": "core disabled"}
             continue
+        index += 1
         driver = registry.get(key, require_enabled=False)
-        _tick(progress, step, total, f"{key}: reloading")
+        _tick(progress, index, total, f"{key}: reloading")
         cores[key] = await _safe(
             key,
-            lambda driver=driver, key=key, step=step: _reload_core(
+            lambda driver=driver, key=key, index=index: _reload_core(
                 key,
                 driver,
                 progress=progress,
-                step=step,
+                step=index,
                 total=total,
             ),
         )
-        step += 1
-        _tick(progress, min(step, total), total, f"{key}: done")
+        _tick(progress, index, total, f"{key}: done")
 
     for key in _TAIL_STEPS:
-        _tick(progress, step, total, f"{key}: reloading")
+        index += 1
+        _tick(progress, index, total, f"{key}: reloading")
         if key == "mullvad":
             cores[key] = await _safe("mullvad", lambda: _reload_mullvad(settings, store))
         else:
             cores[key] = await _safe("peer_egress", lambda: _reload_peer_egress(settings, store))
-        step += 1
-        _tick(progress, min(step, total), total, f"{key}: done")
+        _tick(progress, index, total, f"{key}: done")
 
     ok = all(bool(row.get("ok")) for row in cores.values())
     log.info("service reload finished ok=%s", ok)
@@ -164,18 +164,10 @@ async def _reload_xray(driver: Any) -> dict[str, Any]:
         config = await driver._read_config()
         await driver.import_config(config, path=str(path))
         imported = True
-        sync_report = await driver.enforce_disk_clients_on_runtime()
-        if not sync_report.get("ok", True):
-            return {
-                "ok": False,
-                "error": "Xray client sync from stored config failed",
-                "config": str(path),
-                "imported": imported,
-                "sync": sync_report,
-                **{k: started.get(k) for k in ("started", "already_running")},
-            }
-    return {
-        "ok": True,
+        sync_report = await driver.enforce_disk_clients_on_runtime(persist_confirm=False)
+    sync_ok = bool(sync_report.get("ok", True)) if sync_report else True
+    payload: dict[str, Any] = {
+        "ok": sync_ok,
         "config": str(path),
         "started": bool(started.get("started")),
         "already_running": bool(started.get("already_running")),
@@ -185,6 +177,13 @@ async def _reload_xray(driver: Any) -> dict[str, Any]:
         "removed_extra": int(sync_report.get("removed_extra") or 0),
         "removed_disabled": int(sync_report.get("removed_disabled") or 0),
     }
+    if imported and not sync_ok:
+        detail = "; ".join(str(item) for item in (sync_report.get("errors") or [])[:3]).strip()
+        payload["error"] = detail or "Xray client sync from stored config failed"
+        payload["sync"] = sync_report
+    elif not sync_ok:
+        payload["sync"] = sync_report
+    return payload
 
 
 async def _recover_xray_file(driver: Any, path: Path) -> dict[str, Any]:

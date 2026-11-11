@@ -131,6 +131,7 @@ def test_reload_invokes_progress_callback(monkeypatch):
 
     def progress(label, done, total):
         seen.append((label, done, total))
+        assert 1 <= done <= total
 
     asyncio.run(
         reload_stored_services(

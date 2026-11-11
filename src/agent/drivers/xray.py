@@ -585,7 +585,11 @@ class XrayDriver(CoreDriver):
         )
         return report
 
-    async def enforce_disk_clients_on_runtime(self) -> dict[str, Any]:
+    async def enforce_disk_clients_on_runtime(
+        self,
+        *,
+        persist_confirm: bool = True,
+    ) -> dict[str, Any]:
         """Make the running core match config.json: add missing, remove extra live users."""
         from agent.runtime import RuntimeTrace
 
@@ -598,7 +602,23 @@ class XrayDriver(CoreDriver):
             "removed_extra": 0,
             "removed_disabled": 0,
             "skipped": [],
+            "errors": [],
         }
+
+        async def _confirm_removed(tag: str, emails: list[str]) -> None:
+            if not emails:
+                return
+            if persist_confirm:
+                await self._confirm_httpapi_persisted(tag, [], emails, log_failure=False)
+                return
+            seen, by_id = await self._visible_user_index(tag, emails)
+            still = [email for email in emails if email in seen or email in by_id]
+            if still:
+                raise AgentError(
+                    "EXEC_ERROR",
+                    f"Live Xray still lists removed clients on {tag}: {', '.join(still[:3])}",
+                    500,
+                )
         if not await aiofiles.os.path.isfile(str(path)):
             report["skipped"].append("no_config")
             return report
@@ -631,7 +651,7 @@ class XrayDriver(CoreDriver):
                 live_rows = await self._api_call("list_users", tag)
             except AgentError as exc:
                 report["skipped"].append(tag)
-                report["ok"] = False
+                report["errors"].append(f"{tag}: {exc.message}")
                 _log.warning(
                     "xray store sync skipped inbound=%s operation_id=%s error=%s",
                     tag,
@@ -646,19 +666,24 @@ class XrayDriver(CoreDriver):
 
             drop = sorted(email for email in disabled_emails if email in live_emails or email in disk_emails)
             if drop:
+                removed: list[str] = []
                 for email in drop:
                     try:
                         await self._api_call("remove_users", tag, [email])
+                        removed.append(email)
                     except AgentError as exc:
                         if _is_missing_user_error(exc):
+                            removed.append(email)
                             continue
                         report["ok"] = False
+                        report["errors"].append(f"{tag} disable {email}: {exc.message}")
                 try:
-                    await self._confirm_httpapi_persisted(tag, [], drop)
-                    report["removed_disabled"] += len(drop)
-                    live_emails -= set(drop)
-                except AgentError:
+                    await _confirm_removed(tag, removed)
+                    report["removed_disabled"] += len(removed)
+                    live_emails -= set(removed)
+                except AgentError as exc:
                     report["ok"] = False
+                    report["errors"].append(f"{tag}: {exc.message}")
 
             missing_runtime = [
                 row
@@ -680,9 +705,16 @@ class XrayDriver(CoreDriver):
                     )
                     wanted = [str(row.get("email") or "").strip() for row in missing_runtime]
                     seen, _by_id = await self._visible_user_index(tag, wanted)
-                    report["added_runtime"] += len([email for email in wanted if email in seen])
-                except AgentError:
+                    confirmed = [email for email in wanted if email in seen]
+                    report["added_runtime"] += len(confirmed)
+                    if len(confirmed) != len(wanted):
+                        report["ok"] = False
+                        report["errors"].append(
+                            f"{tag}: added {len(confirmed)}/{len(wanted)} clients from disk"
+                        )
+                except AgentError as exc:
                     report["ok"] = False
+                    report["errors"].append(f"{tag} add: {exc.message}")
 
             extra_emails = sorted(
                 email
@@ -692,10 +724,14 @@ class XrayDriver(CoreDriver):
             if extra_emails:
                 try:
                     await self._api_call("remove_users", tag, extra_emails)
-                    await self._confirm_httpapi_persisted(tag, [], extra_emails)
+                    await _confirm_removed(tag, extra_emails)
                     report["removed_extra"] += len(extra_emails)
-                except AgentError:
-                    report["ok"] = False
+                except AgentError as exc:
+                    if _is_missing_user_error(exc):
+                        report["removed_extra"] += len(extra_emails)
+                    else:
+                        report["ok"] = False
+                        report["errors"].append(f"{tag} remove extra: {exc.message}")
 
         return report
 

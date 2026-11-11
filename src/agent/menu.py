@@ -243,7 +243,8 @@ def _factory_reset_action() -> None:
 
 def _show_service_reload_progress(label: str, done: int, total: int) -> None:
     if total > 0:
-        _print(paint(f"  [{done + 1}/{total}] {label}", CYAN))
+        step = min(max(1, done), total)
+        _print(paint(f"  [{step}/{total}] {label}", CYAN))
     else:
         _print(paint(f"  {label}", CYAN))
 
@@ -292,6 +293,10 @@ def _print_reload_report(report: dict) -> None:
         error = str(row.get("error") or row.get("detail") or "").strip()
         if error and not row.get("ok"):
             _print(paint(f"    {error}", RED))
+        sync = row.get("sync")
+        if isinstance(sync, dict):
+            for item in sync.get("errors") or []:
+                _print(paint(f"    {item}", RED))
         for item in row.get("failed") or []:
             if not isinstance(item, dict):
                 continue
