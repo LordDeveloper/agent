@@ -1,40 +1,87 @@
 """Rebuild VPN runtime from data the agent already stored.
 
-CLI and the text menu call this with ``run_sync`` (no server loop). A healthy
-process is left running. Missing interfaces, unit configs, and Mullvad conf
-files are written from the store and started. A missing Xray ``config.json``
-is saved from the live core when that core still has user inbounds; an empty
-default config is never invented over a deleted file.
+CLI and the text menu call this with ``run_sync`` (no server loop). Stored
+interface/server documents and Xray config.json are rewritten onto disk and
+pushed into the live core. Runtime-only peers, users, and Xray clients that
+are not in the store are removed. Missing unit files and down services are
+started. Xray config.json is never invented from an empty default when the
+file was deleted but the process still has user inbounds to recover.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from agent.asyncutil import gather_independent, maybe_await
 from agent.errors import AgentError
-from agent.logutil import get_logger
+from agent.logutil import get_logger, report_progress
+from agent.auth_scope import filter_visible
 
 log = get_logger("service.reload")
 
 _CORE_ORDER = ("xray", "wireguard", "amnezia", "l2tp", "openvpn")
+_TAIL_STEPS = ("mullvad", "peer_egress")
+
+ProgressFn = Callable[[str, int, int], None]
 
 
-async def reload_stored_services(settings: Any, store: Any, registry: Any) -> dict[str, Any]:
-    """Regenerate stored cores and start whatever is down."""
+def _planned_steps(registry: Any) -> list[str]:
+    enabled = {key for key, _driver in registry.enabled_drivers()}
+    steps = [key for key in _CORE_ORDER if key in enabled]
+    steps.extend(_TAIL_STEPS)
+    return steps or list(_TAIL_STEPS)
+
+
+def _tick(progress: ProgressFn | None, done: int, total: int, label: str) -> None:
+    report_progress(done, total, label)
+    if progress is not None:
+        progress(label, done, total)
+
+
+async def reload_stored_services(
+    settings: Any,
+    store: Any,
+    registry: Any,
+    *,
+    progress: ProgressFn | None = None,
+) -> dict[str, Any]:
+    """Regenerate stored cores, sync runtime, and start whatever is down."""
+    steps = _planned_steps(registry)
+    total = max(1, len(steps))
     enabled = {key for key, _driver in registry.enabled_drivers()}
     cores: dict[str, Any] = {}
+    step = 0
     for key in _CORE_ORDER:
         if key not in enabled:
             cores[key] = {"ok": True, "skipped": True, "reason": "core disabled"}
             continue
         driver = registry.get(key, require_enabled=False)
-        cores[key] = await _safe(key, lambda driver=driver, key=key: _reload_core(key, driver))
-    cores["mullvad"] = await _safe("mullvad", lambda: _reload_mullvad(settings, store))
-    cores["peer_egress"] = await _safe("peer_egress", lambda: _reload_peer_egress(settings, store))
+        _tick(progress, step, total, f"{key}: reloading")
+        cores[key] = await _safe(
+            key,
+            lambda driver=driver, key=key, step=step: _reload_core(
+                key,
+                driver,
+                progress=progress,
+                step=step,
+                total=total,
+            ),
+        )
+        step += 1
+        _tick(progress, min(step, total), total, f"{key}: done")
+
+    for key in _TAIL_STEPS:
+        _tick(progress, step, total, f"{key}: reloading")
+        if key == "mullvad":
+            cores[key] = await _safe("mullvad", lambda: _reload_mullvad(settings, store))
+        else:
+            cores[key] = await _safe("peer_egress", lambda: _reload_peer_egress(settings, store))
+        step += 1
+        _tick(progress, min(step, total), total, f"{key}: done")
+
     ok = all(bool(row.get("ok")) for row in cores.values())
     log.info("service reload finished ok=%s", ok)
     return {"ok": ok, "cores": cores}
@@ -55,13 +102,20 @@ async def _safe(name: str, fn: Any) -> dict[str, Any]:
     return result
 
 
-async def _reload_core(key: str, driver: Any) -> dict[str, Any]:
+async def _reload_core(
+    key: str,
+    driver: Any,
+    *,
+    progress: ProgressFn | None,
+    step: int,
+    total: int,
+) -> dict[str, Any]:
     if key == "xray":
         return await _reload_xray(driver)
     if key in {"wireguard", "amnezia"}:
-        return await _reload_tunnel_core(driver)
+        return await _reload_tunnel_core(driver, key=key, progress=progress, step=step, total=total)
     if key == "l2tp":
-        return await _reload_l2tp(driver)
+        return await _reload_l2tp(driver, store=driver.store)
     if key == "openvpn":
         return await _reload_openvpn(driver)
     return {"ok": True, "skipped": True, "reason": "unsupported core"}
@@ -105,13 +159,21 @@ async def _reload_xray(driver: Any) -> dict[str, Any]:
         password=xray.password,
     )
     imported = False
-    # A file recovered from the live process is already what that process is
-    # serving. Importing the reconstruction back can drop fields the API list
-    # omitted. Disk is applied only when it was already the stored copy.
+    sync_report: dict[str, Any] = {}
     if not recovered:
         config = await driver._read_config()
         await driver.import_config(config, path=str(path))
         imported = True
+        sync_report = await driver.enforce_disk_clients_on_runtime()
+        if not sync_report.get("ok", True):
+            return {
+                "ok": False,
+                "error": "Xray client sync from stored config failed",
+                "config": str(path),
+                "imported": imported,
+                "sync": sync_report,
+                **{k: started.get(k) for k in ("started", "already_running")},
+            }
     return {
         "ok": True,
         "config": str(path),
@@ -119,6 +181,9 @@ async def _reload_xray(driver: Any) -> dict[str, Any]:
         "already_running": bool(started.get("already_running")),
         "recovered_from_runtime": recovered,
         "imported": imported,
+        "added_runtime": int(sync_report.get("added_runtime") or 0),
+        "removed_extra": int(sync_report.get("removed_extra") or 0),
+        "removed_disabled": int(sync_report.get("removed_disabled") or 0),
     }
 
 
@@ -184,24 +249,49 @@ async def _recover_xray_file(driver: Any, path: Path) -> dict[str, Any]:
     return {"ok": True, "recovered_from_runtime": True, "inbounds": len(user_rows)}
 
 
-async def _reload_tunnel_core(driver: Any) -> dict[str, Any]:
-    """Rewrite WireGuard/Amnezia confs from sqlite and bring down interfaces up."""
-    ifaces = [
-        row
-        for row in (await maybe_await(driver.list_interfaces()) or [])
-        if isinstance(row, dict)
-    ]
+async def _reload_tunnel_core(
+    driver: Any,
+    *,
+    key: str,
+    progress: ProgressFn | None,
+    step: int,
+    total: int,
+) -> dict[str, Any]:
+    """Rewrite WireGuard/Amnezia confs from sqlite and sync live peers."""
+    ifaces = filter_visible(list(await maybe_await(driver.list_interfaces()) or []), key)
     if not ifaces:
         return {"ok": True, "skipped": True, "reason": "no interfaces in store"}
 
     brought_up: list[str] = []
     synced: list[str] = []
+    removed_peers = 0
     failed: list[dict[str, str]] = []
-    for iface in ifaces:
+    iface_total = len(ifaces)
+    for index, summary in enumerate(ifaces, start=1):
+        iface_id = summary.get("id")
+        name = str(summary.get("name") or "").strip()
+        sub_label = f"{key} {name or iface_id}: {index}/{iface_total}"
+        _tick(progress, step, total, sub_label)
+        try:
+            iface = await driver.get_interface(iface_id if iface_id is not None else name)
+        except AgentError as exc:
+            failed.append({"name": name, "error": exc.message})
+            continue
         name = str(iface.get("name") or "").strip()
         if not name:
             failed.append({"name": "", "error": "interface has no name"})
             continue
+        before_keys: set[str] = set()
+        if await driver._interface_is_up(name):
+            dump = await driver._peer_dump(name)
+            if isinstance(dump, dict):
+                from agent.drivers.wireguard import _peer_kernel_drift
+
+                before_keys = {
+                    row["public_key"]
+                    for row in _peer_kernel_drift(iface, dump)
+                    if row.get("action") == "remove"
+                }
         try:
             if await driver._interface_is_up(name):
                 await driver._apply_live(iface)
@@ -215,19 +305,49 @@ async def _reload_tunnel_core(driver: Any) -> dict[str, Any]:
                     if isinstance(row, dict):
                         detail = str(row.get("stderr") or row.get("message") or "")
                     failed.append({"name": name, "error": detail or "wg-quick up failed"})
+                    continue
+            if before_keys:
+                dump = await driver._peer_dump(name)
+                if isinstance(dump, dict):
+                    from agent.drivers.wireguard import _peer_kernel_drift
+
+                    after = {
+                        row["public_key"]
+                        for row in _peer_kernel_drift(iface, dump)
+                        if row.get("action") == "remove"
+                    }
+                    removed_peers += len(before_keys - after)
         except Exception as exc:
             failed.append({"name": name, "error": getattr(exc, "message", None) or str(exc)})
-    return {"ok": not failed, "brought_up": brought_up, "synced": synced, "failed": failed}
+    payload: dict[str, Any] = {
+        "ok": not failed,
+        "brought_up": brought_up,
+        "synced": synced,
+        "failed": failed,
+    }
+    if removed_peers:
+        payload["removed_peers"] = removed_peers
+    return payload
 
 
-async def _reload_l2tp(driver: Any) -> dict[str, Any]:
-    servers = list(await maybe_await(driver.list_servers()) or [])
+async def _reload_l2tp(driver: Any, *, store: Any) -> dict[str, Any]:
+    from agent.support.l2tp_companion import sync_companions
+
+    servers = filter_visible(list(await maybe_await(driver.list_servers()) or []), driver.key)
     if not servers:
         return {"ok": True, "skipped": True, "reason": "no servers in store"}
+    await driver._apply_all_configs()
+    companion = await sync_companions(store)
+    await driver.reconcile_runtime()
     result = await driver.enable()
-    payload = {"ok": True, "servers": len(servers)}
+    payload: dict[str, Any] = {
+        "ok": True,
+        "servers": len(servers),
+        "companions_removed": int(companion.get("removed") or 0),
+        "companions_updated": int(companion.get("updated") or 0),
+    }
     if isinstance(result, dict):
-        payload.update(result)
+        payload.update({k: v for k, v in result.items() if k not in payload})
     return payload
 
 
@@ -235,15 +355,16 @@ async def _reload_openvpn(driver: Any) -> dict[str, Any]:
     """Rewrite server configs. Start units that are down; leave active ones up."""
     from agent.support.process import run
 
-    servers = [
-        row
-        for row in (await maybe_await(driver.list_servers()) or [])
-        if isinstance(row, dict)
-    ]
+    servers = filter_visible(
+        [row for row in (await maybe_await(driver.list_servers()) or []) if isinstance(row, dict)],
+        driver.key,
+    )
     if not servers:
         return {"ok": True, "skipped": True, "reason": "no servers in store"}
 
     await driver._apply_all_configs()
+    await driver._stop_orphan_units()
+    await driver.reconcile_runtime()
     driver._install_unit_dropin()
     await run(["systemctl", "daemon-reload"], check=False, timeout=30)
 
@@ -286,6 +407,7 @@ async def _reload_openvpn(driver: Any) -> dict[str, Any]:
         "started": started,
         "kept": kept,
         "failed": failed,
+        "orphan_units_stopped": True,
     }
 
 

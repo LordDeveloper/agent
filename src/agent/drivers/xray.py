@@ -585,6 +585,120 @@ class XrayDriver(CoreDriver):
         )
         return report
 
+    async def enforce_disk_clients_on_runtime(self) -> dict[str, Any]:
+        """Make the running core match config.json: add missing, remove extra live users."""
+        from agent.runtime import RuntimeTrace
+
+        path = Path(self.settings.xray.config)
+        operation_id = RuntimeTrace.request_id() or "-"
+        report: dict[str, Any] = {
+            "ok": True,
+            "core": "xray",
+            "added_runtime": 0,
+            "removed_extra": 0,
+            "removed_disabled": 0,
+            "skipped": [],
+        }
+        if not await aiofiles.os.path.isfile(str(path)):
+            report["skipped"].append("no_config")
+            return report
+        try:
+            config = json.loads(await aiofs.read_text(path))
+        except (OSError, json.JSONDecodeError):
+            report["ok"] = False
+            report["skipped"].append("invalid_config")
+            return report
+        if not isinstance(config, dict):
+            report["ok"] = False
+            report["skipped"].append("invalid_config")
+            return report
+
+        disabled_emails: set[str] = set()
+        for row in await self._disabled_docs():
+            email = str(row.get("email") or "").strip()
+            if email:
+                disabled_emails.add(email)
+
+        for inbound in list(config.get("inbounds") or []):
+            if not isinstance(inbound, dict) or self._is_api_inbound(inbound):
+                continue
+            tag = str(inbound.get("tag") or "").strip()
+            if not tag:
+                continue
+            protocol = self._protocol_of(inbound)
+            settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None
+            try:
+                live_rows = await self._api_call("list_users", tag)
+            except AgentError as exc:
+                report["skipped"].append(tag)
+                report["ok"] = False
+                _log.warning(
+                    "xray store sync skipped inbound=%s operation_id=%s error=%s",
+                    tag,
+                    operation_id,
+                    exc.message,
+                )
+                continue
+            live = [row for row in (live_rows or []) if isinstance(row, dict)]
+            live_emails = {str(row.get("email") or "").strip() for row in live if str(row.get("email") or "").strip()}
+            disk = [row for row in xray_client_rows(inbound) if isinstance(row, dict)]
+            disk_emails = {str(row.get("email") or "").strip() for row in disk if str(row.get("email") or "").strip()}
+
+            drop = sorted(email for email in disabled_emails if email in live_emails or email in disk_emails)
+            if drop:
+                for email in drop:
+                    try:
+                        await self._api_call("remove_users", tag, [email])
+                    except AgentError as exc:
+                        if _is_missing_user_error(exc):
+                            continue
+                        report["ok"] = False
+                try:
+                    await self._confirm_httpapi_persisted(tag, [], drop)
+                    report["removed_disabled"] += len(drop)
+                    live_emails -= set(drop)
+                except AgentError:
+                    report["ok"] = False
+
+            missing_runtime = [
+                row
+                for row in disk
+                if str(row.get("email") or "").strip()
+                and str(row.get("email") or "").strip() not in live_emails
+                and str(row.get("email") or "").strip() not in disabled_emails
+            ]
+            if missing_runtime:
+                try:
+                    await self._api_call(
+                        "add_users",
+                        tag,
+                        missing_runtime,
+                        protocol=protocol,
+                        inbound_settings=settings,
+                        atomic=False,
+                        parallel=False,
+                    )
+                    wanted = [str(row.get("email") or "").strip() for row in missing_runtime]
+                    seen, _by_id = await self._visible_user_index(tag, wanted)
+                    report["added_runtime"] += len([email for email in wanted if email in seen])
+                except AgentError:
+                    report["ok"] = False
+
+            extra_emails = sorted(
+                email
+                for email in live_emails
+                if email and email not in disk_emails and email not in disabled_emails
+            )
+            if extra_emails:
+                try:
+                    await self._api_call("remove_users", tag, extra_emails)
+                    await self._confirm_httpapi_persisted(tag, [], extra_emails)
+                    report["removed_extra"] += len(extra_emails)
+                except AgentError:
+                    report["ok"] = False
+
+        return report
+
     async def enable(self) -> dict[str, Any]:
         from agent.ops import install_xray
         from agent.xray_service import binary_has_httpapi, ensure_xray_running

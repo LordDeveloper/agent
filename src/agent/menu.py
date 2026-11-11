@@ -241,15 +241,31 @@ def _factory_reset_action() -> None:
     _run_action("Factory reset", _run)
 
 
+def _show_service_reload_progress(label: str, done: int, total: int) -> None:
+    if total > 0:
+        _print(paint(f"  [{done + 1}/{total}] {label}", CYAN))
+    else:
+        _print(paint(f"  {label}", CYAN))
+
+
 def _show_service_reload() -> None:
     from agent.runtime import open_runtime
     from agent.service_reload import reload_stored_services
 
     runtime = open_runtime()
     try:
-        report = run_sync(reload_stored_services(runtime.settings, runtime.store, runtime.registry))
+        _print(paint("  Syncing cores from stored data…", DIM))
+        report = run_sync(
+            reload_stored_services(
+                runtime.settings,
+                runtime.store,
+                runtime.registry,
+                progress=_show_service_reload_progress,
+            )
+        )
     finally:
         run_sync(runtime.close())
+    _print()
     _print_reload_report(report)
 
 
@@ -288,12 +304,27 @@ def _reload_detail(row: dict) -> str:
     if row.get("skipped"):
         reason = str(row.get("reason") or "").strip()
         return reason
-    for key in ("brought_up", "synced", "started", "kept", "rebuilt", "restored", "persisted"):
+    for key in (
+        "brought_up",
+        "synced",
+        "started",
+        "kept",
+        "rebuilt",
+        "restored",
+        "persisted",
+        "removed_extra",
+        "removed_peers",
+        "removed_disabled",
+        "added_runtime",
+        "companions_removed",
+    ):
         value = row.get(key)
         if isinstance(value, list) and value:
             parts.append(f"{key}={','.join(str(item) for item in value)}")
         elif key == "started" and value is True:
             parts.append("started")
+        elif isinstance(value, int) and value and key.startswith(("removed", "added", "companions")):
+            parts.append(f"{key}={value}")
     if row.get("already_running"):
         parts.append("already running")
     if row.get("recovered_from_runtime"):
@@ -857,7 +888,8 @@ def _service_menu() -> None:
             return
         if picked == "reload":
             if not confirm(
-                "Reload services from stored data? Missing configs are recreated and stopped services are started.",
+                "Reload from stored data? Regenerates core configs, syncs runtime, "
+                "removes extra peers/users/clients, and starts stopped services.",
                 default=True,
             ):
                 continue

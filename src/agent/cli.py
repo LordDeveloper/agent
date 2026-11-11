@@ -264,7 +264,7 @@ def cmd_service(args: argparse.Namespace) -> int:
 
 
 def cmd_service_reload() -> int:
-    """Rewrite VPN runtime from stored data and start anything that is down."""
+    """Regenerate core configs from stored data, sync runtime, and start down services."""
     from agent.service_reload import reload_stored_services
 
     runtime = open_runtime()

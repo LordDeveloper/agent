@@ -50,7 +50,14 @@ def test_down_tunnel_is_brought_up_and_live_tunnel_is_synced():
             self.synced: list[str] = []
 
         def list_interfaces(self):
-            return [{"name": "wg0"}, {"name": "wg1"}]
+            return [{"id": "1", "name": "wg0"}, {"id": "2", "name": "wg1"}]
+
+        async def get_interface(self, iface_id):
+            name = "wg0" if str(iface_id) == "1" else "wg1"
+            return {"id": iface_id, "name": name}
+
+        async def _peer_dump(self, _name):
+            return {}
 
         async def _interface_is_up(self, name):
             return name == "wg1"
@@ -63,7 +70,9 @@ def test_down_tunnel_is_brought_up_and_live_tunnel_is_synced():
             self.synced.append(iface["name"])
 
     driver = Driver()
-    result = asyncio.run(_reload_tunnel_core(driver))
+    result = asyncio.run(
+        _reload_tunnel_core(driver, key="wireguard", progress=None, step=0, total=1)
+    )
     assert result["ok"] is True
     assert result["brought_up"] == ["wg0"]
     assert result["synced"] == ["wg1"]
@@ -76,7 +85,13 @@ def test_reload_awaits_async_list_interfaces():
             self.up: list[str] = []
 
         async def list_interfaces(self):
-            return [{"name": "awg0"}]
+            return [{"id": "1", "name": "awg0"}]
+
+        async def get_interface(self, iface_id):
+            return {"id": iface_id, "name": "awg0"}
+
+        async def _peer_dump(self, _name):
+            return {}
 
         async def _interface_is_up(self, name):
             return False
@@ -89,14 +104,48 @@ def test_reload_awaits_async_list_interfaces():
             raise AssertionError("down interface should be brought up")
 
     driver = Driver()
-    result = asyncio.run(_reload_tunnel_core(driver))
+    result = asyncio.run(
+        _reload_tunnel_core(driver, key="amnezia", progress=None, step=0, total=1)
+    )
     assert result["ok"] is True
     assert result["brought_up"] == ["awg0"]
     assert driver.up == ["awg0"]
 
 
+def test_reload_invokes_progress_callback(monkeypatch):
+    seen: list[tuple[str, int, int]] = []
+
+    async def ok(*_args, **_kwargs):
+        return {"ok": True, "skipped": True}
+
+    monkeypatch.setattr("agent.service_reload._reload_core", ok)
+    monkeypatch.setattr("agent.service_reload._reload_mullvad", ok)
+    monkeypatch.setattr("agent.service_reload._reload_peer_egress", ok)
+
+    class Registry:
+        def enabled_drivers(self):
+            return [("wireguard", object())]
+
+        def get(self, key, require_enabled=False):
+            return object()
+
+    def progress(label, done, total):
+        seen.append((label, done, total))
+
+    asyncio.run(
+        reload_stored_services(
+            SimpleNamespace(wireguard_config_dir="/tmp"),
+            object(),
+            Registry(),
+            progress=progress,
+        )
+    )
+    assert seen
+    assert any("wireguard" in row[0] for row in seen)
+
+
 def test_reload_reports_disabled_cores_and_a_failed_one(monkeypatch):
-    async def core(key, driver):
+    async def core(key, driver, *, progress=None, step=0, total=1):
         if key == "wireguard":
             return {"ok": False, "error": "wg-quick missing"}
         return {"ok": True, "skipped": True}
