@@ -54,6 +54,8 @@ async def _panel_pending_read_locked(traffic: TrafficService) -> tuple[bool, str
 async def collect_volume_billing_snapshot(
     traffic: TrafficService,
     settings: AgentSettings,
+    *,
+    pending_limit: int = 12,
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
     pending_bytes = 0
@@ -78,6 +80,7 @@ async def collect_volume_billing_snapshot(
         "enforce_local_volume_quota": bool(settings.enforce_local_volume_quota),
         "traffic_sample_interval_s": float(settings.traffic_sample_interval),
         "quota_enforce_interval_s": float(settings.quota_enforce_interval),
+        "pending_limit": max(0, int(pending_limit)),
         "top_pending": [
             {
                 "core": str(row.get("core") or ""),
@@ -87,7 +90,9 @@ async def collect_volume_billing_snapshot(
                 "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
                 "updated_at": row.get("updated_at"),
             }
-            for row in rows_sorted[:12]
+            for row in rows_sorted[
+                : len(rows_sorted) if pending_limit <= 0 else max(1, int(pending_limit))
+            ]
         ],
     }
 
@@ -190,9 +195,17 @@ def render_volume_billing_frame(
     print(f"  last_sample_at={sampled}", flush=True)
 
     top = snapshot.get("top_pending") or []
+    total_clients = int(snapshot.get("pending_clients") or 0)
+    limit = int(snapshot.get("pending_limit") or 12)
     if not top:
         print("  (no unacked pending rows)", flush=True)
     else:
+        if limit > 0 and total_clients > len(top):
+            print(
+                f"  (showing top {len(top)} of {total_clients} pending rows; "
+                "use stats-volume-watch --all-pending for full list)",
+                flush=True,
+            )
         for row in top:
             key = str(row.get("client_key") or "")[:48]
             core = str(row.get("core") or "")
@@ -210,6 +223,8 @@ def run_volume_billing_watch(
     interval: float = 2.0,
     once: bool = False,
     as_json: bool = False,
+    pending_limit: int = 12,
+    log_lines: int = 40,
 ) -> int:
     from agent.asyncutil import run_sync
 
@@ -229,9 +244,15 @@ def run_volume_billing_watch(
     prev_fp: tuple[Any, ...] | None = None
     try:
         while True:
-            snapshot = run_sync(collect_volume_billing_snapshot(traffic, runtime.settings))
-            log_lines, log_cursor = _filtered_activity_lines(log_cursor)
-            log_lines.extend(file_tail.poll())
+            snapshot = run_sync(
+                collect_volume_billing_snapshot(
+                    traffic,
+                    runtime.settings,
+                    pending_limit=pending_limit,
+                )
+            )
+            log_lines_out, log_cursor = _filtered_activity_lines(log_cursor)
+            log_lines_out.extend(file_tail.poll(limit=max(1, int(log_lines))))
             fp = _snapshot_fingerprint(snapshot)
             note = None
             compact = False
@@ -246,7 +267,7 @@ def run_volume_billing_watch(
             if as_json:
                 print(
                     json.dumps(
-                        {**snapshot, "unchanged": note is not None, "log_lines": log_lines},
+                        {**snapshot, "unchanged": note is not None, "log_lines": log_lines_out},
                         ensure_ascii=False,
                         default=str,
                     ),
@@ -266,10 +287,10 @@ def run_volume_billing_watch(
                     f"sample_lag={lag_label}",
                     flush=True,
                 )
-                for line in log_lines:
+                for line in log_lines_out:
                     print(f"  log | {line}", flush=True)
             else:
-                render_volume_billing_frame(snapshot, log_lines, note=note)
+                render_volume_billing_frame(snapshot, log_lines_out, note=note)
 
             if once:
                 return 0

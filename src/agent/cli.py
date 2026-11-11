@@ -139,11 +139,14 @@ def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
 
     runtime = open_runtime(args.env_file)
     try:
+        pending_limit = 0 if getattr(args, "all_pending", False) else int(args.pending_limit)
         return run_volume_billing_watch(
             runtime,
             interval=float(args.interval),
             once=bool(args.once),
             as_json=bool(args.json),
+            pending_limit=pending_limit,
+            log_lines=int(args.log_lines),
         )
     finally:
         run_sync(runtime.close())
@@ -840,6 +843,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stats_vol.add_argument("--once", action="store_true", help="Print one snapshot and exit")
     p_stats_vol.add_argument("--json", action="store_true", help="Emit JSON lines")
+    p_stats_vol.add_argument(
+        "--pending-limit",
+        type=int,
+        default=12,
+        help="Max pending client rows to print per tick (default 12)",
+    )
+    p_stats_vol.add_argument(
+        "--all-pending",
+        action="store_true",
+        help="Print every pending client each tick (same as --pending-limit 0)",
+    )
+    p_stats_vol.add_argument(
+        "--log-lines",
+        type=int,
+        default=40,
+        help="Max traffic/ack log lines per tick (default 40)",
+    )
     p_stats_vol.set_defaults(func=cmd_stats_volume_watch)
 
     p_core = sub.add_parser("core", help="Manage VPN cores")
