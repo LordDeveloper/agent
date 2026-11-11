@@ -174,10 +174,8 @@ async def stats_clients_traffic_pending(
          ``sample_all`` when the last sample is older than one interval.
       3. Panel bills queued bytes, then POST ``/pending/ack`` **subtracts** what was
          billed (``billed`` body when present). The worker keeps upserting pending
-         during GET; the meta read lock is for diagnostics only and expires after ack
-         or ~20s.
+         on every sample; GET never takes a write lock.
     """
-    await traffic.note_panel_pending_read()
     payload = await traffic.pending_payload(persist_snapshot=False)
 
     settings = getattr(registry, "settings", None)

@@ -19,9 +19,7 @@ AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 FETCH_LOCK_META_KEY = "traffic_fetch_lock"
-# Legacy meta lock TTL (GET no longer blocks on this). Ack still clears the row
-# when present so upgrades from builds that held the lock do not leave stale meta.
-PENDING_READ_LOCK_SECONDS = 20.0
+# Legacy panel read-lock meta (removed). Ack still deletes stale keys after upgrade.
 # A volume sample may hold the worker exclusively for this long. After that
 # the next sample tick cancels it and starts a new cycle.
 DEFAULT_SAMPLE_LOCK_SECONDS = 120.0
@@ -750,36 +748,6 @@ class TrafficService:
         from agent.auth_scope import current_scope
 
         return f"{FETCH_LOCK_META_KEY}:{current_scope()}"
-
-    def _pending_reader_owner(self) -> str:
-        override = getattr(self, "_pending_reader_id", None)
-        if override:
-            return str(override)
-        return str(os.getpid())
-
-    async def note_panel_pending_read(self) -> None:
-        """Panel GET /pending: metadata lock for watch (TTL). Does not block the worker."""
-        await self._claim_pending_read()
-
-    async def _claim_pending_read(self) -> bool:
-        now = time.time()
-        return await self.store.claim_meta_lock(
-            AGENT_META_CORE,
-            self._pending_lock_meta_key(),
-            self._pending_reader_owner(),
-            now + PENDING_READ_LOCK_SECONDS,
-            now,
-        )
-
-    async def _pending_read_is_held(self) -> bool:
-        raw = await self.store.get_meta(AGENT_META_CORE, self._pending_lock_meta_key(), None)
-        if not isinstance(raw, dict):
-            return False
-        try:
-            expires_at = float(raw.get("expires_at") or 0)
-        except (TypeError, ValueError):
-            return False
-        return expires_at > time.time() and bool(str(raw.get("owner") or ""))
 
     async def _release_pending_read(self) -> None:
         await self.store.delete_meta(AGENT_META_CORE, self._pending_lock_meta_key())

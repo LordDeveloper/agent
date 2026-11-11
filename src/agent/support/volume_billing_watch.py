@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from agent.auth_scope import current_scope
 from agent.logutil import activity_log, resolve_log_path
-from agent.traffic.service import AGENT_META_CORE, FETCH_LOCK_META_KEY, LAST_SAMPLE_META_KEY, TrafficService
+from agent.traffic.service import AGENT_META_CORE, LAST_SAMPLE_META_KEY, TrafficService
 
 if TYPE_CHECKING:
     from agent.config import AgentSettings
+    from agent.registry import CoreRegistry
     from agent.runtime import Runtime
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
@@ -33,22 +34,22 @@ def _format_bytes(value: int) -> str:
     return f"{n} B"
 
 
-async def _panel_pending_read_locked(traffic: TrafficService) -> tuple[bool, str]:
-    raw = await traffic.store.get_meta(
-        AGENT_META_CORE,
-        f"{FETCH_LOCK_META_KEY}:{current_scope()}",
-        None,
-    )
-    if not isinstance(raw, dict):
-        return False, ""
+async def _live_wireguard_counters(registry: CoreRegistry) -> dict[str, tuple[int, int]]:
+    """Kernel cumulative totals from wg (not the SQLite pending queue)."""
+    if "wireguard" not in set(registry.settings.cores()):
+        return {}
     try:
-        expires_at = float(raw.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        return False, ""
-    if expires_at <= time.time():
-        return False, ""
-    owner = str(raw.get("owner") or "").strip()
-    return True, owner
+        snapshot = await registry.usage_snapshot("wireguard")
+    except Exception:
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    for inbound in snapshot.inbounds or []:
+        for client in inbound.clients or []:
+            key = str(client.id or "").strip()
+            if not key:
+                continue
+            out[key] = (int(client.incoming or 0), int(client.outgoing or 0))
+    return out
 
 
 async def collect_volume_billing_snapshot(
@@ -56,13 +57,13 @@ async def collect_volume_billing_snapshot(
     settings: AgentSettings,
     *,
     pending_limit: int = 0,
+    registry: CoreRegistry | None = None,
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
     pending_bytes = 0
     for row in rows:
         pending_bytes += int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0)
 
-    locked, lock_owner = await _panel_pending_read_locked(traffic)
     rows_sorted = sorted(
         rows,
         key=lambda row: int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
@@ -77,33 +78,50 @@ async def collect_volume_billing_snapshot(
         if pending_last_touch is None or str(touch) > str(pending_last_touch):
             pending_last_touch = touch
 
-    return {
+    snapshot_body: dict[str, Any] = {
         "pending_clients": len(rows),
         "pending_bytes": pending_bytes,
         "pending_bytes_label": _format_bytes(pending_bytes),
         "pending_last_touch": pending_last_touch,
         "worker_lag_ms": await traffic.last_sample_age_ms(),
         "last_sample_at": await traffic.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY),
-        "panel_pending_read_locked": locked,
-        "panel_pending_read_owner": lock_owner or None,
         "enforce_local_volume_quota": bool(settings.enforce_local_volume_quota),
         "traffic_sample_interval_s": float(settings.traffic_sample_interval),
         "quota_enforce_interval_s": float(settings.quota_enforce_interval),
         "pending_limit": max(0, int(pending_limit)),
-        "top_pending": [
-            {
-                "core": str(row.get("core") or ""),
-                "client_key": str(row.get("client_key") or ""),
-                "downlink": int(row.get("delta_incoming") or 0),
-                "uplink": int(row.get("delta_outgoing") or 0),
-                "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
-                "updated_at": row.get("updated_at"),
-            }
-            for row in rows_sorted[
-                : len(rows_sorted) if pending_limit <= 0 else max(1, int(pending_limit))
-            ]
-        ],
     }
+    top: list[dict[str, Any]] = []
+    slice_end = len(rows_sorted) if pending_limit <= 0 else max(1, int(pending_limit))
+    live_wg = await _live_wireguard_counters(registry) if registry is not None else {}
+    kernel_ahead_bytes = 0
+    for row in rows_sorted[:slice_end]:
+        core = str(row.get("core") or "")
+        client_key = str(row.get("client_key") or "")
+        counter_down = int(row.get("current_incoming") or 0)
+        counter_up = int(row.get("current_outgoing") or 0)
+        item: dict[str, Any] = {
+            "core": core,
+            "client_key": client_key,
+            "downlink": int(row.get("delta_incoming") or 0),
+            "uplink": int(row.get("delta_outgoing") or 0),
+            "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
+            "counter_downlink": counter_down,
+            "counter_uplink": counter_up,
+            "updated_at": row.get("updated_at"),
+        }
+        if core == "wireguard" and client_key in live_wg:
+            live_down, live_up = live_wg[client_key]
+            item["live_downlink"] = live_down
+            item["live_uplink"] = live_up
+            ahead = max(0, live_down - counter_down) + max(0, live_up - counter_up)
+            item["kernel_ahead"] = ahead
+            kernel_ahead_bytes += ahead
+        top.append(item)
+
+    snapshot_body["top_pending"] = top
+    snapshot_body["kernel_ahead_bytes"] = kernel_ahead_bytes
+    snapshot_body["kernel_ahead_label"] = _format_bytes(kernel_ahead_bytes)
+    return snapshot_body
 
 
 def _filtered_activity_lines(since_seq: int) -> tuple[list[str], int]:
@@ -165,6 +183,11 @@ def _unchanged_note(snapshot: dict[str, Any]) -> str:
             "new usage is added only after sample_all writes SQLite (ack is not required to grow)"
         )
     clients = int(snapshot.get("pending_clients") or 0)
+    if int(snapshot.get("kernel_ahead_bytes") or 0) > 0:
+        return (
+            f"unchanged pending totals — WireGuard kernel is +{snapshot.get('kernel_ahead_label')} "
+            "ahead of last sample (wait for agent work, not a read lock)"
+        )
     if clients > 0:
         return (
             "unchanged — no new bytes since last worker sample (GET/watch only read DB; "
@@ -182,11 +205,6 @@ def render_volume_billing_frame(
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lag = snapshot.get("worker_lag_ms")
     lag_label = f"{lag} ms" if lag is not None else "—"
-    lock = "yes" if snapshot.get("panel_pending_read_locked") else "no"
-    owner = snapshot.get("panel_pending_read_owner")
-    if owner:
-        lock += f" (pid {owner})"
-
     header = f"--- volume billing · {ts} ---"
     if note:
         header += f"  ({note})"
@@ -194,7 +212,7 @@ def render_volume_billing_frame(
     print(
         f"  pending_clients={snapshot.get('pending_clients')}  "
         f"unacked={snapshot.get('pending_bytes_label')}  "
-        f"sample_lag={lag_label}  panel_read_lock={lock}",
+        f"sample_lag={lag_label}",
         flush=True,
     )
     interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
@@ -221,6 +239,13 @@ def render_volume_billing_frame(
     )
     sampled = snapshot.get("last_sample_at") or "—"
     print(f"  last_sample_at={sampled}", flush=True)
+    ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
+    if ahead > 0:
+        print(
+            f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} "
+            "(live interface moved; pending updates on next agent work sample, not panel GET)",
+            flush=True,
+        )
 
     top = snapshot.get("top_pending") or []
     total_clients = int(snapshot.get("pending_clients") or 0)
@@ -239,7 +264,11 @@ def render_volume_billing_frame(
             core = str(row.get("core") or "")
             down = _format_bytes(int(row.get("downlink") or 0))
             up = _format_bytes(int(row.get("uplink") or 0))
-            print(f"    {core:8} {key:48}  ↓{down}  ↑{up}", flush=True)
+            extra = ""
+            ahead = int(row.get("kernel_ahead") or 0)
+            if ahead > 0:
+                extra = f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
+            print(f"    {core:8} {key:48}  ↓{down}  ↑{up}{extra}", flush=True)
 
     for line in log_lines:
         print(f"  log | {line}", flush=True)
@@ -263,8 +292,9 @@ def run_volume_billing_watch(
 
     if not as_json and sys.stderr.isatty():
         print(
-            "Watching traffic pending + worker activity (Ctrl+C to stop). "
-            "Panel bills via GET pending then POST ack; snapshot is stored in agent DB for ack.",
+            "Watching SQLite pending (written by agent work sample_all). "
+            "No panel_read lock. GET/watch do not block WG counters; "
+            "unchanged rows mean the worker has not committed a sample yet.",
             file=sys.stderr,
             flush=True,
         )
@@ -277,6 +307,7 @@ def run_volume_billing_watch(
                     traffic,
                     runtime.settings,
                     pending_limit=pending_limit,
+                    registry=runtime.registry,
                 )
             )
             log_lines_out, log_cursor = _filtered_activity_lines(log_cursor)
