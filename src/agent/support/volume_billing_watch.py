@@ -24,6 +24,32 @@ if TYPE_CHECKING:
     from agent.runtime import Runtime
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
+_WATCH_TOP_PENDING = 10
+
+
+class _LiveScreen:
+    """Overwrite the previous frame on TTYs instead of appending new blocks."""
+
+    def __init__(self, stream: Any = None) -> None:
+        self._stream = stream or sys.stdout
+        self._lines = 0
+        self._tty = bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def draw(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        block = "\n".join(lines)
+        if self._tty:
+            if self._lines > 0:
+                self._stream.write(f"\033[{self._lines}A\033[J")
+            self._stream.write(block + "\n")
+            self._stream.flush()
+            self._lines = len(lines)
+            return
+        print(block, flush=True)
+
+    def reset(self) -> None:
+        self._lines = 0
 
 
 def _format_bytes(value: int) -> str:
@@ -109,7 +135,8 @@ async def collect_volume_billing_snapshot(
         "pending_limit": max(0, int(pending_limit)),
     }
     top: list[dict[str, Any]] = []
-    slice_end = len(rows_sorted) if pending_limit <= 0 else max(1, int(pending_limit))
+    top_n = _WATCH_TOP_PENDING if pending_limit <= 0 else max(1, int(pending_limit))
+    slice_end = min(len(rows_sorted), top_n)
     live_wg = await _live_wireguard_counters(registry) if registry is not None else {}
     kernel_ahead_bytes = 0
     if registry is not None and live_wg and wg_chunk_clients:
@@ -221,6 +248,114 @@ def _unchanged_note(snapshot: dict[str, Any]) -> str:
     return "unchanged — queue empty or idle"
 
 
+def _format_timing_summary(raw: Any) -> str | None:
+    if not raw:
+        return None
+    try:
+        timing = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return str(raw)
+    parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
+    sqlite_ms = timing.get("sqlite_ms")
+    xray = (timing.get("xray") or {}).get("snapshot_ms")
+    wg = (timing.get("wireguard") or {}).get("snapshot_ms")
+    parts = [f"parallel={parallel}ms", f"sqlite={sqlite_ms}ms"]
+    if xray is not None:
+        parts.append(f"xray={xray}ms")
+    if wg is not None:
+        parts.append(f"wg={wg}ms")
+    return "  sample  " + "  ".join(str(p) for p in parts)
+
+
+def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> list[str]:
+    lines: list[str] = []
+    if not top:
+        return lines
+    lines.append(f"  Top unacked by volume (showing {len(top)} of {total_clients} clients)")
+    lines.append(
+        f"  {'#':>3}  {'core':8}  {'client (node_id)':32}  {'down':>10}  {'up':>10}  {'total':>10}  chunks"
+    )
+    lines.append(f"  {'-' * 3}  {'-' * 8}  {'-' * 32}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ------")
+    for index, row in enumerate(top, start=1):
+        core = str(row.get("core") or "")[:8]
+        client_key = str(row.get("client_key") or "")[:32]
+        down = _format_bytes(int(row.get("downlink") or 0))
+        up = _format_bytes(int(row.get("uplink") or 0))
+        total = _format_bytes(int(row.get("total") or 0))
+        chunks = int(row.get("chunk_count") or 0)
+        lines.append(
+            f"  {index:3d}  {core:8}  {client_key:32}  {down:>10}  {up:>10}  {total:>10}  {chunks:5d}"
+        )
+    return lines
+
+
+def format_volume_billing_frame(
+    snapshot: dict[str, Any],
+    log_lines: list[str],
+    *,
+    note: str | None = None,
+) -> list[str]:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    lag = snapshot.get("worker_lag_ms")
+    lag_label = f"{lag} ms" if lag is not None else "—"
+    out: list[str] = []
+    header = f"--- volume billing · {ts} ---"
+    if note:
+        header += f"  · {note}"
+    out.append(header)
+    out.append(
+        f"  pending_clients={snapshot.get('pending_clients')}  "
+        f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
+        f"unacked={snapshot.get('pending_bytes_label')}  "
+        f"sample_lag={lag_label}"
+    )
+    interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
+    stale_ms = max(30_000, int(interval_s * 15_000))
+    if isinstance(lag, int) and lag > stale_ms:
+        out.append(
+            f"  hint: sample_lag>{stale_ms // 1000}s — worker may be stuck; "
+            "pending grows only when a sample finishes."
+        )
+    unacked = int(snapshot.get("pending_bytes") or 0)
+    clients = int(snapshot.get("pending_clients") or 0)
+    if unacked >= 256 * 1024 * 1024 or clients >= 80:
+        out.append(
+            f"  hint: backlog {snapshot.get('pending_bytes_label')} / {clients} clients — "
+            "panel must POST ack after billing."
+        )
+    out.append(
+        f"  sample_interval={snapshot.get('traffic_sample_interval_s')}s  "
+        f"quota_interval={snapshot.get('quota_enforce_interval_s')}s  "
+        f"local_volume_quota={'on' if snapshot.get('enforce_local_volume_quota') else 'off (panel owns cutoff)'}"
+    )
+    out.append(f"  last_sample_at={snapshot.get('last_sample_at') or '—'}")
+    ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
+    if ahead > 0:
+        wg_note = (
+            "live WG since last stored cursor"
+            if not snapshot.get("kernel_ahead_unreliable")
+            else "IGNORE if huge — cursor desync"
+        )
+        out.append(f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} ({wg_note})")
+    timing_line = _format_timing_summary(snapshot.get("sample_timing"))
+    if timing_line:
+        out.append(timing_line)
+    total_clients = int(snapshot.get("pending_clients") or 0)
+    total_chunks = int(snapshot.get("pending_chunks") or 0)
+    if total_clients <= 0:
+        out.append("  (no unacked pending rows)")
+    else:
+        out.append(
+            f"  queue: {total_clients} clients · {total_chunks} chunks · "
+            f"{snapshot.get('pending_bytes_label')} unacked"
+        )
+        out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], total_clients))
+    for line in log_lines[-3:]:
+        if "traffic sample timing" in line or "traffic sample cycle" in line:
+            out.append(f"  log | {line}")
+    return out
+
+
 def print_pending_queue_summary(snapshot: dict[str, Any], *, limit: int = 30) -> None:
     """Print the same pending rows as the live watch (for reset preview)."""
     total = int(snapshot.get("pending_clients") or 0)
@@ -250,80 +385,8 @@ def render_volume_billing_frame(
     *,
     note: str | None = None,
 ) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    lag = snapshot.get("worker_lag_ms")
-    lag_label = f"{lag} ms" if lag is not None else "—"
-    header = f"--- volume billing · {ts} ---"
-    if note:
-        header += f"  ({note})"
-    print(header, flush=True)
-    print(
-        f"  pending_clients={snapshot.get('pending_clients')}  "
-        f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
-        f"unacked={snapshot.get('pending_bytes_label')}  "
-        f"sample_lag={lag_label}",
-        flush=True,
-    )
-    interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
-    stale_ms = max(30_000, int(interval_s * 15_000))
-    if isinstance(lag, int) and lag > stale_ms:
-        print(
-            f"  hint: sample_lag>{stale_ms // 1000}s — worker may be stuck; "
-            "pending still grows only when a sample finishes.",
-            flush=True,
-        )
-    unacked = int(snapshot.get("pending_bytes") or 0)
-    clients = int(snapshot.get("pending_clients") or 0)
-    if unacked >= 256 * 1024 * 1024 or clients >= 80:
-        print(
-            f"  hint: backlog {snapshot.get('pending_bytes_label')} / {clients} clients — "
-            "panel must POST ack after billing; until then this queue does not shrink.",
-            flush=True,
-        )
-    print(
-        f"  sample_interval={snapshot.get('traffic_sample_interval_s')}s  "
-        f"quota_interval={snapshot.get('quota_enforce_interval_s')}s  "
-        f"local_volume_quota={'on' if snapshot.get('enforce_local_volume_quota') else 'off (panel owns cutoff)'}",
-        flush=True,
-    )
-    sampled = snapshot.get("last_sample_at") or "—"
-    print(f"  last_sample_at={sampled}", flush=True)
-    ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
-    if ahead > 0:
-        note = (
-            "live WG since last stored cursor (small = normal between 5s samples)"
-            if not snapshot.get("kernel_ahead_unreliable")
-            else "IGNORE if huge — cursor desync; trust unacked chunk sum above"
-        )
-        print(
-            f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} ({note})",
-            flush=True,
-        )
-    agg = int(snapshot.get("pending_bytes_aggregate") or 0)
-    chunk_sum = int(snapshot.get("pending_bytes_chunks") or 0)
-    if chunk_sum > 0 and abs(agg - chunk_sum) > max(1024, chunk_sum // 50):
-        print(
-            f"  warn: aggregate pending { _format_bytes(agg) } != chunk sum { _format_bytes(chunk_sum) }",
-            flush=True,
-        )
-
-    total_clients = int(snapshot.get("pending_clients") or 0)
-    total_chunks = int(snapshot.get("pending_chunks") or 0)
-    if total_clients <= 0:
-        print("  (no unacked pending rows)", flush=True)
-    else:
-        print(
-            f"  queue: {total_clients} clients · {total_chunks} chunks · "
-            f"{snapshot.get('pending_bytes_label')} unacked (per-client list disabled)",
-            flush=True,
-        )
-    timing = snapshot.get("sample_timing")
-    if timing:
-        print(f"  last_sample_timing={timing}", flush=True)
-
-    for line in log_lines:
-        if "traffic sample timing" in line or "traffic sample cycle" in line:
-            print(f"  log | {line}", flush=True)
+    for line in format_volume_billing_frame(snapshot, log_lines, note=note):
+        print(line, flush=True)
 
 
 def run_volume_billing_watch(
@@ -332,8 +395,8 @@ def run_volume_billing_watch(
     interval: float = 2.0,
     once: bool = False,
     as_json: bool = False,
-    pending_limit: int = 0,
-    log_lines: int = 40,
+    pending_limit: int = _WATCH_TOP_PENDING,
+    log_lines: int = 3,
 ) -> int:
     from agent.asyncutil import run_sync
 
@@ -342,14 +405,8 @@ def run_volume_billing_watch(
     file_tail = _AgentLogTail(resolve_log_path(runtime.settings))
     wait_s = max(0.5, float(interval))
 
-    if not as_json and sys.stderr.isatty():
-        print(
-            "Watching SQLite pending (written by agent work). "
-            "Per-core sample timing: grep 'traffic sample timing' in agent.log. "
-            "Cores run in parallel; lag > interval usually means xray snapshot_ms or sqlite_ms is high.",
-            file=sys.stderr,
-            flush=True,
-        )
+    screen = _LiveScreen()
+    banner_printed = False
 
     prev_fp: tuple[Any, ...] | None = None
     try:
@@ -366,10 +423,8 @@ def run_volume_billing_watch(
             log_lines_out.extend(file_tail.poll(limit=max(1, int(log_lines))))
             fp = _snapshot_fingerprint(snapshot)
             note = None
-            compact = False
             if prev_fp is not None and fp == prev_fp:
                 note = _unchanged_note(snapshot)
-                compact = not as_json
             prev_fp = fp
 
             if as_json:
@@ -381,30 +436,26 @@ def run_volume_billing_watch(
                     ),
                     flush=True,
                 )
-            elif compact:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                lag = snapshot.get("worker_lag_ms")
-                lag_label = f"{lag} ms" if lag is not None else "—"
-                print(
-                    f"--- volume billing · {ts} ---  ({note})",
-                    flush=True,
-                )
-                print(
-                    f"  pending_clients={snapshot.get('pending_clients')}  "
-                    f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
-                    f"unacked={snapshot.get('pending_bytes_label')}  "
-                    f"sample_lag={lag_label}",
-                    flush=True,
-                )
-                for line in log_lines_out:
-                    print(f"  log | {line}", flush=True)
             else:
-                render_volume_billing_frame(snapshot, log_lines_out, note=note)
+                if not banner_printed and sys.stderr.isatty():
+                    print(
+                        "Volume billing watch (screen refresh in place). Ctrl+C to stop.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    banner_printed = True
+                frame = format_volume_billing_frame(snapshot, log_lines_out, note=note)
+                if once or not screen._tty:
+                    for line in frame:
+                        print(line, flush=True)
+                else:
+                    screen.draw(frame)
 
             if once:
                 return 0
             time.sleep(wait_s)
     except KeyboardInterrupt:
         if not as_json:
+            screen.reset()
             print("\nStopped.", flush=True)
         return 0
