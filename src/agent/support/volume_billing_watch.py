@@ -55,7 +55,7 @@ async def collect_volume_billing_snapshot(
     traffic: TrafficService,
     settings: AgentSettings,
     *,
-    pending_limit: int = 12,
+    pending_limit: int = 0,
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
     pending_bytes = 0
@@ -231,7 +231,7 @@ def render_volume_billing_frame(
         if limit > 0 and total_clients > len(top):
             print(
                 f"  (showing top {len(top)} of {total_clients} pending rows; "
-                "use stats-volume-watch --all-pending for full list)",
+                "use --pending-limit 0 for full list)",
                 flush=True,
             )
         for row in top:
@@ -251,7 +251,7 @@ def run_volume_billing_watch(
     interval: float = 2.0,
     once: bool = False,
     as_json: bool = False,
-    pending_limit: int = 12,
+    pending_limit: int = 0,
     log_lines: int = 40,
 ) -> int:
     from agent.asyncutil import run_sync

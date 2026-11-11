@@ -173,9 +173,11 @@ async def stats_clients_traffic_pending(
       2. GET only reads that queue (no live counter read). A nudge may schedule
          ``sample_all`` when the last sample is older than one interval.
       3. Panel bills queued bytes, then POST ``/pending/ack`` **subtracts** what was
-         billed so the same bytes are not sent twice. Until ack, the queue can still
-         **grow** when the worker runs; it does not shrink.
+         billed (``billed`` body when present). The worker keeps upserting pending
+         during GET; the meta read lock is for diagnostics only and expires after ack
+         or ~20s.
     """
+    await traffic.note_panel_pending_read()
     payload = await traffic.pending_payload(persist_snapshot=False)
 
     settings = getattr(registry, "settings", None)

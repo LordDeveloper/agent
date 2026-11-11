@@ -922,7 +922,7 @@ def _show_volume_billing_watch() -> None:
             interval=2.0,
             once=False,
             json=False,
-            pending_limit=12,
+            pending_limit=0,
             all_pending=False,
             log_lines=40,
         )

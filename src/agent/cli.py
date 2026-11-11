@@ -142,7 +142,7 @@ def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
         pending_limit = (
             0
             if getattr(args, "all_pending", False)
-            else int(getattr(args, "pending_limit", 12))
+            else int(getattr(args, "pending_limit", 0))
         )
         return run_volume_billing_watch(
             runtime,
@@ -850,8 +850,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats_vol.add_argument(
         "--pending-limit",
         type=int,
-        default=12,
-        help="Max pending client rows to print per tick (default 12)",
+        default=0,
+        help="Max pending rows per tick (0 = print every client, default)",
     )
     p_stats_vol.add_argument(
         "--all-pending",

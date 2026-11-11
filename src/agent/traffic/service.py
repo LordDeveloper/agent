@@ -757,6 +757,10 @@ class TrafficService:
             return str(override)
         return str(os.getpid())
 
+    async def note_panel_pending_read(self) -> None:
+        """Panel GET /pending: metadata lock for watch (TTL). Does not block the worker."""
+        await self._claim_pending_read()
+
     async def _claim_pending_read(self) -> bool:
         now = time.time()
         return await self.store.claim_meta_lock(
@@ -907,7 +911,17 @@ class TrafficService:
                 not_found.append(label)
                 continue
 
-            to_ack.extend(rows)
+            for row in rows:
+                patched = dict(row)
+                amounts = (
+                    billed.get(label)
+                    or billed.get(canonical)
+                    or billed.get(self._public_client_key(str(row.get("client_key") or "")))
+                )
+                if amounts:
+                    patched["billed_incoming"] = max(0, int(amounts[0]))
+                    patched["billed_outgoing"] = max(0, int(amounts[1]))
+                to_ack.append(patched)
             published = self._public_client_key(str(rows[0].get("client_key") or "")) or self._public_client_key(label)
             if published and published not in acked:
                 acked.append(published)

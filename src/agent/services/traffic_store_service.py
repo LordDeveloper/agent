@@ -399,8 +399,12 @@ class TrafficStoreService:
                 client_key = str(snap.get("client_key") or "")
                 live = live_map.get((core, client_key))
                 ack = ack_map.get((core, client_key))
-                billed_in = int(snap.get("delta_incoming") or 0)
-                billed_out = int(snap.get("delta_outgoing") or 0)
+                if "billed_incoming" in snap or "billed_outgoing" in snap:
+                    billed_in = max(0, int(snap.get("billed_incoming") or 0))
+                    billed_out = max(0, int(snap.get("billed_outgoing") or 0))
+                else:
+                    billed_in = int(snap.get("delta_incoming") or 0)
+                    billed_out = int(snap.get("delta_outgoing") or 0)
                 snap_in = int(snap.get("current_incoming") or 0)
                 snap_out = int(snap.get("current_outgoing") or 0)
                 previous_in = int(ack.incoming) if ack is not None else None
