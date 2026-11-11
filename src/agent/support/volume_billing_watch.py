@@ -69,10 +69,19 @@ async def collect_volume_billing_snapshot(
         reverse=True,
     )
 
+    pending_last_touch = None
+    for row in rows:
+        touch = row.get("updated_at")
+        if not touch:
+            continue
+        if pending_last_touch is None or str(touch) > str(pending_last_touch):
+            pending_last_touch = touch
+
     return {
         "pending_clients": len(rows),
         "pending_bytes": pending_bytes,
         "pending_bytes_label": _format_bytes(pending_bytes),
+        "pending_last_touch": pending_last_touch,
         "worker_lag_ms": await traffic.last_sample_age_ms(),
         "last_sample_at": await traffic.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY),
         "panel_pending_read_locked": locked,
@@ -142,7 +151,26 @@ def _snapshot_fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         snapshot.get("pending_clients"),
         snapshot.get("pending_bytes"),
         snapshot.get("last_sample_at"),
+        snapshot.get("pending_last_touch"),
     )
+
+
+def _unchanged_note(snapshot: dict[str, Any]) -> str:
+    lag = snapshot.get("worker_lag_ms")
+    interval_s = float(snapshot.get("traffic_sample_interval_s") or 5.0)
+    stale_ms = max(2000, int(interval_s * 2000))
+    if isinstance(lag, int) and lag > stale_ms:
+        return (
+            f"unchanged — worker has not finished a sample in ~{lag // 1000}s; "
+            "new usage is added only after sample_all writes SQLite (ack is not required to grow)"
+        )
+    clients = int(snapshot.get("pending_clients") or 0)
+    if clients > 0:
+        return (
+            "unchanged — no new bytes since last worker sample (GET/watch only read DB; "
+            "POST ack shrinks billed bytes, it does not add usage)"
+        )
+    return "unchanged — queue empty or idle"
 
 
 def render_volume_billing_frame(
@@ -257,10 +285,7 @@ def run_volume_billing_watch(
             note = None
             compact = False
             if prev_fp is not None and fp == prev_fp:
-                note = (
-                    "unchanged — panel has not POST ack; worker/sample values are the same as last tick "
-                    "(watch does not bill; only the panel shrinks this queue)"
-                )
+                note = _unchanged_note(snapshot)
                 compact = not as_json
             prev_fp = fp
 

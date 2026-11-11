@@ -668,6 +668,18 @@ class TrafficService:
             )
             return "regressed" if reset else "pending"
 
+        # Keep unacked bytes queued even when this tick added 0 (worker tick ≠ panel ack).
+        if preserved_in > 0 or preserved_out > 0:
+            set_pending(
+                core,
+                client_key_label,
+                preserved_in,
+                preserved_out,
+                current_incoming,
+                current_outgoing,
+            )
+            return "unchanged"
+
         delete_pending(core, client_key_label)
         return "regressed" if reset else "unchanged"
 

@@ -168,17 +168,19 @@ async def stats_clients_traffic_pending(
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
-      1. ``agent work`` keeps ``pending = current_cumulative - ack`` until POST ack.
-      2. GET only reads that queue. Core sampling runs in the worker, not in this HTTP
-         process (scheduling sample here blocked SQLite and the panel poll).
-      3. Panel bills those bytes, then POST ``/pending/ack`` with each
-         client node_id so only growth after the GET snapshot remains queued.
+      1. ``agent work`` samples Xray on an interval and **adds** growth onto each
+         client's pending row in SQLite. That does **not** wait for panel ack.
+      2. GET only reads that queue (no live counter read). A nudge may schedule
+         ``sample_all`` when the last sample is older than one interval.
+      3. Panel bills queued bytes, then POST ``/pending/ack`` **subtracts** what was
+         billed so the same bytes are not sent twice. Until ack, the queue can still
+         **grow** when the worker runs; it does not shrink.
     """
     payload = await traffic.pending_payload(persist_snapshot=False)
 
     settings = getattr(registry, "settings", None)
     interval_s = float(getattr(settings, "traffic_sample_interval", 5.0) or 5.0)
-    max_sample_age_ms = max(1000, int(interval_s * 1000 * 2))
+    max_sample_age_ms = max(1000, int(interval_s * 1000))
     sample_refresh_scheduled = await traffic.ensure_sample_fresh(
         registry,
         max_sample_age_ms=max_sample_age_ms,
