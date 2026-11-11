@@ -40,6 +40,23 @@ class TrafficPending(Base):
     )
 
 
+class TrafficPendingChunk(Base):
+    """One billable slice per worker sample tick (panel ack deletes by chunk_id)."""
+
+    __tablename__ = "traffic_pending_chunk"
+    __table_args__ = {"sqlite_with_rowid": False}
+
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
+    chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    core: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    delta_incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delta_outgoing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_outgoing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sampled_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class TrafficIdentity(Base):
     __tablename__ = "traffic_identity"
     __table_args__ = {"sqlite_with_rowid": False}

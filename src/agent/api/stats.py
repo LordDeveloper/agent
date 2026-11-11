@@ -168,13 +168,13 @@ async def stats_clients_traffic_pending(
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
-      1. ``agent work`` samples Xray on an interval and **adds** growth onto each
-         client's pending row in SQLite. That does **not** wait for panel ack.
-      2. GET only reads that queue (no live counter read). A nudge may schedule
-         ``sample_all`` when the last sample is older than one interval.
-      3. Panel bills queued bytes, then POST ``/pending/ack`` **subtracts** what was
-         billed (``billed`` body when present). The worker keeps upserting pending
-         on every sample; GET never takes a write lock.
+      1. ``agent work`` samples on an interval and appends one pending **chunk**
+         per client when counters grow. Chunks are not held until panel ack.
+      2. GET returns ``users[node_id]`` with summed ``downlink``/``uplink`` and
+         ``chunks: [{id, downlink, uplink, sampled_at}, ...]``.
+      3. Panel bills the summed totals, then POST ``/pending/ack`` with
+         ``chunk_ids`` (processed chunk rows) plus optional ``clients``/``billed``
+         for baseline settlement. GET does not take a write lock.
     """
     payload = await traffic.pending_payload(persist_snapshot=False)
 
@@ -226,12 +226,10 @@ async def stats_clients_traffic_pending_ack(
     Subtracts the GET snapshot from the live pending row. Bytes sampled onto
     the queue after that GET stay pending and are not cleared.
 
-    Body: ``{"clients": ["<node_id>", ...], "billed": {"<node_id>": {"incoming": 0, "outgoing": 0}}, "drop": ["<node_id>", ...]}``.
-    ``billed`` is the raw queue the panel already applied. It is used when the
-    GET snapshot no longer has that id, and only those bytes are subtracted.
-    ``drop`` deletes keys the panel will never bill, including when the GET
-    snapshot no longer has that id. Email and a protocol UUID may find the row.
-    ``acked`` always lists the panel node_id, which is the stored client key.
+    Body: ``{"chunk_ids": ["<uuid>", ...], "clients": [...], "billed": {...}, "drop": [...]}``.
+    ``chunk_ids`` delete the billed sample chunks (primary idempotent clear).
+    ``clients``/``billed`` settle the ack watermark when needed; ``drop`` clears
+    keys the panel will never bill.
     """
     raw = body.get("clients")
     if raw is None:
@@ -246,6 +244,16 @@ async def stats_clients_traffic_pending_ack(
 
     client_keys = [str(item).strip() for item in raw if str(item or "").strip()]
     drop_keys = [str(item).strip() for item in drop_raw if str(item or "").strip()]
+    chunk_raw = body.get("chunk_ids") or []
+    chunk_ids = [
+        str(item).strip()
+        for item in (chunk_raw if isinstance(chunk_raw, list) else [])
+        if str(item or "").strip()
+    ]
+    chunks_deleted = 0
+    chunks_missing: list[str] = []
+    if chunk_ids:
+        chunks_deleted, chunks_missing = await traffic.ack_chunk_ids(chunk_ids)
     acked, not_found = await traffic.ack_clients(
         client_keys,
         _billed_amounts(body.get("billed")),
@@ -256,6 +264,8 @@ async def stats_clients_traffic_pending_ack(
         "success": True,
         "acked": acked,
         "not_found": not_found,
+        "chunks_deleted": chunks_deleted,
+        "chunks_missing": chunks_missing,
         # Lets the panel tell a settled miss from an older agent that reports
         # not_found while the billed bytes are still queued.
         "billed_ack": True,

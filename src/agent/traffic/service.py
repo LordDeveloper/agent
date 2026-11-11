@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -399,6 +400,7 @@ class TrafficService:
         # One pending entry per client. Later samples in this batch replace it.
         pending_upserts: dict[tuple[str, str], dict[str, Any]] = {}
         pending_deletes: set[tuple[str, str]] = set()
+        chunk_inserts: list[dict[str, Any]] = []
         identity_upserts: list[tuple[str, str, str]] = []
 
         def set_ack(core: str, key: str, incoming: int, outgoing: int) -> None:
@@ -437,6 +439,61 @@ class TrafficService:
             pending_upserts.pop((core, key), None)
             pending_deletes.add((core, key))
 
+        def insert_chunk(
+            core: str,
+            key: str,
+            delta_incoming: int,
+            delta_outgoing: int,
+            current_incoming: int,
+            current_outgoing: int,
+        ) -> None:
+            if delta_incoming <= 0 and delta_outgoing <= 0:
+                return
+            chunk_inserts.append(
+                {
+                    "chunk_id": str(uuid.uuid4()),
+                    "core": core,
+                    "client_key": key,
+                    "delta_incoming": int(delta_incoming),
+                    "delta_outgoing": int(delta_outgoing),
+                    "current_incoming": int(current_incoming),
+                    "current_outgoing": int(current_outgoing),
+                    "sampled_at": sampled_at,
+                }
+            )
+            row = pending.get((core, key))
+            if row is None:
+                pending[(core, key)] = {
+                    "delta_incoming": int(delta_incoming),
+                    "delta_outgoing": int(delta_outgoing),
+                    "current_incoming": int(current_incoming),
+                    "current_outgoing": int(current_outgoing),
+                }
+                return
+            row["delta_incoming"] = int(row["delta_incoming"]) + int(delta_incoming)
+            row["delta_outgoing"] = int(row["delta_outgoing"]) + int(delta_outgoing)
+            row["current_incoming"] = int(current_incoming)
+            row["current_outgoing"] = int(current_outgoing)
+
+        def sync_pending_state(
+            core: str,
+            key: str,
+            bill_in: int,
+            bill_out: int,
+            current_incoming: int,
+            current_outgoing: int,
+        ) -> None:
+            if bill_in <= 0 and bill_out <= 0:
+                if (core, key) not in pending:
+                    return
+                return
+            pending[(core, key)] = {
+                "delta_incoming": int(bill_in),
+                "delta_outgoing": int(bill_out),
+                "current_incoming": int(current_incoming),
+                "current_outgoing": int(current_outgoing),
+            }
+
         protected = {str(sample["label"]) for sample in samples if str(sample["label"])}
         for sample in samples:
             core = str(sample["core"])
@@ -471,6 +528,8 @@ class TrafficService:
                 set_ack=set_ack,
                 set_pending=set_pending,
                 delete_pending=delete_pending,
+                insert_chunk=insert_chunk,
+                sync_pending_state=sync_pending_state,
             )
             stats[outcome] = stats.get(outcome, 0) + 1
             for alias in (email, protocol_id):
@@ -486,6 +545,7 @@ class TrafficService:
             "ack_deletes": ack_deletes,
             "pending_upserts": list(pending_upserts.values()),
             "pending_deletes": list(pending_deletes),
+            "chunk_inserts": chunk_inserts,
             "identity_upserts": identity_upserts,
             "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
         }
@@ -596,6 +656,8 @@ class TrafficService:
         set_ack,
         set_pending,
         delete_pending,
+        insert_chunk,
+        sync_pending_state,
     ) -> str:
         preserved_in, preserved_out = TrafficService._preserved_delta(pending, core, client_key_label)
         last = pending.get((core, client_key_label))
@@ -610,7 +672,7 @@ class TrafficService:
                 current_outgoing,
             )
             if preserved_in > 0 or preserved_out > 0:
-                set_pending(
+                sync_pending_state(
                     core,
                     client_key_label,
                     preserved_in,
@@ -655,29 +717,29 @@ class TrafficService:
             )
         if base_in != ack_in or base_out != ack_out:
             set_ack(core, client_key_label, base_in, base_out)
+        tick_in = max(0, bill_in - preserved_in)
+        tick_out = max(0, bill_out - preserved_out)
+        if tick_in > 0 or tick_out > 0:
+            insert_chunk(
+                core,
+                client_key_label,
+                tick_in,
+                tick_out,
+                current_incoming,
+                current_outgoing,
+            )
+        sync_pending_state(
+            core,
+            client_key_label,
+            bill_in,
+            bill_out,
+            current_incoming,
+            current_outgoing,
+        )
         if bill_in > 0 or bill_out > 0:
-            set_pending(
-                core,
-                client_key_label,
-                bill_in,
-                bill_out,
-                current_incoming,
-                current_outgoing,
-            )
             return "regressed" if reset else "pending"
-
-        # Keep unacked bytes queued even when this tick added 0 (worker tick ≠ panel ack).
         if preserved_in > 0 or preserved_out > 0:
-            set_pending(
-                core,
-                client_key_label,
-                preserved_in,
-                preserved_out,
-                current_incoming,
-                current_outgoing,
-            )
             return "unchanged"
-
         delete_pending(core, client_key_label)
         return "regressed" if reset else "unchanged"
 
@@ -770,10 +832,28 @@ class TrafficService:
         the in-memory snapshot is enough until a background meta write finishes.
         """
         await self._load_persisted_aliases()
+        chunks = await self.store.list_traffic_pending_chunks()
         rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()
+
+        chunks_by_label: dict[str, list[dict[str, Any]]] = {}
+        for chunk in chunks:
+            stored = str(chunk["client_key"])
+            if str(chunk.get("core") or "") == "l2tp" and stored in linked_l2tp:
+                continue
+            label = self._public_client_key(stored)
+            if not label:
+                continue
+            chunks_by_label.setdefault(label, []).append(
+                {
+                    "id": str(chunk["chunk_id"]),
+                    "downlink": int(chunk["delta_incoming"]),
+                    "uplink": int(chunk["delta_outgoing"]),
+                    "sampled_at": chunk.get("sampled_at"),
+                }
+            )
 
         for row in rows:
             stored = str(row["client_key"])
@@ -782,17 +862,56 @@ class TrafficService:
             label = self._public_client_key(stored)
             if not label:
                 continue
-
-            published = dict(row)
+            chunk_list = chunks_by_label.pop(label, [])
+            published = {
+                "core": str(row["core"]),
+                "client_key": stored,
+                "delta_incoming": int(row["delta_incoming"]),
+                "delta_outgoing": int(row["delta_outgoing"]),
+                "current_incoming": int(row["current_incoming"]),
+                "current_outgoing": int(row["current_outgoing"]),
+            }
             snapshot.setdefault(label, []).append(published)
             if stored != label:
                 snapshot.setdefault(stored, []).append(published)
-            entry = {
-                "core": row["core"],
+            users[label] = {
+                "core": str(row["core"]),
                 "uplink": int(row["delta_outgoing"]),
                 "downlink": int(row["delta_incoming"]),
+                "chunks": chunk_list,
             }
-            users[label] = entry
+
+        for label, chunk_list in chunks_by_label.items():
+            downlink = sum(int(item["downlink"]) for item in chunk_list)
+            uplink = sum(int(item["uplink"]) for item in chunk_list)
+            if downlink == 0 and uplink == 0:
+                continue
+            stored = label
+            core = "xray"
+            current_incoming = 0
+            current_outgoing = 0
+            for chunk in chunks:
+                if self._public_client_key(str(chunk["client_key"])) != label:
+                    continue
+                stored = str(chunk["client_key"])
+                core = str(chunk["core"])
+                current_incoming = int(chunk["current_incoming"])
+                current_outgoing = int(chunk["current_outgoing"])
+            users[label] = {
+                "core": core,
+                "uplink": uplink,
+                "downlink": downlink,
+                "chunks": chunk_list,
+            }
+            published = {
+                "core": core,
+                "client_key": stored,
+                "delta_incoming": downlink,
+                "delta_outgoing": uplink,
+                "current_incoming": current_incoming,
+                "current_outgoing": current_outgoing,
+            }
+            snapshot.setdefault(label, []).append(published)
 
         self._write_snapshot(snapshot)
         if persist_snapshot:
@@ -808,6 +927,9 @@ class TrafficService:
             "worker_lag_ms": await self._worker_lag_ms(),
             "users": users,
         }
+
+    async def ack_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
+        return await self.store.ack_traffic_chunk_ids(chunk_ids)
 
     async def ack_pending(self) -> int:
         rows = await self.store.list_traffic_pending()

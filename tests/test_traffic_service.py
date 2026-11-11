@@ -62,11 +62,11 @@ async def test_traffic_service_tracks_pending_delta(store):
     await _sample(traffic, registry)
 
     payload = await traffic.pending_payload()
-    assert payload["users"]["uuid-1"] == {
-        "core": "xray",
-        "uplink": 200_000,
-        "downlink": 200_000,
-    }
+    user = payload["users"]["uuid-1"]
+    assert user["core"] == "xray"
+    assert user["downlink"] == 200_000
+    assert user["uplink"] == 200_000
+    assert len(user["chunks"]) == 1
 
     acked = await traffic.ack_pending()
     assert acked == 1
@@ -123,11 +123,11 @@ async def test_traffic_service_migrates_legacy_email_rows_to_client_id(store):
     await _sample(traffic, registry)
 
     payload = await traffic.pending_payload()
-    assert payload["users"]["uuid-new"] == {
-        "core": "xray",
-        "uplink": 100,
-        "downlink": 200,
-    }
+    user = payload["users"]["uuid-new"]
+    assert user["core"] == "xray"
+    assert user["downlink"] == 200
+    assert user["uplink"] == 100
+    assert user["chunks"] == []
     assert "legacy@example.com" not in payload["users"]
     assert await store.get_traffic_pending("xray", "legacy@example.com") is None
     assert await store.get_traffic_ack("xray", "legacy@example.com") is None
@@ -458,7 +458,10 @@ async def test_counter_reset_keeps_unacked_bytes_and_does_not_rebill_them(store)
     assert grown["downlink"] == 850
     assert grown["uplink"] == 180
 
-    await traffic.ack_clients(["node-1"])
+    await traffic.pending_payload()
+    acked, not_found = await traffic.ack_clients(["node-1"])
+    assert acked == ["node-1"]
+    assert not_found == []
     await _sample(traffic, registry)
     assert (await traffic.pending_payload())["users"] == {}
 
@@ -500,11 +503,11 @@ async def test_xray_uuid_pending_moves_to_node_id_without_double_billing(store):
     await _sample(traffic, registry)
 
     payload = await traffic.pending_payload()
-    assert payload["users"]["node-1"] == {
-        "core": "xray",
-        "uplink": 200,
-        "downlink": 300,
-    }
+    user = payload["users"]["node-1"]
+    assert user["core"] == "xray"
+    assert user["downlink"] == 300
+    assert user["uplink"] == 200
+    assert len(user["chunks"]) == 1
     assert "xray-uuid" not in payload["users"]
     assert await store.get_traffic_pending("xray", "xray-uuid") is None
     assert await store.get_traffic_ack("xray", "node-1") == {"incoming": 1_000, "outgoing": 500}
@@ -572,11 +575,11 @@ async def test_pending_get_reads_the_queue_without_deleting_rows(store):
         "56a3e781-fe73-456e-80cf-4027ca3e52d9",
         "still-unlisted",
     }
-    assert payload["users"]["live-node"] == {
-        "core": "wireguard",
-        "uplink": 5,
-        "downlink": 10,
-    }
+    live = payload["users"]["live-node"]
+    assert live["core"] == "wireguard"
+    assert live["downlink"] == 10
+    assert live["uplink"] == 5
+    assert live["chunks"] == []
     email = await store.get_traffic_pending("wireguard", "0wPo9T")
     assert int(email["delta_incoming"]) == 400
     assert int(email["delta_outgoing"]) == 50
@@ -607,11 +610,11 @@ async def test_pending_email_does_not_replace_a_larger_node_id_row(store):
 
     payload = await TrafficService(store).pending_payload()
 
-    assert payload["users"]["live-node"] == {
-        "core": "wireguard",
-        "uplink": 20,
-        "downlink": 80,
-    }
+    live = payload["users"]["live-node"]
+    assert live["core"] == "wireguard"
+    assert live["downlink"] == 80
+    assert live["uplink"] == 20
+    assert live["chunks"] == []
     assert payload["users"]["0wPo9T"]["downlink"] == 5
     assert await store.get_traffic_pending("wireguard", "0wPo9T") is not None
     assert int((await store.get_traffic_pending("wireguard", "live-node"))["delta_incoming"]) == 80
@@ -630,11 +633,11 @@ async def test_xray_pending_uses_quota_node_id_and_drops_removed_clients(store):
     payload = await TrafficService(store).pending_payload()
 
     assert set(payload["users"]) == {"iEhV1M", "deleted-uuid"}
-    assert payload["users"]["iEhV1M"] == {
-        "core": "xray",
-        "uplink": 7,
-        "downlink": 30,
-    }
+    quoted = payload["users"]["iEhV1M"]
+    assert quoted["core"] == "xray"
+    assert quoted["downlink"] == 30
+    assert quoted["uplink"] == 7
+    assert quoted["chunks"] == []
     assert await store.get_traffic_pending("xray", "iEhV1M") is not None
     assert await store.get_traffic_pending("xray", "deleted-uuid") is not None
 
@@ -875,3 +878,23 @@ async def test_unacked_samples_sum_download_and_upload(store):
     assert rows[0]["client_key"] == "node-sum"
     assert rows[0]["delta_incoming"] == 11 * mb
     assert rows[0]["delta_outgoing"] == 8 * mb
+
+
+async def test_ack_chunk_ids_clears_billed_chunks(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="chunk-node", email="chunk@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 1_000
+    client.outgoing = 500
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
+    chunk_ids = [str(item["id"]) for item in payload["users"]["chunk-node"]["chunks"]]
+    assert chunk_ids
+
+    deleted, missing = await traffic.ack_chunk_ids(chunk_ids)
+    assert deleted == len(chunk_ids)
+    assert missing == []
+    assert (await traffic.pending_payload())["users"] == {}

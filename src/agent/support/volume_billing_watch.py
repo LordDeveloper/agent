@@ -60,6 +60,12 @@ async def collect_volume_billing_snapshot(
     registry: CoreRegistry | None = None,
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
+    chunks = await traffic.store.list_traffic_pending_chunks()
+    chunks_by_client: dict[tuple[str, str], int] = {}
+    for chunk in chunks:
+        key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
+        chunks_by_client[key] = chunks_by_client.get(key, 0) + 1
+
     pending_bytes = 0
     for row in rows:
         pending_bytes += int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0)
@@ -80,6 +86,7 @@ async def collect_volume_billing_snapshot(
 
     snapshot_body: dict[str, Any] = {
         "pending_clients": len(rows),
+        "pending_chunks": len(chunks),
         "pending_bytes": pending_bytes,
         "pending_bytes_label": _format_bytes(pending_bytes),
         "pending_last_touch": pending_last_touch,
@@ -105,6 +112,7 @@ async def collect_volume_billing_snapshot(
             "downlink": int(row.get("delta_incoming") or 0),
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
+            "chunk_count": int(chunks_by_client.get((core, client_key), 0)),
             "counter_downlink": counter_down,
             "counter_uplink": counter_up,
             "updated_at": row.get("updated_at"),
@@ -211,6 +219,7 @@ def render_volume_billing_frame(
     print(header, flush=True)
     print(
         f"  pending_clients={snapshot.get('pending_clients')}  "
+        f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
         f"unacked={snapshot.get('pending_bytes_label')}  "
         f"sample_lag={lag_label}",
         flush=True,
@@ -265,9 +274,12 @@ def render_volume_billing_frame(
             down = _format_bytes(int(row.get("downlink") or 0))
             up = _format_bytes(int(row.get("uplink") or 0))
             extra = ""
+            chunk_count = int(row.get("chunk_count") or 0)
+            if chunk_count > 0:
+                extra = f"  ({chunk_count} chunks)"
             ahead = int(row.get("kernel_ahead") or 0)
             if ahead > 0:
-                extra = f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
+                extra += f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
             print(f"    {core:8} {key:48}  ↓{down}  ↑{up}{extra}", flush=True)
 
     for line in log_lines:
@@ -339,6 +351,7 @@ def run_volume_billing_watch(
                 )
                 print(
                     f"  pending_clients={snapshot.get('pending_clients')}  "
+                    f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
                     f"unacked={snapshot.get('pending_bytes_label')}  "
                     f"sample_lag={lag_label}",
                     flush=True,
