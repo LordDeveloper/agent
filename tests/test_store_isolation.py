@@ -99,7 +99,7 @@ def test_traffic_sample_does_not_stick_the_writer_snapshot() -> None:
         await store.open()
         try:
             await store.apply_traffic_sample(
-                lambda _acks, _pending: {
+                lambda _cursors: {
                     "ack_upserts": [("xray", "client-1", 5, 1)],
                     "stats": {"clients_seen": 1},
                 }

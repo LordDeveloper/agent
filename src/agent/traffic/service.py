@@ -259,8 +259,8 @@ class TrafficService:
         self,
         registry: CoreRegistry,
     ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
-        """Thread-pool core snapshots, then a single SQLite commit (one writer)."""
-        from agent.traffic.sample_parallel import gather_core_snapshots
+        """Parallel core snapshots on the worker registry, then one SQLite commit."""
+        from agent.asyncutil import gather_independent
 
         cycle_started = time.monotonic()
         all_cores = self._listed_cores(registry) or []
@@ -274,17 +274,10 @@ class TrafficService:
             await self._drop_linked_l2tp_billing(registry.get("l2tp"))
 
         owners_task = asyncio.create_task(self.store.client_scopes())
-        from agent.config import AgentSettings
-
-        if isinstance(settings, AgentSettings) and cores:
-            captured = await gather_core_snapshots(settings, cores)
-        else:
-            from agent.asyncutil import gather_independent
-
-            captured = await gather_independent(
-                *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
-                return_exceptions=True,
-            )
+        captured = await gather_independent(
+            *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
+            return_exceptions=True,
+        )
         owners = await owners_task
         core_snapshots: list[tuple[str, Any, int]] = []
         core_timings: dict[str, dict[str, int]] = {}
@@ -306,17 +299,33 @@ class TrafficService:
             )
 
         sqlite_started = time.monotonic()
-        stats = await self._commit_merged_core_samples(core_snapshots, owners)
+        stats, sqlite_detail = await self._commit_merged_core_samples(core_snapshots, owners)
         sqlite_ms = int((time.monotonic() - sqlite_started) * 1000)
         core_timings["_sqlite_ms"] = sqlite_ms
+        if sqlite_detail:
+            core_timings.update(sqlite_detail)
         cycle_ms = int((time.monotonic() - cycle_started) * 1000)
-        log.info(
-            "traffic sample timing sqlite_ms=%s cycle_ms=%s clients=%s pending=%s",
-            sqlite_ms,
-            cycle_ms,
-            stats.get("clients_seen", 0),
-            stats.get("pending", 0),
-        )
+        if sqlite_detail:
+            log.info(
+                "traffic sample timing sqlite_ms=%s cursor_load_ms=%s plan_ms=%s write_ms=%s "
+                "chunk_count=%s cycle_ms=%s clients=%s pending=%s",
+                sqlite_ms,
+                sqlite_detail.get("cursor_load_ms", 0),
+                sqlite_detail.get("plan_ms", 0),
+                sqlite_detail.get("write_ms", 0),
+                sqlite_detail.get("chunk_count", 0),
+                cycle_ms,
+                stats.get("clients_seen", 0),
+                stats.get("pending", 0),
+            )
+        else:
+            log.info(
+                "traffic sample timing sqlite_ms=%s cycle_ms=%s clients=%s pending=%s",
+                sqlite_ms,
+                cycle_ms,
+                stats.get("clients_seen", 0),
+                stats.get("pending", 0),
+            )
         return stats, core_timings, cycle_ms
 
     async def _read_core_usage_snapshot(
@@ -330,7 +339,13 @@ class TrafficService:
         driver = registry.get(core_key)
         if core_key == "l2tp":
             await self._drop_linked_l2tp_billing(driver)
+        cache_hit: bool | None = None
+        if core_key == "xray":
+            max_age = getattr(driver, "_usage_cache_max_age", lambda: 5.0)()
+            cache_hit = getattr(driver, "cached_usage_snapshot", lambda _a: None)(max_age) is not None
         snapshot = await maybe_await(driver.usage_snapshot())
+        if core_key == "xray" and cache_hit is not None:
+            log.info("traffic sample xray cache=%s", "hit" if cache_hit else "miss")
         snapshot_ms = int((time.monotonic() - started) * 1000)
         return core_key, snapshot, snapshot_ms
 
@@ -338,7 +353,7 @@ class TrafficService:
         self,
         core_snapshots: list[tuple[str, Any, int]],
         owners: dict[tuple[str, str], str],
-    ) -> dict[str, int]:
+    ) -> tuple[dict[str, int], dict[str, int]]:
         from agent.auth_scope import DEFAULT_SCOPE, current_scope
 
         sampled_at = datetime.now(timezone.utc).isoformat()
@@ -350,6 +365,17 @@ class TrafficService:
 
         if not grouped:
             grouped[DEFAULT_SCOPE] = []
+
+        cursor_keys: set[tuple[str, str]] = set()
+        for group in grouped.values():
+            for sample in group:
+                core = str(sample["core"])
+                label = str(sample["label"])
+                cursor_keys.add((core, label))
+                for alias in (sample.get("email"), sample.get("client_id"), sample.get("protocol_id")):
+                    alias_text = str(alias or "").strip()
+                    if alias_text:
+                        cursor_keys.add((core, alias_text))
 
         def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
             merged_stats = {
@@ -383,15 +409,25 @@ class TrafficService:
             }
 
         try:
-            return await self.store.apply_traffic_sample(plan, current_scope(), fast_stats=True)
+            stats, sqlite_detail = await self.store.apply_traffic_sample(
+                plan,
+                current_scope(),
+                fast_stats=True,
+                cursor_keys=cursor_keys,
+                return_sqlite_timing=True,
+            )
+            return stats, sqlite_detail
         except Exception:
             log.exception("traffic merged sqlite commit failed")
-            return {
-                "clients_seen": 0,
-                "pending": 0,
-                "initialized": 0,
-                "regressed": 0,
-            }
+            return (
+                {
+                    "clients_seen": 0,
+                    "pending": 0,
+                    "initialized": 0,
+                    "regressed": 0,
+                },
+                {},
+            )
 
     async def _sample_core(
         self,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -483,6 +485,43 @@ class TrafficStoreService:
                 )
         return found
 
+    async def load_client_traffic_cursors_for_keys(
+        self,
+        scope: str | None = None,
+        keys: set[tuple[str, str]] | None = None,
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        scope = str(scope or current_scope())
+        if not keys:
+            return {}
+        by_core: dict[str, list[str]] = defaultdict(list)
+        for core_name, client_id in keys:
+            core_text = str(core_name or "").strip()
+            client_text = str(client_id or "").strip()
+            if not core_text or not client_text:
+                continue
+            by_core[core_text].append(client_text)
+        found: dict[tuple[str, str], tuple[int, int]] = {}
+        async with self._runtime.reading() as session:
+            for core_name, client_ids in by_core.items():
+                unique_ids = list(dict.fromkeys(client_ids))
+                for offset in range(0, len(unique_ids), 400):
+                    batch = unique_ids[offset : offset + 400]
+                    result = await session.execute(
+                        select(Client).where(
+                            Client.scope == scope,
+                            Client.core_id == core_name,
+                            Client.id.in_(batch),
+                        )
+                    )
+                    for row in result.scalars().all():
+                        if row.incoming is None and row.outgoing is None:
+                            continue
+                        found[(str(row.core_id), str(row.id))] = (
+                            int(row.incoming or 0),
+                            int(row.outgoing or 0),
+                        )
+        return found
+
     async def apply_traffic_sample(
         self,
         plan,
@@ -490,16 +529,35 @@ class TrafficStoreService:
         core: str | None = None,
         *,
         fast_stats: bool = False,
-    ) -> dict[str, int]:
+        cursor_keys: set[tuple[str, str]] | None = None,
+        return_sqlite_timing: bool = False,
+    ) -> dict[str, int] | tuple[dict[str, int], dict[str, int]]:
         scope = str(scope or current_scope())
-        cursors = await self.load_client_traffic_cursors(scope, core)
+        cursor_started = time.monotonic()
+        if cursor_keys:
+            cursors = await self.load_client_traffic_cursors_for_keys(scope, cursor_keys)
+        else:
+            cursors = await self.load_client_traffic_cursors(scope, core)
+        cursor_load_ms = int((time.monotonic() - cursor_started) * 1000)
+        plan_started = time.monotonic()
         writes = plan(cursors)
+        plan_ms = int((time.monotonic() - plan_started) * 1000)
         if isinstance(writes, dict):
             writes["scope"] = scope
+        write_started = time.monotonic()
         await self._runtime.retry_locked(lambda: self._commit_traffic_plan(writes))
+        write_ms = int((time.monotonic() - write_started) * 1000)
         stats = dict(writes.get("stats") or {})
         if not fast_stats:
             stats["pending"] = await self.count_traffic_pending()
+        sqlite_detail = {
+            "cursor_load_ms": cursor_load_ms,
+            "plan_ms": plan_ms,
+            "write_ms": write_ms,
+            "chunk_count": len(writes.get("chunk_inserts") or []),
+        }
+        if return_sqlite_timing:
+            return stats, sqlite_detail
         return stats
 
     async def _commit_traffic_plan(self, writes: dict[str, Any]) -> None:
@@ -566,12 +624,38 @@ class TrafficStoreService:
                     TrafficPending.client_key == client_key,
                 )
             )
-        for core, alias, canonical_key in writes.get("identity_upserts") or []:
-            row = await session.get(TrafficIdentity, (scope, core, alias))
-            if row is None:
-                session.add(TrafficIdentity(scope=scope, core=core, alias=alias, canonical_key=canonical_key))
-            else:
-                row.canonical_key = canonical_key
+        identity_upserts = list(writes.get("identity_upserts") or [])
+        if identity_upserts:
+            aliases_by_core: dict[str, set[str]] = defaultdict(set)
+            for core, alias, _canonical in identity_upserts:
+                aliases_by_core[str(core)].add(str(alias))
+            identity_rows: dict[tuple[str, str, str], TrafficIdentity] = {}
+            for core_name, aliases in aliases_by_core.items():
+                alias_list = list(aliases)
+                for offset in range(0, len(alias_list), 400):
+                    batch = alias_list[offset : offset + 400]
+                    result = await session.execute(
+                        select(TrafficIdentity).where(
+                            TrafficIdentity.scope == scope,
+                            TrafficIdentity.core == core_name,
+                            TrafficIdentity.alias.in_(batch),
+                        )
+                    )
+                    for row in result.scalars().all():
+                        identity_rows[(scope, str(row.core), str(row.alias))] = row
+            for core, alias, canonical_key in identity_upserts:
+                row = identity_rows.get((scope, str(core), str(alias)))
+                if row is None:
+                    session.add(
+                        TrafficIdentity(
+                            scope=scope,
+                            core=core,
+                            alias=alias,
+                            canonical_key=canonical_key,
+                        )
+                    )
+                else:
+                    row.canonical_key = canonical_key
         cursor_upserts = writes.get("client_cursor_upserts") or []
         await self._apply_client_cursor_upserts(session, scope, cursor_upserts)
         chunk_rows = [

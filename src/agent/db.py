@@ -297,8 +297,17 @@ class Store:
         core: str | None = None,
         *,
         fast_stats: bool = False,
-    ) -> dict[str, int]:
-        return await self._traffic.apply_traffic_sample(plan, scope, core, fast_stats=fast_stats)
+        cursor_keys: set[tuple[str, str]] | None = None,
+        return_sqlite_timing: bool = False,
+    ):
+        return await self._traffic.apply_traffic_sample(
+            plan,
+            scope,
+            core,
+            fast_stats=fast_stats,
+            cursor_keys=cursor_keys,
+            return_sqlite_timing=return_sqlite_timing,
+        )
 
     async def client_scopes(self) -> dict[tuple[str, str], str]:
         from sqlalchemy import select
