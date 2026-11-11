@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
 _WATCH_TOP_PENDING = 10
+_PANEL_NODE_ID_WIDTH = 64
 
 
 class _LiveScreen:
@@ -104,10 +105,20 @@ async def collect_volume_billing_snapshot(
     chunks_by_client: dict[tuple[str, str], int] = {}
     pending_bytes = 0
     wg_chunk_clients: set[str] = set()
+    pending_by_core: dict[str, dict[str, Any]] = {}
     for chunk in chunks:
         key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
         chunks_by_client[key] = chunks_by_client.get(key, 0) + 1
-        pending_bytes += int(chunk.get("incoming") or 0) + int(chunk.get("outgoing") or 0)
+        chunk_bytes = int(chunk.get("incoming") or 0) + int(chunk.get("outgoing") or 0)
+        pending_bytes += chunk_bytes
+        core_name = key[0] or "—"
+        bucket = pending_by_core.setdefault(
+            core_name,
+            {"clients": set(), "chunks": 0, "bytes": 0},
+        )
+        bucket["clients"].add(key[1])
+        bucket["chunks"] += 1
+        bucket["bytes"] += chunk_bytes
         if key[0] == "wireguard" and key[1]:
             wg_chunk_clients.add(key[1])
 
@@ -142,6 +153,17 @@ async def collect_volume_billing_snapshot(
         "traffic_sample_interval_s": float(settings.traffic_sample_interval),
         "quota_enforce_interval_s": float(settings.quota_enforce_interval),
         "pending_limit": max(0, int(pending_limit)),
+        "billing_cores": list(settings.traffic_billing_cores()),
+        "enabled_cores": list(settings.cores()),
+        "pending_by_core": {
+            core: {
+                "clients": len(item["clients"]),
+                "chunks": int(item["chunks"]),
+                "bytes": int(item["bytes"]),
+                "label": _format_bytes(int(item["bytes"])),
+            }
+            for core, item in sorted(pending_by_core.items())
+        },
     }
     top: list[dict[str, Any]] = []
     top_n = _WATCH_TOP_PENDING if pending_limit <= 0 else max(1, int(pending_limit))
@@ -267,15 +289,21 @@ def _format_timing_summary(raw: Any) -> str | None:
     except (json.JSONDecodeError, TypeError, ValueError):
         return str(raw)
     parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
-    sqlite_ms = timing.get("sqlite_ms")
-    xray = (timing.get("xray") or {}).get("snapshot_ms")
-    wg = (timing.get("wireguard") or {}).get("snapshot_ms")
+    sqlite_ms = timing.get("_sqlite_ms", timing.get("sqlite_ms"))
     parts = [f"parallel={parallel}ms", f"sqlite={sqlite_ms}ms"]
-    if xray is not None:
-        parts.append(f"xray={xray}ms")
-    if wg is not None:
-        parts.append(f"wg={wg}ms")
-    return "  sample  " + "  ".join(str(p) for p in parts)
+    core_parts: list[str] = []
+    for key, value in sorted(timing.items()):
+        if key in {"parallel_snapshot_ms", "cycle_ms", "_sqlite_ms", "sqlite_ms"}:
+            continue
+        if not isinstance(value, dict):
+            continue
+        snap = value.get("snapshot_ms")
+        if snap is None:
+            continue
+        short = "wg" if key == "wireguard" else key
+        core_parts.append(f"{short}={snap}ms")
+    parts.extend(core_parts)
+    return "  sample  " + "  ".join(str(p) for p in parts if p is not None)
 
 
 def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> list[str]:
@@ -283,27 +311,20 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
     if not top:
         return lines
     lines.append(f"  Top unacked by volume (showing {len(top)} of {total_clients} clients)")
+    wid = _PANEL_NODE_ID_WIDTH
     lines.append(
-        "  panel node_id = Laravel subscribe id; stored = SQLite traffic_pending_chunk.client_key"
+        f"  {'#':>3}  {'core':8}  {'panel node_id':<{wid}}  {'down':>10}  {'up':>10}  {'total':>10}  ck"
     )
-    lines.append(
-        f"  {'#':>3}  {'core':8}  {'panel node_id':14}  {'stored key':36}  {'down':>9}  {'up':>9}  {'total':>9}  ck"
-    )
-    lines.append(
-        f"  {'-' * 3}  {'-' * 8}  {'-' * 14}  {'-' * 36}  {'-' * 9}  {'-' * 9}  {'-' * 9}  ---"
-    )
+    lines.append(f"  {'-' * 3}  {'-' * 8}  {'-' * wid}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ---")
     for index, row in enumerate(top, start=1):
         core = str(row.get("core") or "")[:8]
-        stored = str(row.get("client_key") or "")
-        panel = str(row.get("panel_node_id") or stored)
-        panel_col = panel if len(panel) <= 14 else panel[:11] + "..."
-        stored_col = stored if len(stored) <= 36 else stored[:33] + "..."
+        panel = str(row.get("panel_node_id") or row.get("client_key") or "")
         down = _format_bytes(int(row.get("downlink") or 0))
         up = _format_bytes(int(row.get("uplink") or 0))
         total = _format_bytes(int(row.get("total") or 0))
         chunks = int(row.get("chunk_count") or 0)
         lines.append(
-            f"  {index:3d}  {core:8}  {panel_col:14}  {stored_col:36}  {down:>9}  {up:>9}  {total:>9}  {chunks:3d}"
+            f"  {index:3d}  {core:8}  {panel:<{wid}}  {down:>10}  {up:>10}  {total:>10}  {chunks:3d}"
         )
     return lines
 
@@ -342,11 +363,17 @@ def format_volume_billing_frame(
             f"  hint: backlog {snapshot.get('pending_bytes_label')} / {clients} clients — "
             "panel must POST ack after billing."
         )
+    billing = snapshot.get("billing_cores") or []
+    enabled = snapshot.get("enabled_cores") or []
+    skipped = [c for c in enabled if c not in billing]
     out.append(
         f"  sample_interval={snapshot.get('traffic_sample_interval_s')}s  "
         f"quota_interval={snapshot.get('quota_enforce_interval_s')}s  "
         f"local_volume_quota={'on' if snapshot.get('enforce_local_volume_quota') else 'off (panel owns cutoff)'}"
     )
+    if billing:
+        skip_note = f"  skip: {','.join(skipped)}" if skipped else ""
+        out.append(f"  volume sample cores: {','.join(billing)}{skip_note}")
     out.append(f"  last_sample_at={snapshot.get('last_sample_at') or '—'}")
     ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
     if ahead > 0:
@@ -368,6 +395,13 @@ def format_volume_billing_frame(
             f"  queue: {total_clients} clients · {total_chunks} chunks · "
             f"{snapshot.get('pending_bytes_label')} unacked"
         )
+        by_core = snapshot.get("pending_by_core") or {}
+        if by_core:
+            core_bits = [
+                f"{name} {item.get('clients', 0)}c/{item.get('chunks', 0)}ch/{item.get('label', '0 B')}"
+                for name, item in sorted(by_core.items())
+            ]
+            out.append(f"  unacked by core: {', '.join(core_bits)}")
         out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], total_clients))
     for line in log_lines[-3:]:
         if "traffic sample timing" in line or "traffic sample cycle" in line:
@@ -386,7 +420,7 @@ def print_pending_queue_summary(snapshot: dict[str, Any], *, limit: int = 30) ->
     if limit > 0 and total > shown:
         print(f"  (showing {shown} of {total} clients)", flush=True)
     for row in top[: max(1, limit) if limit > 0 else len(top)]:
-        key = str(row.get("client_key") or "")[:48]
+        key = str(row.get("panel_node_id") or row.get("client_key") or "")
         core = str(row.get("core") or "")
         down = _format_bytes(int(row.get("downlink") or 0))
         up = _format_bytes(int(row.get("uplink") or 0))
@@ -395,7 +429,7 @@ def print_pending_queue_summary(snapshot: dict[str, Any], *, limit: int = 30) ->
         ahead = int(row.get("kernel_ahead") or 0)
         if ahead > 0:
             extra += f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
-        print(f"    {core:8} {key:48}  ↓{down}  ↑{up}{extra}", flush=True)
+        print(f"    {core:8} {key:<{_PANEL_NODE_ID_WIDTH}}  ↓{down}  ↑{up}{extra}", flush=True)
 
 
 def render_volume_billing_frame(
