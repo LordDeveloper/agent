@@ -3853,7 +3853,11 @@ class XrayDriver(CoreDriver):
 
     def _usage_cache_max_age(self) -> float:
         interval = float(getattr(self.settings, "traffic_sample_interval", 2.0) or 2.0)
-        return max(3.0, interval / 2.0)
+        return max(1.0, interval * 0.95)
+
+    async def warm_usage_cache(self) -> None:
+        """Refresh grouped stats into the in-memory cache (traffic worker prewarm)."""
+        await self._load_usage_snapshot()
 
     async def _clip_usage_snapshot(self, snapshot: UsageSnapshotModel) -> UsageSnapshotModel:
         if not scope_is_enforced("xray"):

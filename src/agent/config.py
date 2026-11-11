@@ -100,10 +100,6 @@ class AgentSettings(BaseSettings):
     # Pending bytes are invisible to the panel until the next sample, so this
     # is the lower bound on how fast a new connection shows up in the database.
     traffic_sample_interval: float = 5.0
-    # A sample still running after this many seconds is cancelled so the next
-    # cycle can start. Same idea as withoutOverlapping: one sample at a time,
-    # and a stuck sample cannot block volume calculation longer than this.
-    traffic_sample_lock_seconds: float = 120.0
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0

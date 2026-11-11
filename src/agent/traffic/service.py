@@ -238,6 +238,36 @@ class TrafficService:
 
         loop.create_task(_persist())
 
+    async def sample_cores_blocking(self, registry: CoreRegistry) -> dict[str, int]:
+        """Run one volume sample cycle and await every enabled core (worker cadence)."""
+        cores = self._listed_cores(registry) or []
+        if not cores:
+            return await self.sample_all(registry)
+        from agent.asyncutil import gather_independent
+
+        if "l2tp" in cores:
+            cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+        sampled = await gather_independent(
+            *(self._sample_core(registry, core_key) for core_key in cores),
+            return_exceptions=True,
+        )
+        stats = {
+            "clients_seen": 0,
+            "pending": 0,
+            "initialized": 0,
+            "regressed": 0,
+        }
+        for item in sampled:
+            if isinstance(item, Exception):
+                log.exception("traffic sample failed: %s", item)
+                continue
+            for key in stats:
+                if key == "pending":
+                    stats[key] = max(stats[key], int(item.get(key, 0)))
+                else:
+                    stats[key] += int(item.get(key, 0))
+        return stats
+
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from every core at once (online not required).
 

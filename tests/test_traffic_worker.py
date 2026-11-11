@@ -70,18 +70,18 @@ async def test_finished_sample_does_not_block_the_next_cycle():
     assert calls == 2
 
 
-async def test_worker_attempts_on_each_interval_with_the_overlap_lock():
-    locks: list[float] = []
+async def test_worker_runs_blocking_samples_on_interval():
+    calls: list[float] = []
 
     class Traffic:
         def cancel_inflight_sample(self) -> None:
-            locks.append(-1)
+            calls.append(-1.0)
 
-        async def sample_unless_overlapping(self, _registry, *, lock_seconds: float):
-            locks.append(lock_seconds)
-            return {"started": 1}
+        async def sample_cores_blocking(self, _registry):
+            calls.append(1.0)
+            return {"clients_seen": 0, "pending": 0, "initialized": 0, "regressed": 0}
 
-    settings = SimpleNamespace(traffic_sample_interval=1, traffic_sample_lock_seconds=120)
+    settings = SimpleNamespace(traffic_sample_interval=1, cores=lambda: [])
     stop = asyncio.Event()
     task = asyncio.create_task(
         traffic_worker_loop(None, Traffic(), settings, stop)  # type: ignore[arg-type]
@@ -90,7 +90,6 @@ async def test_worker_attempts_on_each_interval_with_the_overlap_lock():
     stop.set()
     await task
 
-    samples = [value for value in locks if value == 120]
-    # Immediate attempt, then another each second. Three fits inside 2.15s.
-    assert len(samples) >= 3
-    assert locks[-1] == -1
+    samples = [value for value in calls if value > 0]
+    assert len(samples) >= 2
+    assert calls[-1] == -1.0
