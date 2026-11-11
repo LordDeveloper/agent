@@ -916,7 +916,17 @@ def _service_menu() -> None:
 def _show_volume_billing_watch() -> None:
     from agent.cli import cmd_stats_volume_watch
 
-    cmd_stats_volume_watch(SimpleNamespace(env_file=None, interval=2.0, once=False, json=False))
+    cmd_stats_volume_watch(
+        SimpleNamespace(
+            env_file=None,
+            interval=2.0,
+            once=False,
+            json=False,
+            pending_limit=12,
+            all_pending=False,
+            log_lines=40,
+        )
+    )
 
 
 def _stats_menu() -> None:

@@ -139,14 +139,18 @@ def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
 
     runtime = open_runtime(args.env_file)
     try:
-        pending_limit = 0 if getattr(args, "all_pending", False) else int(args.pending_limit)
+        pending_limit = (
+            0
+            if getattr(args, "all_pending", False)
+            else int(getattr(args, "pending_limit", 12))
+        )
         return run_volume_billing_watch(
             runtime,
-            interval=float(args.interval),
-            once=bool(args.once),
-            as_json=bool(args.json),
+            interval=float(getattr(args, "interval", 2.0)),
+            once=bool(getattr(args, "once", False)),
+            as_json=bool(getattr(args, "json", False)),
             pending_limit=pending_limit,
-            log_lines=int(args.log_lines),
+            log_lines=int(getattr(args, "log_lines", 40)),
         )
     finally:
         run_sync(runtime.close())
