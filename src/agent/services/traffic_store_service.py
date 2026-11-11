@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent.auth_scope import current_scope
@@ -351,6 +351,9 @@ class TrafficStoreService:
         async with self._runtime.writing() as session:
             scope = current_scope()
             seen: set[tuple[str, str, str]] = set()
+            unique_snaps: list[dict[str, Any]] = []
+            pending_filters: list[Any] = []
+            ack_filters: list[Any] = []
             now = datetime.now(timezone.utc).isoformat()
             for snap in rows:
                 core = str(snap.get("core") or "")
@@ -359,8 +362,43 @@ class TrafficStoreService:
                 if not core or not client_key or key in seen:
                     continue
                 seen.add(key)
-                live = await session.get(TrafficPending, key)
-                ack = await session.get(TrafficAck, key)
+                unique_snaps.append(snap)
+                pending_filters.append(
+                    and_(TrafficPending.core == core, TrafficPending.client_key == client_key)
+                )
+                ack_filters.append(
+                    and_(TrafficAck.core == core, TrafficAck.client_key == client_key)
+                )
+
+            live_map: dict[tuple[str, str], TrafficPending] = {}
+            ack_map: dict[tuple[str, str], TrafficAck] = {}
+            if pending_filters:
+                pending_rows = (
+                    await session.execute(
+                        select(TrafficPending).where(
+                            TrafficPending.scope == scope,
+                            or_(*pending_filters),
+                        )
+                    )
+                ).scalars().all()
+                for row in pending_rows:
+                    live_map[(str(row.core), str(row.client_key))] = row
+                ack_rows = (
+                    await session.execute(
+                        select(TrafficAck).where(
+                            TrafficAck.scope == scope,
+                            or_(*ack_filters),
+                        )
+                    )
+                ).scalars().all()
+                for row in ack_rows:
+                    ack_map[(str(row.core), str(row.client_key))] = row
+
+            for snap in unique_snaps:
+                core = str(snap.get("core") or "")
+                client_key = str(snap.get("client_key") or "")
+                live = live_map.get((core, client_key))
+                ack = ack_map.get((core, client_key))
                 billed_in = int(snap.get("delta_incoming") or 0)
                 billed_out = int(snap.get("delta_outgoing") or 0)
                 snap_in = int(snap.get("current_incoming") or 0)

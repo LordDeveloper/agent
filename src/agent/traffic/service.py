@@ -911,7 +911,7 @@ class TrafficService:
             published = self._public_client_key(str(rows[0].get("client_key") or "")) or self._public_client_key(label)
             if published and published not in acked:
                 acked.append(published)
-            log.info("traffic ack client=%s rows=%s", published or label, len(rows))
+            log.debug("traffic ack client=%s rows=%s", published or label, len(rows))
 
         await self.store.ack_billed_snapshots(to_ack)
         await self._forget_acked_snapshot(to_ack)
@@ -943,6 +943,14 @@ class TrafficService:
 
         if requested or drop_labels:
             await self._release_pending_read()
+        if requested or drop_labels:
+            log.info(
+                "traffic ack summary requested=%s acked=%s not_found=%s rows=%s",
+                len(requested),
+                len(acked),
+                len(not_found),
+                len(to_ack),
+            )
         return acked, not_found
 
     async def _drop_pending_keys(self, labels: list[str]) -> tuple[list[str], list[str]]:
