@@ -548,15 +548,7 @@ class TrafficStoreService:
             else:
                 row.canonical_key = canonical_key
         cursor_upserts = writes.get("client_cursor_upserts") or []
-        for core, client_key, current_incoming, current_outgoing in cursor_upserts:
-            await self._update_client_traffic_cursor(
-                session,
-                scope,
-                str(core),
-                str(client_key),
-                int(current_incoming),
-                int(current_outgoing),
-            )
+        await self._apply_client_cursor_upserts(session, scope, cursor_upserts)
         for item in writes.get("chunk_inserts") or []:
             session.add(
                 TrafficPendingChunk(
@@ -570,6 +562,60 @@ class TrafficStoreService:
                 )
             )
 
+    async def _apply_client_cursor_upserts(
+        self,
+        session,
+        scope: str,
+        upserts: list[tuple[str, str, int, int]],
+    ) -> None:
+        if not upserts:
+            return
+        from collections import defaultdict
+
+        from agent.database.models.core import Core
+
+        by_core: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+        for core, client_key, incoming, outgoing in upserts:
+            core_name = str(core or "").strip()
+            client_id = str(client_key or "").strip()
+            if not core_name or not client_id:
+                continue
+            by_core[core_name].append((client_id, int(incoming), int(outgoing)))
+
+        for core_name in by_core:
+            if await session.get(Core, core_name) is None:
+                session.add(Core(id=core_name))
+
+        existing: dict[tuple[str, str], Client] = {}
+        for core_name, rows in by_core.items():
+            client_ids = [item[0] for item in rows]
+            if not client_ids:
+                continue
+            result = await session.execute(
+                select(Client).where(Client.core_id == core_name, Client.id.in_(client_ids))
+            )
+            for row in result.scalars().all():
+                existing[(str(row.core_id), str(row.id))] = row
+
+        for core_name, rows in by_core.items():
+            for client_id, incoming, outgoing in rows:
+                key = (core_name, client_id)
+                client = existing.get(key)
+                if client is None:
+                    session.add(
+                        Client(
+                            core_id=core_name,
+                            id=client_id,
+                            scope=scope,
+                            incoming=int(incoming),
+                            outgoing=int(outgoing),
+                        )
+                    )
+                    continue
+                if str(client.scope) == scope:
+                    client.incoming = int(incoming)
+                    client.outgoing = int(outgoing)
+
     async def _update_client_traffic_cursor(
         self,
         session,
@@ -579,27 +625,7 @@ class TrafficStoreService:
         incoming: int,
         outgoing: int,
     ) -> None:
-        from agent.database.models.core import Core
-
-        if not core or not client_key:
-            return
-        if await session.get(Core, core) is None:
-            session.add(Core(id=core))
-        client = await session.get(Client, (core, client_key))
-        if client is None:
-            session.add(
-                Client(
-                    core_id=core,
-                    id=client_key,
-                    scope=scope,
-                    incoming=int(incoming),
-                    outgoing=int(outgoing),
-                )
-            )
-            return
-        if str(client.scope) == scope:
-            client.incoming = int(incoming)
-            client.outgoing = int(outgoing)
+        await self._apply_client_cursor_upserts(session, scope, [(core, client_key, incoming, outgoing)])
 
     async def ack_billed_snapshots(self, rows: list[dict[str, Any]]) -> None:
         """Remove billed bytes from chunk rows (panel also sends chunk_ids)."""

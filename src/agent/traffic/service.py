@@ -247,8 +247,9 @@ class TrafficService:
 
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+        owners_task = asyncio.create_task(self.store.client_scopes())
         sampled = await gather_independent(
-            *(self._sample_core(registry, core_key) for core_key in cores),
+            *(self._sample_core(registry, core_key, owners_task=owners_task) for core_key in cores),
             return_exceptions=True,
         )
         stats = {
@@ -287,8 +288,9 @@ class TrafficService:
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
 
+        owners_task = asyncio.create_task(self.store.client_scopes())
         sampled = await gather_independent(
-            *(self._sample_core(registry, core_key) for core_key in cores),
+            *(self._sample_core(registry, core_key, owners_task=owners_task) for core_key in cores),
             return_exceptions=True,
         )
 
@@ -304,17 +306,51 @@ class TrafficService:
                     stats[key] += int(item.get(key, 0))
         return stats
 
-    async def _sample_core(self, registry: CoreRegistry, core_key: str) -> dict[str, int]:
-        from agent.asyncutil import maybe_await
+    async def _sample_core(
+        self,
+        registry: CoreRegistry,
+        core_key: str,
+        *,
+        owners_task: asyncio.Task | None = None,
+    ) -> dict[str, int]:
+        from agent.asyncutil import gather_independent, maybe_await
 
+        started = time.monotonic()
         driver = registry.get(core_key)
         if core_key == "l2tp":
             await self._drop_linked_l2tp_billing(driver)
-        # One bulk snapshot per core (Xray user>>> grouped, WireGuard peer dump, …).
-        snapshot = await maybe_await(driver.usage_snapshot())
-        return await self._store_core_samples(core_key, snapshot)
+        if owners_task is not None:
+            snapshot = await maybe_await(driver.usage_snapshot())
+            owners = await owners_task
+        else:
+            snapshot, owners = await gather_independent(
+                maybe_await(driver.usage_snapshot()),
+                self.store.client_scopes(),
+            )
+        snapshot_ms = int((time.monotonic() - started) * 1000)
+        store_started = time.monotonic()
+        stats = await self._store_core_samples(core_key, snapshot, owners=owners)
+        store_ms = int((time.monotonic() - store_started) * 1000)
+        total_ms = int((time.monotonic() - started) * 1000)
+        log.info(
+            "traffic sample timing core=%s clients=%s pending=%s "
+            "snapshot_ms=%s sqlite_ms=%s total_ms=%s",
+            core_key,
+            stats.get("clients_seen", 0),
+            stats.get("pending", 0),
+            snapshot_ms,
+            store_ms,
+            total_ms,
+        )
+        return stats
 
-    async def _store_core_samples(self, core_key: str, snapshot: Any) -> dict[str, int]:
+    async def _store_core_samples(
+        self,
+        core_key: str,
+        snapshot: Any,
+        *,
+        owners: dict[tuple[str, str], str],
+    ) -> dict[str, int]:
         from agent.auth_scope import DEFAULT_SCOPE
 
         stats = {
@@ -325,7 +361,6 @@ class TrafficService:
         }
         samples = self._usage_rows(core_key, snapshot)
         sampled_at = datetime.now(timezone.utc).isoformat()
-        owners = await self.store.client_scopes()
         grouped: dict[str, list[dict[str, Any]]] = {}
         for sample in samples:
             scope = owners.get((str(sample["core"]), str(sample["label"])), DEFAULT_SCOPE)

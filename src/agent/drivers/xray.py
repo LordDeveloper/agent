@@ -3908,17 +3908,23 @@ class XrayDriver(CoreDriver):
         return snapshot
 
     async def _build_usage_snapshot(self) -> UsageSnapshotModel:
-        user_groups, inbound_groups = await gather_independent(
+        user_groups, inbound_groups, identity_rows, quota_index = await gather_independent(
             self._api_call("stats_query_grouped", "user>>>", "user"),
             self._api_call("stats_query_grouped", "inbound>>>", "inbound"),
+            self._usage_identity_rows(),
+            self._quota_index(),
+            return_exceptions=True,
         )
+        if isinstance(user_groups, BaseException):
+            raise user_groups
+        if isinstance(inbound_groups, BaseException):
+            raise inbound_groups
+        if isinstance(identity_rows, BaseException):
+            identity_rows = []
+        if isinstance(quota_index, BaseException):
+            quota_index = {}
         user_traffic = dict(user_groups.get("user") or {})
         inbound_traffic = dict(inbound_groups.get("inbound") or {})
-        try:
-            identity_rows = await self._usage_identity_rows()
-        except AgentError:
-            identity_rows = []
-        quota_index = await self._quota_index()
         inbounds = [
             {
                 "id": inbound_id,

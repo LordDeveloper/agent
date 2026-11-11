@@ -327,9 +327,9 @@ def run_volume_billing_watch(
 
     if not as_json and sys.stderr.isatty():
         print(
-            "Watching SQLite pending (written by agent work sample_all). "
-            "No panel_read lock. GET/watch do not block WG counters; "
-            "unchanged rows mean the worker has not committed a sample yet.",
+            "Watching SQLite pending (written by agent work). "
+            "Per-core sample timing: grep 'traffic sample timing' in agent.log. "
+            "Cores run in parallel; lag > interval usually means xray snapshot_ms or sqlite_ms is high.",
             file=sys.stderr,
             flush=True,
         )
