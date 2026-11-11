@@ -819,6 +819,42 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.get_traffic_ack("xray", "b") is None
 
 
+async def test_legacy_traffic_pending_does_not_stack_on_chunks(store):
+    """Stale traffic_pending rows must not inflate chunk sums (watch / GET pending)."""
+    from agent.auth_scope import DEFAULT_SCOPE
+    from agent.database.models.traffic import TrafficPending
+
+    mb = 1024 * 1024
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="node-legacy", email="legacy@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await _sample(traffic, registry)
+    client.incoming = 5 * mb
+    client.outgoing = mb
+    await _sample(traffic, registry)
+
+    async with store._runtime.writing() as session:
+        session.add(
+            TrafficPending(
+                scope=DEFAULT_SCOPE,
+                core="xray",
+                client_key="node-legacy",
+                delta_incoming=500 * mb,
+                delta_outgoing=0,
+                current_incoming=0,
+                current_outgoing=0,
+            )
+        )
+        await session.commit()
+
+    rows = await store.list_traffic_pending()
+    assert len(rows) == 1
+    assert rows[0]["delta_incoming"] == 5 * mb
+    assert rows[0]["delta_outgoing"] == mb
+
+
 async def test_unacked_samples_sum_download_and_upload(store):
     """Three growth samples before any ack are one pending total, per direction."""
     mb = 1024 * 1024

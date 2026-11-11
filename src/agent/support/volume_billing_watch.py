@@ -67,13 +67,11 @@ async def collect_volume_billing_snapshot(
     rows = await traffic.store.list_traffic_pending()
     chunks = await traffic.store.list_traffic_pending_chunks()
     chunks_by_client: dict[tuple[str, str], int] = {}
+    pending_bytes = 0
     for chunk in chunks:
         key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
         chunks_by_client[key] = chunks_by_client.get(key, 0) + 1
-
-    pending_bytes = 0
-    for row in rows:
-        pending_bytes += int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0)
+        pending_bytes += int(chunk.get("incoming") or 0) + int(chunk.get("outgoing") or 0)
 
     rows_sorted = sorted(
         rows,
@@ -90,7 +88,7 @@ async def collect_volume_billing_snapshot(
             pending_last_touch = touch
 
     snapshot_body: dict[str, Any] = {
-        "pending_clients": len(rows),
+        "pending_clients": len(chunks_by_client) or len(rows),
         "pending_chunks": len(chunks),
         "pending_bytes": pending_bytes,
         "pending_bytes_label": _format_bytes(pending_bytes),

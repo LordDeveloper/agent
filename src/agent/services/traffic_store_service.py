@@ -447,20 +447,15 @@ class TrafficStoreService:
                 legacy_query = legacy_query.where(TrafficPending.core == core_name)
             for row in (await session.execute(legacy_query)).scalars().all():
                 key = (str(row.core), str(row.client_key))
-                legacy = {
+                if key in pending:
+                    # Chunk rows are authoritative; legacy TrafficPending deltas must not stack.
+                    continue
+                pending[key] = {
                     "delta_incoming": int(row.delta_incoming),
                     "delta_outgoing": int(row.delta_outgoing),
                     "current_incoming": int(row.current_incoming),
                     "current_outgoing": int(row.current_outgoing),
                 }
-                if key in pending:
-                    if legacy["delta_incoming"] or legacy["delta_outgoing"]:
-                        pending[key]["delta_incoming"] += legacy["delta_incoming"]
-                        pending[key]["delta_outgoing"] += legacy["delta_outgoing"]
-                    pending[key]["current_incoming"] = int(legacy["current_incoming"])
-                    pending[key]["current_outgoing"] = int(legacy["current_outgoing"])
-                    continue
-                pending[key] = legacy
             return acks, pending
 
     async def load_client_traffic_cursors(
