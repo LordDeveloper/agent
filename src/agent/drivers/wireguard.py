@@ -1980,6 +1980,16 @@ class WireGuardDriver(CoreDriver):
         await self.audit.record("delete", f"{self.key}/peer/{peer_id}")
         return True
 
+    @staticmethod
+    def _peer_matches_remove_key(peer: dict[str, Any], key: str) -> bool:
+        key = str(key or "").strip()
+        if not key:
+            return False
+        for field in ("id", "email", "name", "agent_id"):
+            if str(peer.get(field) or "").strip() == key:
+                return True
+        return False
+
     def _peer_index(self, iface: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         by_id: dict[str, dict[str, Any]] = {}
         by_email: dict[str, dict[str, Any]] = {}
@@ -2335,30 +2345,48 @@ class WireGuardDriver(CoreDriver):
         _ensure_address_cursor(iface)
         remove_keys = set(email_keys + id_keys)
         errors: list[dict[str, str]] = []
-        succeeded = 0
-        failed = 0
         matched: set[str] = set()
 
         filtered: list[dict[str, Any]] = []
         drop_keys: list[str] = []
         for peer in iface.get("peers", []):
+            if not any(self._peer_matches_remove_key(peer, key) for key in remove_keys):
+                filtered.append(peer)
+                continue
+            for key in remove_keys:
+                if self._peer_matches_remove_key(peer, key):
+                    matched.add(key)
             peer_id = str(peer.get("id") or "")
             email = str(peer.get("email") or "")
-            if peer_id in remove_keys or email in remove_keys:
-                if peer_id:
-                    matched.add(peer_id)
-                    drop_keys.append(peer_id)
-                if email:
-                    matched.add(email)
-                    drop_keys.append(email)
-                succeeded += 1
-                continue
-            filtered.append(peer)
+            if peer_id:
+                drop_keys.append(peer_id)
+            if email:
+                drop_keys.append(email)
 
-        for key in remove_keys:
-            if key not in matched:
-                failed += 1
-                errors.append({"email": key, "message": "peer not found"})
+        unmatched = [key for key in remove_keys if key not in matched]
+
+        if drop_keys:
+            iface["peers"] = filtered
+            stripped = await self._validate_before_apply(iface)
+            await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+            try:
+                await self._apply_live(iface, stripped=stripped, drop_keys=drop_keys or None, hold_lock=False)
+            except AgentError:
+                await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
+                raise
+
+        for key in unmatched:
+            try:
+                await self.delete_peer(interface_id, key, hold_lock=False)
+                matched.add(key)
+            except AgentError as exc:
+                if str(exc.code or "").upper() == "CLIENT_NOT_FOUND":
+                    matched.add(key)
+                    continue
+                errors.append({"email": key, "id": key, "message": exc.message})
+
+        succeeded = len(matched)
+        failed = len(remove_keys) - succeeded
 
         if succeeded == 0:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -2369,15 +2397,6 @@ class WireGuardDriver(CoreDriver):
                 "errors": errors,
                 "ms": elapsed_ms,
             }
-
-        iface["peers"] = filtered
-        stripped = await self._validate_before_apply(iface)
-        await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
-        try:
-            await self._apply_live(iface, stripped=stripped, drop_keys=drop_keys or None, hold_lock=False)
-        except AgentError:
-            await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
-            raise
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         await self.audit.record(

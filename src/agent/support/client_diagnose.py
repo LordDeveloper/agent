@@ -865,13 +865,82 @@ async def _traffic_for_client(driver: Any, inbound_tag: str, inbound_id: str, co
 
 
 
-def _not_found_report(*, inbound_id: str | None, key: str) -> dict[str, Any]:
+async def _orphan_hints(driver: Any, key: str) -> dict[str, Any]:
+    """Live runtime or quota rows left after the client left the saved config."""
+    hints: dict[str, Any] = {}
+    key = str(key or '').strip()
+    if not key:
+        return hints
+    try:
+        index = await driver._quota_index()
+        meta = select_quota_meta(index, protocol_id=key, email=key)
+        if meta is None:
+            meta = index.get(f'n:{key}') or index.get(f'i:{key}')
+        if isinstance(meta, dict):
+            hints['quota_doc_present'] = True
+            email = str(meta.get('email') or '').strip()
+            if email:
+                hints['quota_email'] = email
+    except Exception:
+        pass
+    try:
+        aliases = await driver._lookup_keys_for_panel_id(key)
+        probe = driver._probe_email(aliases) if hasattr(driver, '_probe_email') else ''
+        if probe:
+            hints['probe_email'] = probe
+        live_tags: list[str] = []
+        config = await driver.read_config()
+        for inbound in config.get('inbounds') or []:
+            if not isinstance(inbound, dict):
+                continue
+            tag = str(inbound.get('tag') or '').strip()
+            if not tag:
+                continue
+            email = probe or key
+            try:
+                live = await driver._filtered_live_user(tag, email)
+            except Exception:
+                live = None
+            if live is not None:
+                live_tags.append(tag)
+        if live_tags:
+            hints['live_inbound_tags'] = live_tags
+    except Exception:
+        pass
+    return hints
+
+
+def _not_found_report(
+    *,
+    inbound_id: str | None,
+    key: str,
+    orphan_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     scope = f'inbound [{inbound_id}]' if inbound_id else 'any inbound'
     issue = _issue(
         'error',
         'CLIENT_NOT_FOUND',
         f'Client [{key}] not found in Xray config for {scope}',
     )
+    issues = [issue]
+    if orphan_hints:
+        if orphan_hints.get('quota_doc_present'):
+            issues.append(
+                _issue(
+                    'warning',
+                    'ORPHAN_QUOTA_DOC',
+                    'Quota document still exists even though the client is missing from config.',
+                ),
+            )
+        if orphan_hints.get('live_inbound_tags'):
+            issues.append(
+                _issue(
+                    'warning',
+                    'ORPHAN_LIVE_USER',
+                    'User is still present on a live inbound: '
+                    + ', '.join(str(tag) for tag in orphan_hints['live_inbound_tags']),
+                ),
+            )
     return {
         'success': True,
         'found': False,
@@ -879,11 +948,12 @@ def _not_found_report(*, inbound_id: str | None, key: str) -> dict[str, Any]:
         'inbound_id': inbound_id,
         'key': key,
         'matches': [],
-        'issues': [issue],
+        'issues': issues,
+        'orphan_hints': orphan_hints or {},
         'summary': {
             'healthy': False,
-            'issue_count': 1,
-            'warning_count': 0,
+            'issue_count': sum(1 for row in issues if row.get('level') == 'error'),
+            'warning_count': sum(1 for row in issues if row.get('level') == 'warning'),
             'match_count': 0,
         },
     }
@@ -922,7 +992,11 @@ async def diagnose_xray_clients_by_key(driver: Any, client_key: str) -> dict[str
     config = await driver.read_config()
     located = _find_config_clients_by_key(config, key)
     if not located:
-        return _not_found_report(inbound_id=None, key=key)
+        return _not_found_report(
+            inbound_id=None,
+            key=key,
+            orphan_hints=await _orphan_hints(driver, key),
+        )
 
     online_keys, online_error = await _load_online_user_keys(driver)
     resolved_email = ''
@@ -969,7 +1043,11 @@ async def diagnose_xray_client(driver: Any, inbound_id: str | int, client_key: s
     config_client, inbound_summary = _find_config_client(config, tag, str(inbound_id), key)
 
     if config_client is None:
-        return _not_found_report(inbound_id=str(inbound_id), key=key)
+        return _not_found_report(
+            inbound_id=str(inbound_id),
+            key=key,
+            orphan_hints=await _orphan_hints(driver, key),
+        )
 
     online_state, live_traffic = await gather_independent(
         _load_online_user_keys(driver),

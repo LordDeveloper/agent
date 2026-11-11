@@ -2332,6 +2332,38 @@ class XrayDriver(CoreDriver):
             "ms": elapsed_ms,
         }
 
+    async def _resolve_remove_wire_email(
+        self,
+        inbound: dict[str, Any],
+        key: str,
+        *,
+        by_email: dict[str, dict[str, Any]],
+        by_id: dict[str, dict[str, Any]],
+    ) -> str:
+        """Map a panel node_id, email, or protocol uuid to the Xray user email."""
+        key = str(key or "").strip()
+        if not key:
+            return ""
+        row = by_email.get(key) or by_id.get(key)
+        if row is not None:
+            return str(row.get("email") or key).strip()
+        for alias in await self._lookup_keys_for_panel_id(key):
+            row = by_email.get(alias) or by_id.get(alias)
+            if row is not None:
+                return str(row.get("email") or alias).strip()
+        index = await self._quota_index()
+        meta = select_quota_meta(index, protocol_id=key, email=key)
+        if meta is None:
+            meta = index.get(f"n:{key}") or index.get(f"i:{key}") or index.get(f"e:{key}")
+        if isinstance(meta, dict):
+            email = str(meta.get("email") or "").strip()
+            if email:
+                return email
+        remembered = self._identity_email.get(key, "")
+        if remembered:
+            return str(remembered).strip()
+        return key
+
     async def batch_remove_clients(
         self,
         inbound_id: int | str,
@@ -2353,7 +2385,6 @@ class XrayDriver(CoreDriver):
         inbound = await self.get_inbound(inbound_id)
         tag = str(inbound["tag"])
         started = time.perf_counter()
-        remove_emails: list[str] = []
         errors: list[dict[str, str]] = []
         succeeded = 0
         failed = 0
@@ -2361,72 +2392,75 @@ class XrayDriver(CoreDriver):
         async with self._inbound_lock(tag):
             inbound = await self.get_inbound(inbound_id)
             by_email, by_id = self._index_clients(inbound)
-            seen: set[str] = set()
-            for email in email_keys:
-                row = by_email.get(email)
-                if row is None:
-                    failed += 1
-                    errors.append({"email": email, "message": "client not found"})
-                    continue
-                target = str(row.get("email") or email)
-                if target not in seen:
-                    seen.add(target)
-                    remove_emails.append(target)
-            for cid in id_keys:
-                # Panel prune sends the email as an id when the SS user has no uuid.
-                row = by_id.get(cid) or by_email.get(cid)
-                if row is None:
-                    failed += 1
-                    errors.append({"email": cid, "message": "client not found"})
-                    continue
-                target = str(row.get("email") or cid)
-                if target not in seen:
-                    seen.add(target)
-                    remove_emails.append(target)
+            protocol = self._protocol_of(inbound)
+            inbound_settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None
+            all_keys = list(dict.fromkeys([*email_keys, *id_keys]))
+            wire_by_key: dict[str, str] = {}
+            for key in all_keys:
+                wire_by_key[key] = await self._resolve_remove_wire_email(
+                    inbound,
+                    key,
+                    by_email=by_email,
+                    by_id=by_id,
+                )
+            seen_wires: set[str] = set()
+            remove_emails: list[str] = []
+            for wire in wire_by_key.values():
+                if wire and wire not in seen_wires:
+                    seen_wires.add(wire)
+                    remove_emails.append(wire)
 
-            removed_now: list[str] = []
-            if remove_emails:
+            removed_live = await self._remove_live_clients(tag, remove_emails, errors) if remove_emails else set()
+
+            forget_keys: list[str] = []
+            for key in all_keys:
+                wire = wire_by_key.get(key, key)
+                if wire in removed_live:
+                    succeeded += 1
+                    forget_keys.extend([key, wire])
+                    continue
                 try:
-                    await self._api_call("remove_users", tag, remove_emails)
-                    removed_now = list(remove_emails)
-                    succeeded = len(remove_emails)
+                    await self.get_client_record(inbound_id, key)
                 except AgentError as exc:
-                    async def drop_one(email: str) -> tuple[str, str | None]:
-                        try:
-                            await self._api_call("remove_users", tag, [email])
-                            return email, None
-                        except AgentError as row_exc:
-                            return email, row_exc.message
+                    if str(exc.code or "").upper() == "CLIENT_NOT_FOUND":
+                        succeeded += 1
+                        forget_keys.extend([key, wire])
+                        continue
+                    failed += 1
+                    errors.append({"email": key, "id": key, "message": exc.message})
+                    continue
+                failed += 1
+                errors.append({
+                    "email": key,
+                    "id": key,
+                    "message": "client is still live after delete",
+                })
 
-                    outcomes = await bounded_gather(
-                        [lambda email=email: drop_one(email) for email in remove_emails],
-                        limit=_CLIENT_PARALLELISM,
+            drop_emails = sorted(removed_live)
+            if drop_emails:
+                try:
+                    await self._confirm_persisted_or_repair(
+                        tag,
+                        [],
+                        drop_emails,
+                        protocol=protocol,
+                        inbound_settings=inbound_settings,
                     )
-                    forgotten: list[str] = []
-                    for outcome in outcomes:
-                        if not isinstance(outcome, tuple):
+                except AgentError as exc:
+                    for key in all_keys:
+                        wire = wire_by_key.get(key, key)
+                        if wire not in removed_live:
                             continue
-                        email, message = outcome
-                        if message is None:
-                            succeeded += 1
-                            forgotten.append(email)
-                        else:
+                        if key in forget_keys:
+                            succeeded = max(0, succeeded - 1)
                             failed += 1
-                            errors.append({"email": email, "message": message})
-                    removed_now = forgotten
-                    if succeeded == 0 and not errors:
-                        raise exc
-                if removed_now:
-                    try:
-                        await self._confirm_httpapi_persisted(tag, [], removed_now)
-                    except AgentError as exc:
-                        failed += len(removed_now)
-                        succeeded = max(0, succeeded - len(removed_now))
-                        errors.append({"email": "", "message": exc.message})
-                        removed_now = []
-                if removed_now:
-                    await self._forget_client_quotas(removed_now + id_keys)
-                    await self._forget_disabled_keys(removed_now + id_keys)
+                            errors.append({"email": key, "id": key, "message": exc.message})
+                    forget_keys = [item for item in forget_keys if item not in drop_emails]
+            if forget_keys:
+                unique_forget = list(dict.fromkeys([*forget_keys, *id_keys, *email_keys]))
+                await self._forget_client_quotas(unique_forget)
+                await self._forget_disabled_keys(unique_forget)
+                await self._forget_client_keys(unique_forget)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         await self.audit.record(
@@ -2958,14 +2992,34 @@ class XrayDriver(CoreDriver):
                 if not email or email == key:
                     raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
         if not removed:
-            try:
-                await self._api_call("remove_users", tag, [email])
-            except AgentError as exc:
-                if _is_missing_user_error(exc):
-                    raise AgentError("CLIENT_NOT_FOUND", f"Client [{key}] not found", 404) from exc
-                raise
+            drop_errors: list[dict[str, str]] = []
+            removed_live = await self._remove_live_clients(tag, [email], drop_errors)
+            if email not in removed_live:
+                try:
+                    await self.get_client_record(inbound_id, key)
+                except AgentError as exc:
+                    if str(exc.code or "").upper() != "CLIENT_NOT_FOUND":
+                        if drop_errors:
+                            raise AgentError(
+                                drop_errors[0].get("message", "delete failed"),
+                                drop_errors[0].get("message", "delete failed"),
+                                500,
+                            )
+                        raise
+                else:
+                    detail = drop_errors[0]["message"] if drop_errors else "client is still live after delete"
+                    raise AgentError("DELETE_INCOMPLETE", detail, 500)
 
-        await self._confirm_httpapi_persisted(tag, [], [email])
+        inbound = await self.get_inbound(inbound_id)
+        protocol = self._protocol_of(inbound)
+        inbound_settings = inbound.get("settings") if isinstance(inbound.get("settings"), dict) else None
+        await self._confirm_persisted_or_repair(
+            tag,
+            [],
+            [email],
+            protocol=protocol,
+            inbound_settings=inbound_settings,
+        )
         await self._forget_client_keys([key, email])
         await self._release_emails_from_other_inbounds([email], tag)
         await self.audit.record("delete", f"xray/inbound/{inbound_id}/clients/{key}", email)

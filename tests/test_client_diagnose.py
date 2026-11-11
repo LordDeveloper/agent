@@ -129,6 +129,30 @@ def test_diagnose_xray_client_missing():
     assert report["summary"]["issue_count"] == 1
 
 
+def test_diagnose_reports_orphan_quota_hint_when_config_misses_the_client():
+    class Driver(_FakeXrayDriver):
+        async def read_config(self):
+            return {"inbounds": []}
+
+        async def _quota_index(self):
+            row = {"id": "node-x", "node_id": "node-x", "email": "orphan@x"}
+            return {"n:node-x": row, "e:orphan@x": row}
+
+        async def _lookup_keys_for_panel_id(self, key):
+            return [key]
+
+        def _probe_email(self, aliases):
+            return ""
+
+        async def _filtered_live_user(self, tag, email):
+            return None
+
+    report = asyncio.run(diagnose_xray_clients_by_key(Driver(), "node-x"))
+    assert report["found"] is False
+    codes = [row["code"] for row in report["issues"]]
+    assert "ORPHAN_QUOTA_DOC" in codes
+
+
 def _online_check(report: dict) -> dict:
     checks = report["matches"][0]["checks"]
     return next(row for row in checks if row["name"] == "online_now")

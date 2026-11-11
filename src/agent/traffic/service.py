@@ -385,8 +385,9 @@ class TrafficService:
         }
         ack_upserts: list[tuple[str, str, int, int]] = []
         ack_deletes: list[tuple[str, str]] = []
-        pending_upserts: list[dict[str, Any]] = []
-        pending_deletes: list[tuple[str, str]] = []
+        # One pending entry per client. Later samples in this batch replace it.
+        pending_upserts: dict[tuple[str, str], dict[str, Any]] = {}
+        pending_deletes: set[tuple[str, str]] = set()
         identity_upserts: list[tuple[str, str, str]] = []
 
         def set_ack(core: str, key: str, incoming: int, outgoing: int) -> None:
@@ -407,6 +408,7 @@ class TrafficService:
             current_incoming: int,
             current_outgoing: int,
         ) -> None:
+            # Update the client's single pending. Do not append another row.
             row = {
                 "delta_incoming": delta_incoming,
                 "delta_outgoing": delta_outgoing,
@@ -414,13 +416,15 @@ class TrafficService:
                 "current_outgoing": current_outgoing,
             }
             pending[(core, key)] = row
-            pending_upserts.append({"core": core, "client_key": key, **row})
+            pending_upserts[(core, key)] = {"core": core, "client_key": key, **row}
+            pending_deletes.discard((core, key))
 
         def delete_pending(core: str, key: str) -> None:
             if (core, key) not in pending:
                 return
             del pending[(core, key)]
-            pending_deletes.append((core, key))
+            pending_upserts.pop((core, key), None)
+            pending_deletes.add((core, key))
 
         protected = {str(sample["label"]) for sample in samples if str(sample["label"])}
         for sample in samples:
@@ -469,8 +473,8 @@ class TrafficService:
             "stats": stats,
             "ack_upserts": ack_upserts,
             "ack_deletes": ack_deletes,
-            "pending_upserts": pending_upserts,
-            "pending_deletes": pending_deletes,
+            "pending_upserts": list(pending_upserts.values()),
+            "pending_deletes": list(pending_deletes),
             "identity_upserts": identity_upserts,
             "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
         }
@@ -625,7 +629,7 @@ class TrafficService:
             last_out,
             has_last,
         )
-        reset = current_incoming < ack_in or current_outgoing < ack_out
+        reset = current_incoming < last_in or current_outgoing < last_out
         if reset:
             log.warning(
                 "traffic counter regression core=%s client=%s ack=(%s,%s) current=(%s,%s) preserved=(%s,%s)",
@@ -662,18 +666,22 @@ class TrafficService:
         last_observed: int,
         has_last: bool,
     ) -> tuple[int, int]:
-        """Usage since the stored baseline, plus any pending the baseline does not cover.
+        """Add this tick onto the client's one pending row.
 
-        A counter that fell below the baseline is a new epoch (Xray restart,
-        interface down/up). Its whole value is new usage and the baseline moves
-        to it. Otherwise only the growth since the last observation is added,
-        so a lost pending row is rebuilt from the baseline instead of the full counter.
+        Tick matches the classic counter delta against the last stored counter
+        (the pending row's current value, or the ack when there is no pending):
+
+            tick = current if current < last else current - last
+
+        Until a reset, that tick is added onto the pending already queued.
+        A reset (current < last) still adds the whole new counter onto the
+        unacked pending, then moves the baseline to the new counter. The
+        same row is updated; a sample never inserts a second pending.
         """
-        if current < baseline:
+        last = last_observed if has_last else baseline
+        if current < last:
             return preserved + current, current
-        if has_last and last_observed >= baseline:
-            return preserved + (current - last_observed), baseline
-        return max(0, current - baseline), baseline
+        return preserved + (current - last), baseline
 
     def _remember_identity(self, canonical: str, email: str, client_id: str) -> None:
         self._aliases[canonical] = canonical

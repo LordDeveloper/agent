@@ -469,3 +469,35 @@ def test_openvpn_auth_write_is_verified_and_failure_is_not_success(tmp_path: Pat
             aiofs.atomic_write = original
 
     asyncio.run(run())
+
+
+def test_xray_batch_remove_drops_live_user_when_config_row_is_gone(tmp_path: Path):
+    async def run() -> None:
+        import agent.drivers.xray as xray_mod
+
+        fake = FakeXrayHttpClient()
+        store, driver, config = await _xray(tmp_path, fake)
+        previous_delay = xray_mod._PERSIST_CONFIRM_DELAY_SECONDS
+        xray_mod._PERSIST_CONFIRM_DELAY_SECONDS = 0
+        node_id = "panel-node-1"
+        email = "ss1a2b"
+        try:
+            fake.add_users("inbound-1", [_client(email)])
+            await store.put_doc(
+                "xray",
+                "client_quota",
+                node_id,
+                {"id": node_id, "node_id": node_id, "email": email},
+            )
+            config.write_text(json.dumps({"inbounds": [_inbound()]}), encoding="utf-8")
+            driver._invalidate_config_cache()
+
+            result = await driver.batch_remove_clients(1, ids=[node_id])
+            assert result["succeeded"] == 1, result
+            assert [row["email"] for row in fake.list_users("inbound-1")] == []
+            assert await store.get_doc("xray", "client_quota", node_id) is None
+        finally:
+            xray_mod._PERSIST_CONFIRM_DELAY_SECONDS = previous_delay
+            await store.close()
+
+    asyncio.run(run())

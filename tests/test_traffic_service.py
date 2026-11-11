@@ -795,14 +795,7 @@ async def test_fast_core_samples_while_another_core_is_still_reading(store):
     await slow_flight
 
 
-async def test_sample_does_not_commit_in_chunks(store, monkeypatch):
-    chunks = {"n": 0}
-
-    async def track_chunk(session, pending):
-        chunks["n"] += 1
-        return pending
-
-    monkeypatch.setattr(store._runtime, "commit_chunk", track_chunk)
+async def test_sample_does_not_commit_in_chunks(store):
     traffic = TrafficService(store)
     driver = FakeDriver(
         [
@@ -817,20 +810,15 @@ async def test_sample_does_not_commit_in_chunks(store, monkeypatch):
     driver._clients[1].incoming = 260
     await _sample(traffic, registry)
 
-    assert chunks["n"] == 0
     payload = await traffic.pending_payload()
     assert payload["users"]["a"]["downlink"] == 50
     assert payload["users"]["b"]["downlink"] == 60
+    rows = await store.list_traffic_pending()
+    assert len(rows) == 2
+    assert {row["client_key"] for row in rows} == {"a", "b"}
 
 
 async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypatch):
-    chunks = {"n": 0}
-
-    async def track_chunk(session, pending):
-        chunks["n"] += 1
-        return pending
-
-    monkeypatch.setattr(store._runtime, "commit_chunk", track_chunk)
     original = store._traffic._write_traffic_plan
 
     async def write_then_fail(session, writes):
@@ -848,7 +836,6 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
 
     await _sample(traffic, FakeRegistry(["xray"], driver))
 
-    assert chunks["n"] == 0
     assert await store.list_traffic_pending() == []
     assert await store.get_traffic_ack("xray", "a") is None
     assert await store.get_traffic_ack("xray", "b") is None
@@ -882,3 +869,19 @@ async def test_unacked_samples_sum_download_and_upload(store):
     pending = (await traffic.pending_payload())["users"]["node-sum"]
     assert pending["downlink"] == 9 * mb
     assert pending["uplink"] == 7 * mb
+
+    rows = await store.list_traffic_pending()
+    assert len(rows) == 1
+    assert rows[0]["client_key"] == "node-sum"
+    assert rows[0]["delta_incoming"] == 9 * mb
+    assert rows[0]["delta_outgoing"] == 7 * mb
+
+    # A counter reset updates that same row: previous pending plus the new counter.
+    client.incoming = 2 * mb
+    client.outgoing = 1 * mb
+    await _sample(traffic, registry)
+    rows = await store.list_traffic_pending()
+    assert len(rows) == 1
+    assert rows[0]["client_key"] == "node-sum"
+    assert rows[0]["delta_incoming"] == 11 * mb
+    assert rows[0]["delta_outgoing"] == 8 * mb

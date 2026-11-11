@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent.auth_scope import current_scope
 from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending
@@ -112,27 +113,44 @@ class TrafficStoreService:
     ) -> None:
         async with self._runtime.writing() as session:
             scope = current_scope()
-            row = await session.get(TrafficPending, (scope, core, client_key))
-            if row is None:
-                session.add(
-                    TrafficPending(
-                        scope=scope,
-                        core=core,
-                        client_key=client_key,
-                        delta_incoming=int(delta_incoming),
-                        delta_outgoing=int(delta_outgoing),
-                        current_incoming=int(current_incoming),
-                        current_outgoing=int(current_outgoing),
-                        updated_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                )
-            else:
-                row.delta_incoming = int(delta_incoming)
-                row.delta_outgoing = int(delta_outgoing)
-                row.current_incoming = int(current_incoming)
-                row.current_outgoing = int(current_outgoing)
-                row.updated_at = datetime.now(timezone.utc).isoformat()
+            await self._upsert_pending(
+                session,
+                scope,
+                {
+                    "core": core,
+                    "client_key": client_key,
+                    "delta_incoming": int(delta_incoming),
+                    "delta_outgoing": int(delta_outgoing),
+                    "current_incoming": int(current_incoming),
+                    "current_outgoing": int(current_outgoing),
+                },
+            )
             await session.commit()
+
+    async def _upsert_pending(self, session, scope: str, item: dict[str, Any]) -> None:
+        """Update the one pending row for this client. Insert it only the first time."""
+        now = datetime.now(timezone.utc).isoformat()
+        stmt = sqlite_insert(TrafficPending).values(
+            scope=scope,
+            core=str(item["core"]),
+            client_key=str(item["client_key"]),
+            delta_incoming=int(item["delta_incoming"]),
+            delta_outgoing=int(item["delta_outgoing"]),
+            current_incoming=int(item["current_incoming"]),
+            current_outgoing=int(item["current_outgoing"]),
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[TrafficPending.scope, TrafficPending.core, TrafficPending.client_key],
+            set_={
+                "delta_incoming": stmt.excluded.delta_incoming,
+                "delta_outgoing": stmt.excluded.delta_outgoing,
+                "current_incoming": stmt.excluded.current_incoming,
+                "current_outgoing": stmt.excluded.current_outgoing,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        await session.execute(stmt)
 
     async def delete_traffic_pending(self, core: str, client_key: str) -> None:
         async with self._runtime.writing() as session:
@@ -299,33 +317,14 @@ class TrafficStoreService:
                     TrafficAck.client_key == client_key,
                 )
             )
-        staged_pending: dict[tuple[str, str, str], TrafficPending] = {}
+        # One statement per client updates the existing pending row.
+        seen_pending: set[tuple[str, str]] = set()
         for item in writes.get("pending_upserts") or []:
-            core = item["core"]
-            client_key = item["client_key"]
-            key = (scope, core, client_key)
-            row = staged_pending.get(key)
-            if row is None:
-                row = await session.get(TrafficPending, key)
-            if row is None:
-                row = TrafficPending(
-                    scope=scope,
-                    core=core,
-                    client_key=client_key,
-                    delta_incoming=int(item["delta_incoming"]),
-                    delta_outgoing=int(item["delta_outgoing"]),
-                    current_incoming=int(item["current_incoming"]),
-                    current_outgoing=int(item["current_outgoing"]),
-                    updated_at=datetime.now(timezone.utc).isoformat(),
-                )
-                session.add(row)
-            else:
-                row.delta_incoming = int(item["delta_incoming"])
-                row.delta_outgoing = int(item["delta_outgoing"])
-                row.current_incoming = int(item["current_incoming"])
-                row.current_outgoing = int(item["current_outgoing"])
-                row.updated_at = datetime.now(timezone.utc).isoformat()
-            staged_pending[key] = row
+            key = (str(item["core"]), str(item["client_key"]))
+            if key in seen_pending:
+                continue
+            seen_pending.add(key)
+            await self._upsert_pending(session, scope, item)
         for core, client_key in writes.get("pending_deletes") or []:
             await session.execute(
                 delete(TrafficPending).where(
@@ -516,17 +515,17 @@ class TrafficStoreService:
                         )
                     )
                 for core, key, delta_in, delta_out, current_in, current_out in pending_upserts:
-                    await session.merge(
-                        TrafficPending(
-                            scope=scope,
-                            core=core,
-                            client_key=key,
-                            delta_incoming=delta_in,
-                            delta_outgoing=delta_out,
-                            current_incoming=current_in,
-                            current_outgoing=current_out,
-                            updated_at=datetime.now(timezone.utc).isoformat(),
-                        )
+                    await self._upsert_pending(
+                        session,
+                        scope,
+                        {
+                            "core": core,
+                            "client_key": key,
+                            "delta_incoming": delta_in,
+                            "delta_outgoing": delta_out,
+                            "current_incoming": current_in,
+                            "current_outgoing": current_out,
+                        },
                     )
                 for core, key in pending_deletes:
                     await session.execute(
