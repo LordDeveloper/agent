@@ -241,83 +241,144 @@ class TrafficService:
 
     async def sample_cores_blocking(self, registry: CoreRegistry) -> dict[str, int]:
         """Run one volume sample cycle and await every enabled core (worker cadence)."""
-        cycle_started = time.monotonic()
-        cores = self._listed_cores(registry) or []
-        if not cores:
-            return await self.sample_all(registry)
-        from agent.asyncutil import gather_independent
-
-        if "l2tp" in cores:
-            cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
-        owners_task = asyncio.create_task(self.store.client_scopes())
-        sampled = await gather_independent(
-            *(self._sample_core(registry, core_key, owners_task=owners_task) for core_key in cores),
-            return_exceptions=True,
-        )
-        stats = {
-            "clients_seen": 0,
-            "pending": 0,
-            "initialized": 0,
-            "regressed": 0,
-        }
-        core_timings: dict[str, dict[str, int]] = {}
-        for core_key, item in zip(cores, sampled):
-            if isinstance(item, Exception):
-                log.exception("traffic sample failed core=%s: %s", core_key, item)
-                continue
-            timing = item.pop("_timing", None)
-            if isinstance(timing, dict):
-                core_timings[str(core_key)] = timing
-            for key in stats:
-                if key == "pending":
-                    stats[key] = max(stats[key], int(item.get(key, 0)))
-                else:
-                    stats[key] += int(item.get(key, 0))
-        cycle_ms = int((time.monotonic() - cycle_started) * 1000)
-        timing_payload = {**core_timings, "cycle_ms": cycle_ms}
+        stats, core_timings, cycle_ms = await self._sample_cores_merged(registry)
         import json
 
+        timing_payload = {**core_timings, "sqlite_ms": core_timings.get("_sqlite_ms", 0), "cycle_ms": cycle_ms}
+        timing_payload.pop("_sqlite_ms", None)
         await self.store.set_meta(AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY, json.dumps(timing_payload))
         log.info("traffic sample cycle cycle_ms=%s cores=%s", cycle_ms, json.dumps(core_timings, sort_keys=True))
         return stats
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
-        """Refresh pending deltas from every core at once (online not required).
+        """Refresh pending deltas from every core at once (online not required)."""
+        stats, _, _ = await self._sample_cores_merged(registry)
+        return stats
 
-        Each core reads its counters and writes its own pending rows without
-        waiting for the other cores to finish their snapshot.
-        """
+    async def _sample_cores_merged(
+        self,
+        registry: CoreRegistry,
+    ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
+        """Parallel core snapshots, then a single SQLite commit (avoids write lock pile-up)."""
         from agent.asyncutil import gather_independent
 
-        stats = {
-            "clients_seen": 0,
-            "pending": 0,
-            "initialized": 0,
-            "regressed": 0,
-        }
-
+        cycle_started = time.monotonic()
         cores = self._listed_cores(registry) or []
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
 
         owners_task = asyncio.create_task(self.store.client_scopes())
-        sampled = await gather_independent(
-            *(self._sample_core(registry, core_key, owners_task=owners_task) for core_key in cores),
+        captured = await gather_independent(
+            *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
             return_exceptions=True,
         )
-
-        for item in sampled:
+        owners = await owners_task
+        core_snapshots: list[tuple[str, Any, int]] = []
+        core_timings: dict[str, dict[str, int]] = {}
+        for core_key, item in zip(cores, captured):
             if isinstance(item, Exception):
-                log.exception("traffic sample failed: %s", item)
+                log.exception("traffic snapshot failed core=%s: %s", core_key, item)
                 continue
-            item.pop("_timing", None)
-            for key in stats:
-                if key == "pending":
-                    # Each core reports the whole queue size after its commit.
-                    stats[key] = max(stats[key], int(item.get(key, 0)))
-                else:
-                    stats[key] += int(item.get(key, 0))
-        return stats
+            key, snapshot, snapshot_ms = item
+            core_snapshots.append((key, snapshot, snapshot_ms))
+            core_timings[str(key)] = {
+                "snapshot_ms": int(snapshot_ms),
+                "sqlite_ms": 0,
+                "total_ms": int(snapshot_ms),
+            }
+            log.info(
+                "traffic sample timing core=%s snapshot_ms=%s (sqlite merged)",
+                key,
+                snapshot_ms,
+            )
+
+        sqlite_started = time.monotonic()
+        stats = await self._commit_merged_core_samples(core_snapshots, owners)
+        sqlite_ms = int((time.monotonic() - sqlite_started) * 1000)
+        core_timings["_sqlite_ms"] = sqlite_ms
+        cycle_ms = int((time.monotonic() - cycle_started) * 1000)
+        log.info(
+            "traffic sample timing sqlite_ms=%s cycle_ms=%s clients=%s pending=%s",
+            sqlite_ms,
+            cycle_ms,
+            stats.get("clients_seen", 0),
+            stats.get("pending", 0),
+        )
+        return stats, core_timings, cycle_ms
+
+    async def _read_core_usage_snapshot(
+        self,
+        registry: CoreRegistry,
+        core_key: str,
+    ) -> tuple[str, Any, int]:
+        from agent.asyncutil import maybe_await
+
+        started = time.monotonic()
+        driver = registry.get(core_key)
+        if core_key == "l2tp":
+            await self._drop_linked_l2tp_billing(driver)
+        snapshot = await maybe_await(driver.usage_snapshot())
+        snapshot_ms = int((time.monotonic() - started) * 1000)
+        return core_key, snapshot, snapshot_ms
+
+    async def _commit_merged_core_samples(
+        self,
+        core_snapshots: list[tuple[str, Any, int]],
+        owners: dict[tuple[str, str], str],
+    ) -> dict[str, int]:
+        from agent.auth_scope import DEFAULT_SCOPE, current_scope
+
+        sampled_at = datetime.now(timezone.utc).isoformat()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for core_key, snapshot, _snapshot_ms in core_snapshots:
+            for sample in self._usage_rows(core_key, snapshot):
+                scope = owners.get((str(sample["core"]), str(sample["label"])), DEFAULT_SCOPE)
+                grouped.setdefault(scope, []).append(sample)
+
+        if not grouped:
+            grouped[DEFAULT_SCOPE] = []
+
+        def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
+            merged_stats = {
+                "clients_seen": 0,
+                "pending": 0,
+                "initialized": 0,
+                "regressed": 0,
+                "unchanged": 0,
+            }
+            chunk_inserts: list[dict[str, Any]] = []
+            client_cursor_upserts: list[tuple[str, str, int, int]] = []
+            identity_upserts: list[tuple[str, str, str]] = []
+            for _scope, group in grouped.items():
+                if not group:
+                    continue
+                part = self._plan_sample(group, cursors, sampled_at)
+                for key in merged_stats:
+                    if key == "pending":
+                        merged_stats[key] += int(part.get("stats", {}).get(key, 0))
+                    else:
+                        merged_stats[key] += int(part.get("stats", {}).get(key, 0))
+                chunk_inserts.extend(part.get("chunk_inserts") or [])
+                client_cursor_upserts.extend(part.get("client_cursor_upserts") or [])
+                identity_upserts.extend(part.get("identity_upserts") or [])
+            return {
+                "stats": merged_stats,
+                "chunk_inserts": chunk_inserts,
+                "client_cursor_upserts": client_cursor_upserts,
+                "identity_upserts": identity_upserts,
+                "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
+            }
+
+        try:
+            return await self.store.apply_traffic_sample(plan, current_scope())
+        except Exception:
+            log.exception("traffic merged sqlite commit failed")
+            return {
+                "clients_seen": 0,
+                "pending": 0,
+                "initialized": 0,
+                "regressed": 0,
+            }
 
     async def _sample_core(
         self,
