@@ -241,17 +241,9 @@ class TrafficService:
 
         loop.create_task(_persist())
 
-    async def sample_cores_blocking(
-        self,
-        registry: CoreRegistry,
-        *,
-        xray_prefetched: tuple[Any, int] | None = None,
-    ) -> dict[str, int]:
+    async def sample_cores_blocking(self, registry: CoreRegistry) -> dict[str, int]:
         """Run one volume sample cycle and await every enabled core (worker cadence)."""
-        stats, core_timings, cycle_ms = await self._sample_cores_merged(
-            registry,
-            xray_prefetched=xray_prefetched,
-        )
+        stats, core_timings, cycle_ms = await self._sample_cores_merged(registry)
         import json
 
         timing_payload = {**core_timings, "sqlite_ms": core_timings.get("_sqlite_ms", 0), "cycle_ms": cycle_ms}
@@ -268,8 +260,6 @@ class TrafficService:
     async def _sample_cores_merged(
         self,
         registry: CoreRegistry,
-        *,
-        xray_prefetched: tuple[Any, int] | None = None,
     ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
         """Parallel core snapshots on the worker registry, then one SQLite commit."""
         from agent.asyncutil import gather_independent
@@ -286,23 +276,14 @@ class TrafficService:
             await self._drop_linked_l2tp_billing(registry.get("l2tp"))
 
         owners_task = asyncio.create_task(self.store.client_scopes())
-        other_cores = [key for key in cores if key != "xray"]
-        capture_tasks = [
-            self._read_core_usage_snapshot(registry, core_key) for core_key in other_cores
-        ]
-        if "xray" in cores:
-            if xray_prefetched is not None:
-
-                async def _xray_from_prefetch() -> tuple[str, Any, int]:
-                    snap, snapshot_ms = xray_prefetched
-                    return "xray", snap, int(snapshot_ms)
-
-                capture_tasks.append(_xray_from_prefetch())
-            else:
-                capture_tasks.append(self._read_core_usage_snapshot(registry, "xray"))
-        captured = await gather_independent(*capture_tasks, return_exceptions=True)
+        snapshot_started = time.monotonic()
+        captured = await gather_independent(
+            *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
+            return_exceptions=True,
+        )
+        parallel_snapshot_ms = int((time.monotonic() - snapshot_started) * 1000)
         owners = await owners_task
-        capture_order = other_cores + (["xray"] if "xray" in cores else [])
+        capture_order = list(cores)
         core_snapshots: list[tuple[str, Any, int]] = []
         core_timings: dict[str, dict[str, int]] = {}
         for core_key, item in zip(capture_order, captured):
@@ -322,8 +303,13 @@ class TrafficService:
                 snapshot_ms,
             )
 
+        core_timings["parallel_snapshot_ms"] = parallel_snapshot_ms
         sqlite_started = time.monotonic()
-        stats, sqlite_detail = await self._commit_merged_core_samples(core_snapshots, owners)
+        stats, sqlite_detail = await self._commit_merged_core_samples(
+            core_snapshots,
+            owners,
+            registry,
+        )
         sqlite_ms = int((time.monotonic() - sqlite_started) * 1000)
         core_timings["_sqlite_ms"] = sqlite_ms
         if sqlite_detail:
@@ -363,13 +349,18 @@ class TrafficService:
         driver = registry.get(core_key)
         if core_key == "l2tp":
             await self._drop_linked_l2tp_billing(driver)
+        reset_xray = core_key == "xray" and bool(
+            getattr(registry.settings, "traffic_xray_reset_stats", False)
+        )
         cache_hit: bool | None = None
-        if core_key == "xray":
+        if core_key == "xray" and not reset_xray:
             max_age = getattr(driver, "_usage_cache_max_age", lambda: 5.0)()
             cache_hit = getattr(driver, "cached_usage_snapshot", lambda _a: None)(max_age) is not None
-        snapshot = await maybe_await(driver.usage_snapshot())
+        snapshot = await maybe_await(driver.usage_snapshot(reset_stats=reset_xray))
         if core_key == "xray" and cache_hit is not None:
             log.info("traffic sample xray cache=%s", "hit" if cache_hit else "miss")
+        if core_key == "xray" and reset_xray:
+            log.info("traffic sample xray reset_stats=on")
         snapshot_ms = int((time.monotonic() - started) * 1000)
         return core_key, snapshot, snapshot_ms
 
@@ -377,6 +368,7 @@ class TrafficService:
         self,
         core_snapshots: list[tuple[str, Any, int]],
         owners: dict[tuple[str, str], str],
+        registry: CoreRegistry,
     ) -> tuple[dict[str, int], dict[str, int]]:
         from agent.auth_scope import DEFAULT_SCOPE, current_scope
 
@@ -401,6 +393,8 @@ class TrafficService:
                     if alias_text:
                         cursor_keys.add((core, alias_text))
 
+        xray_reset = bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
+
         def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
             merged_stats = {
                 "clients_seen": 0,
@@ -415,7 +409,7 @@ class TrafficService:
             for _scope, group in grouped.items():
                 if not group:
                     continue
-                part = self._plan_sample(group, cursors, sampled_at)
+                part = self._plan_sample(group, cursors, sampled_at, xray_reset_stats=xray_reset)
                 for key in merged_stats:
                     if key == "pending":
                         merged_stats[key] += int(part.get("stats", {}).get(key, 0))
@@ -466,17 +460,25 @@ class TrafficService:
         driver = registry.get(core_key)
         if core_key == "l2tp":
             await self._drop_linked_l2tp_billing(driver)
+        reset_xray = core_key == "xray" and bool(
+            getattr(registry.settings, "traffic_xray_reset_stats", False)
+        )
         if owners_task is not None:
-            snapshot = await maybe_await(driver.usage_snapshot())
+            snapshot = await maybe_await(driver.usage_snapshot(reset_stats=reset_xray))
             owners = await owners_task
         else:
             snapshot, owners = await gather_independent(
-                maybe_await(driver.usage_snapshot()),
+                maybe_await(driver.usage_snapshot(reset_stats=reset_xray)),
                 self.store.client_scopes(),
             )
         snapshot_ms = int((time.monotonic() - started) * 1000)
         store_started = time.monotonic()
-        stats = await self._store_core_samples(core_key, snapshot, owners=owners)
+        stats = await self._store_core_samples(
+            core_key,
+            snapshot,
+            owners=owners,
+            registry=registry,
+        )
         store_ms = int((time.monotonic() - store_started) * 1000)
         total_ms = int((time.monotonic() - started) * 1000)
         log.info(
@@ -502,6 +504,7 @@ class TrafficService:
         snapshot: Any,
         *,
         owners: dict[tuple[str, str], str],
+        registry: CoreRegistry | None = None,
     ) -> dict[str, int]:
         from agent.auth_scope import DEFAULT_SCOPE
 
@@ -520,8 +523,19 @@ class TrafficService:
         if not grouped:
             grouped[DEFAULT_SCOPE] = []
 
+        xray_reset = (
+            core_key == "xray"
+            and registry is not None
+            and bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
+        )
         for scope, group in grouped.items():
-            stored = await self._commit_samples(group, sampled_at, scope, core_key)
+            stored = await self._commit_samples(
+                group,
+                sampled_at,
+                scope,
+                core_key,
+                xray_reset_stats=xray_reset,
+            )
             for key in stats:
                 if key == "pending":
                     stats[key] = max(stats[key], int(stored.get(key, 0)))
@@ -588,11 +602,18 @@ class TrafficService:
         sampled_at: str,
         scope: str | None = None,
         core: str | None = None,
+        *,
+        xray_reset_stats: bool = False,
     ) -> dict[str, int]:
         from agent.auth_scope import current_scope
 
         def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
-            return self._plan_sample(samples, cursors, sampled_at)
+            return self._plan_sample(
+                samples,
+                cursors,
+                sampled_at,
+                xray_reset_stats=xray_reset_stats and str(core or "") == "xray",
+            )
 
         return await self.store.apply_traffic_sample(plan, scope or current_scope(), core)
 
@@ -601,6 +622,8 @@ class TrafficService:
         samples: list[dict[str, Any]],
         sample_cursors: dict[tuple[str, str], tuple[int, int]],
         sampled_at: str,
+        *,
+        xray_reset_stats: bool = False,
     ) -> dict[str, Any]:
         stats = {
             "clients_seen": 0,
@@ -631,16 +654,28 @@ class TrafficService:
                 protected=protected,
                 sample_cursors=sample_cursors,
             )
-            outcome = self._classify_interval_sample(
-                core,
-                label,
-                current_incoming,
-                current_outgoing,
-                sample_cursors=sample_cursors,
-                chunk_inserts=chunk_inserts,
-                client_cursor_upserts=client_cursor_upserts,
-                sampled_at=sampled_at,
-            )
+            if core == "xray" and xray_reset_stats:
+                outcome = self._classify_xray_reset_interval_sample(
+                    core,
+                    label,
+                    current_incoming,
+                    current_outgoing,
+                    sample_cursors=sample_cursors,
+                    chunk_inserts=chunk_inserts,
+                    client_cursor_upserts=client_cursor_upserts,
+                    sampled_at=sampled_at,
+                )
+            else:
+                outcome = self._classify_interval_sample(
+                    core,
+                    label,
+                    current_incoming,
+                    current_outgoing,
+                    sample_cursors=sample_cursors,
+                    chunk_inserts=chunk_inserts,
+                    client_cursor_upserts=client_cursor_upserts,
+                    sampled_at=sampled_at,
+                )
             stats[outcome] = stats.get(outcome, 0) + 1
             for alias in (email, protocol_id):
                 alias_text = str(alias or "").strip()
@@ -690,6 +725,42 @@ class TrafficService:
             )
         if best is not None:
             sample_cursors[(core, canonical_key)] = best
+
+    @staticmethod
+    def _classify_xray_reset_interval_sample(
+        core: str,
+        client_key: str,
+        interval_incoming: int,
+        interval_outgoing: int,
+        *,
+        sample_cursors: dict[tuple[str, str], tuple[int, int]],
+        chunk_inserts: list[dict[str, Any]],
+        client_cursor_upserts: list[tuple[str, str, int, int]],
+        sampled_at: str,
+    ) -> str:
+        """Xray stats query reset=true: snapshot values are interval bytes, not kernel totals."""
+        tick_in = max(0, int(interval_incoming))
+        tick_out = max(0, int(interval_outgoing))
+        pair = (core, client_key)
+        last = sample_cursors.get(pair)
+        base_in, base_out = last if last is not None else (0, 0)
+        new_in = int(base_in) + tick_in
+        new_out = int(base_out) + tick_out
+        client_cursor_upserts.append((core, client_key, new_in, new_out))
+        sample_cursors[pair] = (new_in, new_out)
+        if tick_in <= 0 and tick_out <= 0:
+            return "unchanged"
+        chunk_inserts.append(
+            {
+                "chunk_id": str(uuid.uuid4()),
+                "core": core,
+                "client_key": client_key,
+                "incoming": tick_in,
+                "outgoing": tick_out,
+                "sampled_at": sampled_at,
+            }
+        )
+        return "pending"
 
     @staticmethod
     def _classify_interval_sample(
@@ -1420,7 +1491,10 @@ class TrafficService:
                 await registry.get("xray").warm_usage_cache()
             except Exception:
                 log.exception("pending reset: xray usage prewarm failed")
+        skip_xray_kernel = bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
         for core_key in cores:
+            if core_key == "xray" and skip_xray_kernel:
+                continue
             driver = registry.get(core_key)
             try:
                 snapshot = await maybe_await(driver.usage_snapshot())

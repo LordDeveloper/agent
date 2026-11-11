@@ -105,6 +105,8 @@ class AgentSettings(BaseSettings):
     # When ``agent work`` runs the traffic worker, keep false so GET /pending does not
     # spawn a second sampler in the HTTP process (SQLite lock + cold xray API).
     traffic_schedule_sample_on_get: bool = False
+    # Xray volume: use stats query reset=true; snapshot values are interval bytes (not kernel delta).
+    traffic_xray_reset_stats: bool = True
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0

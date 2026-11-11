@@ -3872,7 +3872,9 @@ class XrayDriver(CoreDriver):
         ]
         return snapshot.model_copy(update={"inbounds": kept})
 
-    async def usage_snapshot(self) -> UsageSnapshotModel:
+    async def usage_snapshot(self, *, reset_stats: bool = False) -> UsageSnapshotModel:
+        if reset_stats:
+            return await self._clip_usage_snapshot(await self._build_usage_snapshot(reset_stats=True))
         max_age = self._usage_cache_max_age()
         cached = self.cached_usage_snapshot(max_age)
         if cached is not None:
@@ -3903,15 +3905,17 @@ class XrayDriver(CoreDriver):
                             self._usage_flight = None
                             flight.add_done_callback(_drain_task)
 
-    async def _load_usage_snapshot(self) -> UsageSnapshotModel:
-        snapshot = await self._build_usage_snapshot()
-        self._usage_cache = (time.monotonic(), snapshot)
+    async def _load_usage_snapshot(self, *, reset_stats: bool = False) -> UsageSnapshotModel:
+        snapshot = await self._build_usage_snapshot(reset_stats=reset_stats)
+        if not reset_stats:
+            self._usage_cache = (time.monotonic(), snapshot)
         return snapshot
 
-    async def _build_usage_snapshot(self) -> UsageSnapshotModel:
+    async def _build_usage_snapshot(self, *, reset_stats: bool = False) -> UsageSnapshotModel:
+        reset_kw = {"reset": True} if reset_stats else {}
         user_groups, inbound_groups, identity_rows, quota_index = await gather_independent(
-            self._api_call("stats_query_grouped", "user>>>", "user"),
-            self._api_call("stats_query_grouped", "inbound>>>", "inbound"),
+            self._api_call("stats_query_grouped", "user>>>", "user", **reset_kw),
+            self._api_call("stats_query_grouped", "inbound>>>", "inbound", **reset_kw),
             self._usage_identity_rows(),
             self._quota_index(),
             return_exceptions=True,

@@ -414,17 +414,27 @@ class TrafficStoreService:
             chunk_rows = (await session.execute(chunk_query)).scalars().all()
             pending: dict[tuple[str, str], dict[str, int]] = {}
             cursor_map: dict[tuple[str, str], tuple[int, int]] = {}
-            client_query = select(Client).where(Client.scope == scope)
-            if core_name:
-                client_query = client_query.where(Client.core_id == core_name)
-            for row in (await session.execute(client_query)).scalars().all():
-                pair = (str(row.core_id), str(row.id))
-                if row.incoming is None and row.outgoing is None:
-                    continue
-                cursor_map[pair] = (
-                    int(row.incoming or 0),
-                    int(row.outgoing or 0),
-                )
+            pending_keys: set[tuple[str, str]] = set()
+            for row in chunk_rows:
+                pending_keys.add((str(row.core), str(row.client_key)))
+            if pending_keys:
+                by_core: dict[str, list[str]] = defaultdict(list)
+                for core_id, client_id in pending_keys:
+                    by_core[str(core_id)].append(str(client_id))
+                for core_id, client_ids in by_core.items():
+                    unique = list(dict.fromkeys(client_ids))
+                    for offset in range(0, len(unique), 400):
+                        batch = unique[offset : offset + 400]
+                        result = await session.execute(
+                            select(Client).where(Client.core_id == core_id, Client.id.in_(batch))
+                        )
+                        for row in result.scalars().all():
+                            if row.incoming is None and row.outgoing is None:
+                                continue
+                            cursor_map[(str(row.core_id), str(row.id))] = (
+                                int(row.incoming or 0),
+                                int(row.outgoing or 0),
+                            )
             for row in chunk_rows:
                 key = (str(row.core), str(row.client_key))
                 agg = pending.setdefault(
@@ -534,7 +544,6 @@ class TrafficStoreService:
                     batch = unique_ids[offset : offset + 400]
                     result = await session.execute(
                         select(Client).where(
-                            Client.scope == scope,
                             Client.core_id == core_name,
                             Client.id.in_(batch),
                         )
@@ -750,9 +759,8 @@ class TrafficStoreService:
                         )
                     )
                     continue
-                if str(client.scope) == scope:
-                    client.incoming = int(incoming)
-                    client.outgoing = int(outgoing)
+                client.incoming = int(incoming)
+                client.outgoing = int(outgoing)
 
     async def _update_client_traffic_cursor(
         self,

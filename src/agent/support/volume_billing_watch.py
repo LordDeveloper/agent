@@ -68,10 +68,17 @@ async def collect_volume_billing_snapshot(
     chunks = await traffic.store.list_traffic_pending_chunks()
     chunks_by_client: dict[tuple[str, str], int] = {}
     pending_bytes = 0
+    wg_chunk_clients: set[str] = set()
     for chunk in chunks:
         key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
         chunks_by_client[key] = chunks_by_client.get(key, 0) + 1
         pending_bytes += int(chunk.get("incoming") or 0) + int(chunk.get("outgoing") or 0)
+        if key[0] == "wireguard" and key[1]:
+            wg_chunk_clients.add(key[1])
+
+    row_delta_bytes = sum(
+        int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0) for row in rows
+    )
 
     rows_sorted = sorted(
         rows,
@@ -105,11 +112,21 @@ async def collect_volume_billing_snapshot(
     slice_end = len(rows_sorted) if pending_limit <= 0 else max(1, int(pending_limit))
     live_wg = await _live_wireguard_counters(registry) if registry is not None else {}
     kernel_ahead_bytes = 0
+    if registry is not None and live_wg and wg_chunk_clients:
+        for client_key in wg_chunk_clients:
+            live = live_wg.get(client_key)
+            if live is None:
+                continue
+            stored = await traffic.store.get_client_traffic_cursor("wireguard", client_key)
+            if stored is None:
+                continue
+            live_down, live_up = live
+            counter_down, counter_up = stored
+            kernel_ahead_bytes += max(0, live_down - counter_down) + max(0, live_up - counter_up)
+
     for row in rows_sorted[:slice_end]:
         core = str(row.get("core") or "")
         client_key = str(row.get("client_key") or "")
-        counter_down = int(row.get("current_incoming") or 0)
-        counter_up = int(row.get("current_outgoing") or 0)
         item: dict[str, Any] = {
             "core": core,
             "client_key": client_key,
@@ -117,22 +134,18 @@ async def collect_volume_billing_snapshot(
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
             "chunk_count": int(chunks_by_client.get((core, client_key), 0)),
-            "counter_downlink": counter_down,
-            "counter_uplink": counter_up,
             "updated_at": row.get("updated_at"),
         }
-        if core == "wireguard" and client_key in live_wg:
-            live_down, live_up = live_wg[client_key]
-            item["live_downlink"] = live_down
-            item["live_uplink"] = live_up
-            ahead = max(0, live_down - counter_down) + max(0, live_up - counter_up)
-            item["kernel_ahead"] = ahead
-            kernel_ahead_bytes += ahead
         top.append(item)
 
     snapshot_body["top_pending"] = top
+    snapshot_body["pending_bytes_chunks"] = pending_bytes
+    snapshot_body["pending_bytes_aggregate"] = row_delta_bytes
     snapshot_body["kernel_ahead_bytes"] = kernel_ahead_bytes
     snapshot_body["kernel_ahead_label"] = _format_bytes(kernel_ahead_bytes)
+    snapshot_body["kernel_ahead_unreliable"] = (
+        pending_bytes > 0 and kernel_ahead_bytes > max(pending_bytes * 20, 512 * 1024 * 1024)
+    )
     return snapshot_body
 
 
@@ -277,9 +290,20 @@ def render_volume_billing_frame(
     print(f"  last_sample_at={sampled}", flush=True)
     ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
     if ahead > 0:
+        note = (
+            "live WG since last stored cursor (small = normal between 5s samples)"
+            if not snapshot.get("kernel_ahead_unreliable")
+            else "IGNORE if huge — cursor desync; trust unacked chunk sum above"
+        )
         print(
-            f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} "
-            "(live interface moved; pending updates on next agent work sample, not panel GET)",
+            f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} ({note})",
+            flush=True,
+        )
+    agg = int(snapshot.get("pending_bytes_aggregate") or 0)
+    chunk_sum = int(snapshot.get("pending_bytes_chunks") or 0)
+    if chunk_sum > 0 and abs(agg - chunk_sum) > max(1024, chunk_sum // 50):
+        print(
+            f"  warn: aggregate pending { _format_bytes(agg) } != chunk sum { _format_bytes(chunk_sum) }",
             flush=True,
         )
 

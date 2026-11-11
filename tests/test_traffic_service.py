@@ -14,7 +14,7 @@ class FakeDriver:
     def __init__(self, clients: list[ClientUsageModel]):
         self._clients = clients
 
-    def usage_snapshot(self) -> UsageSnapshotModel:
+    def usage_snapshot(self, **_kwargs: object) -> UsageSnapshotModel:
         return UsageSnapshotModel(
             inbounds=[
                 InboundUsageModel(
@@ -28,7 +28,15 @@ class FakeDriver:
 
 class FakeRegistry:
     def __init__(self, cores: list[str], driver: FakeDriver):
-        self.settings = type("S", (), {"cores": lambda self: cores})()
+        self.settings = type(
+            "S",
+            (),
+            {
+                "cores": lambda self: cores,
+                "traffic_billing_cores": lambda self: cores,
+                "traffic_xray_reset_stats": False,
+            },
+        )()
         self._driver = driver
 
     def get(self, core: str) -> FakeDriver:
@@ -817,6 +825,35 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.list_traffic_pending() == []
     assert await store.get_traffic_ack("xray", "a") is None
     assert await store.get_traffic_ack("xray", "b") is None
+
+
+async def test_xray_reset_stats_queues_interval_and_sums_client_cursor(store):
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="node-x", email="x@example.com", incoming=100, outgoing=40)
+    driver = FakeDriver([client])
+    settings = type(
+        "S",
+        (),
+        {
+            "cores": lambda self: ["xray"],
+            "traffic_billing_cores": lambda self: ["xray"],
+            "traffic_xray_reset_stats": True,
+        },
+    )()
+    registry = FakeRegistry(["xray"], driver)
+    registry.settings = settings
+
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
+    assert payload["users"]["node-x"]["downlink"] == 100
+    assert payload["users"]["node-x"]["uplink"] == 40
+
+    client.incoming = 30
+    client.outgoing = 10
+    await _sample(traffic, registry)
+    payload = await traffic.pending_payload()
+    assert payload["users"]["node-x"]["downlink"] == 130
+    assert payload["users"]["node-x"]["uplink"] == 50
 
 
 async def test_zero_cursor_does_not_queue_lifetime_total(store):

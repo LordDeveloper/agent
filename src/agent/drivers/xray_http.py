@@ -407,12 +407,15 @@ class XrayHttpClient:
         group: str | None = None,
         *,
         online_only: bool = False,
+        reset: bool = False,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"pattern": pattern, "grouped": "true"}
         if group:
             params["group"] = group
         if online_only:
             params["online_only"] = "true"
+        if reset:
+            params["reset"] = "true"
         body = await self.get("/api/stats/query", params=params)
         return dict(body.get("stats") or {})
 
