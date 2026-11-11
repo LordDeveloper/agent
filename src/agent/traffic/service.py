@@ -19,8 +19,8 @@ AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 FETCH_LOCK_META_KEY = "traffic_fetch_lock"
-# How long a pending GET owns the snapshot. Another process cannot rebuild it
-# until ack, or until this window passes. Just longer than one 15s panel pass.
+# Legacy meta lock TTL (GET no longer blocks on this). Ack still clears the row
+# when present so upgrades from builds that held the lock do not leave stale meta.
 PENDING_READ_LOCK_SECONDS = 20.0
 # A volume sample may hold the worker exclusively for this long. After that
 # the next sample tick cancels it and starts a new cycle.
@@ -766,8 +766,13 @@ class TrafficService:
         self._fetch_snapshot[current_scope()] = snapshot
 
     async def pending_payload(self) -> dict[str, Any]:
-        if not await self._claim_pending_read():
-            raise PendingReadLocked()
+        """Return unacked pending deltas and persist a fetch snapshot for POST ack.
+
+        The panel runs a single billing writer per node (UpdateSubscribeStats
+        withoutOverlapping). Blocking a second GET until ack only delayed billing
+        when the first pass was still applying rows. Correctness comes from the
+        persisted snapshot plus the ``billed`` map on ack, not from an exclusive lock.
+        """
         await self._load_persisted_aliases()
         rows = await self.store.list_traffic_pending()
         users: dict[str, dict[str, Any]] = {}
@@ -795,8 +800,6 @@ class TrafficService:
 
         self._write_snapshot(snapshot)
         await self._persist_fetch_snapshot(snapshot)
-        if not users:
-            await self._release_pending_read()
 
         return {
             "sampled_at": await self.store.get_meta(
@@ -856,9 +859,8 @@ class TrafficService:
             drop_seen.add(label)
             drop_labels.append(label)
 
-        # A different worker's memory snapshot is not the GET the panel billed.
-        # While the read lock is held, ack the snapshot that GET persisted.
-        if await self._pending_read_is_held() or not self._read_snapshot():
+        # HTTP workers do not share memory; reload the snapshot that GET persisted.
+        if not self._read_snapshot():
             await self._load_persisted_snapshot()
 
         acked: list[str] = []

@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from agent.models import ClientUsageModel, InboundUsageModel, UsageSnapshotModel
-from agent.traffic.service import PendingReadLocked, TrafficService
+from agent.traffic.service import TrafficService
 
 
 class FakeDriver:
@@ -249,7 +249,8 @@ async def test_traffic_sample_writes_many_clients_in_one_plan(store):
     assert (await traffic.pending_payload())["users"] == {}
 
 
-async def test_pending_read_stays_locked_until_the_other_process_acks(store):
+async def test_pending_get_is_not_blocked_while_snapshot_awaits_ack(store):
+    """Single-writer panel billing; GET must not 409 while ack is still in flight."""
     owner = TrafficService(store)
     owner._pending_reader_id = "proc-a"
     client = ClientUsageModel(id="locked-node", email="locked@example.com", incoming=0, outgoing=0)
@@ -264,26 +265,15 @@ async def test_pending_read_stays_locked_until_the_other_process_acks(store):
 
     other = TrafficService(store)
     other._pending_reader_id = "proc-b"
-    other._write_snapshot({
-        "stale-node": [{
-            "core": "xray",
-            "client_key": "stale-node",
-            "delta_incoming": 1,
-            "delta_outgoing": 0,
-            "current_incoming": 1,
-            "current_outgoing": 0,
-        }],
-    })
-
-    with pytest.raises(PendingReadLocked):
-        await other.pending_payload()
+    again = await other.pending_payload()
+    assert again["users"]["locked-node"]["downlink"] == 500
 
     acked, not_found = await other.ack_clients(["locked-node"])
     assert acked == ["locked-node"]
     assert not_found == []
 
-    again = await other.pending_payload()
-    assert "locked-node" not in again["users"]
+    cleared = await other.pending_payload()
+    assert "locked-node" not in cleared["users"]
 
 
 async def test_ack_billed_amount_when_snapshot_is_missing_keeps_later_growth(store):

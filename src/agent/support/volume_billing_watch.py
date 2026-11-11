@@ -189,7 +189,7 @@ def run_volume_billing_watch(
     if not as_json and sys.stderr.isatty():
         print(
             "Watching traffic pending + worker activity (Ctrl+C to stop). "
-            "Panel bills via GET /stats/clients/traffic/pending; lock blocks new snapshots until ack.",
+            "Panel bills via GET pending then POST ack; snapshot is stored in agent DB for ack.",
             file=sys.stderr,
             flush=True,
         )
