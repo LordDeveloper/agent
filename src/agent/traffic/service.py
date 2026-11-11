@@ -18,6 +18,7 @@ log = get_logger("traffic")
 
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
+LAST_SAMPLE_TIMING_META_KEY = "traffic_last_sample_timing"
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 FETCH_LOCK_META_KEY = "traffic_fetch_lock"
 # Legacy panel read-lock meta (removed). Ack still deletes stale keys after upgrade.
@@ -240,6 +241,7 @@ class TrafficService:
 
     async def sample_cores_blocking(self, registry: CoreRegistry) -> dict[str, int]:
         """Run one volume sample cycle and await every enabled core (worker cadence)."""
+        cycle_started = time.monotonic()
         cores = self._listed_cores(registry) or []
         if not cores:
             return await self.sample_all(registry)
@@ -258,15 +260,25 @@ class TrafficService:
             "initialized": 0,
             "regressed": 0,
         }
-        for item in sampled:
+        core_timings: dict[str, dict[str, int]] = {}
+        for core_key, item in zip(cores, sampled):
             if isinstance(item, Exception):
-                log.exception("traffic sample failed: %s", item)
+                log.exception("traffic sample failed core=%s: %s", core_key, item)
                 continue
+            timing = item.pop("_timing", None)
+            if isinstance(timing, dict):
+                core_timings[str(core_key)] = timing
             for key in stats:
                 if key == "pending":
                     stats[key] = max(stats[key], int(item.get(key, 0)))
                 else:
                     stats[key] += int(item.get(key, 0))
+        cycle_ms = int((time.monotonic() - cycle_started) * 1000)
+        timing_payload = {**core_timings, "cycle_ms": cycle_ms}
+        import json
+
+        await self.store.set_meta(AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY, json.dumps(timing_payload))
+        log.info("traffic sample cycle cycle_ms=%s cores=%s", cycle_ms, json.dumps(core_timings, sort_keys=True))
         return stats
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
@@ -298,6 +310,7 @@ class TrafficService:
             if isinstance(item, Exception):
                 log.exception("traffic sample failed: %s", item)
                 continue
+            item.pop("_timing", None)
             for key in stats:
                 if key == "pending":
                     # Each core reports the whole queue size after its commit.
@@ -342,6 +355,11 @@ class TrafficService:
             store_ms,
             total_ms,
         )
+        stats["_timing"] = {
+            "snapshot_ms": snapshot_ms,
+            "sqlite_ms": store_ms,
+            "total_ms": total_ms,
+        }
         return stats
 
     async def _store_core_samples(
@@ -1216,21 +1234,87 @@ class TrafficService:
         await self.store.delete_traffic_ack(core, client_key_label)
         await self.store.delete_traffic_pending(core, client_key_label)
 
-    async def clear_pending_queue(self) -> dict[str, int]:
-        """Wipe the unacked pending queue. Does not change clients.incoming/outgoing cursors."""
-        result = await self.store.clear_pending_traffic_queue()
-        await self._release_pending_read()
-        self._write_snapshot({})
+    async def clear_pending_queue(
+        self,
+        registry: CoreRegistry | None = None,
+    ) -> dict[str, int]:
+        """Drop pending rows and align clients.incoming/outgoing with live kernel counters."""
         from agent.auth_scope import current_scope
 
-        await self.store.delete_meta(AGENT_META_CORE, f"{FETCH_SNAPSHOT_META_KEY}:{current_scope()}")
+        scope = current_scope()
+        synced = 0
+        if registry is not None:
+            synced = await self._sync_kernel_cursors_for_reset(registry, scope)
+        result = await self.store.clear_pending_traffic_queue(scope)
+        await self._release_pending_read()
+        self._write_snapshot({})
+        await self.store.delete_meta(AGENT_META_CORE, f"{FETCH_SNAPSHOT_META_KEY}:{scope}")
+        result["cursors_synced"] = synced
         log.warning(
-            "pending queue cleared chunks=%s clients=%s legacy=%s",
+            "pending queue cleared chunks=%s clients=%s legacy=%s cursors_synced=%s",
             result.get("chunks_deleted"),
             result.get("clients_cleared"),
             result.get("legacy_rows_deleted"),
+            synced,
         )
         return result
+
+    async def _sync_kernel_cursors_for_reset(self, registry: CoreRegistry, scope: str) -> int:
+        """Set clients.incoming/outgoing from core counters (discard unacked pending)."""
+        from agent.asyncutil import maybe_await
+        from collections import defaultdict
+
+        upserts: list[tuple[str, str, int, int]] = []
+        seen: set[tuple[str, str]] = set()
+        cores = list(registry.settings.cores())
+        if "l2tp" in cores:
+            cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+        for core_key in cores:
+            driver = registry.get(core_key)
+            try:
+                snapshot = await maybe_await(driver.usage_snapshot())
+            except Exception:
+                log.exception("pending reset: could not read usage snapshot core=%s", core_key)
+                continue
+            for sample in self._usage_rows(core_key, snapshot):
+                label = str(sample["label"])
+                pair = (str(core_key), label)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                upserts.append(
+                    (
+                        str(core_key),
+                        label,
+                        int(sample["incoming"]),
+                        int(sample["outgoing"]),
+                    )
+                )
+        chunk_totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+        for chunk in await self.store.list_traffic_pending_chunks():
+            key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
+            chunk_totals[key][0] += int(chunk.get("incoming") or 0)
+            chunk_totals[key][1] += int(chunk.get("outgoing") or 0)
+        for key, deltas in chunk_totals.items():
+            if key in seen:
+                continue
+            core_name, client_id = key
+            if not core_name or not client_id:
+                continue
+            client = await self.store.get_client_traffic_cursor(core_name, client_id)
+            base_in, base_out = client if client is not None else (0, 0)
+            upserts.append(
+                (
+                    core_name,
+                    client_id,
+                    base_in + int(deltas[0]),
+                    base_out + int(deltas[1]),
+                )
+            )
+        if not upserts:
+            return 0
+        await self.store.bulk_set_client_traffic_cursors(scope, upserts)
+        return len(upserts)
 
     async def reset_client_record(
         self,

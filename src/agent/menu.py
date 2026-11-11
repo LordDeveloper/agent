@@ -951,7 +951,7 @@ def _reset_pending_volume_queue() -> None:
         ):
             _print(paint("  Cancelled.", DIM))
             return
-        cleared = run_sync(traffic.clear_pending_queue())
+        cleared = run_sync(traffic.clear_pending_queue(runtime.registry))
         _print(
             kv(
                 "Cleared",

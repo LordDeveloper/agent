@@ -28,7 +28,7 @@ class Runtime:
         await self.store.close()
 
 
-def open_runtime(env_file: str | None = None) -> Runtime:
+def open_runtime(env_file: str | None = None, *, migrate: bool = True) -> Runtime:
     import asyncio
 
     from agent.audit import AuditLog
@@ -43,7 +43,7 @@ def open_runtime(env_file: str | None = None) -> Runtime:
         database_config_from_settings(settings),
         slow_query_log_ms=float(settings.slow_query_log_ms or 0.0),
     )
-    asyncio.run(store.open())
+    asyncio.run(store.open(migrate=migrate))
     from agent.support.quota_identity_migration import migrate_client_quota_identity
 
     asyncio.run(migrate_client_quota_identity(store))

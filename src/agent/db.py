@@ -268,6 +268,16 @@ class Store:
     async def clear_pending_traffic_queue(self, scope: str | None = None) -> dict[str, int]:
         return await self._traffic.clear_pending_traffic_queue(scope)
 
+    async def get_client_traffic_cursor(self, core: str, client_id: str) -> tuple[int, int] | None:
+        return await self._traffic.get_client_traffic_cursor(core, client_id)
+
+    async def bulk_set_client_traffic_cursors(
+        self,
+        scope: str,
+        upserts: list[tuple[str, str, int, int]],
+    ) -> None:
+        await self._traffic.bulk_set_client_traffic_cursors(scope, upserts)
+
     async def count_traffic_pending(self) -> int:
         return await self._traffic.count_traffic_pending()
 

@@ -163,7 +163,7 @@ def cmd_stats_volume_reset(args: argparse.Namespace) -> int:
             )
             print_pending_queue_summary(snapshot, limit=int(getattr(args, "show", 25)))
             return 1
-        cleared = run_sync(traffic.clear_pending_queue())
+        cleared = run_sync(traffic.clear_pending_queue(runtime.registry))
         _print_json({"success": True, "cleared": cleared})
         return 0
     finally:
@@ -173,7 +173,7 @@ def cmd_stats_volume_reset(args: argparse.Namespace) -> int:
 def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
     from agent.support.volume_billing_watch import run_volume_billing_watch
 
-    runtime = open_runtime(args.env_file)
+    runtime = open_runtime(args.env_file, migrate=False)
     try:
         pending_limit = (
             0

@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any
 
 from agent.auth_scope import current_scope
 from agent.logutil import activity_log, resolve_log_path
-from agent.traffic.service import AGENT_META_CORE, LAST_SAMPLE_META_KEY, TrafficService
+from agent.traffic.service import (
+    AGENT_META_CORE,
+    LAST_SAMPLE_META_KEY,
+    LAST_SAMPLE_TIMING_META_KEY,
+    TrafficService,
+)
 
 if TYPE_CHECKING:
     from agent.config import AgentSettings
@@ -92,6 +97,7 @@ async def collect_volume_billing_snapshot(
         "pending_last_touch": pending_last_touch,
         "worker_lag_ms": await traffic.last_sample_age_ms(),
         "last_sample_at": await traffic.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_META_KEY),
+        "sample_timing": await traffic.store.get_meta(AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY),
         "enforce_local_volume_quota": bool(settings.enforce_local_volume_quota),
         "traffic_sample_interval_s": float(settings.traffic_sample_interval),
         "quota_enforce_interval_s": float(settings.quota_enforce_interval),
@@ -279,34 +285,23 @@ def render_volume_billing_frame(
             flush=True,
         )
 
-    top = snapshot.get("top_pending") or []
     total_clients = int(snapshot.get("pending_clients") or 0)
-    limit = int(snapshot.get("pending_limit") or 12)
-    if not top:
+    total_chunks = int(snapshot.get("pending_chunks") or 0)
+    if total_clients <= 0:
         print("  (no unacked pending rows)", flush=True)
     else:
-        if limit > 0 and total_clients > len(top):
-            print(
-                f"  (showing top {len(top)} of {total_clients} pending rows; "
-                "use --pending-limit 0 for full list)",
-                flush=True,
-            )
-        for row in top:
-            key = str(row.get("client_key") or "")[:48]
-            core = str(row.get("core") or "")
-            down = _format_bytes(int(row.get("downlink") or 0))
-            up = _format_bytes(int(row.get("uplink") or 0))
-            extra = ""
-            chunk_count = int(row.get("chunk_count") or 0)
-            if chunk_count > 0:
-                extra = f"  ({chunk_count} chunks)"
-            ahead = int(row.get("kernel_ahead") or 0)
-            if ahead > 0:
-                extra += f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
-            print(f"    {core:8} {key:48}  ↓{down}  ↑{up}{extra}", flush=True)
+        print(
+            f"  queue: {total_clients} clients · {total_chunks} chunks · "
+            f"{snapshot.get('pending_bytes_label')} unacked (per-client list disabled)",
+            flush=True,
+        )
+    timing = snapshot.get("sample_timing")
+    if timing:
+        print(f"  last_sample_timing={timing}", flush=True)
 
     for line in log_lines:
-        print(f"  log | {line}", flush=True)
+        if "traffic sample timing" in line or "traffic sample cycle" in line:
+            print(f"  log | {line}", flush=True)
 
 
 def run_volume_billing_watch(

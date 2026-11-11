@@ -248,6 +248,28 @@ class TrafficStoreService:
             )
             return max(int(count or 0), int(legacy or 0))
 
+    async def get_client_traffic_cursor(
+        self,
+        core: str,
+        client_id: str,
+    ) -> tuple[int, int] | None:
+        async with self._runtime.reading() as session:
+            row = await session.get(Client, (str(core), str(client_id)))
+            if row is None or row.incoming is None and row.outgoing is None:
+                return None
+            return int(row.incoming or 0), int(row.outgoing or 0)
+
+    async def bulk_set_client_traffic_cursors(
+        self,
+        scope: str,
+        upserts: list[tuple[str, str, int, int]],
+    ) -> None:
+        if not upserts:
+            return
+        async with self._runtime.writing() as session:
+            await self._apply_client_cursor_upserts(session, str(scope), upserts)
+            await session.commit()
+
     async def clear_pending_traffic_queue(self, scope: str | None = None) -> dict[str, int]:
         """Delete all unacked pending chunks and legacy aggregate rows (panel will not bill them)."""
         scope = str(scope or current_scope())
