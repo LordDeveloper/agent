@@ -480,6 +480,37 @@ class TrafficStoreService:
                 )
         return found
 
+    async def _merge_identity_cursors(
+        self,
+        scope: str,
+        cursors: dict[tuple[str, str], tuple[int, int]],
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        if not cursors:
+            return cursors
+        merged = dict(cursors)
+        for row in await self.list_traffic_identity():
+            core = str(row.get("core") or "").strip()
+            alias = str(row.get("alias") or "").strip()
+            canonical = str(row.get("canonical_key") or "").strip()
+            if not core or not alias or not canonical or alias == canonical:
+                continue
+            alias_pair = (core, alias)
+            canon_pair = (core, canonical)
+            alias_cursor = merged.pop(alias_pair, None)
+            canon_cursor = merged.get(canon_pair)
+            if alias_cursor is None and canon_cursor is None:
+                continue
+            if canon_cursor is None:
+                merged[canon_pair] = alias_cursor
+                continue
+            if alias_cursor is None:
+                continue
+            merged[canon_pair] = (
+                max(canon_cursor[0], alias_cursor[0]),
+                max(canon_cursor[1], alias_cursor[1]),
+            )
+        return merged
+
     async def load_client_traffic_cursors_for_keys(
         self,
         scope: str | None = None,
@@ -533,6 +564,7 @@ class TrafficStoreService:
             cursors = await self.load_client_traffic_cursors_for_keys(scope, cursor_keys)
         else:
             cursors = await self.load_client_traffic_cursors(scope, core)
+        cursors = await self._merge_identity_cursors(scope, cursors)
         cursor_load_ms = int((time.monotonic() - cursor_started) * 1000)
         plan_started = time.monotonic()
         writes = plan(cursors)

@@ -819,6 +819,24 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.get_traffic_ack("xray", "b") is None
 
 
+async def test_zero_cursor_does_not_queue_lifetime_total(store):
+    from agent.auth_scope import DEFAULT_SCOPE
+
+    traffic = TrafficService(store)
+    gb = 1024**3
+    client = ClientUsageModel(id="node-zero", email="zero@example.com", incoming=2 * gb, outgoing=0)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["xray"], driver)
+
+    await store.bulk_set_client_traffic_cursors(
+        DEFAULT_SCOPE,
+        [("xray", "node-zero", 0, 0)],
+    )
+    stats = await _sample(traffic, registry)
+    assert stats.get("initialized", 0) >= 1
+    assert (await traffic.pending_payload())["users"] == {}
+
+
 async def test_legacy_traffic_pending_does_not_stack_on_chunks(store):
     """Stale traffic_pending rows must not inflate chunk sums (watch / GET pending)."""
     from agent.auth_scope import DEFAULT_SCOPE

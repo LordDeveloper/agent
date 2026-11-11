@@ -19,6 +19,8 @@ log = get_logger("traffic")
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 LAST_SAMPLE_TIMING_META_KEY = "traffic_last_sample_timing"
+# From a stored (0,0) cursor, deltas above this are lifetime skew (reset/stale), not one interval.
+_ZERO_CURSOR_SKEW_BYTES = 512 * 1024 * 1024
 FETCH_SNAPSHOT_META_KEY = "traffic_fetch_snapshot"
 FETCH_LOCK_META_KEY = "traffic_fetch_lock"
 # Legacy panel read-lock meta (removed). Ack still deletes stale keys after upgrade.
@@ -723,6 +725,16 @@ class TrafficService:
         else:
             tick_in = max(0, current_incoming - last_in)
             tick_out = max(0, current_outgoing - last_out)
+        if last_in == 0 and last_out == 0 and (tick_in + tick_out) > _ZERO_CURSOR_SKEW_BYTES:
+            log.warning(
+                "traffic zero-cursor skew core=%s client=%s tick=(%s,%s) "
+                "re-anchor without chunk (reset/stale cursor)",
+                core,
+                client_key,
+                tick_in,
+                tick_out,
+            )
+            return "initialized"
         if tick_in <= 0 and tick_out <= 0:
             return "unchanged"
         chunk_inserts.append(
@@ -1396,9 +1408,18 @@ class TrafficService:
 
         upserts: list[tuple[str, str, int, int]] = []
         seen: set[tuple[str, str]] = set()
-        cores = list(registry.settings.cores())
+        settings = registry.settings
+        if hasattr(settings, "traffic_billing_cores") and callable(settings.traffic_billing_cores):
+            cores = list(settings.traffic_billing_cores())
+        else:
+            cores = list(settings.cores())
         if "l2tp" in cores:
             cores = ["l2tp"] + [key for key in cores if key != "l2tp"]
+        if "xray" in cores:
+            try:
+                await registry.get("xray").warm_usage_cache()
+            except Exception:
+                log.exception("pending reset: xray usage prewarm failed")
         for core_key in cores:
             driver = registry.get(core_key)
             try:
@@ -1443,8 +1464,18 @@ class TrafficService:
             )
         if not upserts:
             return 0
+        cursor_map = {(str(c), str(k)): (int(i), int(o)) for c, k, i, o in upserts}
+        for row in await self.store.list_traffic_identity():
+            base = cursor_map.get((str(row.get("core") or ""), str(row.get("canonical_key") or "")))
+            if base is None:
+                continue
+            alias = str(row.get("alias") or "").strip()
+            core_name = str(row.get("core") or "").strip()
+            if not alias or not core_name or (core_name, alias) in cursor_map:
+                continue
+            upserts.append((core_name, alias, base[0], base[1]))
         await self.store.bulk_set_client_traffic_cursors(scope, upserts)
-        return len(upserts)
+        return len(cursor_map)
 
     async def reset_client_record(
         self,
