@@ -77,7 +77,7 @@ async def test_worker_runs_blocking_samples_on_interval():
         def cancel_inflight_sample(self) -> None:
             calls.append(-1.0)
 
-        async def sample_cores_blocking(self, _registry):
+        async def sample_cores_blocking(self, _registry, **kwargs):
             calls.append(1.0)
             return {"clients_seen": 0, "pending": 0, "initialized": 0, "regressed": 0}
 

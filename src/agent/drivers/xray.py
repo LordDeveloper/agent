@@ -3853,7 +3853,8 @@ class XrayDriver(CoreDriver):
 
     def _usage_cache_max_age(self) -> float:
         interval = float(getattr(self.settings, "traffic_sample_interval", 2.0) or 2.0)
-        return max(1.0, interval * 0.95)
+        # Cover a full slow sample cycle so parallel WG/OpenVPN work does not expire the cache.
+        return max(15.0, interval * 4.0)
 
     async def warm_usage_cache(self) -> None:
         """Refresh grouped stats into the in-memory cache (traffic worker prewarm)."""

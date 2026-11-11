@@ -102,6 +102,9 @@ class AgentSettings(BaseSettings):
     traffic_sample_interval: float = 5.0
     # Comma-separated cores excluded from volume sampling (L2TP bills via linked WG peers).
     traffic_sample_skip_cores: str = "l2tp"
+    # When ``agent work`` runs the traffic worker, keep false so GET /pending does not
+    # spawn a second sampler in the HTTP process (SQLite lock + cold xray API).
+    traffic_schedule_sample_on_get: bool = False
     # Max seconds for panel GET/HEAD on stats and /cores/*/diagnose before core I/O is capped.
     # Keep below typical Laravel Guzzle timeouts so the agent fails fast with 503 instead of idle sockets.
     read_budget_seconds: float = 12.0

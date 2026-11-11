@@ -239,9 +239,17 @@ class TrafficService:
 
         loop.create_task(_persist())
 
-    async def sample_cores_blocking(self, registry: CoreRegistry) -> dict[str, int]:
+    async def sample_cores_blocking(
+        self,
+        registry: CoreRegistry,
+        *,
+        xray_prefetched: tuple[Any, int] | None = None,
+    ) -> dict[str, int]:
         """Run one volume sample cycle and await every enabled core (worker cadence)."""
-        stats, core_timings, cycle_ms = await self._sample_cores_merged(registry)
+        stats, core_timings, cycle_ms = await self._sample_cores_merged(
+            registry,
+            xray_prefetched=xray_prefetched,
+        )
         import json
 
         timing_payload = {**core_timings, "sqlite_ms": core_timings.get("_sqlite_ms", 0), "cycle_ms": cycle_ms}
@@ -258,6 +266,8 @@ class TrafficService:
     async def _sample_cores_merged(
         self,
         registry: CoreRegistry,
+        *,
+        xray_prefetched: tuple[Any, int] | None = None,
     ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
         """Parallel core snapshots on the worker registry, then one SQLite commit."""
         from agent.asyncutil import gather_independent
@@ -274,14 +284,26 @@ class TrafficService:
             await self._drop_linked_l2tp_billing(registry.get("l2tp"))
 
         owners_task = asyncio.create_task(self.store.client_scopes())
-        captured = await gather_independent(
-            *(self._read_core_usage_snapshot(registry, core_key) for core_key in cores),
-            return_exceptions=True,
-        )
+        other_cores = [key for key in cores if key != "xray"]
+        capture_tasks = [
+            self._read_core_usage_snapshot(registry, core_key) for core_key in other_cores
+        ]
+        if "xray" in cores:
+            if xray_prefetched is not None:
+
+                async def _xray_from_prefetch() -> tuple[str, Any, int]:
+                    snap, snapshot_ms = xray_prefetched
+                    return "xray", snap, int(snapshot_ms)
+
+                capture_tasks.append(_xray_from_prefetch())
+            else:
+                capture_tasks.append(self._read_core_usage_snapshot(registry, "xray"))
+        captured = await gather_independent(*capture_tasks, return_exceptions=True)
         owners = await owners_task
+        capture_order = other_cores + (["xray"] if "xray" in cores else [])
         core_snapshots: list[tuple[str, Any, int]] = []
         core_timings: dict[str, dict[str, int]] = {}
-        for core_key, item in zip(cores, captured):
+        for core_key, item in zip(capture_order, captured):
             if isinstance(item, Exception):
                 log.exception("traffic snapshot failed core=%s: %s", core_key, item)
                 continue
@@ -542,21 +564,19 @@ class TrafficService:
         *,
         max_sample_age_ms: int,
     ) -> bool:
-        """If the last snapshot is stale, schedule a background ``sample_all``.
+        """Report whether the last snapshot is stale; optionally schedule a refresh.
 
-        Returns True when a refresh was scheduled. **Never awaits** the sample: the panel
-        uses a ~20s HTTP timeout; ``sample_all`` can block longer when cores are slow, which
-        caused cURL error 28 with 0 bytes. The GET always returns promptly with whatever is
-        in the pending queue; the traffic worker or the next poll sees fresher data.
+        With split ``agent serve`` + ``agent work``, sampling must stay in the worker only.
+        **Never awaits** the sample on GET.
         """
-        if max_sample_age_ms <= 0:
-            self._schedule_sample_all(registry)
-            return True
-
         age = await self.last_sample_age_ms()
-        if age is not None and age <= max_sample_age_ms:
+        settings = getattr(registry, "settings", None)
+        schedule_on_get = bool(getattr(settings, "traffic_schedule_sample_on_get", False))
+        stale = max_sample_age_ms <= 0 or age is None or age > max_sample_age_ms
+        if not schedule_on_get:
             return False
-
+        if not stale:
+            return False
         self._schedule_sample_all(registry)
         return True
 
