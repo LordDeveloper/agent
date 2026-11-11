@@ -103,6 +103,37 @@ def _gen_password() -> str:
 DEFAULT_IPSEC_PSK = '12345678'
 
 
+def _stack_signature(server: dict[str, Any]) -> tuple[Any, ...]:
+    """Fields that change xl2tpd or IPsec. User rows are not part of it."""
+    subnet = str(server.get('subnet') or '').strip()
+    if subnet:
+        try:
+            subnet = normalize_l2tp_subnet(subnet)
+        except AgentError:
+            pass
+    gateway = str(server.get('gateway') or '').strip()
+    if subnet:
+        try:
+            gateway = l2tp_gateway(subnet)
+        except AgentError:
+            pass
+    templates = normalize_templates(server.get('templates'))
+    template_key = tuple(sorted(templates.items()))
+    try:
+        port = int(server.get('listen_port') or 1701)
+    except (TypeError, ValueError):
+        port = 1701
+    return (
+        str(server.get('name') or ''),
+        port,
+        subnet,
+        gateway,
+        str(server.get('ipsec_psk') or '').strip() or DEFAULT_IPSEC_PSK,
+        str(server.get('public_host') or ''),
+        template_key,
+    )
+
+
 def _gen_psk() -> str:
     return DEFAULT_IPSEC_PSK
 
@@ -232,14 +263,27 @@ class L2tpDriver(CoreDriver):
     async def list_servers(self) -> list[dict[str, Any]]:
         return await self.store.list_docs(self.key, self._kind)
 
-    async def get_server(self, server_id: int | str) -> dict[str, Any]:
+    async def get_server(self, server_id: int | str, *, include_users: bool = True) -> dict[str, Any]:
+        if not include_users:
+            shell = await self.store.get_server_shell(self.key, str(server_id))
+            if shell and row_visible(self.key, shell.get('scope')):
+                return shell
+            for row in await self.store.list_server_shells(self.key):
+                if not row_visible(self.key, row.get('scope')):
+                    continue
+                if row.get('name') == server_id or str(row.get('id')) == str(server_id):
+                    return row
+            raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
+
         doc = await self.store.get_doc(self.key, self._kind, str(server_id))
         if doc and row_visible(self.key, doc.get('scope')):
+            doc.setdefault('users', [])
             return doc
         for row in await self.list_servers():
             if not row_visible(self.key, row.get('scope')):
                 continue
             if row.get('name') == server_id or str(row.get('id')) == str(server_id):
+                row.setdefault('users', [])
                 return row
         raise AgentError('CONFIG_NOT_FOUND', f'L2TP server [{server_id}] not found', 404)
 
@@ -446,14 +490,17 @@ class L2tpDriver(CoreDriver):
         return changed
 
     async def update_server(self, server_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
-        server = await self.get_server(server_id)
+        # Shell only. Loading every user here made the panel wait on a full
+        # rewrite, then on a strongSwan/xl2tpd restart, and the socket stayed
+        # at 0 bytes until the client gave up.
+        server = await self.get_server(server_id, include_users=False)
         updates = {k: v for k, v in payload.items() if k not in ('id', 'users')}
         if 'subnet' in updates and updates['subnet'] is not None:
             new_subnet = normalize_l2tp_subnet(str(updates['subnet']))
             old_subnet = str(server.get('subnet') or '').strip()
-            orphaned = []
+            orphaned: list[str] = []
             if old_subnet and new_subnet != old_subnet:
-                for user in server.get('users') or []:
+                for user in (await self.get_server(server_id)).get('users') or []:
                     addr = str((user or {}).get('address') or '').strip()
                     if not addr:
                         continue
@@ -478,11 +525,32 @@ class L2tpDriver(CoreDriver):
             updates['ipsec_psk'] = psk or DEFAULT_IPSEC_PSK
         if 'templates' in updates:
             updates['templates'] = normalize_templates(updates.get('templates'))
-        server.update(updates)
-        await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
-        await self._apply_all_configs()
-        await self._ensure_services(start=True, restart=True)
-        return server
+
+        candidate = dict(server)
+        candidate.update(updates)
+        before = _stack_signature(server)
+        after = _stack_signature(candidate)
+        if before == after:
+            log.info(
+                'l2tp server %s unchanged — skip config rewrite and service restart',
+                server.get('id'),
+            )
+            return candidate
+
+        pool_changed = before[1] != after[1] or before[2] != after[2]
+        ipsec_changed = before[4] != after[4] or before[6] != after[6]
+        await self.store.save_server_config(self.key, str(server.get('id')), candidate)
+        await self.audit.record('update', f'{self.key}/server/{server.get("id")}')
+        await self._write_stack_configs()
+        if ipsec_changed or pool_changed:
+            # Start units that are down. Do not pkill charon or bounce xl2tpd
+            # unless the address pool or listen port actually changed.
+            await self._ensure_services(start=True, restart=False)
+        if ipsec_changed:
+            await self._reload_ipsec_secrets()
+        if pool_changed:
+            await self._ensure_xl2tpd(force_restart=True)
+        return candidate
 
     async def delete_server(self, server_id: int | str) -> bool:
         server = await self.get_server(server_id)
@@ -1320,9 +1388,18 @@ class L2tpDriver(CoreDriver):
             )
             return
 
-        await run(['ipsec', 'rereadsecrets'], check=False, timeout=30)
-        await run(['ipsec', 'reload'], check=False, timeout=30)
-        status = await run(['ipsec', 'statusall'], check=False, timeout=30)
+        await self._reload_ipsec_secrets()
+
+    async def _reload_ipsec_secrets(self) -> None:
+        """Pick up a new PSK or cipher list without killing charon."""
+        from agent.ops import charon_ctl_ready
+
+        if not charon_ctl_ready():
+            log.info('l2tp skip ipsec reload — charon.ctl not ready')
+            return
+        await run(['ipsec', 'rereadsecrets'], check=False, timeout=8)
+        await run(['ipsec', 'reload'], check=False, timeout=8)
+        status = await run(['ipsec', 'statusall'], check=False, timeout=8)
         text = (status.stdout or '') + (status.stderr or '')
         if 'L2TP-PSK' not in text:
             log.warning('l2tp ipsec reload finished but L2TP-PSK conn not visible in statusall')

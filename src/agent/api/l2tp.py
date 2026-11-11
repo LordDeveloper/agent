@@ -55,9 +55,17 @@ async def create_server(payload: L2tpServerPayload, l2tp: L2tpDriver = Depends(g
 
 
 @router.get('/servers/{server_id}')
-async def get_server(server_id: str, l2tp: L2tpDriver = Depends(get_l2tp)):
+async def get_server(
+    server_id: str,
+    include_users: bool = True,
+    include_clients: bool = True,
+    l2tp: L2tpDriver = Depends(get_l2tp),
+):
     try:
-        server = await l2tp.get_server(server_id)
+        server = await l2tp.get_server(
+            server_id,
+            include_users=include_users and include_clients,
+        )
     except AgentError as exc:
         raise_agent_error(exc.code, exc.message, exc.status)
     return {'success': True, 'server': server}

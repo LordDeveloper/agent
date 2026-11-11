@@ -101,6 +101,15 @@ class Store:
     async def get_doc(self, core: str, kind: str, doc_id: str) -> dict[str, Any] | None:
         return await self._documents.get_doc(core, kind, doc_id)
 
+    async def get_server_shell(self, core: str, doc_id: str) -> dict[str, Any] | None:
+        return await self._documents.get_server_shell(core, doc_id)
+
+    async def list_server_shells(self, core: str) -> list[dict[str, Any]]:
+        return await self._documents.list_server_shells(core)
+
+    async def save_server_config(self, core: str, doc_id: str, data: dict[str, Any]) -> None:
+        await self._documents.save_server_config(core, doc_id, data)
+
     async def put_doc(self, core: str, kind: str, doc_id: str, data: dict[str, Any]) -> None:
         await self._documents.put_doc(core, kind, doc_id, data)
 

@@ -141,6 +141,107 @@ def test_retry_same_email_keeps_one_user(tmp_path, monkeypatch):
     assert remaining['users'] == []
 
 
+def test_unchanged_server_update_does_not_rewrite_or_restart(tmp_path, monkeypatch):
+    calls = {'apply': 0, 'ensure': 0, 'write': 0, 'ipsec': 0, 'xl2tpd': 0}
+
+    async def _count_apply(self):
+        calls['apply'] += 1
+
+    async def _count_ensure(self, **kwargs):
+        calls['ensure'] += 1
+        assert kwargs.get('restart') is not True
+
+    async def _count_write(self):
+        calls['write'] += 1
+
+    async def _count_ipsec(self):
+        calls['ipsec'] += 1
+
+    async def _count_xl2tpd(self, **_kwargs):
+        calls['xl2tpd'] += 1
+
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _count_apply)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _count_ensure)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._write_stack_configs', _count_write)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._reload_ipsec_secrets', _count_ipsec)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_xl2tpd', _count_xl2tpd)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._commit_user_runtime', _async_none)
+
+    from tests.conftest import open_store
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = open_store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        server = await driver.create_server({'subnet': '10.90.0.0/16', 'name': 'sync'})
+        user = await driver.add_user(server['id'], {'id': 'keep-me', 'email': 'keep@test'})
+        before = dict(calls)
+        again = await driver.update_server(server['id'], {
+            'name': server['name'],
+            'listen_port': server['listen_port'],
+            'subnet': server['subnet'],
+            'gateway': server['gateway'],
+            'ipsec_psk': server['ipsec_psk'],
+            'templates': server['templates'],
+            'public_host': server.get('public_host') or '',
+        })
+        shell = await driver.get_server(server['id'], include_users=False)
+        stored = await driver.get_server(server['id'])
+        return before, again, shell, stored, user
+
+    before, again, shell, stored, user = asyncio.run(scenario())
+    assert calls == before
+    assert again['subnet'] == '10.90.0.0/16'
+    assert shell['users'] == []
+    assert stored['users'][0]['id'] == user['id']
+
+
+def test_psk_change_reloads_secrets_without_hard_restart(tmp_path, monkeypatch):
+    calls = {'ensure_restart': [], 'write': 0, 'ipsec': 0, 'xl2tpd': 0}
+
+    async def _count_ensure(self, **kwargs):
+        calls['ensure_restart'].append(bool(kwargs.get('restart')))
+
+    async def _count_write(self):
+        calls['write'] += 1
+
+    async def _count_ipsec(self):
+        calls['ipsec'] += 1
+
+    async def _count_xl2tpd(self, **kwargs):
+        calls['xl2tpd'] += 1
+        calls['xl2tpd_force'] = bool(kwargs.get('force_restart'))
+
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _count_ensure)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._write_stack_configs', _count_write)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._reload_ipsec_secrets', _count_ipsec)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_xl2tpd', _count_xl2tpd)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._commit_user_runtime', _async_none)
+
+    from tests.conftest import open_store
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = open_store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        server = await driver.create_server({'subnet': '10.91.0.0/16', 'name': 'psk'})
+        await driver.add_user(server['id'], {'id': 'still-here', 'email': 'still@test'})
+        before = len(calls['ensure_restart'])
+        await driver.update_server(server['id'], {'ipsec_psk': 'rotated-psk'})
+        return await driver.get_server(server['id']), before
+
+    stored, before = asyncio.run(scenario())
+    assert stored['ipsec_psk'] == 'rotated-psk'
+    assert stored['users'][0]['id'] == 'still-here'
+    assert calls['write'] == 1
+    assert calls['ipsec'] == 1
+    assert calls['ensure_restart'][before:] == [False]
+    assert calls['xl2tpd'] == 0
+
+
 def test_normalize_templates_upgrades_windows_slow_defaults():
     from agent.support.l2tp_config import DEFAULT_IPSEC_ESP, DEFAULT_IPSEC_IKE, normalize_templates
 

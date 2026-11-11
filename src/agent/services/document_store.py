@@ -474,6 +474,48 @@ class DocumentStore:
             artifact = await session.get(CoreArtifact, (core, kind, str(doc_id)))
             return dict(artifact.data) if artifact else None
 
+    async def get_server_shell(self, core: str, doc_id: str) -> dict[str, Any] | None:
+        """Server config only. Does not load every user row."""
+        async with self._runtime.reading() as session:
+            row = await session.get(Server, (core, str(doc_id)))
+            if row is None:
+                return None
+            return self._server_shell(row)
+
+    async def list_server_shells(self, core: str) -> list[dict[str, Any]]:
+        async with self._runtime.reading() as session:
+            rows = (
+                await session.execute(select(Server).where(Server.core_id == core).order_by(Server.id))
+            ).scalars().all()
+            return [self._server_shell(row) for row in rows]
+
+    async def save_server_config(self, core: str, doc_id: str, data: dict[str, Any]) -> None:
+        """Update the server row. Leave user rows in place.
+
+        A full put_doc deletes and reinserts every user, which holds the SQLite
+        write lock long enough that a concurrent GET returns zero bytes.
+        """
+        config, _users = split_server_document(data)
+        async with self._runtime.writing() as session:
+            await self._ensure_core(session, core)
+            row = await session.get(Server, (core, str(doc_id)))
+            if row is None or not row_visible(core, row.scope):
+                return
+            if str(core) in SHARED_CORES:
+                row.scope = DEFAULT_SCOPE
+            row.config = config
+            row.updated_at = _now()
+            await session.commit()
+
+    @staticmethod
+    def _server_shell(row: Server) -> dict[str, Any]:
+        doc = dict(row.config or {})
+        doc["scope"] = str(row.scope or DEFAULT_SCOPE)
+        doc["users"] = []
+        if doc.get("id") is None:
+            doc["id"] = row.id
+        return doc
+
     async def list_docs(self, core: str, kind: str) -> list[dict[str, Any]]:
         docs: list[dict[str, Any]] = []
         async with self._runtime.reading() as session:
