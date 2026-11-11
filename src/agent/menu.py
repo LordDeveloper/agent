@@ -913,6 +913,12 @@ def _service_menu() -> None:
         _run_action(f"Service {picked}", lambda action=picked: _show_service_action(action))
 
 
+def _show_volume_billing_watch() -> None:
+    from agent.cli import cmd_stats_volume_watch
+
+    cmd_stats_volume_watch(SimpleNamespace(env_file=None, interval=2.0, once=False, json=False))
+
+
 def _stats_menu() -> None:
     while True:
         render_header("Stats")
@@ -920,11 +926,15 @@ def _stats_menu() -> None:
             [
                 Choice("snapshot", "Usage snapshot", CYAN, "1"),
                 Choice("online", "Online users", GREEN, "2"),
+                Choice("volume_watch", "Volume billing (live)", YELLOW, "3"),
                 Choice("back", "Back", WHITE, "0"),
             ]
         )
         if picked in {None, "back"}:
             return
+        if picked == "volume_watch":
+            _run_action("Volume billing (live)", _show_volume_billing_watch)
+            continue
         _run_action(
             "Online users" if picked == "online" else "Usage snapshot",
             lambda online=picked == "online": _show_stats(online_only=online),

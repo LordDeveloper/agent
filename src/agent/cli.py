@@ -134,6 +134,21 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats_volume_watch(args: argparse.Namespace) -> int:
+    from agent.support.volume_billing_watch import run_volume_billing_watch
+
+    runtime = open_runtime(args.env_file)
+    try:
+        return run_volume_billing_watch(
+            runtime,
+            interval=float(args.interval),
+            once=bool(args.once),
+            as_json=bool(args.json),
+        )
+    finally:
+        run_sync(runtime.close())
+
+
 def cmd_core_list(args: argparse.Namespace) -> int:
     runtime = open_runtime(args.env_file)
     try:
@@ -811,6 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print uplink/downlink for currently online subscriptions",
     )
     p_stats.set_defaults(func=cmd_stats)
+
+    p_stats_vol = sub.add_parser(
+        "stats-volume-watch",
+        help="Foreground pending-queue / volume-billing monitor (Ctrl+C to stop)",
+    )
+    _env_flag(p_stats_vol)
+    p_stats_vol.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Seconds between refreshes (default 2)",
+    )
+    p_stats_vol.add_argument("--once", action="store_true", help="Print one snapshot and exit")
+    p_stats_vol.add_argument("--json", action="store_true", help="Emit JSON lines")
+    p_stats_vol.set_defaults(func=cmd_stats_volume_watch)
 
     p_core = sub.add_parser("core", help="Manage VPN cores")
     core_sub = p_core.add_subparsers(dest="core_command", required=True)
