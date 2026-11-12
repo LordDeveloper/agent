@@ -2,9 +2,23 @@
 # Build: pyinstaller agent.spec
 # Prefer Linux Docker build for VPS binaries (see Dockerfile / make build).
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
+
+# Loaded at import time via marshal (see agent.traffic.service, agent.api.stats).
+_RUNTIME_BLOBS = [
+    ("src/agent/traffic/_service_body.pyc", "agent/traffic"),
+    ("src/agent/api/_stats_body.pyc", "agent/api"),
+]
+for _src, _dest in _RUNTIME_BLOBS:
+    if not Path(_src).is_file():
+        raise SystemExit(
+            f"Missing marshal blob for PyInstaller: {_src!s} "
+            f"(force-add from git if ignored: git add -f {_src!s})"
+        )
 
 _hidden = [
     'agent.cli',
@@ -51,6 +65,7 @@ a = Analysis(
     datas=[
         ('alembic.ini', '.'),
         ('alembic', 'alembic'),
+        *_RUNTIME_BLOBS,
     ],
     hiddenimports=_hidden,
     hookspath=[],
