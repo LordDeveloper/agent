@@ -27,6 +27,12 @@ class Client(Base):
         Index("clients_by_email", "core_id", "email"),
         Index("clients_by_parent_iface", "parent_interface_core_id", "parent_interface_id"),
         Index("clients_by_parent_server", "parent_server_core_id", "parent_server_id"),
+        # Cursor reads must not pull the JSON meta blob stored on the same row.
+        Index("ix_clients_scope_cursor", "scope", "core_id", "id", "incoming", "outgoing"),
+        Index("ix_clients_cursor", "core_id", "id", "incoming", "outgoing"),
+        Index("ix_clients_by_id", "id"),
+        Index("ix_clients_email", "email"),
+        Index("ix_clients_by_role", "core_id", "role"),
         {"sqlite_with_rowid": False},
     )
 

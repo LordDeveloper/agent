@@ -7,13 +7,17 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, bindparam, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent.auth_scope import current_scope
 from agent.database.models.client import Client
 from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending, TrafficPendingChunk
 from agent.database.session import DatabaseRuntime
+
+
+def _sqlite(session) -> bool:
+    return session.get_bind().dialect.name == "sqlite"
 
 
 class TrafficStoreService:
@@ -206,7 +210,11 @@ class TrafficStoreService:
             await session.commit()
 
     async def get_traffic_pending(self, core: str, client_key: str) -> dict[str, Any] | None:
-        _, pending = await self._traffic_books(scope=current_scope(), core=core)
+        _, pending = await self._traffic_books(
+            scope=current_scope(),
+            core=core,
+            client_key=client_key,
+        )
         row = pending.get((str(core), str(client_key)))
         if row is None:
             return None
@@ -256,10 +264,28 @@ class TrafficStoreService:
         client_id: str,
     ) -> tuple[int, int] | None:
         async with self._runtime.reading() as session:
-            row = await session.get(Client, (str(core), str(client_id)))
-            if row is None or row.incoming is None and row.outgoing is None:
+            if _sqlite(session):
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT incoming, outgoing FROM clients INDEXED BY ix_clients_cursor "
+                            "WHERE core_id = :core AND id = :client_id"
+                        ),
+                        {"core": str(core), "client_id": str(client_id)},
+                    )
+                ).first()
+            else:
+                row = (
+                    await session.execute(
+                        select(Client.incoming, Client.outgoing).where(
+                            Client.core_id == str(core),
+                            Client.id == str(client_id),
+                        )
+                    )
+                ).first()
+            if row is None or row[0] is None and row[1] is None:
                 return None
-            return int(row.incoming or 0), int(row.outgoing or 0)
+            return int(row[0] or 0), int(row[1] or 0)
 
     async def bulk_set_client_traffic_cursors(
         self,
@@ -318,22 +344,120 @@ class TrafficStoreService:
         async with self._runtime.reading() as session:
             rows = (
                 await session.execute(
-                    select(TrafficPendingChunk)
+                    select(
+                        TrafficPendingChunk.chunk_id,
+                        TrafficPendingChunk.core,
+                        TrafficPendingChunk.client_key,
+                        TrafficPendingChunk.incoming,
+                        TrafficPendingChunk.outgoing,
+                        TrafficPendingChunk.sampled_at,
+                    )
                     .where(TrafficPendingChunk.scope == scope)
-                    .order_by(TrafficPendingChunk.core, TrafficPendingChunk.client_key, TrafficPendingChunk.sampled_at)
+                    .order_by(
+                        TrafficPendingChunk.core,
+                        TrafficPendingChunk.client_key,
+                        TrafficPendingChunk.sampled_at,
+                    )
                 )
-            ).scalars().all()
+            ).all()
             return [
                 {
-                    "chunk_id": str(row.chunk_id),
-                    "core": row.core,
-                    "client_key": row.client_key,
-                    "incoming": int(row.incoming),
-                    "outgoing": int(row.outgoing),
-                    "sampled_at": row.sampled_at,
+                    "chunk_id": str(chunk_id),
+                    "core": core,
+                    "client_key": client_key,
+                    "incoming": int(incoming),
+                    "outgoing": int(outgoing),
+                    "sampled_at": sampled_at,
                 }
-                for row in rows
+                for chunk_id, core, client_key, incoming, outgoing, sampled_at in rows
             ]
+
+    async def load_pending_billing(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Chunk rows and their sums from one read.
+
+        The panel GET used to scan every chunk twice and then load each client's
+        JSON document only to fill counters the response does not return.
+        """
+        scope = current_scope()
+        async with self._runtime.reading() as session:
+            chunk_rows = (
+                await session.execute(
+                    select(
+                        TrafficPendingChunk.chunk_id,
+                        TrafficPendingChunk.core,
+                        TrafficPendingChunk.client_key,
+                        TrafficPendingChunk.incoming,
+                        TrafficPendingChunk.outgoing,
+                        TrafficPendingChunk.sampled_at,
+                    )
+                    .where(TrafficPendingChunk.scope == scope)
+                    .order_by(
+                        TrafficPendingChunk.core,
+                        TrafficPendingChunk.client_key,
+                        TrafficPendingChunk.sampled_at,
+                    )
+                )
+            ).all()
+            chunks: list[dict[str, Any]] = []
+            pending: dict[tuple[str, str], dict[str, int]] = {}
+            for chunk_id, core, client_key, incoming, outgoing, sampled_at in chunk_rows:
+                key = (str(core), str(client_key))
+                agg = pending.setdefault(
+                    key,
+                    {
+                        "delta_incoming": 0,
+                        "delta_outgoing": 0,
+                        "current_incoming": 0,
+                        "current_outgoing": 0,
+                    },
+                )
+                agg["delta_incoming"] += int(incoming)
+                agg["delta_outgoing"] += int(outgoing)
+                chunks.append(
+                    {
+                        "chunk_id": str(chunk_id),
+                        "core": key[0],
+                        "client_key": key[1],
+                        "incoming": int(incoming),
+                        "outgoing": int(outgoing),
+                        "sampled_at": sampled_at,
+                    }
+                )
+            legacy = (
+                await session.execute(
+                    select(
+                        TrafficPending.core,
+                        TrafficPending.client_key,
+                        TrafficPending.delta_incoming,
+                        TrafficPending.delta_outgoing,
+                        TrafficPending.current_incoming,
+                        TrafficPending.current_outgoing,
+                    ).where(TrafficPending.scope == scope)
+                )
+            ).all()
+            for core, client_key, delta_in, delta_out, current_in, current_out in legacy:
+                key = (str(core), str(client_key))
+                if key in pending:
+                    continue
+                pending[key] = {
+                    "delta_incoming": int(delta_in),
+                    "delta_outgoing": int(delta_out),
+                    "current_incoming": int(current_in),
+                    "current_outgoing": int(current_out),
+                }
+        rows = [
+            {
+                "core": core,
+                "client_key": client_key,
+                "delta_incoming": int(item["delta_incoming"]),
+                "delta_outgoing": int(item["delta_outgoing"]),
+                "current_incoming": int(item["current_incoming"]),
+                "current_outgoing": int(item["current_outgoing"]),
+                "updated_at": None,
+            }
+            for (core, client_key), item in sorted(pending.items())
+        ]
+        return chunks, rows
 
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         ids = [str(item).strip() for item in chunk_ids if str(item or "").strip()]
@@ -384,87 +508,134 @@ class TrafficStoreService:
         async with self._runtime.reading() as session:
             rows = (
                 await session.execute(
-                    select(TrafficIdentity)
+                    select(
+                        TrafficIdentity.core,
+                        TrafficIdentity.alias,
+                        TrafficIdentity.canonical_key,
+                    )
                     .where(TrafficIdentity.scope == current_scope())
                     .order_by(TrafficIdentity.core, TrafficIdentity.alias)
                 )
-            ).scalars().all()
+            ).all()
             return [
-                {"core": row.core, "alias": row.alias, "canonical_key": row.canonical_key}
-                for row in rows
+                {"core": core, "alias": alias, "canonical_key": canonical_key}
+                for core, alias, canonical_key in rows
             ]
 
-    async def _traffic_books(self, scope: str | None = None, core: str | None = None) -> tuple[
+    async def _select_cursors(
+        self,
+        session,
+        keys: list[tuple[str, str]] | set[tuple[str, str]],
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        """Read kernel cursors from the covering index, not the client JSON row."""
+        by_core: dict[str, list[str]] = defaultdict(list)
+        for core_name, client_id in keys:
+            core_text = str(core_name or "").strip()
+            client_text = str(client_id or "").strip()
+            if core_text and client_text:
+                by_core[core_text].append(client_text)
+        found: dict[tuple[str, str], tuple[int, int]] = {}
+        sqlite = _sqlite(session)
+        keyed = text(
+            "SELECT core_id, id, incoming, outgoing FROM clients INDEXED BY ix_clients_cursor "
+            "WHERE core_id = :core AND id IN :ids"
+        ).bindparams(bindparam("ids", expanding=True))
+        for core_name, client_ids in by_core.items():
+            unique_ids = list(dict.fromkeys(client_ids))
+            for offset in range(0, len(unique_ids), 400):
+                batch = unique_ids[offset : offset + 400]
+                if sqlite:
+                    result = await session.execute(keyed, {"core": core_name, "ids": batch})
+                else:
+                    result = await session.execute(
+                        select(Client.core_id, Client.id, Client.incoming, Client.outgoing).where(
+                            Client.core_id == core_name,
+                            Client.id.in_(batch),
+                        )
+                    )
+                for core_id, client_id, incoming, outgoing in result.all():
+                    if incoming is None and outgoing is None:
+                        continue
+                    found[(str(core_id), str(client_id))] = (int(incoming or 0), int(outgoing or 0))
+        return found
+
+    async def _traffic_books(
+        self,
+        scope: str | None = None,
+        core: str | None = None,
+        client_key: str | None = None,
+    ) -> tuple[
         dict[tuple[str, str], tuple[int, int]],
         dict[tuple[str, str], dict[str, int]],
     ]:
         scope = str(scope or current_scope())
         core_name = str(core or "").strip()
+        client_name = str(client_key or "").strip()
         async with self._runtime.reading() as session:
-            ack_query = select(TrafficAck).where(TrafficAck.scope == scope)
-            chunk_query = select(TrafficPendingChunk).where(TrafficPendingChunk.scope == scope)
+            ack_query = select(
+                TrafficAck.core,
+                TrafficAck.client_key,
+                TrafficAck.incoming,
+                TrafficAck.outgoing,
+            ).where(TrafficAck.scope == scope)
+            chunk_query = (
+                select(
+                    TrafficPendingChunk.core,
+                    TrafficPendingChunk.client_key,
+                    func.coalesce(func.sum(TrafficPendingChunk.incoming), 0),
+                    func.coalesce(func.sum(TrafficPendingChunk.outgoing), 0),
+                )
+                .where(TrafficPendingChunk.scope == scope)
+                .group_by(TrafficPendingChunk.core, TrafficPendingChunk.client_key)
+            )
             if core_name:
                 ack_query = ack_query.where(TrafficAck.core == core_name)
                 chunk_query = chunk_query.where(TrafficPendingChunk.core == core_name)
-            ack_rows = (await session.execute(ack_query)).scalars().all()
+            if client_name:
+                ack_query = ack_query.where(TrafficAck.client_key == client_name)
+                chunk_query = chunk_query.where(TrafficPendingChunk.client_key == client_name)
             acks = {
-                (str(row.core), str(row.client_key)): (int(row.incoming), int(row.outgoing))
-                for row in ack_rows
+                (str(ack_core), str(ack_key)): (int(incoming), int(outgoing))
+                for ack_core, ack_key, incoming, outgoing in (await session.execute(ack_query)).all()
             }
-            chunk_rows = (await session.execute(chunk_query)).scalars().all()
             pending: dict[tuple[str, str], dict[str, int]] = {}
-            cursor_map: dict[tuple[str, str], tuple[int, int]] = {}
-            pending_keys: set[tuple[str, str]] = set()
-            for row in chunk_rows:
-                pending_keys.add((str(row.core), str(row.client_key)))
-            if pending_keys:
-                by_core: dict[str, list[str]] = defaultdict(list)
-                for core_id, client_id in pending_keys:
-                    by_core[str(core_id)].append(str(client_id))
-                for core_id, client_ids in by_core.items():
-                    unique = list(dict.fromkeys(client_ids))
-                    for offset in range(0, len(unique), 400):
-                        batch = unique[offset : offset + 400]
-                        result = await session.execute(
-                            select(Client).where(Client.core_id == core_id, Client.id.in_(batch))
-                        )
-                        for row in result.scalars().all():
-                            if row.incoming is None and row.outgoing is None:
-                                continue
-                            cursor_map[(str(row.core_id), str(row.id))] = (
-                                int(row.incoming or 0),
-                                int(row.outgoing or 0),
-                            )
-            for row in chunk_rows:
-                key = (str(row.core), str(row.client_key))
-                agg = pending.setdefault(
-                    key,
-                    {
-                        "delta_incoming": 0,
-                        "delta_outgoing": 0,
-                        "current_incoming": 0,
-                        "current_outgoing": 0,
-                    },
-                )
-                agg["delta_incoming"] += int(row.incoming)
-                agg["delta_outgoing"] += int(row.outgoing)
+            summed = (await session.execute(chunk_query)).all()
+            for chunk_core, chunk_key, incoming, outgoing in summed:
+                pending[(str(chunk_core), str(chunk_key))] = {
+                    "delta_incoming": int(incoming or 0),
+                    "delta_outgoing": int(outgoing or 0),
+                    "current_incoming": 0,
+                    "current_outgoing": 0,
+                }
+            cursor_map = await self._select_cursors(session, list(pending))
             for key, agg in pending.items():
                 cursor = cursor_map.get(key, (0, 0))
                 agg["current_incoming"] = int(cursor[0])
                 agg["current_outgoing"] = int(cursor[1])
-            legacy_query = select(TrafficPending).where(TrafficPending.scope == scope)
+            legacy_query = select(
+                TrafficPending.core,
+                TrafficPending.client_key,
+                TrafficPending.delta_incoming,
+                TrafficPending.delta_outgoing,
+                TrafficPending.current_incoming,
+                TrafficPending.current_outgoing,
+            ).where(TrafficPending.scope == scope)
             if core_name:
                 legacy_query = legacy_query.where(TrafficPending.core == core_name)
-            for row in (await session.execute(legacy_query)).scalars().all():
-                key = (str(row.core), str(row.client_key))
+            if client_name:
+                legacy_query = legacy_query.where(TrafficPending.client_key == client_name)
+            for row_core, row_key, delta_in, delta_out, current_in, current_out in (
+                await session.execute(legacy_query)
+            ).all():
+                key = (str(row_core), str(row_key))
                 if key in pending:
                     # Chunk rows are authoritative; legacy TrafficPending deltas must not stack.
                     continue
                 pending[key] = {
-                    "delta_incoming": int(row.delta_incoming),
-                    "delta_outgoing": int(row.delta_outgoing),
-                    "current_incoming": int(row.current_incoming),
-                    "current_outgoing": int(row.current_outgoing),
+                    "delta_incoming": int(delta_in),
+                    "delta_outgoing": int(delta_out),
+                    "current_incoming": int(current_in),
+                    "current_outgoing": int(current_out),
                 }
             return acks, pending
 
@@ -475,33 +646,57 @@ class TrafficStoreService:
     ) -> dict[tuple[str, str], tuple[int, int]]:
         scope = str(scope or current_scope())
         core_name = str(core or "").strip()
-        found: dict[tuple[str, str], tuple[int, int]] = {}
         async with self._runtime.reading() as session:
-            client_query = select(Client).where(Client.scope == scope)
-            if core_name:
-                client_query = client_query.where(Client.core_id == core_name)
-            for row in (await session.execute(client_query)).scalars().all():
-                pair = (str(row.core_id), str(row.id))
-                if row.incoming is None and row.outgoing is None:
-                    continue
-                found[pair] = (
-                    int(row.incoming or 0),
-                    int(row.outgoing or 0),
+            if _sqlite(session):
+                sql = (
+                    "SELECT core_id, id, incoming, outgoing FROM clients "
+                    "INDEXED BY ix_clients_scope_cursor WHERE scope = :scope"
                 )
-        return found
+                params: dict[str, Any] = {"scope": scope}
+                if core_name:
+                    sql += " AND core_id = :core"
+                    params["core"] = core_name
+                rows = (await session.execute(text(sql), params)).all()
+            else:
+                client_query = select(Client.core_id, Client.id, Client.incoming, Client.outgoing).where(
+                    Client.scope == scope
+                )
+                if core_name:
+                    client_query = client_query.where(Client.core_id == core_name)
+                rows = (await session.execute(client_query)).all()
+            found: dict[tuple[str, str], tuple[int, int]] = {}
+            for core_id, client_id, incoming, outgoing in rows:
+                if incoming is None and outgoing is None:
+                    continue
+                found[(str(core_id), str(client_id))] = (int(incoming or 0), int(outgoing or 0))
+            return await self._merge_identity_cursors(scope, found, session)
 
     async def _merge_identity_cursors(
         self,
         scope: str,
         cursors: dict[tuple[str, str], tuple[int, int]],
+        session,
     ) -> dict[tuple[str, str], tuple[int, int]]:
         if not cursors:
             return cursors
         merged = dict(cursors)
-        for row in await self.list_traffic_identity():
-            core = str(row.get("core") or "").strip()
-            alias = str(row.get("alias") or "").strip()
-            canonical = str(row.get("canonical_key") or "").strip()
+        cores = sorted({core for core, _key in cursors})
+        rows = (
+            await session.execute(
+                select(
+                    TrafficIdentity.core,
+                    TrafficIdentity.alias,
+                    TrafficIdentity.canonical_key,
+                ).where(
+                    TrafficIdentity.scope == scope,
+                    TrafficIdentity.core.in_(cores),
+                )
+            )
+        ).all()
+        for core, alias, canonical in rows:
+            core = str(core or "").strip()
+            alias = str(alias or "").strip()
+            canonical = str(canonical or "").strip()
             if not core or not alias or not canonical or alias == canonical:
                 continue
             alias_pair = (core, alias)
@@ -525,33 +720,9 @@ class TrafficStoreService:
         scope = str(scope or current_scope())
         if not keys:
             return {}
-        by_core: dict[str, list[str]] = defaultdict(list)
-        for core_name, client_id in keys:
-            core_text = str(core_name or "").strip()
-            client_text = str(client_id or "").strip()
-            if not core_text or not client_text:
-                continue
-            by_core[core_text].append(client_text)
-        found: dict[tuple[str, str], tuple[int, int]] = {}
         async with self._runtime.reading() as session:
-            for core_name, client_ids in by_core.items():
-                unique_ids = list(dict.fromkeys(client_ids))
-                for offset in range(0, len(unique_ids), 400):
-                    batch = unique_ids[offset : offset + 400]
-                    result = await session.execute(
-                        select(Client).where(
-                            Client.core_id == core_name,
-                            Client.id.in_(batch),
-                        )
-                    )
-                    for row in result.scalars().all():
-                        if row.incoming is None and row.outgoing is None:
-                            continue
-                        found[(str(row.core_id), str(row.id))] = (
-                            int(row.incoming or 0),
-                            int(row.outgoing or 0),
-                        )
-        return found
+            found = await self._select_cursors(session, keys)
+            return await self._merge_identity_cursors(scope, found, session)
 
     async def apply_traffic_sample(
         self,
@@ -569,7 +740,6 @@ class TrafficStoreService:
             cursors = await self.load_client_traffic_cursors_for_keys(scope, cursor_keys)
         else:
             cursors = await self.load_client_traffic_cursors(scope, core)
-        cursors = await self._merge_identity_cursors(scope, cursors)
         cursor_load_ms = int((time.monotonic() - cursor_started) * 1000)
         plan_started = time.monotonic()
         writes = plan(cursors)
@@ -713,8 +883,6 @@ class TrafficStoreService:
     ) -> None:
         if not upserts:
             return
-        from collections import defaultdict
-
         from agent.database.models.core import Core
 
         by_core: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
@@ -728,23 +896,37 @@ class TrafficStoreService:
         for core_name in by_core:
             if await session.get(Core, core_name) is None:
                 session.add(Core(id=core_name))
+        if by_core:
+            await session.flush()
 
-        existing: dict[tuple[str, str], Client] = {}
+        existing: set[tuple[str, str]] = set()
         for core_name, rows in by_core.items():
-            client_ids = [item[0] for item in rows]
-            if not client_ids:
-                continue
-            result = await session.execute(
-                select(Client).where(Client.core_id == core_name, Client.id.in_(client_ids))
-            )
-            for row in result.scalars().all():
-                existing[(str(row.core_id), str(row.id))] = row
+            client_ids = list(dict.fromkeys(item[0] for item in rows))
+            for offset in range(0, len(client_ids), 400):
+                batch = client_ids[offset : offset + 400]
+                if _sqlite(session):
+                    result = await session.execute(
+                        text(
+                            "SELECT core_id, id FROM clients INDEXED BY ix_clients_cursor "
+                            "WHERE core_id = :core AND id IN :ids"
+                        ).bindparams(bindparam("ids", expanding=True)),
+                        {"core": core_name, "ids": batch},
+                    )
+                else:
+                    result = await session.execute(
+                        select(Client.core_id, Client.id).where(
+                            Client.core_id == core_name,
+                            Client.id.in_(batch),
+                        )
+                    )
+                for core_id, client_id in result.all():
+                    existing.add((str(core_id), str(client_id)))
 
+        updates: list[dict[str, Any]] = []
         for core_name, rows in by_core.items():
             for client_id, incoming, outgoing in rows:
                 key = (core_name, client_id)
-                client = existing.get(key)
-                if client is None:
+                if key not in existing:
                     session.add(
                         Client(
                             core_id=core_name,
@@ -754,9 +936,18 @@ class TrafficStoreService:
                             outgoing=int(outgoing),
                         )
                     )
+                    existing.add(key)
                     continue
-                client.incoming = int(incoming)
-                client.outgoing = int(outgoing)
+                updates.append(
+                    {
+                        "core_id": core_name,
+                        "id": client_id,
+                        "incoming": int(incoming),
+                        "outgoing": int(outgoing),
+                    }
+                )
+        if updates:
+            await session.execute(update(Client), updates)
 
     async def _update_client_traffic_cursor(
         self,

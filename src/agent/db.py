@@ -262,6 +262,9 @@ class Store:
     async def list_traffic_pending_chunks(self) -> list[dict[str, Any]]:
         return await self._traffic.list_traffic_pending_chunks()
 
+    async def load_pending_billing(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return await self._traffic.load_pending_billing()
+
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         return await self._traffic.ack_traffic_chunk_ids(chunk_ids)
 

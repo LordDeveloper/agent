@@ -5,6 +5,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -13,15 +14,58 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from agent.database.config import DatabaseConfig
-from agent.database.engine import configure_sqlite_pragmas, create_read_engine, create_write_engine
+from agent.database.engine import (
+    BUSY_TIMEOUT_MS,
+    CACHE_SIZE_KIB,
+    MMAP_SIZE,
+    configure_sqlite_pragmas,
+    create_read_engine,
+    create_write_engine,
+)
 from agent.logutil import get_logger
 from agent.runtime import RuntimeTrace
 
 _sql_log = get_logger("sql")
 
 LOCK_ATTEMPTS = 4
+_SQL_TEXT_LIMIT = 180
+_stmt_trace: ContextVar[list[tuple[float, str]] | None] = ContextVar("agent_sql_stmt_trace", default=None)
+_traced_engines: set[int] = set()
 
 T = TypeVar("T")
+
+
+def _install_statement_trace(engine) -> None:
+    marker = id(engine)
+    if marker in _traced_engines:
+        return
+    _traced_engines.add(marker)
+    sync = engine.sync_engine
+
+    @event.listens_for(sync, "before_cursor_execute")
+    def _before(_conn, _cursor, _statement, _parameters, context, _executemany):
+        if _stmt_trace.get() is None:
+            return
+        context._agent_sql_started = time.perf_counter()
+
+    @event.listens_for(sync, "after_cursor_execute")
+    def _after(_conn, _cursor, statement, _parameters, context, _executemany):
+        buf = _stmt_trace.get()
+        started = getattr(context, "_agent_sql_started", None)
+        if buf is None or started is None:
+            return
+        elapsed = (time.perf_counter() - started) * 1000
+        text = " ".join(str(statement).split())
+        if len(text) > _SQL_TEXT_LIMIT:
+            text = text[: _SQL_TEXT_LIMIT - 3] + "..."
+        buf.append((elapsed, text))
+
+
+def _slow_statement_detail(buf: list[tuple[float, str]] | None) -> str:
+    if not buf:
+        return ""
+    elapsed, sql = max(buf, key=lambda item: item[0])
+    return f"stmts={len(buf)} slowest_ms={elapsed:.1f} sql={sql}"
 
 
 def _is_db_locked(exc: BaseException) -> bool:
@@ -63,17 +107,30 @@ class DatabaseRuntime:
 
             @event.listens_for(self._write_engine.sync_engine, "connect")
             def _on_write_connect(dbapi_conn, _record):
-                dbapi_conn.execute("PRAGMA busy_timeout=15000")
+                dbapi_conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                dbapi_conn.execute(f"PRAGMA cache_size=-{CACHE_SIZE_KIB}")
+                dbapi_conn.execute("PRAGMA temp_store=MEMORY")
+                dbapi_conn.execute(f"PRAGMA mmap_size={MMAP_SIZE}")
+                dbapi_conn.execute("PRAGMA journal_mode=WAL")
+                dbapi_conn.execute("PRAGMA synchronous=NORMAL")
                 dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
             @event.listens_for(self._read_engine.sync_engine, "connect")
             def _on_read_connect(dbapi_conn, _record):
-                dbapi_conn.execute("PRAGMA busy_timeout=15000")
+                dbapi_conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                dbapi_conn.execute(f"PRAGMA cache_size=-{CACHE_SIZE_KIB}")
+                dbapi_conn.execute("PRAGMA temp_store=MEMORY")
+                dbapi_conn.execute(f"PRAGMA mmap_size={MMAP_SIZE}")
                 dbapi_conn.execute("PRAGMA query_only=ON")
                 dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
             async with self._write_engine.connect() as conn:
                 await configure_sqlite_pragmas(conn, query_only=False)
+                await conn.exec_driver_sql("PRAGMA optimize")
+                await conn.commit()
+
+        _install_statement_trace(self._write_engine)
+        _install_statement_trace(self._read_engine)
 
         self._write_factory = async_sessionmaker(
             self._write_engine,
@@ -114,11 +171,14 @@ class DatabaseRuntime:
         self._maybe_log_slow("db.wait_lock", (time.perf_counter() - wait_started) * 1000)
         session = self.write_session()
         q_started = time.perf_counter()
+        trace = _stmt_trace.set([])
         try:
             with RuntimeTrace.span("db.query"):
                 yield session
-            self._maybe_log_slow("db.write", (time.perf_counter() - q_started) * 1000)
         finally:
+            detail = _slow_statement_detail(_stmt_trace.get())
+            _stmt_trace.reset(trace)
+            self._maybe_log_slow("db.write", (time.perf_counter() - q_started) * 1000, detail)
             try:
                 await session.rollback()
             except Exception:
@@ -139,13 +199,17 @@ class DatabaseRuntime:
     async def reading(self) -> AsyncIterator[AsyncSession]:
         session = self.read_session()
         q_started = time.perf_counter()
+        trace = _stmt_trace.set([])
         try:
             with RuntimeTrace.span("db.query"):
                 yield session
         finally:
+            detail = _slow_statement_detail(_stmt_trace.get())
+            _stmt_trace.reset(trace)
             self._maybe_log_slow(
                 "db.read",
                 (time.perf_counter() - q_started) * 1000,
+                detail,
             )
             await session.close()
 

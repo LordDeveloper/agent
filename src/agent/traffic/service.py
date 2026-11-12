@@ -977,8 +977,7 @@ class TrafficService:
         the in-memory snapshot is enough until a background meta write finishes.
         """
         await self._load_persisted_aliases()
-        chunks = await self.store.list_traffic_pending_chunks()
-        rows = await self.store.list_traffic_pending()
+        chunks, rows = await self.store.load_pending_billing()
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()

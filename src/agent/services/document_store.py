@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import selectinload
 
@@ -558,6 +559,44 @@ class DocumentStore:
             doc["id"] = row.id
         return doc
 
+    async def _members_by_parent(self, session, core: str, parent_type: str) -> dict[str, list[dict[str, Any]]]:
+        if parent_type == PARENT_INTERFACE:
+            stmt = select(Client).where(
+                Client.core_id == core,
+                Client.parent_type == PARENT_INTERFACE,
+                Client.parent_interface_core_id == core,
+            )
+            parent_attr = "parent_interface_id"
+        else:
+            stmt = select(Client).where(
+                Client.core_id == core,
+                Client.parent_type == PARENT_SERVER,
+                Client.parent_server_core_id == core,
+            )
+            parent_attr = "parent_server_id"
+        stmt = stmt.order_by(Client.id)
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in (await session.execute(stmt)).scalars().all():
+            parent_id = getattr(row, parent_attr)
+            if parent_id:
+                grouped[str(parent_id)].append(client_row_to_member(row))
+        return grouped
+
+    async def _quota_documents(self, session, core: str) -> list[tuple[str, dict[str, Any]]]:
+        rows = await session.execute(
+            select(Quota, Client)
+            .outerjoin(
+                Client,
+                and_(Client.core_id == Quota.core_id, Client.id == Quota.client_id),
+            )
+            .where(Quota.core_id == core)
+            .order_by(Quota.client_id)
+        )
+        return [
+            (str(quota.client_id), self._quota_as_document(quota, client))
+            for quota, client in rows.all()
+        ]
+
     async def list_docs(self, core: str, kind: str) -> list[dict[str, Any]]:
         docs: list[dict[str, Any]] = []
         async with self._runtime.reading() as session:
@@ -567,17 +606,9 @@ class DocumentStore:
                         select(Interface).where(Interface.core_id == core).order_by(Interface.id)
                     )
                 ).scalars().all()
+                members = await self._members_by_parent(session, core, PARENT_INTERFACE)
                 for iface in rows:
-                    peers = (
-                        await session.execute(
-                            select(Client).where(
-                                Client.core_id == core,
-                                Client.parent_interface_core_id == core,
-                                Client.parent_interface_id == iface.id,
-                            )
-                        )
-                    ).scalars().all()
-                    doc = assemble_interface(dict(iface.config or {}), [client_row_to_member(p) for p in peers])
+                    doc = assemble_interface(dict(iface.config or {}), members.get(str(iface.id), []))
                     doc["scope"] = str(iface.scope or DEFAULT_SCOPE)
                     docs.append(doc)
                 return docs
@@ -585,29 +616,14 @@ class DocumentStore:
                 rows = (
                     await session.execute(select(Server).where(Server.core_id == core).order_by(Server.id))
                 ).scalars().all()
+                members = await self._members_by_parent(session, core, PARENT_SERVER)
                 for server in rows:
-                    users = (
-                        await session.execute(
-                            select(Client).where(
-                                Client.core_id == core,
-                                Client.parent_server_core_id == core,
-                                Client.parent_server_id == server.id,
-                            )
-                        )
-                    ).scalars().all()
-                    doc = assemble_server(dict(server.config or {}), [client_row_to_member(u) for u in users])
+                    doc = assemble_server(dict(server.config or {}), members.get(str(server.id), []))
                     doc["scope"] = str(server.scope or DEFAULT_SCOPE)
                     docs.append(doc)
                 return docs
             if kind == QUOTA_KIND:
-                rows = (
-                    await session.execute(select(Quota).where(Quota.core_id == core).order_by(Quota.client_id))
-                ).scalars().all()
-                docs: list[dict[str, Any]] = []
-                for row in rows:
-                    client = await session.get(Client, (core, row.client_id))
-                    docs.append(self._quota_as_document(row, client))
-                return docs
+                return [doc for _client_id, doc in await self._quota_documents(session, core)]
             if kind == DISABLED_KIND:
                 rows = (
                     await session.execute(
@@ -744,10 +760,28 @@ class DocumentStore:
                     item["parent_doc_id"] = str(parent_doc)
                 found.append(item)
             quota_stmt = select(Quota).where(Quota.client_id.in_(cleaned))
-            for row in (await session.execute(quota_stmt)).scalars().all():
-                if row.client_id in matched:
-                    continue
-                owner = await session.get(Client, (row.core_id, row.client_id))
+            quota_rows = [
+                row
+                for row in (await session.execute(quota_stmt)).scalars().all()
+                if row.client_id not in matched
+            ]
+            owners: dict[tuple[str, str], Client] = {}
+            owners_by_core: dict[str, list[str]] = defaultdict(list)
+            for row in quota_rows:
+                owners_by_core[str(row.core_id)].append(str(row.client_id))
+            for core_id, client_ids in owners_by_core.items():
+                unique_ids = list(dict.fromkeys(client_ids))
+                for offset in range(0, len(unique_ids), 400):
+                    batch = unique_ids[offset : offset + 400]
+                    owner_rows = (
+                        await session.execute(
+                            select(Client).where(Client.core_id == core_id, Client.id.in_(batch))
+                        )
+                    ).scalars().all()
+                    for owner in owner_rows:
+                        owners[(str(owner.core_id), str(owner.id))] = owner
+            for row in quota_rows:
+                owner = owners.get((str(row.core_id), str(row.client_id)))
                 if owner is not None and not row_visible(owner.core_id, owner.scope):
                     continue
                 matched.add(row.client_id)
@@ -804,18 +838,12 @@ class DocumentStore:
         async def append_docs(core_key: str, kind_key: str) -> None:
             if kind_key == QUOTA_KIND:
                 async with self._runtime.reading() as session:
-                    quota_rows = (
-                        await session.execute(
-                            select(Quota).where(Quota.core_id == core_key).order_by(Quota.client_id)
-                        )
-                    ).scalars().all()
-                    for qrow in quota_rows:
-                        client = await session.get(Client, (core_key, qrow.client_id))
+                    for client_id, doc in await self._quota_documents(session, core_key):
                         rows.append({
                             "core": core_key,
                             "kind": kind_key,
-                            "doc_id": qrow.client_id,
-                            "data": self._quota_as_document(qrow, client),
+                            "doc_id": client_id,
+                            "data": doc,
                         })
                 return
             for doc in await self.list_docs(core_key, kind_key):

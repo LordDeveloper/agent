@@ -15,6 +15,7 @@ class Quota(Base):
             ondelete="CASCADE",
         ),
         Index("quotas_by_core", "core_id", "client_id"),
+        Index("ix_quotas_by_client_id", "client_id"),
         {"sqlite_with_rowid": False},
     )
 

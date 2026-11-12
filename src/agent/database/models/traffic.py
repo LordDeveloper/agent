@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKeyConstraint, Integer, String, Text, func
+from sqlalchemy import ForeignKeyConstraint, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent.database.base import Base
@@ -8,7 +8,10 @@ from agent.database.base import Base
 
 class TrafficAck(Base):
     __tablename__ = "traffic_ack"
-    __table_args__ = {"sqlite_with_rowid": False}
+    __table_args__ = (
+        Index("ix_traffic_ack_client", "scope", "client_key"),
+        {"sqlite_with_rowid": False},
+    )
 
     scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
     core: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -24,7 +27,10 @@ class TrafficAck(Base):
 
 class TrafficPending(Base):
     __tablename__ = "traffic_pending"
-    __table_args__ = {"sqlite_with_rowid": False}
+    __table_args__ = (
+        Index("ix_traffic_pending_client", "scope", "client_key"),
+        {"sqlite_with_rowid": False},
+    )
 
     scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
     core: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -50,6 +56,7 @@ class TrafficPendingChunk(Base):
             ("clients.core_id", "clients.id"),
             ondelete="CASCADE",
         ),
+        Index("ix_traffic_pending_chunk_client", "scope", "core", "client_key"),
         {"sqlite_with_rowid": False},
     )
 
