@@ -94,6 +94,7 @@ def test_batch_users_commits_runtime_once(tmp_path, monkeypatch):
     before, result, stored = asyncio.run(scenario())
     assert result['applied'] == 8
     assert result['failed'] == 0
+    assert len(result['users']) == 8
     # One chap/egress commit for the batch. No xl2tpd/ipsec apply or restart.
     assert calls['commit'] == before['commit'] + 1
     assert calls['apply'] == before['apply']
@@ -139,6 +140,41 @@ def test_retry_same_email_keeps_one_user(tmp_path, monkeypatch):
     assert enabled['is_enabled'] is True
     assert first['username'] in chap_enabled
     assert remaining['users'] == []
+
+
+def test_batch_upsert_matches_existing_username(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._commit_user_runtime', _async_none)
+
+    from tests.conftest import open_store
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = open_store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        server = await driver.create_server({'subnet': '10.90.0.0/16', 'name': 'names'})
+        first = await driver.add_user(server['id'], {
+            'username': 'user@test',
+            'password': 'secret',
+            'email': 'user@test',
+        })
+        result = await driver.batch_users(server['id'], [{
+            'id': 'panel-node-id',
+            'email': 'user@test',
+            'username': 'user@test',
+            'is_enabled': True,
+        }])
+        stored = await driver.get_server(server['id'])
+        return first, result, stored
+
+    first, result, stored = asyncio.run(scenario())
+    assert result['applied'] == 1
+    assert result['failed'] == 0
+    assert len(stored['users']) == 1
+    assert stored['users'][0]['id'] == first['id']
+    assert stored['users'][0]['username'] == 'user@test'
 
 
 def test_unchanged_server_update_does_not_rewrite_or_restart(tmp_path, monkeypatch):

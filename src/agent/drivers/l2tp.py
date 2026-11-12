@@ -48,6 +48,21 @@ _USER_BATCH_MAX = 200
 _IMMUTABLE_USER_KEYS = frozenset({'username', 'password', 'address'})
 
 
+def _row_matches(user: dict[str, Any], *keys: str) -> bool:
+    """True when a stored L2TP user is the same account as any of these keys."""
+    wanted = {str(key).strip() for key in keys if str(key or '').strip()}
+    if not wanted or not isinstance(user, dict):
+        return False
+    present = {
+        str(user.get('id') or '').strip(),
+        str(user.get('node_id') or '').strip(),
+        str(user.get('email') or '').strip(),
+        str(user.get('username') or '').strip(),
+    }
+    present.discard('')
+    return bool(wanted & present)
+
+
 def _l2tp_host(value: Any) -> str:
     return str(value or '').split('/', 1)[0].strip()
 
@@ -584,13 +599,13 @@ class L2tpDriver(CoreDriver):
         server = await self.get_server(server_id)
         payload_id = str(payload.get('id') or payload.get('node_id') or '').strip()
         email = str(payload.get('email') or payload.get('name') or '').strip()
+        username = str(payload.get('username') or '').strip()
         touches: list[_UserEgressTouch] = []
 
         for existing in list(server.get('users') or []):
             existing_id = str(existing.get('id') or '')
-            existing_email = str(existing.get('email') or '')
-            same_id = bool(payload_id) and existing_id == payload_id
-            same_email = bool(email) and existing_email == email
+            same_id = _row_matches(existing, payload_id)
+            same_account = _row_matches(existing, email, username)
             if same_id:
                 existing_addr = str(existing.get('address') or '').strip()
                 subnet = str(server.get('subnet') or '')
@@ -610,9 +625,9 @@ class L2tpDriver(CoreDriver):
                         touches.append(_UserEgressTouch(removed, remove=True))
                     server = await self.get_server(server_id)
                     break
-            if same_email:
-                # The email already belongs to this user. Keep that primary key.
-                return await self._update_user_locked(server_id, existing_id or existing_email, payload)
+            if same_account:
+                # Email or username already belongs to this user. Keep that primary key.
+                return await self._update_user_locked(server_id, existing_id or email or username, payload)
 
         user = apply_panel_identity(normalize_peer(payload), store_kind='agent')
         if payload_id:
@@ -666,7 +681,7 @@ class L2tpDriver(CoreDriver):
     ) -> tuple[dict[str, Any], list[_UserEgressTouch]]:
         server = await self.get_server(server_id)
         for idx, user in enumerate(server.get('users') or []):
-            if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
+            if _row_matches(user, user_id):
                 before = _egress_fingerprint(user)
                 previous_address = _l2tp_host(user.get('address'))
                 merged = deepcopy(user)
@@ -729,20 +744,14 @@ class L2tpDriver(CoreDriver):
         server = await self.get_server(server_id)
         _ensure_l2tp_cursor(server)
         users = list(server.get('users') or [])
-        removed = next(
-            (
-                user
-                for user in users
-                if str(user.get('id')) == user_id or str(user.get('email')) == user_id
-            ),
-            None,
-        )
+        removed = next((user for user in users if _row_matches(user, user_id)), None)
         if removed is None:
             return None
+        removed_id = str(removed.get('id') or '')
         server['users'] = [
             user
             for user in users
-            if str(user.get('id')) != user_id and str(user.get('email')) != user_id
+            if not _row_matches(user, user_id) and str(user.get('id') or '') != removed_id
         ]
         await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
         return removed
@@ -870,6 +879,7 @@ class L2tpDriver(CoreDriver):
         applied = 0
         failed = 0
         errors: list[dict[str, Any]] = []
+        applied_users: list[dict[str, Any]] = []
         touches: list[_UserEgressTouch] = []
 
         for row in users:
@@ -878,17 +888,18 @@ class L2tpDriver(CoreDriver):
                 errors.append({'message': 'invalid row'})
                 continue
             try:
-                uid = str(row.get('id') or row.get('email') or '')
+                uid = str(row.get('id') or row.get('node_id') or row.get('email') or row.get('username') or '')
                 existing = await self._find_user(server_id, uid) if uid else None
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    await self.add_user(server_id, row, apply=False, touches_out=touches)
+                    saved = await self.add_user(server_id, row, apply=False, touches_out=touches)
                 else:
                     async with self._lock_for(server_id):
-                        _merged, updated = await self._update_user_locked(server_id, uid, row)
+                        saved, updated = await self._update_user_locked(server_id, uid, row)
                     touches.extend(updated)
                 applied += 1
+                applied_users.append(saved)
             except AgentError as exc:
                 failed += 1
                 errors.append({'id': row.get('id'), 'email': row.get('email'), 'message': exc.message})
@@ -904,12 +915,12 @@ class L2tpDriver(CoreDriver):
         if applied:
             await self._commit_user_runtime(touches, server_id=server_id, operation='batch_users')
 
-        return {'applied': applied, 'failed': failed, 'errors': errors}
+        return {'applied': applied, 'failed': failed, 'errors': errors, 'users': applied_users}
 
     async def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
         server = await self.get_server(server_id)
         for user in server.get('users') or []:
-            if str(user.get('id')) == user_id or str(user.get('email')) == user_id:
+            if _row_matches(user, user_id):
                 return user
         return None
 

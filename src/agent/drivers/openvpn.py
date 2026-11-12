@@ -926,6 +926,7 @@ class OpenVpnDriver(CoreDriver):
         applied = 0
         failed = 0
         errors: list[dict[str, Any]] = []
+        applied_users: list[dict[str, Any]] = []
         subnet_before = str((await self.get_server(server_id)).get('subnet') or '')
         # One database address can belong to only one row in this batch.
         # A later row must not steal it back from someone already placed.
@@ -954,10 +955,11 @@ class OpenVpnDriver(CoreDriver):
                 if mode == 'update' and existing is None:
                     raise AgentError('CLIENT_NOT_FOUND', f'User [{uid}] not found', 404)
                 if existing is None or mode in {'upsert', 'create'}:
-                    await self.add_user(server_id, row, apply=False)
+                    saved = await self.add_user(server_id, row, apply=False)
                 else:
-                    await self.update_user(server_id, uid, row, apply=False)
+                    saved = await self.update_user(server_id, uid, row, apply=False)
                 applied += 1
+                applied_users.append(saved)
             except AgentError as exc:
                 failed += 1
                 if requested and claimed_by.get(requested) == owner:
@@ -969,7 +971,7 @@ class OpenVpnDriver(CoreDriver):
                     raise
         if applied:
             await self._commit_after_user_change(await self.get_server(server_id), subnet_before)
-        return {'applied': applied, 'failed': failed, 'errors': errors}
+        return {'applied': applied, 'failed': failed, 'errors': errors, 'users': applied_users}
 
     async def _find_user(self, server_id: int | str, user_id: str) -> dict[str, Any] | None:
         server = await self.get_server(server_id)

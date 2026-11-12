@@ -204,6 +204,7 @@ def test_openvpn_batch_users_commits_runtime_once(tmp_path: Path):
     before, result = asyncio.run(scenario())
     assert result["applied"] == 6
     assert result["failed"] == 0
+    assert len(result["users"]) == 6
     assert calls["auth"] == before["auth"] + 1
     assert calls["egress"] == before["egress"] + 1
 

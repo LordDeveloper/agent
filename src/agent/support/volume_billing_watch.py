@@ -170,17 +170,20 @@ async def collect_volume_billing_snapshot(
     slice_end = min(len(rows_sorted), top_n)
     live_wg = await _live_wireguard_counters(registry) if registry is not None else {}
     kernel_ahead_bytes = 0
-    if registry is not None and live_wg and wg_chunk_clients:
-        for client_key in wg_chunk_clients:
-            live = live_wg.get(client_key)
-            if live is None:
-                continue
+    wg_live_gap_bytes = 0
+    if registry is not None and live_wg:
+        for client_key, (live_down, live_up) in live_wg.items():
             stored = await traffic.store.get_client_traffic_cursor("wireguard", client_key)
             if stored is None:
+                wg_live_gap_bytes += int(live_down) + int(live_up)
                 continue
-            live_down, live_up = live
             counter_down, counter_up = stored
-            kernel_ahead_bytes += max(0, live_down - counter_down) + max(0, live_up - counter_up)
+            delta_down = max(0, int(live_down) - int(counter_down))
+            delta_up = max(0, int(live_up) - int(counter_up))
+            wg_live_gap_bytes += delta_down + delta_up
+            if client_key not in wg_chunk_clients:
+                continue
+            kernel_ahead_bytes += delta_down + delta_up
 
     for row in rows_sorted[:slice_end]:
         core = str(row.get("core") or "")
@@ -203,6 +206,8 @@ async def collect_volume_billing_snapshot(
     snapshot_body["pending_bytes_aggregate"] = row_delta_bytes
     snapshot_body["kernel_ahead_bytes"] = kernel_ahead_bytes
     snapshot_body["kernel_ahead_label"] = _format_bytes(kernel_ahead_bytes)
+    snapshot_body["wg_live_gap_bytes"] = wg_live_gap_bytes
+    snapshot_body["wg_live_gap_label"] = _format_bytes(wg_live_gap_bytes)
     snapshot_body["kernel_ahead_unreliable"] = (
         pending_bytes > 0 and kernel_ahead_bytes > max(pending_bytes * 20, 512 * 1024 * 1024)
     )
@@ -374,6 +379,30 @@ def format_volume_billing_frame(
     if billing:
         skip_note = f"  skip: {','.join(skipped)}" if skipped else ""
         out.append(f"  volume sample cores: {','.join(billing)}{skip_note}")
+    if "wireguard" not in enabled and "amnezia" not in enabled:
+        out.append(
+            "  hint: ENABLED_CORES has no wireguard/amnezia — the traffic worker never samples WG peers."
+        )
+    elif "wireguard" not in billing and "wireguard" in enabled:
+        out.append("  hint: wireguard is enabled but excluded from volume sampling (traffic_sample_skip_cores).")
+    if "l2tp" in enabled and "l2tp" not in billing:
+        out.append(
+            "  note: L2TP bytes bill on the linked wireguard/amnezia peer (pending core=wireguard|amnezia)."
+        )
+    wg_unacked = int((snapshot.get("pending_by_core") or {}).get("wireguard", {}).get("bytes") or 0)
+    amz_unacked = int((snapshot.get("pending_by_core") or {}).get("amnezia", {}).get("bytes") or 0)
+    wg_gap = int(snapshot.get("wg_live_gap_bytes") or 0)
+    if wg_gap >= 512 * 1024 and wg_unacked == 0 and amz_unacked == 0:
+        if "wireguard" not in billing:
+            out.append(
+                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but no wg unacked — "
+                "add wireguard to ENABLED_CORES and restart agent work."
+            )
+        else:
+            out.append(
+                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but pending wg=0 — "
+                "see agent.log (snapshot failed, unchanged, or peer id ≠ subscribe.node_id)."
+            )
     out.append(f"  last_sample_at={snapshot.get('last_sample_at') or '—'}")
     ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
     if ahead > 0:

@@ -14,7 +14,8 @@ class FakeDriver:
     def __init__(self, clients: list[ClientUsageModel]):
         self._clients = clients
 
-    def usage_snapshot(self, **_kwargs: object) -> UsageSnapshotModel:
+    def usage_snapshot(self, **kwargs: object) -> UsageSnapshotModel:
+        self.last_snapshot_kwargs = kwargs
         return UsageSnapshotModel(
             inbounds=[
                 InboundUsageModel(
@@ -827,6 +828,53 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.get_traffic_ack("xray", "b") is None
 
 
+async def test_wireguard_still_queues_pending_when_xray_reset_flag_is_on(store):
+    """reset_stats is Xray-only. Other cores are sampled with no extra arguments."""
+
+    class CoreDriver:
+        def __init__(self, clients: list[ClientUsageModel]) -> None:
+            self._clients = clients
+
+        def usage_snapshot(self) -> UsageSnapshotModel:
+            return UsageSnapshotModel(
+                inbounds=[InboundUsageModel(id=1, tag="wg0", clients=self._clients)]
+            )
+
+    driver = CoreDriver(
+        [ClientUsageModel(id="peer-1", email="peer@example.com", incoming=100, outgoing=10)]
+    )
+
+    class Registry:
+        def __init__(self) -> None:
+            self.settings = type(
+                "S",
+                (),
+                {
+                    "cores": lambda self: ["wireguard"],
+                    "traffic_billing_cores": lambda self: ["wireguard"],
+                    "traffic_xray_reset_stats": True,
+                },
+            )()
+
+        def get(self, core: str) -> CoreDriver:
+            assert core == "wireguard"
+            return driver
+
+    traffic = TrafficService(store)
+    registry = Registry()
+    first = await traffic.sample_all(registry)
+    assert first.get("initialized", 0) >= 1
+    assert (await traffic.pending_payload())["users"] == {}
+
+    driver._clients[0].incoming = 180
+    driver._clients[0].outgoing = 25
+    await traffic.sample_all(registry)
+    user = (await traffic.pending_payload())["users"]["peer-1"]
+    assert user["core"] == "wireguard"
+    assert user["downlink"] == 80
+    assert user["uplink"] == 15
+
+
 async def test_xray_reset_stats_queues_interval_and_sums_client_cursor(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="node-x", email="x@example.com", incoming=100, outgoing=40)
@@ -844,6 +892,7 @@ async def test_xray_reset_stats_queues_interval_and_sums_client_cursor(store):
     registry.settings = settings
 
     await _sample(traffic, registry)
+    assert driver.last_snapshot_kwargs == {"reset_stats": True}
     payload = await traffic.pending_payload()
     assert payload["users"]["node-x"]["downlink"] == 100
     assert payload["users"]["node-x"]["uplink"] == 40
