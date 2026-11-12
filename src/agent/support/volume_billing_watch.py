@@ -24,8 +24,26 @@ if TYPE_CHECKING:
     from agent.runtime import Runtime
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
+_WATCH_LOG_HINTS = (
+    "traffic sample timing",
+    "traffic sample cycle",
+    "traffic snapshot failed",
+    "traffic snapshot errors",
+    "traffic sample failed",
+)
 _WATCH_TOP_PENDING = 10
 _PANEL_NODE_ID_WIDTH = 64
+_TIMING_META_KEYS = {
+    "parallel_snapshot_ms",
+    "cycle_ms",
+    "sqlite_ms",
+    "_sqlite_ms",
+    "cursor_load_ms",
+    "plan_ms",
+    "write_ms",
+    "chunk_count",
+    "errors",
+}
 
 
 class _LiveScreen:
@@ -286,29 +304,80 @@ def _unchanged_note(snapshot: dict[str, Any]) -> str:
     return "unchanged — queue empty or idle"
 
 
-def _format_timing_summary(raw: Any) -> str | None:
+def _load_sample_timing(raw: Any) -> dict[str, Any]:
     if not raw:
-        return None
+        return {}
     try:
         timing = json.loads(raw) if isinstance(raw, str) else dict(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return timing if isinstance(timing, dict) else {}
+
+
+def _core_timing_entries(timing: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for key, value in sorted(timing.items()):
+        if key in _TIMING_META_KEYS or not isinstance(value, dict):
+            continue
+        rows.append((str(key), value))
+    return rows
+
+
+def _short_core_name(core: str) -> str:
+    return "wg" if core == "wireguard" else core
+
+
+def _format_timing_summary(raw: Any) -> str | None:
+    timing = _load_sample_timing(raw)
+    if not timing and raw:
         return str(raw)
+    if not timing:
+        return None
     parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
     sqlite_ms = timing.get("_sqlite_ms", timing.get("sqlite_ms"))
     parts = [f"parallel={parallel}ms", f"sqlite={sqlite_ms}ms"]
     core_parts: list[str] = []
-    for key, value in sorted(timing.items()):
-        if key in {"parallel_snapshot_ms", "cycle_ms", "_sqlite_ms", "sqlite_ms"}:
-            continue
-        if not isinstance(value, dict):
+    for key, value in _core_timing_entries(timing):
+        short = _short_core_name(key)
+        if value.get("error"):
+            core_parts.append(f"{short}=FAIL")
             continue
         snap = value.get("snapshot_ms")
         if snap is None:
             continue
-        short = "wg" if key == "wireguard" else key
-        core_parts.append(f"{short}={snap}ms")
+        clients = value.get("clients")
+        if clients is not None:
+            core_parts.append(f"{short}={snap}ms/{clients}c")
+        else:
+            core_parts.append(f"{short}={snap}ms")
     parts.extend(core_parts)
     return "  sample  " + "  ".join(str(p) for p in parts if p is not None)
+
+
+def _format_snapshot_errors(raw: Any) -> list[str]:
+    timing = _load_sample_timing(raw)
+    if not timing:
+        return []
+    errors: list[tuple[str, str]] = []
+    bundled = timing.get("errors")
+    if isinstance(bundled, dict):
+        for core, message in sorted(bundled.items()):
+            text = str(message or "").strip()
+            if text:
+                errors.append((str(core), text))
+    for core, value in _core_timing_entries(timing):
+        text = str(value.get("error") or "").strip()
+        if not text:
+            continue
+        if any(name == core and msg == text for name, msg in errors):
+            continue
+        errors.append((core, text))
+    if not errors:
+        return []
+    lines = ["  snapshot errors:"]
+    for core, message in errors:
+        lines.append(f"    {core}: {message}")
+    return lines
 
 
 def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> list[str]:
@@ -392,17 +461,27 @@ def format_volume_billing_frame(
     wg_unacked = int((snapshot.get("pending_by_core") or {}).get("wireguard", {}).get("bytes") or 0)
     amz_unacked = int((snapshot.get("pending_by_core") or {}).get("amnezia", {}).get("bytes") or 0)
     wg_gap = int(snapshot.get("wg_live_gap_bytes") or 0)
+    timing = _load_sample_timing(snapshot.get("sample_timing"))
+    wg_sample = next((value for key, value in _core_timing_entries(timing) if key == "wireguard"), {})
+    bundled_errors = timing.get("errors") if isinstance(timing.get("errors"), dict) else {}
+    wg_error = str(bundled_errors.get("wireguard") or wg_sample.get("error") or "").strip()
     if wg_gap >= 512 * 1024 and wg_unacked == 0 and amz_unacked == 0:
         if "wireguard" not in billing:
             out.append(
                 f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but no wg unacked — "
                 "add wireguard to ENABLED_CORES and restart agent work."
             )
+        elif wg_error:
+            out.append(
+                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but pending wg=0 — "
+                f"snapshot failed: {wg_error}"
+            )
         else:
             out.append(
                 f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but pending wg=0 — "
-                "see agent.log (snapshot failed, unchanged, or peer id ≠ subscribe.node_id)."
+                "snapshot ok but no delta queued (unchanged, zero-cursor skew, or peer id ≠ subscribe.node_id)."
             )
+    out.extend(_format_snapshot_errors(snapshot.get("sample_timing")))
     out.append(f"  last_sample_at={snapshot.get('last_sample_at') or '—'}")
     ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
     if ahead > 0:
@@ -432,8 +511,9 @@ def format_volume_billing_frame(
             ]
             out.append(f"  unacked by core: {', '.join(core_bits)}")
         out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], total_clients))
-    for line in log_lines[-3:]:
-        if "traffic sample timing" in line or "traffic sample cycle" in line:
+    for line in log_lines[-8:]:
+        lowered = line.lower()
+        if any(token in lowered for token in _WATCH_LOG_HINTS):
             out.append(f"  log | {line}")
     return out
 

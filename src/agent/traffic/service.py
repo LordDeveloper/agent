@@ -248,6 +248,14 @@ class TrafficService:
 
         timing_payload = {**core_timings, "sqlite_ms": core_timings.get("_sqlite_ms", 0), "cycle_ms": cycle_ms}
         timing_payload.pop("_sqlite_ms", None)
+        errors = {
+            key: value.get("error")
+            for key, value in core_timings.items()
+            if isinstance(value, dict) and value.get("error")
+        }
+        if errors:
+            timing_payload["errors"] = errors
+            log.error("traffic snapshot errors %s", json.dumps(errors, sort_keys=True))
         await self.store.set_meta(AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY, json.dumps(timing_payload))
         log.info("traffic sample cycle cycle_ms=%s cores=%s", cycle_ms, json.dumps(core_timings, sort_keys=True))
         return stats
@@ -260,7 +268,7 @@ class TrafficService:
     async def _sample_cores_merged(
         self,
         registry: CoreRegistry,
-    ) -> tuple[dict[str, int], dict[str, dict[str, int]], int]:
+    ) -> tuple[dict[str, int], dict[str, Any], int]:
         """Parallel core snapshots on the worker registry, then one SQLite commit."""
         from agent.asyncutil import gather_independent
 
@@ -285,22 +293,37 @@ class TrafficService:
         owners = await owners_task
         capture_order = list(cores)
         core_snapshots: list[tuple[str, Any, int]] = []
-        core_timings: dict[str, dict[str, int]] = {}
+        core_timings: dict[str, Any] = {}
         for core_key, item in zip(capture_order, captured):
             if isinstance(item, Exception):
-                log.exception("traffic snapshot failed core=%s: %s", core_key, item)
+                log.error(
+                    "traffic snapshot failed core=%s: %s",
+                    core_key,
+                    item,
+                    exc_info=item,
+                )
+                core_timings[str(core_key)] = {"snapshot_ms": 0, "error": self._exc_label(item)}
                 continue
             key, snapshot, snapshot_ms = item
+            if isinstance(snapshot, BaseException):
+                core_timings[str(key)] = {
+                    "snapshot_ms": int(snapshot_ms),
+                    "error": self._exc_label(snapshot),
+                }
+                continue
+            clients = self._snapshot_client_count(snapshot)
             core_snapshots.append((key, snapshot, snapshot_ms))
             core_timings[str(key)] = {
                 "snapshot_ms": int(snapshot_ms),
                 "sqlite_ms": 0,
                 "total_ms": int(snapshot_ms),
+                "clients": clients,
             }
             log.info(
-                "traffic sample timing core=%s snapshot_ms=%s (sqlite merged)",
+                "traffic sample timing core=%s snapshot_ms=%s clients=%s (sqlite merged)",
                 key,
                 snapshot_ms,
+                clients,
             )
 
         core_timings["parallel_snapshot_ms"] = parallel_snapshot_ms
@@ -338,31 +361,55 @@ class TrafficService:
             )
         return stats, core_timings, cycle_ms
 
+    @staticmethod
+    def _exc_label(exc: BaseException) -> str:
+        text = str(exc).strip()
+        name = type(exc).__name__
+        return f"{name}: {text}" if text else name
+
+    @staticmethod
+    def _snapshot_client_count(snapshot: Any) -> int:
+        try:
+            return sum(len(inbound.clients or []) for inbound in snapshot.inbounds or [])
+        except Exception:
+            return 0
+
+    async def _await_usage_snapshot(self, driver: Any, core_key: str, *, reset_xray: bool) -> Any:
+        """Xray is the only core whose usage_snapshot accepts reset_stats."""
+        from agent.asyncutil import maybe_await
+
+        if core_key == "xray" and reset_xray:
+            return await maybe_await(driver.usage_snapshot(reset_stats=True))
+        return await maybe_await(driver.usage_snapshot())
+
     async def _read_core_usage_snapshot(
         self,
         registry: CoreRegistry,
         core_key: str,
     ) -> tuple[str, Any, int]:
-        from agent.asyncutil import maybe_await
-
         started = time.monotonic()
-        driver = registry.get(core_key)
-        if core_key == "l2tp":
-            await self._drop_linked_l2tp_billing(driver)
-        reset_xray = core_key == "xray" and bool(
-            getattr(registry.settings, "traffic_xray_reset_stats", False)
-        )
-        cache_hit: bool | None = None
-        if core_key == "xray" and not reset_xray:
-            max_age = getattr(driver, "_usage_cache_max_age", lambda: 5.0)()
-            cache_hit = getattr(driver, "cached_usage_snapshot", lambda _a: None)(max_age) is not None
-        snapshot = await maybe_await(driver.usage_snapshot(reset_stats=reset_xray))
-        if core_key == "xray" and cache_hit is not None:
-            log.info("traffic sample xray cache=%s", "hit" if cache_hit else "miss")
-        if core_key == "xray" and reset_xray:
-            log.info("traffic sample xray reset_stats=on")
-        snapshot_ms = int((time.monotonic() - started) * 1000)
-        return core_key, snapshot, snapshot_ms
+        try:
+            driver = registry.get(core_key)
+            if core_key == "l2tp":
+                await self._drop_linked_l2tp_billing(driver)
+            reset_xray = core_key == "xray" and bool(
+                getattr(registry.settings, "traffic_xray_reset_stats", False)
+            )
+            cache_hit: bool | None = None
+            if core_key == "xray" and not reset_xray:
+                max_age = getattr(driver, "_usage_cache_max_age", lambda: 5.0)()
+                cache_hit = getattr(driver, "cached_usage_snapshot", lambda _a: None)(max_age) is not None
+            snapshot = await self._await_usage_snapshot(driver, core_key, reset_xray=reset_xray)
+            if core_key == "xray" and cache_hit is not None:
+                log.info("traffic sample xray cache=%s", "hit" if cache_hit else "miss")
+            if core_key == "xray" and reset_xray:
+                log.info("traffic sample xray reset_stats=on")
+            snapshot_ms = int((time.monotonic() - started) * 1000)
+            return core_key, snapshot, snapshot_ms
+        except Exception as exc:
+            snapshot_ms = int((time.monotonic() - started) * 1000)
+            log.error("traffic snapshot failed core=%s: %s", core_key, exc, exc_info=exc)
+            return core_key, exc, snapshot_ms
 
     async def _commit_merged_core_samples(
         self,
@@ -454,7 +501,7 @@ class TrafficService:
         *,
         owners_task: asyncio.Task | None = None,
     ) -> dict[str, int]:
-        from agent.asyncutil import gather_independent, maybe_await
+        from agent.asyncutil import gather_independent
 
         started = time.monotonic()
         driver = registry.get(core_key)
@@ -464,11 +511,11 @@ class TrafficService:
             getattr(registry.settings, "traffic_xray_reset_stats", False)
         )
         if owners_task is not None:
-            snapshot = await maybe_await(driver.usage_snapshot(reset_stats=reset_xray))
+            snapshot = await self._await_usage_snapshot(driver, core_key, reset_xray=reset_xray)
             owners = await owners_task
         else:
             snapshot, owners = await gather_independent(
-                maybe_await(driver.usage_snapshot(reset_stats=reset_xray)),
+                self._await_usage_snapshot(driver, core_key, reset_xray=reset_xray),
                 self.store.client_scopes(),
             )
         snapshot_ms = int((time.monotonic() - started) * 1000)

@@ -875,6 +875,78 @@ async def test_wireguard_still_queues_pending_when_xray_reset_flag_is_on(store):
     assert user["uplink"] == 15
 
 
+async def test_sample_all_passes_reset_stats_only_to_xray(store):
+    class WireGuardDriver:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._clients = [ClientUsageModel(id="peer-1", incoming=10, outgoing=1)]
+
+        def usage_snapshot(self) -> UsageSnapshotModel:
+            self.calls += 1
+            return UsageSnapshotModel(
+                inbounds=[InboundUsageModel(id=1, tag="wg0", clients=self._clients)]
+            )
+
+    wg = WireGuardDriver()
+    xray = FakeDriver([ClientUsageModel(id="x-1", incoming=5, outgoing=1)])
+
+    class Registry:
+        def __init__(self) -> None:
+            self.settings = type(
+                "S",
+                (),
+                {
+                    "cores": lambda self: ["xray", "wireguard"],
+                    "traffic_billing_cores": lambda self: ["xray", "wireguard"],
+                    "traffic_xray_reset_stats": True,
+                },
+            )()
+            self._drivers = {"xray": xray, "wireguard": wg}
+
+        def get(self, core: str):
+            return self._drivers[core]
+
+    stats = await TrafficService(store).sample_all(Registry())
+    assert wg.calls == 1
+    assert xray.last_snapshot_kwargs == {"reset_stats": True}
+    # Xray reset_stats counts the first interval as pending; WG anchors without a chunk.
+    assert stats.get("initialized", 0) >= 1
+    users = (await TrafficService(store).pending_payload())["users"]
+    assert users["x-1"]["downlink"] == 5
+    assert "peer-1" not in users
+
+
+async def test_snapshot_failure_is_recorded_in_sample_timing(store):
+    import json
+
+    from agent.traffic.service import AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY
+
+    class BrokenDriver:
+        def usage_snapshot(self) -> UsageSnapshotModel:
+            raise RuntimeError("wg dump failed")
+
+    class Registry:
+        def __init__(self) -> None:
+            self.settings = type(
+                "S",
+                (),
+                {
+                    "cores": lambda self: ["wireguard"],
+                    "traffic_billing_cores": lambda self: ["wireguard"],
+                    "traffic_xray_reset_stats": True,
+                },
+            )()
+
+        def get(self, core: str) -> BrokenDriver:
+            return BrokenDriver()
+
+    await TrafficService(store).sample_cores_blocking(Registry())
+    raw = await store.get_meta(AGENT_META_CORE, LAST_SAMPLE_TIMING_META_KEY)
+    timing = json.loads(raw) if isinstance(raw, str) else raw
+    assert "wg dump failed" in timing["wireguard"]["error"]
+    assert "wg dump failed" in timing["errors"]["wireguard"]
+
+
 async def test_xray_reset_stats_queues_interval_and_sums_client_cursor(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="node-x", email="x@example.com", incoming=100, outgoing=40)
