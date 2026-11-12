@@ -2,8 +2,6 @@
 .env
 .env.dev
 *.pyc
-!**/_service_body.pyc
-!**/_stats_body.pyc
 __pycache__/
 .venv/
 venv/
