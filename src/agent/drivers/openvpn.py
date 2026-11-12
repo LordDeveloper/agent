@@ -1156,12 +1156,19 @@ class OpenVpnDriver(CoreDriver):
                     raw_upload = int(live.get('bytes_received') or 0)
                     prev_download = int(user.get('_raw_incoming') or 0)
                     prev_upload = int(user.get('_raw_outgoing') or 0)
+                    stored_down = int(user.get('incoming') or 0)
+                    stored_up = int(user.get('outgoing') or 0)
                     # Session counters reset on reconnect; treat wrap as a fresh session total.
-                    if raw_download >= prev_download:
+                    # A missing raw baseline must not add the whole session onto an existing cumulative.
+                    if prev_download == 0 and stored_down > 0:
+                        delta_down = 0
+                    elif raw_download >= prev_download:
                         delta_down = raw_download - prev_download
                     else:
                         delta_down = raw_download
-                    if raw_upload >= prev_upload:
+                    if prev_upload == 0 and stored_up > 0:
+                        delta_up = 0
+                    elif raw_upload >= prev_upload:
                         delta_up = raw_upload - prev_upload
                     else:
                         delta_up = raw_upload

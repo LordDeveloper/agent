@@ -828,6 +828,49 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.get_traffic_ack("xray", "b") is None
 
 
+async def test_interface_save_keeps_the_wireguard_billing_cursor(store):
+    """Saving peer stats must not wipe the sampler cursor or the unacked chunk."""
+    traffic = TrafficService(store)
+    client = ClientUsageModel(id="peer-1", email="peer@example.com", incoming=1_000, outgoing=100)
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["wireguard"], driver)
+
+    await _sample(traffic, registry)
+    await store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {
+            "id": 1,
+            "name": "wg0",
+            "peers": [{
+                "id": "peer-1",
+                "email": "peer@example.com",
+                "incoming": 1_500,
+                "outgoing": 140,
+                "_raw_incoming": 1_500,
+                "_raw_outgoing": 140,
+            }],
+        },
+    )
+    client.incoming = 1_500
+    client.outgoing = 140
+    await _sample(traffic, registry)
+
+    user = (await traffic.pending_payload())["users"]["peer-1"]
+    assert user["downlink"] == 500
+    assert user["uplink"] == 40
+
+    await store.put_doc(
+        "wireguard",
+        "interface",
+        "1",
+        {"id": 1, "name": "wg0", "peers": []},
+    )
+    saved = await store.get_doc("wireguard", "interface", "1")
+    assert saved.get("peers") in (None, [])
+
+
 async def test_wireguard_still_queues_pending_when_xray_reset_flag_is_on(store):
     """reset_stats is Xray-only. Other cores are sampled with no extra arguments."""
 

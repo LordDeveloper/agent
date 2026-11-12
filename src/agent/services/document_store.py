@@ -91,24 +91,15 @@ class DocumentStore:
             iface.config = config
             iface.updated_at = _now()
         await session.flush()
-        await session.execute(
-            delete(Client).where(
-                Client.core_id == core,
-                Client.parent_interface_core_id == core,
-                Client.parent_interface_id == doc_id,
-            )
+        await self._sync_parent_members(
+            session,
+            core=core,
+            parent_type=PARENT_INTERFACE,
+            parent_id=doc_id,
+            members=peers,
+            role="peer",
+            scope=str(iface.scope or DEFAULT_SCOPE),
         )
-        for peer in peers:
-            await self._upsert_member(
-                session,
-                core=core,
-                member=peer,
-                parent_type=PARENT_INTERFACE,
-                parent_core=core,
-                parent_id=doc_id,
-                role="peer",
-                scope=iface.scope,
-            )
 
     async def _save_server(self, session, core: str, doc_id: str, data: dict[str, Any]) -> None:
         config, users = split_server_document(data)
@@ -130,24 +121,75 @@ class DocumentStore:
             server.config = config
             server.updated_at = _now()
         await session.flush()
-        await session.execute(
-            delete(Client).where(
-                Client.core_id == core,
-                Client.parent_server_core_id == core,
-                Client.parent_server_id == doc_id,
-            )
+        await self._sync_parent_members(
+            session,
+            core=core,
+            parent_type=PARENT_SERVER,
+            parent_id=doc_id,
+            members=users,
+            role="user",
+            scope=str(server.scope or DEFAULT_SCOPE),
         )
-        for user in users:
+
+    async def _sync_parent_members(
+        self,
+        session,
+        *,
+        core: str,
+        parent_type: str,
+        parent_id: str,
+        members: list[dict[str, Any]],
+        role: str,
+        scope: str,
+    ) -> None:
+        """Update peer/user rows in place.
+
+        Deleting every child and inserting it again drops ``clients.incoming`` /
+        ``outgoing`` (the traffic cursor) and, when SQLite foreign keys are on,
+        cascades away unacked pending chunks. Stats sync then looks like a first
+        sample and either bills the whole cumulative counter or bills nothing.
+        """
+        if parent_type == PARENT_INTERFACE:
+            parent_filter = (
+                Client.parent_interface_core_id == core,
+                Client.parent_interface_id == parent_id,
+            )
+        else:
+            parent_filter = (
+                Client.parent_server_core_id == core,
+                Client.parent_server_id == parent_id,
+            )
+        existing_ids = [
+            str(item)
+            for item in (
+                await session.execute(
+                    select(Client.id).where(Client.core_id == core, *parent_filter)
+                )
+            ).scalars().all()
+        ]
+        keep: set[str] = set()
+        for member in members:
+            client_id = str(member.get("node_id") or member.get("id") or "").strip()
+            if not client_id:
+                continue
+            keep.add(client_id)
             await self._upsert_member(
                 session,
                 core=core,
-                member=user,
-                parent_type=PARENT_SERVER,
+                member=member,
+                parent_type=parent_type,
                 parent_core=core,
-                parent_id=doc_id,
-                role="user",
-                scope=server.scope,
+                parent_id=parent_id,
+                role=role,
+                client_id=client_id,
+                scope=scope,
             )
+        stale = [item for item in existing_ids if item not in keep]
+        if not stale:
+            return
+        await session.execute(
+            delete(Client).where(Client.core_id == core, Client.id.in_(stale))
+        )
 
     async def _member_id(self, member: dict[str, Any], *, fallback: str = "") -> str:
         return str(member.get("node_id") or member.get("id") or fallback or "").strip()

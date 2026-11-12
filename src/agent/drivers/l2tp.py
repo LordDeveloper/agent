@@ -1054,8 +1054,16 @@ class L2tpDriver(CoreDriver):
                     tx = int(live.get('outgoing') or 0)
                     prev_rx = int(user.get('_raw_incoming') or 0)
                     prev_tx = int(user.get('_raw_outgoing') or 0)
-                    delta_in = rx if rx < prev_rx else rx - prev_rx
-                    delta_out = tx if tx < prev_tx else tx - prev_tx
+                    stored_rx = int(user.get('incoming') or 0)
+                    stored_tx = int(user.get('outgoing') or 0)
+                    if prev_rx == 0 and stored_rx > 0:
+                        delta_in = 0
+                    else:
+                        delta_in = rx if rx < prev_rx else rx - prev_rx
+                    if prev_tx == 0 and stored_tx > 0:
+                        delta_out = 0
+                    else:
+                        delta_out = tx if tx < prev_tx else tx - prev_tx
                     user['_raw_incoming'] = rx
                     user['_raw_outgoing'] = tx
                     linked = str(user.get('linked_peer_id') or '').strip()

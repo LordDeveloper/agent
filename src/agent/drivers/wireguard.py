@@ -1360,8 +1360,16 @@ def accumulate_transfer(
     total_out = int(peer.get("outgoing", 0) or 0)
 
     kernel_reset = (prev_in > 0 and incoming < prev_in) or (prev_out > 0 and outgoing < prev_out)
-    delta_in = incoming if incoming < prev_in else incoming - prev_in
-    delta_out = outgoing if outgoing < prev_out else outgoing - prev_out
+    # Raw baseline was lost while cumulative totals already exist. Anchoring to
+    # the live kernel must not add that lifetime counter on top of incoming.
+    if prev_in == 0 and total_in > 0:
+        delta_in = 0
+    else:
+        delta_in = incoming if incoming < prev_in else incoming - prev_in
+    if prev_out == 0 and total_out > 0:
+        delta_out = 0
+    else:
+        delta_out = outgoing if outgoing < prev_out else outgoing - prev_out
 
     peer["incoming"] = total_in + delta_in
     peer["outgoing"] = total_out + delta_out
@@ -1640,7 +1648,31 @@ class WireGuardDriver(CoreDriver):
             )
 
         await self.audit.record("reset_traffic", f"{self.key}/peer/{peer_id}")
+        await self._clear_billing_cursor(reset_peer)
         return reset_peer
+
+    async def _clear_billing_cursor(self, peer: dict[str, Any]) -> None:
+        """Drop unacked chunks and the sampler cursor after a peer traffic reset.
+
+        The kernel counters were just zeroed. Leaving the old cursor makes the
+        next sample treat the post-reset total as a regression, and leaving the
+        old chunks makes reset look like a no-op in the unacked table.
+        """
+        from agent.auth_scope import current_scope
+
+        labels = []
+        for candidate in (peer.get("id"), peer.get("email")):
+            label = str(candidate or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        if not labels:
+            return
+        for label in labels:
+            await self.store.delete_traffic_pending(self.key, label)
+        await self.store.bulk_set_client_traffic_cursors(
+            current_scope(),
+            [(self.key, label, 0, 0) for label in labels],
+        )
 
     async def backup(self) -> dict[str, Any]:
         return {"interfaces": filter_visible(await self.list_interfaces(), self.key), "core": self.key}

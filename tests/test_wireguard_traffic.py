@@ -298,6 +298,20 @@ def test_migrate_wg_counter_fields_does_not_store_cumulative_as_raw():
     assert peer["_raw_outgoing"] == 0
 
 
+def test_accumulate_transfer_does_not_add_kernel_total_when_raw_baseline_is_missing():
+    peer = {
+        "incoming": 324_849_664,
+        "outgoing": 98_304_000,
+        "_raw_incoming": 0,
+        "_raw_outgoing": 0,
+    }
+    accumulate_transfer(peer, incoming=324_849_664, outgoing=98_304_000)
+    assert peer["incoming"] == 324_849_664
+    assert peer["outgoing"] == 98_304_000
+    assert peer["_raw_incoming"] == 324_849_664
+    assert peer["_raw_outgoing"] == 98_304_000
+
+
 def test_accumulate_transfer_migrates_legacy_raw_baseline():
     peer = {
         "incoming": 66_505_328_660,
