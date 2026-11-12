@@ -724,11 +724,23 @@ class TrafficService:
                     sampled_at=sampled_at,
                 )
             stats[outcome] = stats.get(outcome, 0) + 1
+            current_cursor = sample_cursors.get((core, label))
             for alias in (email, protocol_id):
                 alias_text = str(alias or "").strip()
                 if not alias_text or alias_text == label or alias_text in protected:
                     continue
                 identity_upserts.append((core, alias_text, label))
+                # A stale cursor stored under the email must not outrank the live
+                # node_id on the next sample. Otherwise every sample looks like a
+                # counter reset and the whole cumulative total is queued again.
+                if current_cursor is not None:
+                    client_cursor_upserts.append(
+                        (core, alias_text, int(current_cursor[0]), int(current_cursor[1]))
+                    )
+                    sample_cursors[(core, alias_text)] = (
+                        int(current_cursor[0]),
+                        int(current_cursor[1]),
+                    )
 
         stats["pending"] = len(chunk_inserts)
         return {
@@ -761,15 +773,10 @@ class TrafficService:
         best = sample_cursors.get((core, canonical_key))
         for name in aliases:
             alias_cursor = sample_cursors.pop((core, name), None)
-            if alias_cursor is None:
-                continue
-            if best is None:
+            # The node_id cursor is the live baseline. A higher email/protocol
+            # cursor is stale and must not pull the baseline above the sample.
+            if best is None and alias_cursor is not None:
                 best = alias_cursor
-                continue
-            best = (
-                max(best[0], alias_cursor[0]),
-                max(best[1], alias_cursor[1]),
-            )
         if best is not None:
             sample_cursors[(core, canonical_key)] = best
 

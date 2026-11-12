@@ -513,12 +513,8 @@ class TrafficStoreService:
             if canon_cursor is None:
                 merged[canon_pair] = alias_cursor
                 continue
-            if alias_cursor is None:
-                continue
-            merged[canon_pair] = (
-                max(canon_cursor[0], alias_cursor[0]),
-                max(canon_cursor[1], alias_cursor[1]),
-            )
+            # Keep the node_id cursor. A higher alias is a stale baseline and
+            # would make every later sample bill the whole live counter again.
         return merged
 
     async def load_client_traffic_cursors_for_keys(

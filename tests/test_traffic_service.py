@@ -828,6 +828,43 @@ async def test_interrupted_sample_does_not_leave_a_partial_plan(store, monkeypat
     assert await store.get_traffic_ack("xray", "b") is None
 
 
+async def test_stale_email_cursor_does_not_rebill_the_live_counter_every_sample(store):
+    """A higher cursor left under the email must not reset the baseline every sample.
+
+    That path queues the whole live counter again on each tick, so unacked
+    volume climbs by the same GiB block instead of the interval delta.
+    """
+    from agent.auth_scope import DEFAULT_SCOPE
+
+    traffic = TrafficService(store)
+    client = ClientUsageModel(
+        id="adb5e0dc-0d9b-4dad-bdd1-c0522efd00f9",
+        email="wg@example.com",
+        incoming=13_000_000_000,
+        outgoing=3_900_000_000,
+    )
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["wireguard"], driver)
+
+    await _sample(traffic, registry)
+    await store.bulk_set_client_traffic_cursors(
+        DEFAULT_SCOPE,
+        [("wireguard", "wg@example.com", 54_000_000_000, 16_000_000_000)],
+    )
+
+    client.incoming = 13_100_000_000
+    client.outgoing = 3_950_000_000
+    await _sample(traffic, registry)
+    client.incoming = 13_250_000_000
+    client.outgoing = 3_980_000_000
+    await _sample(traffic, registry)
+
+    user = (await traffic.pending_payload())["users"][client.id]
+    assert user["downlink"] == 250_000_000
+    assert user["uplink"] == 80_000_000
+    assert len(user["chunks"]) == 2
+
+
 async def test_interface_save_keeps_the_wireguard_billing_cursor(store):
     """Saving peer stats must not wipe the sampler cursor or the unacked chunk."""
     traffic = TrafficService(store)
