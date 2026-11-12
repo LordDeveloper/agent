@@ -817,6 +817,44 @@ class TrafficService:
         return "pending"
 
     @staticmethod
+    def _interval_delta_from_cursor(
+        stat_incoming: int,
+        stat_outgoing: int,
+        cursor_incoming: int,
+        cursor_outgoing: int,
+    ) -> tuple[int, int, bool]:
+        """Non-xray cumulative cores (WireGuard, OpenVPN, L2TP, …).
+
+        ``stat_*`` is the total read from the core on this sample. ``cursor_*``
+        is the previous sample stored on ``clients.incoming`` / ``clients.outgoing``
+        (panel shadow ``_incoming`` / ``_outgoing`` for the same client).
+
+        Per direction, same rule as classic panel billing::
+
+            delta = stat if stat < cursor else stat - cursor
+
+        The delta is queued on ``traffic_pending_chunk``; the cursor is then
+        replaced with the live ``stat_*`` values.
+        """
+        stat_incoming = int(stat_incoming)
+        stat_outgoing = int(stat_outgoing)
+        cursor_incoming = int(cursor_incoming)
+        cursor_outgoing = int(cursor_outgoing)
+        if stat_incoming < cursor_incoming:
+            tick_in = stat_incoming
+            reg_in = True
+        else:
+            tick_in = max(0, stat_incoming - cursor_incoming)
+            reg_in = False
+        if stat_outgoing < cursor_outgoing:
+            tick_out = stat_outgoing
+            reg_out = True
+        else:
+            tick_out = max(0, stat_outgoing - cursor_outgoing)
+            reg_out = False
+        return tick_in, tick_out, reg_in or reg_out
+
+    @staticmethod
     def _classify_interval_sample(
         core: str,
         client_key: str,
@@ -835,9 +873,13 @@ class TrafficService:
         if last is None:
             return "initialized"
         last_in, last_out = last
-        reset = current_incoming < last_in or current_outgoing < last_out
+        tick_in, tick_out, reset = TrafficService._interval_delta_from_cursor(
+            current_incoming,
+            current_outgoing,
+            last_in,
+            last_out,
+        )
         if reset:
-            tick_in, tick_out = current_incoming, current_outgoing
             log.warning(
                 "traffic counter regression core=%s client=%s last=(%s,%s) current=(%s,%s)",
                 core,
@@ -847,9 +889,6 @@ class TrafficService:
                 current_incoming,
                 current_outgoing,
             )
-        else:
-            tick_in = max(0, current_incoming - last_in)
-            tick_out = max(0, current_outgoing - last_out)
         if last_in == 0 and last_out == 0 and (tick_in + tick_out) > _ZERO_CURSOR_SKEW_BYTES:
             log.warning(
                 "traffic zero-cursor skew core=%s client=%s tick=(%s,%s) "

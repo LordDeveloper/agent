@@ -48,6 +48,18 @@ async def _sample(traffic: TrafficService, registry: FakeRegistry):
     return await traffic.sample_all(registry)
 
 
+def test_interval_delta_matches_panel_per_direction_formula():
+    tick_in, tick_out, reg = TrafficService._interval_delta_from_cursor(130, 65, 100, 50)
+    assert tick_in == 30
+    assert tick_out == 15
+    assert not reg
+
+    tick_in, tick_out, reg = TrafficService._interval_delta_from_cursor(200, 550, 1600, 500)
+    assert tick_in == 200
+    assert tick_out == 50
+    assert reg
+
+
 async def test_traffic_service_tracks_pending_delta(store):
     traffic = TrafficService(store)
     driver = FakeDriver(
@@ -242,7 +254,7 @@ async def test_traffic_sample_writes_many_clients_in_one_plan(store):
 
     await _sample(traffic, registry)
     assert len(plans) == 1
-    assert len(plans[0]["client_cursor_upserts"]) == 40
+    assert len(plans[0]["client_cursor_upserts"]) == 80
     assert plans[0]["chunk_inserts"] == []
 
     await _sample(traffic, registry)
@@ -478,7 +490,7 @@ async def test_one_sided_reset_keeps_growth_on_the_other_direction(store):
     assert stats["regressed"] == 1
     kept = (await traffic.pending_payload())["users"]["node-1"]
     assert kept["downlink"] == 800
-    assert kept["uplink"] == 650
+    assert kept["uplink"] == 150
 
 
 async def test_xray_uuid_pending_moves_to_node_id_without_double_billing(store):
