@@ -517,8 +517,8 @@ def test_usage_snapshot_does_not_rewrite_peer_documents():
                             "email": "a@b.c",
                             "public_key": "aaa",
                             "enable": True,
-                            "incoming": 100,
-                            "outgoing": 40,
+                            "incoming": 5_000,
+                            "outgoing": 4_000,
                             "_raw_incoming": 100,
                             "_raw_outgoing": 40,
                         }

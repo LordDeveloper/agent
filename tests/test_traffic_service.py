@@ -99,6 +99,45 @@ async def test_traffic_service_tracks_pending_delta(store):
     assert payload["users"]["uuid-1"]["downlink"] == 100_000
 
 
+async def test_reboot_bills_only_the_new_core_counter(store):
+    """Cursor is the last core counter. A reboot bills that new counter, not the history."""
+    traffic = TrafficService(store)
+    client = ClientUsageModel(
+        id="peer-reboot",
+        email="reboot@example.com",
+        incoming=14_650_000_000,
+        outgoing=250_000_000,
+    )
+    driver = FakeDriver([client])
+    registry = FakeRegistry(["wireguard"], driver)
+
+    await _sample(traffic, registry)
+    assert (await traffic.pending_payload())["users"] == {}
+
+    client.incoming = 14_700_000_000
+    client.outgoing = 251_000_000
+    await _sample(traffic, registry)
+    grown = (await traffic.pending_payload())["users"]["peer-reboot"]
+    assert grown["downlink"] == 50_000_000
+    assert grown["uplink"] == 1_000_000
+    await traffic.ack_pending()
+
+    client.incoming = 80_000_000
+    client.outgoing = 2_000_000
+    stats = await _sample(traffic, registry)
+    assert stats["regressed"] == 1
+    reset = (await traffic.pending_payload())["users"]["peer-reboot"]
+    assert reset["downlink"] == 80_000_000
+    assert reset["uplink"] == 2_000_000
+
+    client.incoming = 90_000_000
+    client.outgoing = 2_500_000
+    await _sample(traffic, registry)
+    after = (await traffic.pending_payload())["users"]["peer-reboot"]
+    assert after["downlink"] == 90_000_000
+    assert after["uplink"] == 2_500_000
+
+
 async def test_traffic_service_regression_resets_baseline(store):
     traffic = TrafficService(store)
     client = ClientUsageModel(id="uuid-2", email="reset@example.com", incoming=900, outgoing=100)

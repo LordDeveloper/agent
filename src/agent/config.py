@@ -100,8 +100,10 @@ class AgentSettings(BaseSettings):
     # Pending bytes are invisible to the panel until the next sample, so this
     # is the lower bound on how fast a new connection shows up in the database.
     traffic_sample_interval: float = 5.0
-    # Comma-separated cores excluded from volume sampling (L2TP bills via linked WG peers).
-    traffic_sample_skip_cores: str = "l2tp"
+    # Comma-separated cores excluded from volume sampling. Empty by default so
+    # standalone L2TP is sampled as core=l2tp. Users with linked_peer_id still
+    # credit the WireGuard/Amnezia peer and stay out of the L2TP snapshot.
+    traffic_sample_skip_cores: str = ""
     # When ``agent work`` runs the traffic worker, keep false so GET /pending does not
     # spawn a second sampler in the HTTP process (SQLite lock + cold xray API).
     traffic_schedule_sample_on_get: bool = False

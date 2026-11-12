@@ -456,7 +456,8 @@ def format_volume_billing_frame(
         out.append("  hint: wireguard is enabled but excluded from volume sampling (traffic_sample_skip_cores).")
     if "l2tp" in enabled and "l2tp" not in billing:
         out.append(
-            "  note: L2TP bytes bill on the linked wireguard/amnezia peer (pending core=wireguard|amnezia)."
+            "  note: L2TP is excluded by traffic_sample_skip_cores, so standalone L2TP volume is not sampled. "
+            "Companion users still credit the linked wireguard/amnezia peer."
         )
     wg_unacked = int((snapshot.get("pending_by_core") or {}).get("wireguard", {}).get("bytes") or 0)
     amz_unacked = int((snapshot.get("pending_by_core") or {}).get("amnezia", {}).get("bytes") or 0)

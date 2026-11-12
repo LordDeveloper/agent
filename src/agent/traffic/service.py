@@ -18,6 +18,9 @@ log = get_logger("traffic")
 
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
+# clients.incoming/outgoing for these cores store the last core counter, not a cumulative total.
+_CORE_COUNTER_CORES = frozenset({"wireguard", "amnezia"})
+CORE_COUNTER_CURSOR_META_KEY = "traffic_cursor_tracks_core_counter"
 LAST_SAMPLE_TIMING_META_KEY = "traffic_last_sample_timing"
 # From a stored (0,0) cursor, deltas above this are lifetime skew (reset/stale), not one interval.
 _ZERO_CURSOR_SKEW_BYTES = 512 * 1024 * 1024
@@ -441,6 +444,12 @@ class TrafficService:
                         cursor_keys.add((core, alias_text))
 
         xray_reset = bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
+        has_core_counter = any(
+            str(sample["core"]) in _CORE_COUNTER_CORES
+            for group in grouped.values()
+            for sample in group
+        )
+        anchor = has_core_counter and await self._needs_core_counter_anchor()
 
         def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
             merged_stats = {
@@ -456,7 +465,13 @@ class TrafficService:
             for _scope, group in grouped.items():
                 if not group:
                     continue
-                part = self._plan_sample(group, cursors, sampled_at, xray_reset_stats=xray_reset)
+                part = self._plan_sample(
+                    group,
+                    cursors,
+                    sampled_at,
+                    xray_reset_stats=xray_reset,
+                    anchor_core_counters=anchor,
+                )
                 for key in merged_stats:
                     if key == "pending":
                         merged_stats[key] += int(part.get("stats", {}).get(key, 0))
@@ -481,6 +496,8 @@ class TrafficService:
                 cursor_keys=cursor_keys,
                 return_sqlite_timing=True,
             )
+            if anchor:
+                await self._mark_core_counter_anchor()
             return stats, sqlite_detail
         except Exception:
             log.exception("traffic merged sqlite commit failed")
@@ -575,6 +592,11 @@ class TrafficService:
             and registry is not None
             and bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
         )
+        anchor = (
+            core_key in _CORE_COUNTER_CORES
+            and bool(samples)
+            and await self._needs_core_counter_anchor()
+        )
         for scope, group in grouped.items():
             stored = await self._commit_samples(
                 group,
@@ -582,12 +604,15 @@ class TrafficService:
                 scope,
                 core_key,
                 xray_reset_stats=xray_reset,
+                anchor_core_counters=anchor,
             )
             for key in stats:
                 if key == "pending":
                     stats[key] = max(stats[key], int(stored.get(key, 0)))
                 else:
                     stats[key] += int(stored.get(key, 0))
+        if anchor:
+            await self._mark_core_counter_anchor()
         return stats
 
     def _usage_rows(self, core_key: str, snapshot: Any) -> list[dict[str, Any]]:
@@ -651,6 +676,7 @@ class TrafficService:
         core: str | None = None,
         *,
         xray_reset_stats: bool = False,
+        anchor_core_counters: bool = False,
     ) -> dict[str, int]:
         from agent.auth_scope import current_scope
 
@@ -660,6 +686,7 @@ class TrafficService:
                 cursors,
                 sampled_at,
                 xray_reset_stats=xray_reset_stats and str(core or "") == "xray",
+                anchor_core_counters=anchor_core_counters,
             )
 
         return await self.store.apply_traffic_sample(plan, scope or current_scope(), core)
@@ -671,6 +698,7 @@ class TrafficService:
         sampled_at: str,
         *,
         xray_reset_stats: bool = False,
+        anchor_core_counters: bool = False,
     ) -> dict[str, Any]:
         stats = {
             "clients_seen": 0,
@@ -701,7 +729,14 @@ class TrafficService:
                 protected=protected,
                 sample_cursors=sample_cursors,
             )
-            if core == "xray" and xray_reset_stats:
+            if anchor_core_counters and core in _CORE_COUNTER_CORES:
+                # One pass after upgrade: the stored cursor is still the old
+                # cumulative total. Point it at the live core counter and do
+                # not queue that total as a delta.
+                client_cursor_upserts.append((core, label, current_incoming, current_outgoing))
+                sample_cursors[(core, label)] = (current_incoming, current_outgoing)
+                outcome = "initialized"
+            elif core == "xray" and xray_reset_stats:
                 outcome = self._classify_xray_reset_interval_sample(
                     core,
                     label,
@@ -816,6 +851,13 @@ class TrafficService:
         )
         return "pending"
 
+    async def _needs_core_counter_anchor(self) -> bool:
+        flag = await self.store.get_meta(AGENT_META_CORE, CORE_COUNTER_CURSOR_META_KEY, None)
+        return not flag
+
+    async def _mark_core_counter_anchor(self) -> None:
+        await self.store.set_meta(AGENT_META_CORE, CORE_COUNTER_CURSOR_META_KEY, "1")
+
     @staticmethod
     def _interval_delta_from_cursor(
         stat_incoming: int,
@@ -823,36 +865,29 @@ class TrafficService:
         cursor_incoming: int,
         cursor_outgoing: int,
     ) -> tuple[int, int, bool]:
-        """Non-xray cumulative cores (WireGuard, OpenVPN, L2TP, …).
+        """Delta against the previous core counter.
 
-        ``stat_*`` is the total read from the core on this sample. ``cursor_*``
-        is the previous sample stored on ``clients.incoming`` / ``clients.outgoing``
-        (panel shadow ``_incoming`` / ``_outgoing`` for the same client).
+        ``stat_*`` is the counter the core shows now. ``cursor_*`` is the
+        counter it showed last time (``clients.incoming`` / ``clients.outgoing``).
+        Pending receives only the delta. The caller then stores ``stat_*`` as
+        the new cursor, not the delta.
 
-        Per direction, same rule as classic panel billing::
-
-            delta = stat if stat < cursor else stat - cursor
-
-        The delta is queued on ``traffic_pending_chunk``; the cursor is then
-        replaced with the live ``stat_*`` values.
+        After a reboot the core counter is lower than the cursor, so the delta
+        is the new counter itself (bytes since the reset), not the old total.
         """
         stat_incoming = int(stat_incoming)
         stat_outgoing = int(stat_outgoing)
         cursor_incoming = int(cursor_incoming)
         cursor_outgoing = int(cursor_outgoing)
-        if stat_incoming < cursor_incoming:
-            tick_in = stat_incoming
-            reg_in = True
-        else:
-            tick_in = max(0, stat_incoming - cursor_incoming)
-            reg_in = False
-        if stat_outgoing < cursor_outgoing:
-            tick_out = stat_outgoing
-            reg_out = True
-        else:
-            tick_out = max(0, stat_outgoing - cursor_outgoing)
-            reg_out = False
+        tick_in, reg_in = TrafficService._direction_delta(stat_incoming, cursor_incoming)
+        tick_out, reg_out = TrafficService._direction_delta(stat_outgoing, cursor_outgoing)
         return tick_in, tick_out, reg_in or reg_out
+
+    @staticmethod
+    def _direction_delta(stat: int, cursor: int) -> tuple[int, bool]:
+        if stat < cursor:
+            return stat, True
+        return stat - cursor, False
 
     @staticmethod
     def _classify_interval_sample(
@@ -868,6 +903,7 @@ class TrafficService:
     ) -> str:
         pair = (core, client_key)
         last = sample_cursors.get(pair)
+        # Keep the last core counter, not the delta just queued.
         client_cursor_upserts.append((core, client_key, current_incoming, current_outgoing))
         sample_cursors[pair] = (current_incoming, current_outgoing)
         if last is None:
@@ -881,13 +917,15 @@ class TrafficService:
         )
         if reset:
             log.warning(
-                "traffic counter regression core=%s client=%s last=(%s,%s) current=(%s,%s)",
+                "traffic counter regression core=%s client=%s last=(%s,%s) current=(%s,%s) delta=(%s,%s)",
                 core,
                 client_key,
                 last_in,
                 last_out,
                 current_incoming,
                 current_outgoing,
+                tick_in,
+                tick_out,
             )
         if last_in == 0 and last_out == 0 and (tick_in + tick_out) > _ZERO_CURSOR_SKEW_BYTES:
             log.warning(
@@ -900,7 +938,7 @@ class TrafficService:
             )
             return "initialized"
         if tick_in <= 0 and tick_out <= 0:
-            return "unchanged"
+            return "regressed" if reset else "unchanged"
         chunk_inserts.append(
             {
                 "chunk_id": str(uuid.uuid4()),

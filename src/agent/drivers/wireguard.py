@@ -2700,29 +2700,34 @@ class WireGuardDriver(CoreDriver):
         return (await self.peer_config_bundle(interface_id, peer_id, endpoint_host))["config"]
 
     async def usage_snapshot(self) -> UsageSnapshotModel:
-        # Billing only needs the live counters. Persisting every peer row and
-        # repairing kernel drift here is what turned a 30ms `wg show` into seconds.
+        # Billing compares this reading with the previous core counter.
+        # Pending gets only the delta. The accumulated peer total is not the
+        # core counter: after reboot it is still gigabytes, so the delta
+        # formula would queue that whole history.
         ifaces = await self.list_interfaces()
         dumps = await self._dump_interfaces(ifaces)
         rows: list[InboundUsageModel] = []
         for iface in filter_visible(ifaces, self.key):
             name = str(iface.get("name") or "")
             live = dumps.get(name) or {}
-            if _dump_is_usable(iface, live):
-                _apply_dump_counters(iface, live)
+            if not _dump_is_usable(iface, live):
+                continue
             clients = []
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
                     continue
+                stats = live.get(str(peer.get("public_key") or ""))
+                if not isinstance(stats, dict):
+                    continue
+                handshake = int(stats.get("handshake_at") or 0)
                 clients.append(
                     ClientUsageModel(
                         id=str(peer.get("id")),
                         email=peer.get("email"),
-                        # Billing must use cumulative totals, never raw kernel counters.
-                        incoming=int(peer.get("incoming", 0) or 0),
-                        outgoing=int(peer.get("outgoing", 0) or 0),
+                        incoming=int(stats.get("incoming") or 0),
+                        outgoing=int(stats.get("outgoing") or 0),
                         inbound_id=iface.get("id"),
-                        handshake_at=peer_handshake_unix(peer) or None,
+                        handshake_at=handshake or None,
                     )
                 )
             rows.append(

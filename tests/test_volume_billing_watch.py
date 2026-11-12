@@ -1,3 +1,4 @@
+from agent.config import AgentSettings
 from agent.support.volume_billing_watch import (
     _LOG_FILTER,
     _format_bytes,
@@ -83,3 +84,41 @@ def test_watch_frame_shows_snapshot_errors_instead_of_log_hint():
     assert "TypeError: usage_snapshot() got an unexpected keyword argument 'reset_stats'" in text
     assert "snapshot failed:" in text
     assert "see agent.log" not in text
+
+
+def test_default_volume_sample_includes_standalone_l2tp():
+    settings = AgentSettings(
+        enabled_cores="xray,wireguard,openvpn,amnezia,l2tp",
+    )
+    assert settings.traffic_billing_cores() == [
+        "xray",
+        "wireguard",
+        "openvpn",
+        "amnezia",
+        "l2tp",
+    ]
+
+
+def test_watch_frame_names_l2tp_only_when_the_core_is_skipped():
+    included = {
+        "pending_clients": 0,
+        "pending_chunks": 0,
+        "pending_bytes": 0,
+        "pending_bytes_label": "0 B",
+        "worker_lag_ms": 0,
+        "enforce_local_volume_quota": False,
+        "traffic_sample_interval_s": 5,
+        "quota_enforce_interval_s": 10,
+        "billing_cores": ["xray", "wireguard", "openvpn", "amnezia", "l2tp"],
+        "enabled_cores": ["xray", "wireguard", "openvpn", "amnezia", "l2tp"],
+        "pending_by_core": {},
+        "top_pending": [],
+    }
+    included_text = "\n".join(format_volume_billing_frame(included, []))
+    assert "volume sample cores: xray,wireguard,openvpn,amnezia,l2tp" in included_text
+    assert "skip: l2tp" not in included_text
+
+    skipped = {**included, "billing_cores": ["xray", "wireguard", "openvpn", "amnezia"]}
+    skipped_text = "\n".join(format_volume_billing_frame(skipped, []))
+    assert "skip: l2tp" in skipped_text
+    assert "standalone L2TP volume is not sampled" in skipped_text
