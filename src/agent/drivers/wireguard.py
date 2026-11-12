@@ -842,6 +842,41 @@ def _allowed_ip_set(value: Any) -> frozenset[str]:
     return frozenset(found)
 
 
+def parse_wg_all_dump(text: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """Parse ``wg show all dump`` into ``{iface: {public_key: counters}}``.
+
+    Each line starts with the interface name. The interface row has five fields.
+    A peer row has the interface name plus the eight peer columns from ``wg show dump``.
+    ``incoming`` is kernel TX and ``outgoing`` is kernel RX, matching the per-interface parser.
+    """
+    found: dict[str, dict[str, dict[str, Any]]] = {}
+    for raw in text.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 9:
+            continue
+        iface_name = parts[0].strip()
+        public_key = parts[1].strip()
+        if not iface_name or not public_key:
+            continue
+        endpoint = parts[3]
+        allowed_ips = parts[4]
+        try:
+            handshake_at = int(parts[5] or 0)
+            transfer_rx = int(parts[6] or 0)
+            transfer_tx = int(parts[7] or 0)
+        except ValueError:
+            continue
+        found.setdefault(iface_name, {})[public_key] = {
+            "incoming": transfer_tx,
+            "outgoing": transfer_rx,
+            "handshake_at": handshake_at,
+            "endpoint": endpoint,
+            "allowed_ips": allowed_ips,
+            "public_key": public_key,
+        }
+    return found
+
+
 def _apply_dump_counters(iface: dict[str, Any], dump: dict[str, Any] | None) -> bool:
     """Copy kernel counters onto the current peer rows. Does not add, drop, or rewrite config."""
     changed = False
@@ -2665,9 +2700,16 @@ class WireGuardDriver(CoreDriver):
         return (await self.peer_config_bundle(interface_id, peer_id, endpoint_host))["config"]
 
     async def usage_snapshot(self) -> UsageSnapshotModel:
-        await self.sync_peer_stats()
+        # Billing only needs the live counters. Persisting every peer row and
+        # repairing kernel drift here is what turned a 30ms `wg show` into seconds.
+        ifaces = await self.list_interfaces()
+        dumps = await self._dump_interfaces(ifaces)
         rows: list[InboundUsageModel] = []
-        for iface in filter_visible(await self.list_interfaces(), self.key):
+        for iface in filter_visible(ifaces, self.key):
+            name = str(iface.get("name") or "")
+            live = dumps.get(name) or {}
+            if _dump_is_usable(iface, live):
+                _apply_dump_counters(iface, live)
             clients = []
             for peer in iface.get("peers", []):
                 if not record_is_enabled(peer):
@@ -2795,6 +2837,29 @@ class WireGuardDriver(CoreDriver):
 
     def _conf_file(self, name: str) -> Path:
         return self._config_dir() / f"{name}.conf"
+
+    async def _dump_interfaces(self, ifaces: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
+        combined = await self._peer_dump_all()
+        if combined is not None:
+            return combined
+        names = [str(iface.get("name") or "") for iface in ifaces]
+        dumps = await gather_independent(*(self._peer_dump(name) for name in names))
+        found: dict[str, dict[str, dict[str, Any]]] = {}
+        for name, live in zip(names, dumps):
+            found[name] = live if isinstance(live, dict) else {}
+        return found
+
+    async def _peer_dump_all(self) -> dict[str, dict[str, dict[str, Any]]] | None:
+        cli = self._cli_bin()
+        if not cli:
+            return None
+        try:
+            result = await run([cli, "show", "all", "dump"], timeout=5, check=False)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return parse_wg_all_dump(result.stdout or "")
 
     async def _peer_dump(self, iface_name: str) -> dict[str, dict[str, Any]]:
         if not iface_name:

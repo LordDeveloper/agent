@@ -1,5 +1,8 @@
+import asyncio
+
 from agent.drivers.wireguard import (
     WireGuardDriver,
+    parse_wg_all_dump,
     _assign_peer_address,
     _assign_peer_address_with_expand,
     _enabled_peers_sorted_by_ip,
@@ -478,3 +481,73 @@ def test_render_conf_sorts_peers_and_includes_comments(monkeypatch):
     high_index = conf.index("# peer-high")
     assert low_index < high_index
     assert "[Peer]\n# peer-low" in conf
+
+
+def test_parse_wg_all_dump_keeps_iface_and_swaps_rx_tx():
+    text = "\n".join(
+        [
+            "wg0\tpriv\tpub\t51820\toff",
+            "wg0\taaa\t(none)\t1.2.3.4:1\t10.0.0.2/32\t10\t5\t9\toff",
+            "wg1\tbbb\t(none)\t(none)\t10.0.1.2/32\t0\t1\t2\toff",
+        ]
+    )
+    parsed = parse_wg_all_dump(text)
+    assert parsed["wg0"]["aaa"]["incoming"] == 9
+    assert parsed["wg0"]["aaa"]["outgoing"] == 5
+    assert parsed["wg0"]["aaa"]["handshake_at"] == 10
+    assert parsed["wg1"]["bbb"]["incoming"] == 2
+    assert "priv" not in parsed["wg0"]
+
+
+def test_usage_snapshot_does_not_rewrite_peer_documents():
+    class Fake:
+        key = "wireguard"
+
+        def __init__(self) -> None:
+            self.writes = 0
+
+        async def list_interfaces(self) -> list[dict]:
+            return [
+                {
+                    "id": "1",
+                    "name": "wg0",
+                    "peers": [
+                        {
+                            "id": "peer-1",
+                            "email": "a@b.c",
+                            "public_key": "aaa",
+                            "enable": True,
+                            "incoming": 100,
+                            "outgoing": 40,
+                            "_raw_incoming": 100,
+                            "_raw_outgoing": 40,
+                        }
+                    ],
+                }
+            ]
+
+        async def _dump_interfaces(self, _ifaces: list[dict]) -> dict:
+            return await self._peer_dump_all()
+
+        async def _peer_dump_all(self) -> dict:
+            return {
+                "wg0": {
+                    "aaa": {
+                        "incoming": 130,
+                        "outgoing": 45,
+                        "handshake_at": 0,
+                        "endpoint": "",
+                    }
+                }
+            }
+
+        async def put_doc(self, *_args, **_kwargs) -> None:
+            self.writes += 1
+
+    fake = Fake()
+    snapshot = asyncio.run(WireGuardDriver.usage_snapshot(fake))
+    assert fake.writes == 0
+    client = snapshot.inbounds[0].clients[0]
+    assert client.id == "peer-1"
+    assert client.incoming == 130
+    assert client.outgoing == 45
