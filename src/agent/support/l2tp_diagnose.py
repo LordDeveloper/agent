@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -171,18 +172,26 @@ async def _service_active(runner: Runner | None, unit: str) -> bool:
     return dump.get('stdout', '').strip() == 'active'
 
 
-async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[str, Any]]:
-    """Map client IP -> session info from PPP interfaces."""
-    dump = await _run_cmd(runner, ['ip', '-j', 'addr', 'show'])
-    sessions: dict[str, dict[str, Any]] = {}
-    if not dump['ok'] or not dump['stdout'].strip():
-        return sessions
+def _ppp_iface_names() -> list[str]:
+    root = Path('/sys/class/net')
+    if not root.is_dir():
+        return []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(name for name in names if name.startswith('ppp'))
 
+
+def _sessions_from_ip_payload(dump: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map client IP -> session info from one `ip -j addr` payload."""
+    sessions: dict[str, dict[str, Any]] = {}
+    if not dump.get('ok') or not str(dump.get('stdout') or '').strip():
+        return sessions
     try:
         rows = json.loads(dump['stdout'])
     except json.JSONDecodeError:
         return sessions
-
     if not isinstance(rows, list):
         return sessions
 
@@ -231,6 +240,29 @@ async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[
         sessions[client_ip]['outgoing'] = rx
         sessions[client_ip]['seen_at'] = now
 
+    return sessions
+
+
+async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[str, Any]]:
+    """Map client IP -> session info from PPP interfaces.
+
+    A full ``ip addr show`` walks every interface on the host. The sampler only
+    needs the few ``ppp*`` devices, and none at all when nobody is connected.
+    """
+    if runner is not None:
+        dump = await _run_cmd(runner, ['ip', '-j', 'addr', 'show'])
+        return _sessions_from_ip_payload(dump)
+
+    names = _ppp_iface_names()
+    if not names:
+        return {}
+    dumps = await gather_independent(
+        *(_run_cmd(None, ['ip', '-j', 'addr', 'show', 'dev', name], timeout=2.0) for name in names)
+    )
+    sessions: dict[str, dict[str, Any]] = {}
+    for dump in dumps:
+        if isinstance(dump, dict):
+            sessions.update(_sessions_from_ip_payload(dump))
     return sessions
 
 

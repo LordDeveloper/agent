@@ -978,24 +978,37 @@ class L2tpDriver(CoreDriver):
         return await trace_stored_peer(self.store, self.key, address)
 
     async def usage_snapshot(self) -> UsageSnapshotModel:
-        await self.sync_user_stats()
+        # Billing reads the live PPP counters. sync_user_stats rewrites the
+        # server document and, for a companion user, the whole WireGuard
+        # interface. That is what made four L2TP users take longer than
+        # a hundred WireGuard peers.
+        sessions = await self._collect_ppp_sessions()
         rows: list[InboundUsageModel] = []
         for server in filter_visible(await self.list_servers(), self.key):
             clients = []
             for user in server.get('users') or []:
-                if not record_is_enabled(user):
+                if not isinstance(user, dict) or not record_is_enabled(user):
                     continue
-                # Companion users bill only via the linked WireGuard/Amnezia peer.
-                if str(user.get('linked_peer_id') or '').strip():
-                    continue
+                address = str(user.get('address') or '').split('/', 1)[0].strip()
+                live = sessions.get(address) if address else None
+                if not isinstance(live, dict):
+                    live = {}
+                linked = str(user.get('linked_peer_id') or '').strip()
+                billing_core = str(user.get('linked_core') or '').strip() if linked else ''
+                if linked and billing_core not in {'wireguard', 'amnezia'}:
+                    billing_core = 'wireguard'
                 clients.append(
                     ClientUsageModel(
                         id=str(user.get('id')),
                         email=user.get('email'),
-                        incoming=int(user.get('incoming', 0) or 0),
-                        outgoing=int(user.get('outgoing', 0) or 0),
+                        incoming=int(live.get('incoming') or 0),
+                        outgoing=int(live.get('outgoing') or 0),
                         inbound_id=server.get('id'),
-                        handshake_at=self._connected_unix(user),
+                        handshake_at=self._connected_unix(user) if live.get('is_up') else None,
+                        # Same panel node_id as the WireGuard peer. The chunk
+                        # must not be core=l2tp or the pending response drops it.
+                        billing_core=billing_core or None,
+                        billing_key=linked or None,
                     )
                 )
             rows.append(

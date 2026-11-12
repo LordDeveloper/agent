@@ -11,6 +11,10 @@ class ClientUsageModel(BaseModel):
     incoming: int = 0
     outgoing: int = 0
     inbound_id: Optional[int | str] = None
+    # Companion L2TP: the cursor stays on this row, the delta chunk is queued
+    # on the linked WireGuard/Amnezia peer (same panel node_id).
+    billing_core: Optional[str] = None
+    billing_key: Optional[str] = None
     # Unix seconds; WireGuard/Amnezia only. Used to ignore idle counter noise as pending.
     handshake_at: Optional[int] = None
 

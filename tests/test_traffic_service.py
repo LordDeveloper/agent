@@ -99,6 +99,35 @@ async def test_traffic_service_tracks_pending_delta(store):
     assert payload["users"]["uuid-1"]["downlink"] == 100_000
 
 
+async def test_linked_l2tp_delta_is_queued_on_the_wireguard_peer(store):
+    """PPP bytes for a companion use the peer node_id and do not move the kernel cursor."""
+    traffic = TrafficService(store)
+    companion = ClientUsageModel(
+        id="peer-1",
+        email="wg@example.com",
+        incoming=1_000,
+        outgoing=400,
+        billing_core="wireguard",
+        billing_key="peer-1",
+    )
+    driver = FakeDriver([companion])
+    registry = FakeRegistry(["l2tp"], driver)
+
+    await _sample(traffic, registry)
+    companion.incoming = 1_500
+    companion.outgoing = 450
+    await _sample(traffic, registry)
+
+    pending = await traffic.pending_payload()
+    user = pending["users"]["peer-1"]
+    assert user["core"] == "wireguard"
+    assert user["downlink"] == 500
+    assert user["uplink"] == 50
+    assert await store.get_traffic_ack("l2tp", "peer-1") is None
+    cursor = await store.get_traffic_ack("wireguard", "peer-1")
+    assert cursor is None or cursor == {"incoming": 0, "outgoing": 0}
+
+
 async def test_reboot_bills_only_the_new_core_counter(store):
     """Cursor is the last core counter. A reboot bills that new counter, not the history."""
     traffic = TrafficService(store)

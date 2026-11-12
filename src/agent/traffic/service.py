@@ -19,8 +19,8 @@ log = get_logger("traffic")
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 # clients.incoming/outgoing for these cores store the last core counter, not a cumulative total.
-_CORE_COUNTER_CORES = frozenset({"wireguard", "amnezia"})
-CORE_COUNTER_CURSOR_META_KEY = "traffic_cursor_tracks_core_counter"
+_CORE_COUNTER_CORES = frozenset({"wireguard", "amnezia", "l2tp"})
+CORE_COUNTER_CURSOR_META_KEY = "traffic_cursor_tracks_core_counter_v2"
 LAST_SAMPLE_TIMING_META_KEY = "traffic_last_sample_timing"
 # From a stored (0,0) cursor, deltas above this are lifetime skew (reset/stale), not one interval.
 _ZERO_CURSOR_SKEW_BYTES = 512 * 1024 * 1024
@@ -633,6 +633,8 @@ class TrafficService:
                 client_id = str(getattr(client, "id", "") or "").strip()
                 protocol_id = str(getattr(client, "protocol_id", "") or "").strip()
                 self._remember_identity(label, email, client_id)
+                billing_core = str(getattr(client, "billing_core", "") or "").strip()
+                billing_key = str(getattr(client, "billing_key", "") or "").strip()
                 samples.append(
                     {
                         "core": core_key,
@@ -642,6 +644,8 @@ class TrafficService:
                         "protocol_id": protocol_id,
                         "incoming": int(client.incoming or 0),
                         "outgoing": int(client.outgoing or 0),
+                        "billing_core": billing_core,
+                        "billing_key": billing_key,
                     }
                 )
         return samples
@@ -757,6 +761,8 @@ class TrafficService:
                     chunk_inserts=chunk_inserts,
                     client_cursor_upserts=client_cursor_upserts,
                     sampled_at=sampled_at,
+                    billing_core=str(sample.get("billing_core") or ""),
+                    billing_key=str(sample.get("billing_key") or ""),
                 )
             stats[outcome] = stats.get(outcome, 0) + 1
             current_cursor = sample_cursors.get((core, label))
@@ -900,6 +906,8 @@ class TrafficService:
         chunk_inserts: list[dict[str, Any]],
         client_cursor_upserts: list[tuple[str, str, int, int]],
         sampled_at: str,
+        billing_core: str = "",
+        billing_key: str = "",
     ) -> str:
         pair = (core, client_key)
         last = sample_cursors.get(pair)
@@ -939,11 +947,13 @@ class TrafficService:
             return "initialized"
         if tick_in <= 0 and tick_out <= 0:
             return "regressed" if reset else "unchanged"
+        chunk_core = billing_core if billing_core in _CORE_COUNTER_CORES and billing_core != "l2tp" else core
+        chunk_key = billing_key or client_key
         chunk_inserts.append(
             {
                 "chunk_id": str(uuid.uuid4()),
-                "core": core,
-                "client_key": client_key,
+                "core": chunk_core,
+                "client_key": chunk_key,
                 "incoming": int(tick_in),
                 "outgoing": int(tick_out),
                 "sampled_at": sampled_at,

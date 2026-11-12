@@ -27,3 +27,90 @@ def test_collect_ppp_sessions_awaits_runner_and_maps_peer_ip():
 
 def test_collect_ppp_sessions_is_awaitable():
     assert asyncio.iscoroutinefunction(_collect_ppp_sessions)
+
+
+def test_collect_ppp_sessions_does_not_dump_every_interface(monkeypatch):
+    from agent.support import l2tp_diagnose
+
+    calls: list[list[str]] = []
+
+    async def fake_run(_runner, args, **_kwargs):
+        calls.append(list(args))
+        return {
+            "ok": True,
+            "stdout": json.dumps(
+                [
+                    {
+                        "ifname": "ppp0",
+                        "operstate": "UP",
+                        "flags": ["UP"],
+                        "addr_info": [{"local": "10.8.128.1", "peer": "10.8.128.10"}],
+                    }
+                ]
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(l2tp_diagnose, "_ppp_iface_names", lambda: ["ppp0"])
+    monkeypatch.setattr(l2tp_diagnose, "_run_cmd", fake_run)
+    sessions = asyncio.run(_collect_ppp_sessions())
+    assert calls == [["ip", "-j", "addr", "show", "dev", "ppp0"]]
+    assert sessions["10.8.128.10"]["interface"] == "ppp0"
+
+
+def test_l2tp_usage_snapshot_reads_live_counters_without_rewriting_documents():
+    from agent.drivers.l2tp import L2tpDriver
+
+    class Fake:
+        key = "l2tp"
+        writes = 0
+        synced = 0
+
+        async def list_servers(self):
+            return [
+                {
+                    "id": "1",
+                    "name": "l2tp",
+                    "users": [
+                        {
+                            "id": "user-1",
+                            "email": "a@b.c",
+                            "enable": True,
+                            "address": "10.8.128.10",
+                            "incoming": 9_000,
+                            "outgoing": 8_000,
+                        },
+                        {
+                            "id": "user-2",
+                            "email": "linked@b.c",
+                            "enable": True,
+                            "address": "10.8.128.11",
+                            "linked_peer_id": "peer-1",
+                            "incoming": 50,
+                        },
+                    ],
+                }
+            ]
+
+        async def _collect_ppp_sessions(self):
+            return {"10.8.128.10": {"incoming": 100, "outgoing": 40, "is_up": True}}
+
+        async def sync_user_stats(self):
+            self.synced += 1
+
+        async def put_doc(self, *_args, **_kwargs):
+            self.writes += 1
+
+        def _connected_unix(self, _user):
+            return None
+
+    fake = Fake()
+    snapshot = asyncio.run(L2tpDriver.usage_snapshot(fake))
+    assert fake.writes == 0
+    assert fake.synced == 0
+    clients = {client.id: client for client in snapshot.inbounds[0].clients}
+    assert clients["user-1"].incoming == 100
+    assert clients["user-1"].billing_key is None
+    companion = clients["user-2"]
+    assert companion.billing_key == "peer-1"
+    assert companion.billing_core == "wireguard"
