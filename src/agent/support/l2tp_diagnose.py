@@ -246,8 +246,9 @@ def _sessions_from_ip_payload(dump: dict[str, Any]) -> dict[str, dict[str, Any]]
 async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[str, Any]]:
     """Map client IP -> session info from PPP interfaces.
 
-    A full ``ip addr show`` walks every interface on the host. The sampler only
-    needs the few ``ppp*`` devices, and none at all when nobody is connected.
+    When no ``ppp*`` device exists, skip ``ip`` entirely. Otherwise one
+    ``ip -j addr show`` is enough; only ``ppp*`` rows are kept. One process
+    per device turned a few dozen sessions into several seconds.
     """
     if runner is not None:
         dump = await _run_cmd(runner, ['ip', '-j', 'addr', 'show'])
@@ -256,14 +257,8 @@ async def _collect_ppp_sessions(runner: Runner | None = None) -> dict[str, dict[
     names = _ppp_iface_names()
     if not names:
         return {}
-    dumps = await gather_independent(
-        *(_run_cmd(None, ['ip', '-j', 'addr', 'show', 'dev', name], timeout=2.0) for name in names)
-    )
-    sessions: dict[str, dict[str, Any]] = {}
-    for dump in dumps:
-        if isinstance(dump, dict):
-            sessions.update(_sessions_from_ip_payload(dump))
-    return sessions
+    dump = await _run_cmd(None, ['ip', '-j', 'addr', 'show'], timeout=2.0)
+    return _sessions_from_ip_payload(dump)
 
 
 async def diagnose_user_match(

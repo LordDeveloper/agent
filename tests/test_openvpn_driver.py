@@ -258,3 +258,54 @@ def test_enable_and_restart_with_no_servers(tmp_path: Path):
     enabled, restarted = asyncio.run(scenario())
     assert enabled == {"enabled": True, "servers": 0, "units": [], "running": False}
     assert restarted == {"restarted": True, "servers": 0, "units": [], "running": False}
+
+
+def test_usage_snapshot_reads_status_counters_without_rewriting_documents():
+    class Fake:
+        key = "openvpn"
+        writes = 0
+
+        async def list_servers(self):
+            return [
+                {
+                    "id": "1",
+                    "name": "ovpn",
+                    "users": [
+                        {
+                            "id": "user-1",
+                            "email": "a@b.c",
+                            "username": "alice",
+                            "enable": True,
+                            "address": "10.9.0.2",
+                            "incoming": 9_000,
+                            "outgoing": 8_000,
+                        }
+                    ],
+                }
+            ]
+
+        def _status_rows(self, _server):
+            return [
+                {
+                    "username": "alice",
+                    "virtual_address": "10.9.0.2",
+                    "bytes_sent": 120,
+                    "bytes_received": 30,
+                }
+            ]
+
+        async def sync_user_stats(self):
+            raise AssertionError("sample must not rewrite OpenVPN documents")
+
+        async def put_doc(self, *_args, **_kwargs):
+            self.writes += 1
+
+        def _connected_unix(self, _user):
+            return None
+
+    fake = Fake()
+    snapshot = asyncio.run(OpenVpnDriver.usage_snapshot(fake))
+    assert fake.writes == 0
+    client = snapshot.inbounds[0].clients[0]
+    assert client.incoming == 120
+    assert client.outgoing == 30

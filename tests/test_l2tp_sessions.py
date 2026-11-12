@@ -29,7 +29,7 @@ def test_collect_ppp_sessions_is_awaitable():
     assert asyncio.iscoroutinefunction(_collect_ppp_sessions)
 
 
-def test_collect_ppp_sessions_does_not_dump_every_interface(monkeypatch):
+def test_collect_ppp_sessions_uses_one_ip_dump(monkeypatch):
     from agent.support import l2tp_diagnose
 
     calls: list[list[str]] = []
@@ -54,8 +54,14 @@ def test_collect_ppp_sessions_does_not_dump_every_interface(monkeypatch):
     monkeypatch.setattr(l2tp_diagnose, "_ppp_iface_names", lambda: ["ppp0"])
     monkeypatch.setattr(l2tp_diagnose, "_run_cmd", fake_run)
     sessions = asyncio.run(_collect_ppp_sessions())
-    assert calls == [["ip", "-j", "addr", "show", "dev", "ppp0"]]
+    assert calls == [["ip", "-j", "addr", "show"]]
     assert sessions["10.8.128.10"]["interface"] == "ppp0"
+
+    calls.clear()
+    monkeypatch.setattr(l2tp_diagnose, "_ppp_iface_names", lambda: [])
+    idle = asyncio.run(_collect_ppp_sessions())
+    assert calls == []
+    assert idle == {}
 
 
 def test_l2tp_usage_snapshot_reads_live_counters_without_rewriting_documents():

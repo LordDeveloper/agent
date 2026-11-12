@@ -19,8 +19,8 @@ log = get_logger("traffic")
 AGENT_META_CORE = "__agent__"
 LAST_SAMPLE_META_KEY = "traffic_last_sample_at"
 # clients.incoming/outgoing for these cores store the last core counter, not a cumulative total.
-_CORE_COUNTER_CORES = frozenset({"wireguard", "amnezia", "l2tp"})
-CORE_COUNTER_CURSOR_META_KEY = "traffic_cursor_tracks_core_counter_v2"
+_CORE_COUNTER_CORES = frozenset({"wireguard", "amnezia", "l2tp", "openvpn"})
+CORE_COUNTER_CURSOR_META_KEY = "traffic_cursor_tracks_core_counter_v3"
 LAST_SAMPLE_TIMING_META_KEY = "traffic_last_sample_timing"
 # From a stored (0,0) cursor, deltas above this are lifetime skew (reset/stale), not one interval.
 _ZERO_CURSOR_SKEW_BYTES = 512 * 1024 * 1024
@@ -283,8 +283,6 @@ class TrafficService:
         else:
             billing = set(all_cores)
         cores = [key for key in all_cores if key in billing]
-        if "l2tp" in all_cores and "l2tp" not in cores:
-            await self._drop_linked_l2tp_billing(registry.get("l2tp"))
 
         owners_task = asyncio.create_task(self.store.client_scopes())
         snapshot_started = time.monotonic()
@@ -393,8 +391,6 @@ class TrafficService:
         started = time.monotonic()
         try:
             driver = registry.get(core_key)
-            if core_key == "l2tp":
-                await self._drop_linked_l2tp_billing(driver)
             reset_xray = core_key == "xray" and bool(
                 getattr(registry.settings, "traffic_xray_reset_stats", False)
             )
@@ -522,8 +518,6 @@ class TrafficService:
 
         started = time.monotonic()
         driver = registry.get(core_key)
-        if core_key == "l2tp":
-            await self._drop_linked_l2tp_billing(driver)
         reset_xray = core_key == "xray" and bool(
             getattr(registry.settings, "traffic_xray_reset_stats", False)
         )
@@ -1563,24 +1557,6 @@ class TrafficService:
                     if label:
                         keys.add(label)
         return keys
-
-    async def _drop_linked_l2tp_billing(self, driver: Any) -> None:
-        """Remove pending/ack rows for companion L2TP users (WG peer owns billing)."""
-        from agent.asyncutil import maybe_await
-
-        try:
-            servers = await maybe_await(driver.list_servers())
-        except Exception:
-            return
-        for server in servers or []:
-            if not isinstance(server, dict):
-                continue
-            for user in server.get("users") or []:
-                if not isinstance(user, dict):
-                    continue
-                if not str(user.get("linked_peer_id") or "").strip():
-                    continue
-                await self.reset_client_record("l2tp", user)
 
     async def reset_client(self, core: str, client_key_label: str) -> None:
         """Drop ack/pending rows after panel delete or renew."""

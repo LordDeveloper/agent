@@ -1053,20 +1053,52 @@ class OpenVpnDriver(CoreDriver):
 
         return await trace_stored_peer(self.store, self.key, address)
 
+    def _status_rows(self, server: dict[str, Any]) -> list[dict[str, Any]]:
+        for status_path in self._status_log_paths(server):
+            if not status_path.is_file():
+                continue
+            try:
+                text = status_path.read_text(encoding='utf-8', errors='ignore')
+            except OSError:
+                continue
+            if text.strip():
+                return parse_status_v2(text)
+        return []
+
     async def usage_snapshot(self) -> UsageSnapshotModel:
-        await self.sync_user_stats()
+        # The status file is the core counter. Rewriting the server document
+        # on every sample held the SQLite write lock behind L2TP's per-user deletes.
+        servers = [row for row in await self.list_servers() if isinstance(row, dict)]
+        by_user: dict[str, dict[str, Any]] = {}
+        by_ip: dict[str, dict[str, Any]] = {}
+        for server in servers:
+            for row in self._status_rows(server):
+                username = str(row.get('username') or '').strip()
+                vip = str(row.get('virtual_address') or '').split('/', 1)[0].strip()
+                if username:
+                    by_user[username] = row
+                if vip:
+                    by_ip[vip] = row
         rows: list[InboundUsageModel] = []
-        for server in filter_visible(await self.list_servers(), self.key):
+        for server in filter_visible(servers, self.key):
             clients = []
             for user in server.get('users') or []:
-                if not record_is_enabled(user):
+                if not isinstance(user, dict) or not record_is_enabled(user):
+                    continue
+                username = str(user.get('username') or '').strip()
+                address = str(user.get('address') or '').split('/', 1)[0].strip()
+                live = by_user.get(username) or by_ip.get(address)
+                if not live:
+                    # Missing status row is not a zero counter. Reporting 0
+                    # would replace the cursor and the next real reading would
+                    # bill the whole session.
                     continue
                 clients.append(
                     ClientUsageModel(
                         id=str(user.get('id')),
                         email=user.get('email'),
-                        incoming=int(user.get('incoming', 0) or 0),
-                        outgoing=int(user.get('outgoing', 0) or 0),
+                        incoming=int(live.get('bytes_sent') or 0),
+                        outgoing=int(live.get('bytes_received') or 0),
                         inbound_id=server.get('id'),
                         handshake_at=self._connected_unix(user),
                     )
