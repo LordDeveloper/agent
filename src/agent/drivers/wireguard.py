@@ -1585,8 +1585,13 @@ class WireGuardDriver(CoreDriver):
         }
 
     async def peer_ips(self, email: str) -> list[str]:
-        await self.sync_peer_stats()
-        for iface in filter_visible(await self.list_interfaces(), self.key):
+        ifaces = filter_visible(await self.list_interfaces(), self.key)
+        dumps = await gather_independent(
+            *(self._peer_dump(str(iface.get("name") or "")) for iface in ifaces)
+        )
+        for iface, live in zip(ifaces, dumps):
+            if isinstance(live, dict):
+                _apply_dump_counters(iface, live)
             for peer in iface.get("peers", []):
                 if str(peer.get("email")) == email or str(peer.get("id")) == email:
                     return recent_peer_ips(peer)
@@ -2742,20 +2747,28 @@ class WireGuardDriver(CoreDriver):
         return UsageSnapshotModel(inbounds=rows)
 
     async def online_users(self) -> list[str]:
-        await self.sync_peer_stats()
         from agent.support.l2tp_diagnose import live_linked_peer_keys
 
+        ifaces = filter_visible(await self.list_interfaces(), self.key)
+        dumps = await gather_independent(
+            *(self._peer_dump(str(iface.get("name") or "")) for iface in ifaces)
+        )
         companion = await live_linked_peer_keys(self.store)
         online: list[str] = []
         seen: set[str] = set()
-        for iface in filter_visible(await self.list_interfaces(), self.key):
-            for peer in iface.get("peers", []):
-                if not record_is_enabled(peer):
+        now = time.time()
+        for iface, live in zip(ifaces, dumps):
+            if not isinstance(live, dict):
+                live = {}
+            for peer in iface.get("peers") or []:
+                if not isinstance(peer, dict) or not record_is_enabled(peer):
                     continue
                 peer_id = str(peer.get("id") or "").strip()
                 email = str(peer.get("email") or "").strip()
-                live = bool(peer.get("online")) or peer_id in companion or email in companion
-                if not live:
+                stats = live.get(str(peer.get("public_key") or "")) or {}
+                handshake = int(stats.get("handshake_at") or 0)
+                connected = handshake > 0 and (now - handshake) < _ONLINE_HANDSHAKE_SECONDS
+                if not connected and peer_id not in companion and email not in companion:
                     continue
                 for label in (peer_id, email):
                     if label and label not in seen:
@@ -2791,8 +2804,9 @@ class WireGuardDriver(CoreDriver):
                         current = iface
                 if not _dump_is_usable(current, live):
                     continue
-                if _apply_dump_counters(current, live):
-                    await self.store.put_doc(self.key, self._kind, str(current.get("id")), current)
+                # Counters and online live in the kernel dump. Persisting them
+                # rewrites clients.meta for every peer on the stats poll.
+                _apply_dump_counters(current, live)
                 drift = _peer_kernel_drift(current, live)
                 if any(row["action"] != "skip" for row in drift):
                     await self._repair_kernel_peers(current, hold_lock=False)

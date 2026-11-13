@@ -261,16 +261,42 @@ class DocumentStore:
         else:
             if not row_visible(core, row.scope):
                 return
+            parent_interface_core = parent_core if parent_type == PARENT_INTERFACE else None
+            parent_interface_id = parent_id if parent_type == PARENT_INTERFACE else None
+            parent_server_core = parent_core if parent_type == PARENT_SERVER else None
+            parent_server_id = parent_id if parent_type == PARENT_SERVER else None
+            email = str(member.get("email") or "").strip() or None
+            name = str(member.get("name") or "").strip() or None
+            enabled = bool(member.get("is_enabled", True))
+            disabled_reason = str(member.get("disabled_reason") or "").strip() or None
+            disabled_at = str(member.get("disabled_at") or "").strip() or None
+            # Assigning meta always dirties the JSON column. An equal document
+            # would still rewrite the whole row.
+            if (
+                row.parent_type == parent_type
+                and row.parent_interface_core_id == parent_interface_core
+                and row.parent_interface_id == parent_interface_id
+                and row.parent_server_core_id == parent_server_core
+                and row.parent_server_id == parent_server_id
+                and row.email == email
+                and row.name == name
+                and bool(row.is_enabled) == enabled
+                and (row.disabled_reason or None) == disabled_reason
+                and (row.disabled_at or None) == disabled_at
+                and row.role == role
+                and dict(row.meta or {}) == meta
+            ):
+                return
             row.parent_type = parent_type
-            row.parent_interface_core_id = parent_core if parent_type == PARENT_INTERFACE else None
-            row.parent_interface_id = parent_id if parent_type == PARENT_INTERFACE else None
-            row.parent_server_core_id = parent_core if parent_type == PARENT_SERVER else None
-            row.parent_server_id = parent_id if parent_type == PARENT_SERVER else None
-            row.email = str(member.get("email") or "").strip() or None
-            row.name = str(member.get("name") or "").strip() or None
-            row.is_enabled = bool(member.get("is_enabled", True))
-            row.disabled_reason = str(member.get("disabled_reason") or "").strip() or None
-            row.disabled_at = str(member.get("disabled_at") or "").strip() or None
+            row.parent_interface_core_id = parent_interface_core
+            row.parent_interface_id = parent_interface_id
+            row.parent_server_core_id = parent_server_core
+            row.parent_server_id = parent_server_id
+            row.email = email
+            row.name = name
+            row.is_enabled = enabled
+            row.disabled_reason = disabled_reason
+            row.disabled_at = disabled_at
             row.role = role
             row.meta = meta
             row.updated_at = _now()
@@ -311,7 +337,7 @@ class DocumentStore:
             client_id=client_id,
         )
         client_row = await session.get(Client, (core, client_id))
-        if client_row is not None:
+        if client_row is not None and dict(client_row.meta or {}) != quota_meta:
             client_row.meta = quota_meta
         await session.flush()
         volume = data.get("volume")

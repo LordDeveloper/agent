@@ -1115,17 +1115,29 @@ class OpenVpnDriver(CoreDriver):
         return UsageSnapshotModel(inbounds=rows)
 
     async def online_users(self) -> list[str]:
-        await self.sync_user_stats()
         online: list[str] = []
         seen: set[str] = set()
         for server in filter_visible(await self.list_servers(), self.key):
+            live_names: set[str] = set()
+            live_ips: set[str] = set()
+            for row in self._status_rows(server):
+                username = str(row.get('username') or '').strip()
+                vip = str(row.get('virtual_address') or '').split('/', 1)[0].strip()
+                if username:
+                    live_names.add(username)
+                if vip:
+                    live_ips.add(vip)
             for user in server.get('users') or []:
-                if not user.get('online') or not record_is_enabled(user):
+                if not isinstance(user, dict) or not record_is_enabled(user):
+                    continue
+                username = str(user.get('username') or '').strip()
+                address = str(user.get('address') or '').split('/', 1)[0].strip()
+                if username not in live_names and address not in live_ips:
                     continue
                 for label in (
                     str(user.get('id') or '').strip(),
                     str(user.get('email') or '').strip(),
-                    str(user.get('username') or '').strip(),
+                    username,
                 ):
                     if label and label not in seen:
                         seen.add(label)
@@ -1145,90 +1157,8 @@ class OpenVpnDriver(CoreDriver):
         ]
 
     async def sync_user_stats(self) -> None:
-        sessions_by_user: dict[str, dict[str, Any]] = {}
-        sessions_by_ip: dict[str, dict[str, Any]] = {}
-        for server in await self.list_servers():
-            text = ''
-            for status_path in self._status_log_paths(server):
-                if not status_path.is_file():
-                    continue
-                try:
-                    text = status_path.read_text(encoding='utf-8', errors='ignore')
-                except OSError:
-                    continue
-                if text.strip():
-                    break
-            if not text.strip():
-                continue
-            for row in parse_status_v2(text):
-                username = str(row.get('username') or '').strip()
-                vip = str(row.get('virtual_address') or '').split('/', 1)[0].strip()
-                if username:
-                    sessions_by_user[username] = row
-                if vip:
-                    sessions_by_ip[vip] = row
-
-        now = int(time.time())
-        for server in await self.list_servers():
-            changed = False
-            for user in server.get('users') or []:
-                if not isinstance(user, dict):
-                    continue
-                username = str(user.get('username') or '').strip()
-                address = str(user.get('address') or '').split('/', 1)[0].strip()
-                live = sessions_by_user.get(username) or sessions_by_ip.get(address)
-                before_online = user.get('online')
-                before_in = user.get('_raw_incoming')
-                before_out = user.get('_raw_outgoing')
-                if live:
-                    # OpenVPN CLIENT_LIST: Bytes Received = client→server (upload),
-                    # Bytes Sent = server→client (download). Panel convention matches WG:
-                    # incoming = download, outgoing = upload.
-                    raw_download = int(live.get('bytes_sent') or 0)
-                    raw_upload = int(live.get('bytes_received') or 0)
-                    prev_download = int(user.get('_raw_incoming') or 0)
-                    prev_upload = int(user.get('_raw_outgoing') or 0)
-                    stored_down = int(user.get('incoming') or 0)
-                    stored_up = int(user.get('outgoing') or 0)
-                    # Session counters reset on reconnect; treat wrap as a fresh session total.
-                    # A missing raw baseline must not add the whole session onto an existing cumulative.
-                    if prev_download == 0 and stored_down > 0:
-                        delta_down = 0
-                    elif raw_download >= prev_download:
-                        delta_down = raw_download - prev_download
-                    else:
-                        delta_down = raw_download
-                    if prev_upload == 0 and stored_up > 0:
-                        delta_up = 0
-                    elif raw_upload >= prev_upload:
-                        delta_up = raw_upload - prev_upload
-                    else:
-                        delta_up = raw_upload
-                    user['incoming'] = int(user.get('incoming') or 0) + delta_down
-                    user['outgoing'] = int(user.get('outgoing') or 0) + delta_up
-                    user['_raw_incoming'] = raw_download
-                    user['_raw_outgoing'] = raw_upload
-                    user['online'] = True
-                    user['connected_at'] = user.get('connected_at') or now
-                    if live.get('real_address'):
-                        logs = list(user.get('ip_logs') or [])
-                        real = str(live['real_address']).split(':', 1)[0]
-                        if real and real not in logs:
-                            logs.append(real)
-                            user['ip_logs'] = logs[-20:]
-                else:
-                    # Keep _raw. A missed status row (CCD rewrite) must not make the
-                    # next sample add the same session bytes again. A real reconnect
-                    # still counts via the raw < prev branch.
-                    user['online'] = False
-                if (
-                    user.get('online') != before_online
-                    or user.get('_raw_incoming') != before_in
-                    or user.get('_raw_outgoing') != before_out
-                ):
-                    changed = True
-            if changed:
-                await self.store.put_doc(self.key, self._kind, str(server.get('id')), server)
+        """Online state is read from the status file. Do not rewrite clients.meta."""
+        return
 
     def _connected_unix(self, user: dict[str, Any]) -> int | None:
         value = user.get('connected_at')

@@ -220,14 +220,12 @@ def test_sync_peer_stats_does_not_write_the_stale_peer_list() -> None:
 
     fake = Fake()
     asyncio.run(WireGuardDriver.sync_peer_stats(fake))
-    assert fake.writes
-    saved_ids = [peer["id"] for peer in fake.writes[-1]["peers"]]
-    assert saved_ids == ["a", "b"]
-    assert fake.writes[-1]["peers"][0]["allowed_ips"] == "10.0.0.2/32"
-    assert fake.writes[-1]["peers"][0]["incoming"] == 8
-    assert fake.writes[-1]["peers"][1]["allowed_ips"] == "10.0.0.9/32"
+    assert fake.writes == []
     assert fake.repaired is not None
     assert [peer["id"] for peer in fake.repaired["peers"]] == ["a", "b"]
+    assert fake.repaired["peers"][0]["allowed_ips"] == "10.0.0.2/32"
+    assert fake.repaired["peers"][0]["incoming"] == 8
+    assert fake.repaired["peers"][1]["allowed_ips"] == "10.0.0.9/32"
 
 
 def test_idle_peer_on_the_connected_route_is_not_repaired() -> None:
