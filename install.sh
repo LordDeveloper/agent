@@ -33,8 +33,11 @@ done
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  systemctl stop agent-worker.service 2>/dev/null || true
   systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+  systemctl disable agent-worker.service 2>/dev/null || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+  rm -f /etc/systemd/system/agent-worker.service
   rm -f /usr/local/bin/agent
   systemctl daemon-reload
   rm -rf "$PREFIX"
@@ -102,9 +105,12 @@ else
   LISTEN="${LISTEN:-0.0.0.0:8443}"
 fi
 
+install -m 644 "$ROOT/systemd/agent-worker.service" /etc/systemd/system/agent-worker.service
 install -m 644 "$ROOT/systemd/agent.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
+systemctl enable agent-worker.service
 systemctl enable "$SERVICE_NAME"
+systemctl restart agent-worker.service
 systemctl restart "$SERVICE_NAME"
 
 install_xray_from_release() {

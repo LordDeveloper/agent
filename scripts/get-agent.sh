@@ -207,25 +207,52 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 BIN_PATH="${TMP}/${ASSET_NAME}"
-UNIT_PATH="${TMP}/agent.service"
 
 echo "Downloading ${ASSET_NAME} (${TAG})..."
 download_asset "$ASSET_ID" "$BIN_PATH"
 chmod +x "$BIN_PATH"
 
-# Best-effort: also pull unit file from the same release if present.
-UNIT_ID="$(RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
+# agent.service Requires=agent-worker.service. Install that unit before the
+# first restart, or systemd refuses to start the API ("Unit agent-worker.service
+# not found") and this script exits before cores or the token banner.
+install_unit_from_release_or_repo() {
+  local name="$1"
+  local dest="/etc/systemd/system/${name}"
+  local tmp="${TMP}/${name}"
+  local asset_id=""
+  local ref="${TAG:-main}"
+  rm -f "$tmp"
+
+  asset_id="$(RELEASE_JSON="$RELEASE_JSON" UNIT_NAME="$name" python3 - <<'PY'
 import json, os
 payload = json.loads(os.environ["RELEASE_JSON"])
+wanted = os.environ["UNIT_NAME"]
 for asset in payload.get("assets") or []:
-    if asset.get("name") == "agent.service":
+    if asset.get("name") == wanted:
         print(asset["id"])
         break
 PY
 )"
-if [[ -n "${UNIT_ID}" ]]; then
-  download_asset "$UNIT_ID" "$UNIT_PATH" || true
-fi
+  if [[ -n "${asset_id}" ]]; then
+    download_asset "$asset_id" "$tmp" || rm -f "$tmp"
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    curl -fsSL \
+      -H "Accept: application/vnd.github.raw" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      -H "User-Agent: netinja-agent-installer" \
+      "${auth_args[@]}" \
+      -o "$tmp" \
+      "${API}/repos/${REPO}/contents/systemd/${name}?ref=${ref}" || rm -f "$tmp"
+  fi
+
+  if [[ -s "$tmp" ]]; then
+    install -m 644 "$tmp" "$dest"
+    return 0
+  fi
+  return 1
+}
 
 if [[ ! -f /etc/os-release ]]; then
   echo "Unsupported OS"
@@ -261,19 +288,45 @@ if [[ -n "${PP_ID}" ]]; then
   install -m 755 "$PP_PATH" "$PREFIX/bin/pp-forward"
 fi
 
-if [[ -f "$UNIT_PATH" ]]; then
-  install -m 644 "$UNIT_PATH" "/etc/systemd/system/${SERVICE_NAME}.service"
-else
+if ! install_unit_from_release_or_repo "agent-worker.service"; then
+  cat >"/etc/systemd/system/agent-worker.service" <<'UNIT'
+[Unit]
+Description=Netinja node agent background worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=600
+EnvironmentFile=/etc/agent/.env
+WorkingDirectory=/opt/agent
+ExecStart=/opt/agent/bin/agent work
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+fi
+
+if ! install_unit_from_release_or_repo "${SERVICE_NAME}.service"; then
   cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<'UNIT'
 [Unit]
 Description=Netinja node agent API
-After=network.target
+After=network-online.target agent-worker.service
+Wants=network-online.target agent-worker.service
+# Migrations run in agent-worker; it must reach READY before this unit starts (Type=notify).
+Requires=agent-worker.service
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent serve
+# Re-apply peer egress without blocking activation. A missing exit interface
+# must not hold this unit in start-post.
+ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service
 Restart=on-failure
 RestartSec=3
 
@@ -324,8 +377,20 @@ else
 fi
 
 systemctl daemon-reload
+systemctl enable agent-worker.service
 systemctl enable "$SERVICE_NAME"
-systemctl restart "$SERVICE_NAME"
+if ! systemctl restart agent-worker.service; then
+  echo "agent-worker.service failed to start. Recent logs:" >&2
+  systemctl status agent-worker.service --no-pager -l >&2 || true
+  journalctl -u agent-worker.service -n 40 --no-pager >&2 || true
+  exit 1
+fi
+if ! systemctl restart "$SERVICE_NAME"; then
+  echo "${SERVICE_NAME}.service failed to start. Recent logs:" >&2
+  systemctl status "$SERVICE_NAME" --no-pager -l >&2 || true
+  journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+  exit 1
+fi
 
 install_xray_from_release() {
   local xray_repo="${XRAY_GITHUB_REPO:-${REPO}}"

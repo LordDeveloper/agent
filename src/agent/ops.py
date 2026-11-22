@@ -437,14 +437,16 @@ def default_unit_text() -> str:
 Description=Netinja node agent API
 After=network-online.target agent-worker.service
 Wants=network-online.target agent-worker.service
+# Migrations run in agent-worker; it must reach READY before this unit starts (Type=notify).
+Requires=agent-worker.service
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent serve
-# Re-apply peer egress without blocking activation. The apply script used to
-# sleep once per missing exit interface and held this unit in start-post.
+# Re-apply peer egress without blocking activation. A missing exit interface
+# must not hold this unit in start-post.
 ExecStartPost=-/bin/systemctl start --no-block agent-peer-egress.service
 Restart=on-failure
 RestartSec=3
@@ -461,7 +463,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=600
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/bin/agent work
