@@ -199,12 +199,25 @@ def live_ppp_interface_names() -> list[str]:
     return sorted(p.name for p in net.iterdir() if p.name.startswith("ppp") and p.is_dir())
 
 
+def _forwarded_user_needs_tunnel(user: dict[str, Any]) -> bool:
+    """True when this user's packets are forwarded out an exit or the main table.
+
+    A linked companion with no exit is prohibited and does not need a tunnel
+    match. Everyone else who is enabled and has an address does, including
+    standalone users whose ``exit_interface`` is empty.
+    """
+    if not record_is_enabled(user) or not peer_source_cidr(user.get("address")):
+        return False
+    linked = str(user.get("linked_peer_id") or "").strip()
+    if linked and normalize_exit_interface(user.get("exit_interface")) is None:
+        return False
+    return True
+
+
 async def _l2tp_has_egress_users(store: Store) -> bool:
     for server in await store.list_docs("l2tp", _L2TP_KIND):
         for user in server.get("users") or []:
-            if not isinstance(user, dict) or not record_is_enabled(user):
-                continue
-            if normalize_exit_interface(user.get("exit_interface")) and peer_source_cidr(user.get("address")):
+            if isinstance(user, dict) and _forwarded_user_needs_tunnel(user):
                 return True
     return False
 
@@ -212,9 +225,7 @@ async def _l2tp_has_egress_users(store: Store) -> bool:
 async def _openvpn_has_egress_users(store: Store) -> bool:
     for server in await store.list_docs("openvpn", _OPENVPN_KIND):
         for user in server.get("users") or []:
-            if not isinstance(user, dict) or not record_is_enabled(user):
-                continue
-            if normalize_exit_interface(user.get("exit_interface")) and peer_source_cidr(user.get("address")):
+            if isinstance(user, dict) and _forwarded_user_needs_tunnel(user):
                 return True
     return False
 

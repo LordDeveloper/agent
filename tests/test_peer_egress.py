@@ -9,6 +9,8 @@ from agent.db import Store
 from agent.support.host_interfaces import list_host_interfaces
 from agent.support.peer_egress import (
     desired_rules_from_interfaces,
+    l2tp_servers_as_interfaces,
+    openvpn_servers_as_interfaces,
     reconcile_core_egress,
     repair_peer_egress,
     render_apply_script,
@@ -871,4 +873,168 @@ async def test_non_region_empty_exit_nats_main_table_without_policy_rule(tmp_pat
     assert second["main_egress"] == [uplink]
     assert not any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
     assert not any(cmd[:3] == ["ip", "rule", "add"] and "10.50.0.2/32" in cmd for cmd in commands)
+    await store.close()
+
+
+async def test_main_table_l2tp_openvpn_and_amnezia_share_scoped_nat(tmp_path, monkeypatch):
+    """A WireGuard reconcile must not drop other cores' tunnel matches.
+
+    Non-region L2TP and OpenVPN users have no exit_interface. Their tunnel
+    names still have to be on the main-table MASQUERADE, or a later reconcile
+    flushes the chain and only matches the WireGuard interface. An explicit
+    exit on the same L2TP server keeps its policy rule.
+    """
+    store = Store(tmp_path / "agent.db")
+    await store.open()
+    commands: list[list[str]] = []
+    installed = {"nat": False, "forward": False}
+    uplink = "uplink0"
+    exit_iface = "exit0"
+    wg_name = "wg-plain"
+    awg_name = "awg-plain"
+    tun_name = "tun-plain"
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:4] == ["ip", "-4", "route", "get"]:
+            return _Result(stdout=f"1.1.1.1 via 192.0.2.1 dev {uplink} src 192.0.2.10\n")
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout=f"default via 192.0.2.1 dev {uplink}\n")
+        if args == ["ip", "-4", "route", "show"]:
+            return _Result(stdout="")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
+        if args[:1] == ["nft"] and "masquerade" in args:
+            installed["nat"] = True
+            return _Result()
+        if args[:1] == ["nft"] and "add" in args and "forward" in args:
+            installed["forward"] = True
+            return _Result()
+        if args[:2] == ["nft", "-j"] and "postrouting" in args:
+            if not installed["nat"]:
+                return _Result(returncode=1, stderr="no chain")
+            payload = {
+                "nftables": [
+                    {
+                        "rule": {
+                            "expr": [
+                                {"match": {"left": {"meta": {"key": "oifname"}}, "right": uplink}},
+                                {"masquerade": None},
+                            ]
+                        }
+                    },
+                    {
+                        "rule": {
+                            "expr": [
+                                {"match": {"left": {"meta": {"key": "oifname"}}, "right": exit_iface}},
+                                {"masquerade": None},
+                            ]
+                        }
+                    },
+                ]
+            }
+            return _Result(stdout=json.dumps(payload))
+        if args[:1] == ["nft"] and "list" in args and "forward" in args:
+            if not installed["forward"]:
+                return _Result(returncode=1, stderr="no chain")
+            return _Result(
+                stdout="\n".join(
+                    [
+                        'comment "netinja-egress-tunnel-wg-plain-in"',
+                        'comment "netinja-egress-tunnel-awg-plain-in"',
+                        'comment "netinja-egress-tunnel-pppx-in"',
+                        'comment "netinja-egress-tunnel-tunx-in"',
+                        'comment "netinja-egress-tunnel-tun-plain-in"',
+                    ]
+                )
+            )
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr("agent.support.peer_egress.ensure_peer_egress_unit", _stub_peer_egress_unit)
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
+
+    l2tp = {
+        "id": "l2tp-1",
+        "users": [
+            {"id": "l2tp-plain", "address": "10.61.0.2", "is_enabled": True},
+            {"id": "l2tp-exit", "address": "10.61.0.3", "exit_interface": exit_iface, "is_enabled": True},
+        ],
+    }
+    openvpn = {
+        "id": "ovpn-1",
+        "tun_dev": tun_name,
+        "users": [{"id": "ovpn-plain", "address": "10.62.0.2", "is_enabled": True}],
+    }
+    amnezia = {
+        "id": "awg-1",
+        "name": awg_name,
+        "peers": [{"id": "awg-plain", "address": "10.63.0.2", "is_enabled": True}],
+    }
+    wireguard = {
+        "id": "wg-1",
+        "name": wg_name,
+        "peers": [{"id": "wg-plain", "address": "10.64.0.2", "is_enabled": True}],
+    }
+    await store.put_doc("l2tp", "server", "l2tp-1", l2tp)
+    await store.put_doc("openvpn", "server", "ovpn-1", openvpn)
+    await store.put_doc("amnezia", "interface", "awg-1", amnezia)
+    await store.put_doc("wireguard", "interface", "wg-1", wireguard)
+
+    first = await reconcile_core_egress(
+        store,
+        "wireguard",
+        [wireguard],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert first["ok"] is True
+    assert first["main_egress"] == [uplink]
+    scoped = [cmd for cmd in commands if cmd[:1] == ["nft"] and "masquerade" in cmd and uplink in cmd]
+    assert scoped
+    for match in (wg_name, awg_name, "ppp*", "tun*", tun_name):
+        assert any("iifname" in cmd and match in cmd for cmd in scoped), match
+    assert not any(cmd[:3] == ["ip", "rule", "add"] and "10.64.0.2/32" in cmd for cmd in commands)
+
+    script = (tmp_path / "peer-egress-apply.sh").read_text(encoding="utf-8")
+    assert "_main_egress_dev" in script
+    assert uplink not in script
+    for match in ("ppp*", "tun*", tun_name, wg_name, awg_name):
+        assert f'iifname "{match}"' in script
+
+    l2tp_report = await reconcile_core_egress(
+        store,
+        "l2tp",
+        l2tp_servers_as_interfaces([l2tp]),
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert l2tp_report["ok"] is True
+    assert not any(cmd[:3] == ["ip", "rule", "add"] and "10.61.0.2/32" in cmd for cmd in commands)
+    exit_table = table_id_for_interface(exit_iface)
+    assert any(
+        cmd[:3] == ["ip", "rule", "add"] and "10.61.0.3/32" in cmd and str(exit_table) in cmd
+        for cmd in commands
+    )
+
+    openvpn_report = await reconcile_core_egress(
+        store,
+        "openvpn",
+        openvpn_servers_as_interfaces([openvpn]),
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert openvpn_report["ok"] is True
+    assert not any(cmd[:3] == ["ip", "rule", "add"] and "10.62.0.2/32" in cmd for cmd in commands)
+
+    commands.clear()
+    again = await reconcile_core_egress(
+        store,
+        "wireguard",
+        [wireguard],
+        runner=fake_run,
+        data_dir=tmp_path,
+    )
+    assert again["nat_rebuilt"] is False
+    assert not any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
     await store.close()
