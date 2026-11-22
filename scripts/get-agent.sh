@@ -131,24 +131,32 @@ if [[ -n "$TOKEN" ]]; then
   auth_args=(-H "Authorization: Bearer ${TOKEN}")
 fi
 
-api_get() {
-  local url="$1"
-  curl -fsSL \
-    -H "Accept: application/vnd.github+json" \
+# curl|bash shares stdin with the script. Child curls must not read it.
+# --http1.1 avoids the GitHub asset CDN stalling a later transfer on HTTP/2.
+# Without --max-time a stalled socket sits forever on the previous echo line.
+curl_gh() {
+  curl --http1.1 --fail --show-error --location \
+    --retry 3 --retry-delay 2 --retry-connrefused \
+    --connect-timeout 20 --max-time 300 \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     -H "User-Agent: netinja-agent-installer" \
     "${auth_args[@]}" \
+    "$@" \
+    </dev/null
+}
+
+api_get() {
+  local url="$1"
+  curl_gh -sS \
+    -H "Accept: application/vnd.github+json" \
     "$url"
 }
 
 download_asset() {
   local asset_id="$1"
   local dest="$2"
-  curl -fsSL \
+  curl_gh --progress-bar \
     -H "Accept: application/octet-stream" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    -H "User-Agent: netinja-agent-installer" \
-    "${auth_args[@]}" \
     -o "$dest" \
     "${API}/repos/${REPO}/releases/assets/${asset_id}"
 }
@@ -238,11 +246,9 @@ PY
   fi
 
   if [[ ! -s "$tmp" ]]; then
-    curl -fsSL \
+    echo "Fetching systemd/${name} from ${ref}..."
+    curl_gh -sS \
       -H "Accept: application/vnd.github.raw" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      -H "User-Agent: netinja-agent-installer" \
-      "${auth_args[@]}" \
       -o "$tmp" \
       "${API}/repos/${REPO}/contents/systemd/${name}?ref=${ref}" || rm -f "$tmp"
   fi
@@ -283,9 +289,13 @@ PY
 if [[ -n "${PP_ID}" ]]; then
   PP_PATH="${TMP}/${PP_ASSET}"
   echo "Downloading ${PP_ASSET} (${TAG})..."
-  download_asset "$PP_ID" "$PP_PATH"
-  chmod +x "$PP_PATH"
-  install -m 755 "$PP_PATH" "$PREFIX/bin/pp-forward"
+  # Bundled inside the agent binary. A stalled extra download must not abort install.
+  if download_asset "$PP_ID" "$PP_PATH"; then
+    chmod +x "$PP_PATH"
+    install -m 755 "$PP_PATH" "$PREFIX/bin/pp-forward"
+  else
+    echo "pp-forward download failed; continuing (bundled inside the agent binary)" >&2
+  fi
 fi
 
 if ! install_unit_from_release_or_repo "agent-worker.service"; then
