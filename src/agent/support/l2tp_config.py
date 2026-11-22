@@ -157,14 +157,31 @@ def _upgrade_managed_templates(tpl: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_templates(servers: list[dict[str, Any]]) -> dict[str, Any]:
-    """Prefer the first server that carries an explicit templates object."""
+    """Use the first explicit template, then the latest non-empty listen address.
+
+    xl2tpd.conf is one file for every L2TP server. A companion created earlier
+    often still has an empty listen_addr; that must not hide the address set
+    on the server the panel just updated. An empty value does not clear a
+    later address.
+    """
+    chosen: dict[str, Any] | None = None
+    listen = ''
     for server in servers:
         if not isinstance(server, dict):
             continue
         raw = server.get('templates')
-        if isinstance(raw, dict) and raw:
-            return normalize_templates(raw)
-    return default_templates()
+        if not isinstance(raw, dict) or not raw:
+            continue
+        tpl = normalize_templates(raw)
+        if chosen is None:
+            chosen = dict(tpl)
+        addr = str(tpl.get('listen_addr') or '')
+        if addr:
+            listen = addr
+    if chosen is None:
+        return default_templates()
+    chosen['listen_addr'] = listen
+    return chosen
 
 
 def _append_lns_default(

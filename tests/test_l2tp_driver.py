@@ -313,6 +313,35 @@ def test_listen_addr_change_restarts_xl2tpd(tmp_path, monkeypatch):
     assert calls['xl2tpd_force'] is True
 
 
+def test_listen_addr_update_reaches_every_server_template(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._write_stack_configs', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._reload_ipsec_secrets', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_xl2tpd', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._commit_user_runtime', _async_none)
+
+    from agent.support.l2tp_config import resolve_templates
+    from tests.conftest import open_store
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = open_store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        first = await driver.create_server({'subnet': '10.92.0.0/16', 'name': 'older'})
+        second = await driver.create_server({'subnet': '10.93.0.0/16', 'name': 'panel'})
+        await driver.update_server(second['id'], {'templates': {'listen_addr': '172.31.180.2'}})
+        return await driver.list_servers()
+
+    servers = asyncio.run(scenario())
+    assert resolve_templates(servers)['listen_addr'] == '172.31.180.2'
+    assert all(
+        server['templates']['listen_addr'] == '172.31.180.2'
+        for server in servers
+    )
+
+
 def test_normalize_templates_upgrades_windows_slow_defaults():
     from agent.support.l2tp_config import DEFAULT_IPSEC_ESP, DEFAULT_IPSEC_IKE, normalize_templates
 

@@ -1,6 +1,7 @@
 from agent.support.l2tp_config import (
     render_ipsec_conf,
     render_xl2tpd_conf,
+    resolve_templates,
     sanitize_listen_addr,
 )
 
@@ -21,6 +22,16 @@ def test_listen_addr_is_written_to_xl2tpd_and_ipsec():
     assert conf.index('listen-addr = 203.0.113.10') < conf.index('auth file =')
     ipsec = render_ipsec_conf([], templates=templates)
     assert '    left=203.0.113.10\n' in ipsec
+
+
+def test_later_server_listen_addr_is_not_hidden_by_an_empty_template():
+    templates = resolve_templates([
+        {'templates': {'lns_name': 'l2tpd'}},
+        {'templates': {'listen_addr': '172.31.180.2', 'lns_name': 'l2tpd'}},
+    ])
+    assert templates['listen_addr'] == '172.31.180.2'
+    conf = render_xl2tpd_conf([{'subnet': '10.164.0.0/16'}], templates=templates)
+    assert 'listen-addr = 172.31.180.2\n' in conf
 
 
 def test_sanitize_listen_addr():

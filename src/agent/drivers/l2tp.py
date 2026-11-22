@@ -558,6 +558,8 @@ class L2tpDriver(CoreDriver):
         listen_after = str(normalize_templates(candidate.get('templates')).get('listen_addr') or '')
         listen_changed = listen_before != listen_after
         await self.store.save_server_config(self.key, str(server.get('id')), candidate)
+        if listen_changed:
+            await self._propagate_listen_addr(str(server.get('id')), listen_after)
         await self.audit.record('update', f'{self.key}/server/{server.get("id")}')
         await self._write_stack_configs()
         if ipsec_changed or pool_changed:
@@ -576,6 +578,18 @@ class L2tpDriver(CoreDriver):
                 )
             await self._ensure_xl2tpd(force_restart=True)
         return candidate
+
+    async def _propagate_listen_addr(self, source_id: str, listen: str) -> None:
+        """One xl2tpd.conf serves every server, so they must share listen_addr."""
+        for row in await self.list_servers():
+            if not isinstance(row, dict) or str(row.get('id')) == source_id:
+                continue
+            templates = normalize_templates(row.get('templates'))
+            if str(templates.get('listen_addr') or '') == listen:
+                continue
+            templates['listen_addr'] = listen
+            row['templates'] = templates
+            await self.store.save_server_config(self.key, str(row.get('id')), row)
 
     async def delete_server(self, server_id: int | str) -> bool:
         server = await self.get_server(server_id)
