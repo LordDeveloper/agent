@@ -440,7 +440,7 @@ def test_disable_and_delete_still_reconcile(tmp_path):
     assert calls == [(True, []), (True, ["p1", "a@b"])]
 
 
-def test_new_peer_with_exit_reconciles_and_without_exit_does_not(tmp_path):
+def test_new_peer_reconciles_egress_with_or_without_exit(tmp_path):
     store, driver = _driver(tmp_path)
     calls: list[str] = []
 
@@ -482,7 +482,9 @@ def test_new_peer_with_exit_reconciles_and_without_exit_does_not(tmp_path):
             await store.close()
 
     asyncio.run(run())
-    assert calls == ["validate", "apply:False", "validate", "apply:True"]
+    # A peer with no exit_interface still needs egress reconcile: main-table NAT
+    # and FORWARD. The explicit exit peer needs it for policy routing.
+    assert calls == ["validate", "apply:True", "validate", "apply:True"]
 
 
 def _done():
@@ -501,6 +503,10 @@ def test_routing_key_ignores_quota_and_sees_exit_enable_and_link():
     linked = {**before, "is_enabled": False, "linked_peer_id": "l2"}
     assert _peer_routing_changed(before, linked) is True
     assert _peer_routing_changed(linked, {**linked, "volume": 4}) is False
+    plain = {"address": "10.80.0.8", "is_enabled": True}
+    assert _peer_routing_changed({}, plain) is True
+    assert _peer_routing_changed(plain, {**plain, "volume": 3, "incoming": 1}) is False
+    assert _peer_routing_changed(plain, {**plain, "is_enabled": False}) is True
 
 
 @pytest.mark.asyncio
@@ -679,7 +685,7 @@ async def test_repair_fixes_missing_rule_and_wrong_route(tmp_path, monkeypatch):
         {
             "id": 1,
             "name": "wg0",
-            "peers": [{"address": "10.80.0.2", "exit_interface": "eth1", "is_enabled": True}],
+            "peers": [{"id": "peer-1", "address": "10.80.0.2", "exit_interface": "eth1", "is_enabled": True}],
         },
     )
     result = await repair_peer_egress(store, data_dir=tmp_path, runner=fake_run)

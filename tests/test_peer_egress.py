@@ -744,3 +744,131 @@ async def test_repair_peer_egress_force_reconciles(tmp_path, monkeypatch):
         assert "tunnel-wg0-in" in script
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_non_region_empty_exit_nats_main_table_without_policy_rule(tmp_path, monkeypatch):
+    """Standalone peers have no exit_interface. NAT follows the live default device.
+
+    The device name comes from the routing lookup, not from a constant. A second
+    reconcile must not install another copy. A peer with an explicit exit still
+    gets its own policy rule and is not moved onto the main table.
+    """
+    store = Store(tmp_path / "agent.db")
+    await store.open()
+    commands: list[list[str]] = []
+    installed = {"nat": False, "forward": False}
+    uplink = "uplink0"
+    tunnel = "wgmain"
+    exit_iface = "exit0"
+
+    def fake_run(args, **kwargs):
+        commands.append(list(args))
+        if args[:4] == ["ip", "-4", "route", "get"]:
+            return _Result(stdout=f"1.1.1.1 via 192.0.2.1 dev {uplink} src 192.0.2.10\n")
+        if args[:4] == ["ip", "-4", "route", "show"] and args[4:] == ["default"]:
+            return _Result(stdout=f"default via 192.0.2.1 dev {uplink}\n")
+        if args == ["ip", "-4", "route", "show"]:
+            return _Result(stdout="")
+        if args[:3] == ["ip", "-j", "rule"]:
+            return _Result(stdout="[]")
+        if args[:1] == ["nft"] and "masquerade" in args:
+            installed["nat"] = True
+            return _Result()
+        if args[:1] == ["nft"] and "add" in args and "forward" in args:
+            installed["forward"] = True
+            return _Result()
+        if args[:2] == ["nft", "-j"] and "postrouting" in args:
+            if not installed["nat"]:
+                return _Result(returncode=1, stderr="no chain")
+            payload = {
+                "nftables": [
+                    {
+                        "rule": {
+                            "expr": [
+                                {"match": {"left": {"meta": {"key": "oifname"}}, "right": uplink}},
+                                {"masquerade": None},
+                            ]
+                        }
+                    },
+                    {
+                        "rule": {
+                            "expr": [
+                                {"match": {"left": {"meta": {"key": "oifname"}}, "right": exit_iface}},
+                                {"masquerade": None},
+                            ]
+                        }
+                    },
+                ]
+            }
+            return _Result(stdout=json.dumps(payload))
+        if args[:1] == ["nft"] and "list" in args and "forward" in args:
+            if not installed["forward"]:
+                return _Result(returncode=1, stderr="no chain")
+            return _Result(stdout=f'comment "netinja-egress-tunnel-{tunnel}-in"\n')
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_egress.shutil.which", lambda cmd: f"/usr/sbin/{cmd}")
+    monkeypatch.setattr("agent.support.peer_egress.ensure_peer_egress_unit", _stub_peer_egress_unit)
+    monkeypatch.setattr("agent.support.peer_egress._persist_sysctl_forward", _stub_true)
+
+    iface = {
+        "id": 1,
+        "name": tunnel,
+        "peers": [
+            {"id": "plain", "address": "10.50.0.2", "is_enabled": True},
+            {"id": "routed", "address": "10.50.0.3", "exit_interface": exit_iface, "is_enabled": True},
+        ],
+    }
+    await store.put_doc("wireguard", "interface", "1", iface)
+    first = await reconcile_core_egress(store, "wireguard", [iface], runner=fake_run, data_dir=tmp_path)
+    assert first["ok"] is True
+    assert first["main_egress"] == [uplink]
+    assert first["nat_rebuilt"] is True
+    assert not any(
+        cmd[:3] == ["ip", "rule", "add"] and "10.50.0.2/32" in cmd for cmd in commands
+    )
+    exit_table = table_id_for_interface(exit_iface)
+    assert any(
+        cmd[:3] == ["ip", "rule", "add"] and "10.50.0.3/32" in cmd and str(exit_table) in cmd
+        for cmd in commands
+    )
+    scoped = [
+        cmd
+        for cmd in commands
+        if cmd[:1] == ["nft"] and "masquerade" in cmd and uplink in cmd
+    ]
+    assert scoped
+    assert all("iifname" in cmd and tunnel in cmd and "oifname" in cmd for cmd in scoped)
+    explicit = [
+        cmd
+        for cmd in commands
+        if cmd[:1] == ["nft"] and "masquerade" in cmd and exit_iface in cmd
+    ]
+    assert explicit
+    assert all("iifname" not in cmd for cmd in explicit)
+    assert any(
+        cmd[:1] == ["nft"] and "forward" in cmd and "oifname" in cmd and uplink in cmd and "accept" in cmd
+        for cmd in commands
+    )
+    assert any(
+        cmd[:1] == ["nft"]
+        and "forward" in cmd
+        and "iifname" in cmd
+        and uplink in cmd
+        and "related,established" in cmd
+        for cmd in commands
+    )
+    script = (tmp_path / "peer-egress-apply.sh").read_text(encoding="utf-8")
+    assert "_main_egress_dev" in script
+    assert uplink not in script
+    assert exit_iface in script
+    assert script.count(f'iifname "{tunnel}"') >= 1
+
+    commands.clear()
+    second = await reconcile_core_egress(store, "wireguard", [iface], runner=fake_run, data_dir=tmp_path)
+    assert second["nat_rebuilt"] is False
+    assert second["main_egress"] == [uplink]
+    assert not any(cmd[:1] == ["nft"] and "masquerade" in cmd for cmd in commands)
+    assert not any(cmd[:3] == ["ip", "rule", "add"] and "10.50.0.2/32" in cmd for cmd in commands)
+    await store.close()

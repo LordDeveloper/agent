@@ -1303,7 +1303,12 @@ def _peer_change_needs_wg_apply(before: dict[str, Any], after: dict[str, Any]) -
 
 
 def _peer_routing_key(peer: dict[str, Any]) -> tuple[str, str, str] | None:
-    """Identity of the policy rule this peer installs. None when it installs none."""
+    """Identity of the egress this peer needs.
+
+    ``lookup`` installs a policy rule. ``main`` does not: the peer stays on the
+    main table, but NAT and FORWARD still have to be reconciled. Disabled
+    peers with no companion link install nothing.
+    """
     from agent.support.peer_egress import normalize_exit_interface, peer_source_cidr
 
     cidr = peer_source_cidr(peer.get("address"))
@@ -1315,8 +1320,10 @@ def _peer_routing_key(peer: dict[str, Any]) -> tuple[str, str, str] | None:
     enabled = record_is_enabled(peer)
     if linked and (not enabled or not exit_iface):
         return (host, "prohibit", "")
-    if not enabled or not exit_iface:
+    if not enabled:
         return None
+    if not exit_iface:
+        return (host, "main", "")
     return (host, "lookup", exit_iface)
 
 

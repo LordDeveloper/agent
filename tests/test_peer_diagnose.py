@@ -168,3 +168,84 @@ def test_diagnose_flags_missing_exit_and_live_peer(tmp_path, monkeypatch):
     assert "PEER_NOT_IN_LIVE_WG" in codes
     assert "EXIT_INTERFACE_UNSET" in codes
     assert report["summary"]["healthy"] is False
+    path = report["matches"][0]["routing"]["path_verification"]
+    assert path["route_lookup_only"] is True
+    assert path["scope"] == "route_lookup"
+    assert path["live_traffic_observed"] is False
+
+
+def test_diagnose_main_table_checks_nat_and_does_not_call_route_lookup_enough(tmp_path, monkeypatch):
+    store = _store_with_peer(tmp_path)
+
+    async def tweak():
+        iface = await store.get_doc("wireguard", "interface", "1")
+        iface["peers"][0].pop("exit_interface", None)
+        await store.put_doc("wireguard", "interface", "1", iface)
+
+    asyncio.run(tweak())
+
+    def fake_runner(args, **kwargs):
+        if args[:3] == ["ip", "route", "get"]:
+            return _Result(stdout="1.1.1.1 from 10.80.0.5 dev uplink0 table main\n")
+        if args[:1] == ["nft"]:
+            return _Result(
+                stdout="\n".join(
+                    [
+                        'iifname "wg1" oifname "uplink0" masquerade comment "netinja-egress-uplink0"',
+                        'oifname "uplink0" accept comment "netinja-egress-uplink0-fwd-out"',
+                        'iifname "uplink0" ct state related,established accept comment "netinja-egress-uplink0-fwd-in"',
+                        'iifname "wg1" accept comment "netinja-egress-tunnel-wg1-in"',
+                        'oifname "wg1" accept comment "netinja-egress-tunnel-wg1-out"',
+                    ]
+                )
+            )
+        return _Result()
+
+    monkeypatch.setattr("agent.support.peer_diagnose._read_sysctl", lambda path: "1")
+    monkeypatch.setattr(
+        "agent.support.peer_diagnose.shutil.which",
+        lambda cmd: "/usr/sbin/nft" if cmd == "nft" else None,
+    )
+
+    report = asyncio.run(
+        diagnose_peer_address(
+            store,
+            "wireguard",
+            "10.80.0.5",
+            runner=fake_runner,
+            peer_dump_fn=lambda _n: {},
+            interface_is_up_fn=lambda _n: True,
+        )
+    )
+    match = report["matches"][0]
+    path = match["routing"]["path_verification"]
+    assert match["routing"]["main_egress"] == "uplink0"
+    assert match["routing"]["nat"]["masquerade"] is True
+    assert match["routing"]["forward"]["established_return"] is True
+    assert path["route_lookup_only"] is False
+    assert path["firewall_rules_checked"] is True
+    assert path["live_traffic_observed"] is False
+    assert path["scope"] == "firewall_rules"
+    assert "NAT_MISSING" not in {row["code"] for row in match["issues"]}
+
+    def missing_nat(args, **kwargs):
+        if args[:3] == ["ip", "route", "get"]:
+            return _Result(stdout="1.1.1.1 from 10.80.0.5 dev uplink0\n")
+        if args[:1] == ["nft"]:
+            return _Result(stdout='oifname "wg1" accept comment "tunnel-out"\n')
+        return _Result()
+
+    bare = asyncio.run(
+        diagnose_peer_address(
+            store,
+            "wireguard",
+            "10.80.0.5",
+            runner=missing_nat,
+            peer_dump_fn=lambda _n: {},
+            interface_is_up_fn=lambda _n: True,
+        )
+    )
+    codes = {row["code"] for row in bare["matches"][0]["issues"]}
+    assert "NAT_MISSING" in codes
+    assert bare["matches"][0]["routing"]["path_verification"]["route_lookup_only"] is False
+    assert bare["matches"][0]["routing"]["path_verification"]["scope"] == "firewall_rules"

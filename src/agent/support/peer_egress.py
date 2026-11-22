@@ -26,10 +26,16 @@ force-reconciles routing + firewall and restarts the oneshot apply unit.
 
 Missing exit interface (boot race / Mullvad down / server transfer)
 -------------------------------------------------------------------
-Never delete a peer's lookup rule just because ``exit_interface`` is briefly
-absent. Falling through to the main table SNAT's traffic out the region's
-primary internet IP. Retain the previous rule (and apply-script must not
-``ip rule del`` on failure); reinstall once the exit iface is warm again.
+Never delete a peer's lookup rule just because an explicit ``exit_interface``
+is briefly absent. Retain the previous lookup (and the apply script must not
+``ip rule del`` on failure); reinstall once that exit iface is warm again.
+
+Peers that have no exit interface at all (standalone / non-region servers)
+are different: they are meant to use the main routing table. WireGuard still
+decrypts their packets, but the source is a tunnel address, so the agent must
+resolve the live default IPv4 device and install FORWARD plus SNAT for traffic
+that arrives on a tunnel and leaves through that device, and accept the
+ESTABLISHED replies back toward the tunnel. Route lookup alone does not do that.
 
 The apply script must not sleep. A transferred node often has peers aimed at
 exit interfaces (nl, tr, de, …) that do not exist on the new host. Sleeping
@@ -50,6 +56,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import zlib
 from pathlib import Path
@@ -276,6 +283,110 @@ def peer_source_cidr(address: Any) -> str | None:
     return f"{host}/32"
 
 
+def peer_uses_main_table(peer: dict[str, Any]) -> bool:
+    """Enabled peer with no explicit exit and no companion prohibit.
+
+    Standalone (non-region) WireGuard peers are stored this way: the panel
+    omits ``exit_interface`` unless the server is a region host. They must
+    leave through the main-table default device, not a policy table.
+    """
+    if not isinstance(peer, dict):
+        return False
+    if not peer_source_cidr(peer.get("address")):
+        return False
+    if str(peer.get("linked_peer_id") or "").strip():
+        return False
+    if not record_is_enabled(peer):
+        return False
+    return normalize_exit_interface(peer.get("exit_interface")) is None
+
+
+def peers_use_main_table(interfaces: list[dict[str, Any]]) -> bool:
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        for peer in iface.get("peers") or []:
+            if peer_uses_main_table(peer):
+                return True
+    return False
+
+
+def _interfaces_for_core(core: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if core == "l2tp":
+        return l2tp_servers_as_interfaces(docs)
+    if core == "openvpn":
+        return openvpn_servers_as_interfaces(docs)
+    return [row for row in docs if isinstance(row, dict)]
+
+
+async def _core_interface_docs(store: Store, core: str) -> list[dict[str, Any]]:
+    if core == "l2tp":
+        return await store.list_docs(core, _L2TP_KIND)
+    if core == "openvpn":
+        return await store.list_docs(core, _OPENVPN_KIND)
+    return await store.list_docs(core, _IFACE_KIND)
+
+
+async def store_has_main_table_peers(store: Store) -> bool:
+    for core in _EGRESS_CORES:
+        docs = await _core_interface_docs(store, core)
+        if peers_use_main_table(_interfaces_for_core(core, docs)):
+            return True
+    return False
+
+
+async def _other_cores_use_main_table(store: Store, core: str) -> bool:
+    for other in _EGRESS_CORES:
+        if other == core:
+            continue
+        docs = await _core_interface_docs(store, other)
+        if peers_use_main_table(_interfaces_for_core(other, docs)):
+            return True
+    return False
+
+
+def device_from_route_text(text: str) -> str | None:
+    """First ``dev`` token in an ``ip route`` line. Empty when the lookup failed."""
+    devices = devices_from_route_text(text)
+    return devices[0] if devices else None
+
+
+def devices_from_route_text(text: str) -> list[str]:
+    found: list[str] = []
+    for line in str(text or "").splitlines():
+        parts = line.split()
+        if "dev" not in parts:
+            continue
+        try:
+            dev = parts[parts.index("dev") + 1]
+        except IndexError:
+            continue
+        if dev and dev not in found:
+            found.append(dev)
+    return found
+
+
+def _acceptable_egress_device(name: str, skip: set[str]) -> str | None:
+    iface = normalize_exit_interface(name)
+    if not iface or iface in skip or iface in {"lo", "lo0"}:
+        return None
+    return iface
+
+
+def _stored_main_egress(state: dict[str, Any] | None) -> list[str]:
+    raw = (state or {}).get("main_egress")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    found: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
 def apply_script_path(data_dir: str | Path | None = None) -> Path:
     base = Path(data_dir or os.environ.get("DATA_DIR") or "/var/lib/agent")
     return base / "peer-egress-apply.sh"
@@ -422,6 +533,8 @@ def render_apply_script(
     rules: list[dict[str, str | int]],
     tunnel_ifaces: list[str] | None = None,
     bind_ifaces: list[str] | None = None,
+    *,
+    masquerade_main_table: bool = False,
 ) -> str:
     """Self-contained shell script so egress survives reboot (wg-quick PostUp / systemd)."""
     lines = [
@@ -439,6 +552,25 @@ def render_apply_script(
         "fi",
         "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true",
         "",
+    ]
+    if masquerade_main_table:
+        lines.extend(
+            [
+                "# Peers with no exit_interface follow the main table. Resolve the",
+                "# egress device at apply time so a renamed uplink is picked up",
+                "# without baking a host-specific interface name into this script.",
+                "_main_egress_dev() {",
+                "  dev=\"$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}')\"",
+                "  if [ -z \"$dev\" ]; then",
+                "    dev=\"$(ip -4 route show default 2>/dev/null | awk '$1==\"default\"{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}')\"",
+                "  fi",
+                "  printf '%s\\n' \"$dev\"",
+                "}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         '_iface_ready() {',
         '  ip link show "$1" >/dev/null 2>&1',
         '}',
@@ -464,7 +596,8 @@ def render_apply_script(
         '  fi',
         '}',
         "",
-    ]
+        ]
+    )
 
     masq: set[str] = set()
     lookup_rows: list[tuple[str, str, int, str, int]] = []
@@ -527,6 +660,27 @@ def render_apply_script(
     if tunnels:
         lines.append("")
 
+    if masquerade_main_table:
+        lines.extend(
+            [
+                '_main_dev="$(_main_egress_dev)"',
+                'case "$_main_dev" in',
+                '  ""|lo|lo0) _main_dev="" ;;',
+            ]
+        )
+        skip_names = sorted(set(tunnels) | set(masq))
+        for name in skip_names:
+            lines.append(f'  {name}) _main_dev="" ;;')
+        lines.extend(
+            [
+                "esac",
+                'if [ -n "$_main_dev" ]; then',
+                '  _soften_rp_filter "$_main_dev"',
+                "fi",
+                "",
+            ]
+        )
+
     # Prefer a SINGLE NAT backend to avoid double MASQUERADE (causes packet loss).
     lines.extend(
         [
@@ -559,6 +713,8 @@ def render_apply_script(
             f'  nft add rule inet netinja_egress forward iifname "{iface}" '
             f'ct state related,established accept comment "{comment}-fwd-in" 2>/dev/null || true'
         )
+    if masquerade_main_table:
+        _append_main_table_nft_shell(lines, tunnels)
     for tunnel in tunnels:
         tunnel_comment = _tunnel_egress_comment(tunnel)
         match = _nft_iface_match(tunnel)
@@ -600,8 +756,12 @@ def render_apply_script(
     lines.append("  fi")
     lines.append("elif command -v iptables >/dev/null 2>&1; then")
     _append_iptables_firewall_shell(lines, binary="iptables", masq=masq, tunnels=tunnels, indent="  ")
+    if masquerade_main_table:
+        _append_main_table_iptables_shell(lines, binary="iptables", tunnels=tunnels, indent="  ")
     lines.append("elif command -v iptables-legacy >/dev/null 2>&1; then")
     _append_iptables_firewall_shell(lines, binary="iptables-legacy", masq=masq, tunnels=tunnels, indent="  ")
+    if masquerade_main_table:
+        _append_main_table_iptables_shell(lines, binary="iptables-legacy", tunnels=tunnels, indent="  ")
     lines.append("fi")
     lines.append("")
 
@@ -611,6 +771,85 @@ def render_apply_script(
         lines.extend(script_lines(bind_ifaces))
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
+
+
+def _append_main_table_nft_shell(lines: list[str], tunnels: list[str]) -> None:
+    """SNAT only tunnel-sourced traffic out the live main-table device.
+
+    The device name is ``$_main_dev`` in the generated script. Explicit exit
+    NICs keep their own oifname rules and are not repeated here.
+    """
+    lines.extend(
+        [
+            '  if [ -n "$_main_dev" ]; then',
+            '    _main_comment="' + _MASQ_COMMENT_PREFIX + '${_main_dev}"',
+        ]
+    )
+    if tunnels:
+        for tunnel in tunnels:
+            match = _nft_iface_match(tunnel)
+            lines.append(
+                f'    nft add rule inet netinja_egress postrouting iifname "{match}" '
+                'oifname "$_main_dev" masquerade comment "$_main_comment" 2>/dev/null || true'
+            )
+    else:
+        lines.append(
+            '    nft add rule inet netinja_egress postrouting oifname "$_main_dev" '
+            'masquerade comment "$_main_comment" 2>/dev/null || true'
+        )
+    lines.extend(
+        [
+            '    nft add rule inet netinja_egress forward oifname "$_main_dev" '
+            'tcp flags syn / syn,rst tcp option maxseg size set rt mtu '
+            'comment "${_main_comment}-mss" 2>/dev/null || true',
+            '    nft add rule inet netinja_egress forward oifname "$_main_dev" '
+            'accept comment "${_main_comment}-fwd-out" 2>/dev/null || true',
+            '    nft add rule inet netinja_egress forward iifname "$_main_dev" '
+            'ct state related,established accept comment "${_main_comment}-fwd-in" '
+            '2>/dev/null || true',
+            "  fi",
+        ]
+    )
+
+
+def _append_main_table_iptables_shell(
+    lines: list[str],
+    *,
+    binary: str,
+    tunnels: list[str],
+    indent: str,
+) -> None:
+    """Same main-table NAT as nft, for hosts whose iptables is not nft-backed."""
+    pad = indent
+    lines.append(f'{pad}if [ -n "$_main_dev" ]; then')
+    lines.append(f'{pad}  _main_comment="{_MASQ_COMMENT_PREFIX}${{_main_dev}}"')
+    sources = tunnels or [""]
+    for tunnel in sources:
+        incoming = f'-i "{tunnel}" ' if tunnel else ""
+        lines.append(
+            f'{pad}  {binary} -t nat -C POSTROUTING {incoming}-o "$_main_dev" '
+            f'-m comment --comment "$_main_comment" -j MASQUERADE 2>/dev/null || '
+            f'{binary} -t nat -A POSTROUTING {incoming}-o "$_main_dev" '
+            f'-m comment --comment "$_main_comment" -j MASQUERADE'
+        )
+    lines.append(
+        f'{pad}  {binary} -C FORWARD -o "$_main_dev" -p tcp --tcp-flags SYN,RST SYN '
+        f'-m comment --comment "$_main_comment-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || '
+        f'{binary} -I FORWARD 1 -o "$_main_dev" -p tcp --tcp-flags SYN,RST SYN '
+        f'-m comment --comment "$_main_comment-mss" -j TCPMSS --clamp-mss-to-pmtu'
+    )
+    lines.append(
+        f'{pad}  {binary} -C FORWARD -o "$_main_dev" -m comment --comment "$_main_comment-fwd-out" '
+        f'-j ACCEPT 2>/dev/null || '
+        f'{binary} -I FORWARD 1 -o "$_main_dev" -m comment --comment "$_main_comment-fwd-out" -j ACCEPT'
+    )
+    lines.append(
+        f'{pad}  {binary} -C FORWARD -i "$_main_dev" -m state --state RELATED,ESTABLISHED '
+        f'-m comment --comment "$_main_comment-fwd-in" -j ACCEPT 2>/dev/null || '
+        f'{binary} -I FORWARD 1 -i "$_main_dev" -m state --state RELATED,ESTABLISHED '
+        f'-m comment --comment "$_main_comment-fwd-in" -j ACCEPT'
+    )
+    lines.append(f"{pad}fi")
 
 
 def _append_iptables_firewall_shell(
@@ -677,7 +916,12 @@ async def write_apply_script(
     path = apply_script_path(data_dir)
     await aiofs.atomic_write(
         path,
-        render_apply_script(rules, tunnel_ifaces, bind_ifaces=load_bind_ifaces()),
+        render_apply_script(
+            rules,
+            tunnel_ifaces,
+            bind_ifaces=load_bind_ifaces(),
+            masquerade_main_table=False,
+        ),
         encoding="utf-8",
     )
     try:
@@ -763,7 +1007,12 @@ async def persist_peer_egress(
     rules = await all_desired_rules_from_store(store)
     tunnels = await all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
-    new_text = render_apply_script(rules, tunnels, bind_ifaces=load_bind_ifaces())
+    new_text = render_apply_script(
+        rules,
+        tunnels,
+        bind_ifaces=load_bind_ifaces(),
+        masquerade_main_table=await store_has_main_table_peers(store),
+    )
     previous = await aiofs.read_text(path, encoding="utf-8") if path.is_file() else None
     changed = previous != new_text
     if changed:
@@ -795,7 +1044,12 @@ async def write_egress_script_only(
     rules = await all_desired_rules_from_store(store)
     tunnels = await all_tunnel_interface_names(store)
     path = apply_script_path(data_dir)
-    new_text = render_apply_script(rules, tunnels, bind_ifaces=load_bind_ifaces())
+    new_text = render_apply_script(
+        rules,
+        tunnels,
+        bind_ifaces=load_bind_ifaces(),
+        masquerade_main_table=await store_has_main_table_peers(store),
+    )
     previous = await aiofs.read_text(path, encoding="utf-8") if path.is_file() else None
     if previous == new_text:
         return False
@@ -1360,15 +1614,33 @@ async def reconcile_core_egress(
     prev_masq_set = {str(x).strip() for x in previous_masq if str(x).strip()}
     new_masq_set = set(effective_masq)
     tunnel_ifaces = sorted(set(tunnel_interface_names(interfaces)) | set(await all_tunnel_interface_names(store)))
-    nat_ok = await _nat_already_healthy(effective_masq, runner=runner)
+    needs_main = peers_use_main_table(interfaces) or await _other_cores_use_main_table(store, core)
+    new_main: list[str] = []
+    if needs_main:
+        new_main = await _main_table_egress_devices(runner, cache, skip=set(tunnel_ifaces))
+        for dev in new_main:
+            await _soften_rp_filter(runner, dev, cache)
+        if not new_main:
+            log.warning(
+                "peer egress main-table peers have no default IPv4 device core=%s",
+                core,
+            )
+    prev_main = _stored_main_egress(previous)
+    firewall_now = set(new_masq_set) | set(new_main)
+    firewall_prev = set(prev_masq_set) | set(prev_main)
+    # An explicit exit already has an oifname MASQUERADE. Scope the extra rule
+    # to tunnel ingress only when the main-table device is not one of those exits.
+    scoped_main = [dev for dev in new_main if dev not in new_masq_set]
+    nat_ok = await _nat_already_healthy(sorted(firewall_now), runner=runner)
     forward_ok = await _forward_already_healthy(tunnel_ifaces, runner=runner)
     nat_rebuilt = False
-    if force or new_masq_set != prev_masq_set or not nat_ok or (tunnel_ifaces and not forward_ok):
+    if force or firewall_now != firewall_prev or not nat_ok or (tunnel_ifaces and not forward_ok):
         await _sync_masquerade(
-            effective_masq,
-            previous_ifaces=previous_masq,
+            sorted(firewall_now),
+            previous_ifaces=sorted(firewall_prev),
             runner=runner,
             tunnel_ifaces=tunnel_ifaces,
+            scoped_ifaces=scoped_main,
         )
         nat_rebuilt = True
 
@@ -1384,6 +1656,7 @@ async def reconcile_core_egress(
         ],
         "tables": sorted(desired_tables.keys()),
         "masq": masq_ifaces,
+        "main_egress": new_main,
     }
     await store.put_doc(core, _STATE_KIND, _STATE_ID, state)
 
@@ -1415,6 +1688,7 @@ async def reconcile_core_egress(
         "switched": len(dict.fromkeys(switched)),
         "deferred": len(dict.fromkeys(deferred)),
         "masq": masq_ifaces,
+        "main_egress": new_main,
         "nat_rebuilt": nat_rebuilt,
         "forced": force,
         "persist": persist,
@@ -1886,6 +2160,51 @@ async def _gateway_for_iface(
     return _GatewayRead(ok=True, via=None)
 
 
+async def _main_table_egress_devices(
+    runner: Runner,
+    cache: _EgressCache | None,
+    *,
+    skip: set[str],
+) -> list[str]:
+    """Devices that actually carry main-table IPv4, excluding tunnel and loopback.
+
+    ``ip route get`` is the fib decision. The default-route list is only used
+    when that lookup does not name a device. Nothing here is a host-specific name.
+    """
+    probed: list[str] = []
+    try:
+        result = await execute(runner, ["ip", "-4", "route", "get", "1.1.1.1"], check=False, timeout=5)
+    except Exception:
+        result = None
+    if result is not None and getattr(result, "returncode", 1) == 0:
+        for dev in devices_from_route_text(str(getattr(result, "stdout", "") or "")):
+            acceptable = _acceptable_egress_device(dev, skip)
+            if acceptable and acceptable not in probed:
+                probed.append(acceptable)
+    if probed:
+        return probed
+
+    routes = cache.main_defaults if cache is not None else None
+    if routes is None:
+        if cache is not None:
+            cache.counts["route_show"] += 1
+        try:
+            shown = await execute(runner, ["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+        except Exception:
+            shown = None
+        if shown is None or getattr(shown, "returncode", 1) != 0:
+            return []
+        routes = _parse_default_routes(str(getattr(shown, "stdout", "") or ""))
+        if cache is not None:
+            cache.main_defaults = routes
+    found: list[str] = []
+    for dev, _via in routes:
+        acceptable = _acceptable_egress_device(dev, skip)
+        if acceptable and acceptable not in found:
+            found.append(acceptable)
+    return found
+
+
 async def _sysctl_write(
     runner: Runner,
     key: str,
@@ -1976,6 +2295,7 @@ async def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
                     quiet=True,
                     binary="iptables-legacy",
                 )
+                or await _iptables_has_comment_masquerade(runner, "iptables-legacy", iface)
             ):
                 return False
         return True
@@ -2005,6 +2325,7 @@ async def _nat_already_healthy(ifaces: list[str], *, runner: Runner) -> bool:
                     ],
                     quiet=True,
                 )
+                or await _iptables_has_comment_masquerade(runner, "iptables", iface)
             ):
                 return False
         return True
@@ -2017,16 +2338,27 @@ async def _sync_masquerade(
     previous_ifaces: list[str],
     runner: Runner,
     tunnel_ifaces: list[str] | None = None,
+    scoped_ifaces: list[str] | None = None,
 ) -> None:
     """Install SNAT/MASQUERADE on every exit NIC using a single backend.
 
     Installing the same MASQUERADE on nft + iptables + iptables-legacy at once
     double-SNATs packets and shows up as packet loss after region switches.
+
+    ``scoped_ifaces`` are main-table egress devices. Their MASQUERADE matches
+    tunnel ingress as well as the egress name, so host-originated traffic on
+    the primary NIC is not rewritten. Explicit exits stay oifname-only.
     """
     targets = sorted({*ifaces, *[str(x) for x in previous_ifaces if str(x).strip()]})
+    scoped = [str(name) for name in (scoped_ifaces or []) if str(name).strip()]
     nft_ok = False
     if shutil.which("nft"):
-        await _sync_masquerade_nft(ifaces, runner=runner, tunnel_ifaces=tunnel_ifaces or [])
+        await _sync_masquerade_nft(
+            ifaces,
+            runner=runner,
+            tunnel_ifaces=tunnel_ifaces or [],
+            scoped_ifaces=scoped,
+        )
         nft_ok = await _nft_has_masquerade_for(ifaces, runner=runner)
 
     if nft_ok:
@@ -2036,7 +2368,14 @@ async def _sync_masquerade(
         return
 
     if shutil.which("iptables-legacy"):
-        await _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables-legacy")
+        await _sync_masquerade_iptables(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            binary="iptables-legacy",
+            tunnel_ifaces=tunnel_ifaces or [],
+            scoped_ifaces=scoped,
+        )
         await _sync_forward(
             ifaces,
             previous_ifaces=previous_ifaces,
@@ -2049,7 +2388,14 @@ async def _sync_masquerade(
         return
 
     if shutil.which("iptables"):
-        await _sync_masquerade_iptables(ifaces, previous_ifaces=previous_ifaces, runner=runner, binary="iptables")
+        await _sync_masquerade_iptables(
+            ifaces,
+            previous_ifaces=previous_ifaces,
+            runner=runner,
+            binary="iptables",
+            tunnel_ifaces=tunnel_ifaces or [],
+            scoped_ifaces=scoped,
+        )
         await _sync_forward(
             ifaces,
             previous_ifaces=previous_ifaces,
@@ -2155,11 +2501,73 @@ async def _nft_has_masquerade_for(ifaces: list[str], *, runner: Runner) -> bool:
     return all(iface in found for iface in ifaces)
 
 
+async def _iptables_delete_by_comment(
+    runner: Runner,
+    *,
+    binary: str,
+    table: str,
+    chain: str,
+    comment: str,
+) -> None:
+    """Delete every rule in ``chain`` whose comment is exactly ``comment``.
+
+    A rule that also matches ``-i <tunnel>`` is invisible to ``-D -o iface``.
+    Listing the chain removes both the generic and the tunnel-scoped forms,
+    including duplicates left by an earlier apply.
+    """
+    try:
+        result = await execute(runner, [binary, "-t", table, "-S", chain], check=False, timeout=10)
+    except Exception:
+        return
+    if getattr(result, "returncode", 1) != 0:
+        return
+    text = str(getattr(result, "stdout", "") or "")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-A "):
+            continue
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            continue
+        if len(tokens) < 3 or tokens[0] != "-A" or tokens[1] != chain:
+            continue
+        if comment not in tokens:
+            continue
+        await _iptables(
+            runner,
+            ["-t", table, "-D", chain, *tokens[2:]],
+            quiet=True,
+            binary=binary,
+        )
+
+
+async def _iptables_has_comment_masquerade(runner: Runner, binary: str, iface: str) -> bool:
+    comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+    try:
+        result = await execute(runner, [binary, "-t", "nat", "-S", "POSTROUTING"], check=False, timeout=10)
+    except Exception:
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    for line in str(getattr(result, "stdout", "") or "").splitlines():
+        if comment in line and "MASQUERADE" in line and iface in line:
+            return True
+    return False
+
+
 async def _purge_iptables_exit_masq(ifaces: list[str], *, runner: Runner, binary: str) -> None:
     for iface in ifaces:
         if not iface:
             continue
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+        await _iptables_delete_by_comment(
+            runner,
+            binary=binary,
+            table="nat",
+            chain="POSTROUTING",
+            comment=comment,
+        )
         # Uncommented duplicates from manual ops / older agent.
         for _ in range(8):
             if not await _iptables(
@@ -2437,6 +2845,7 @@ async def _sync_masquerade_nft(
     *,
     runner: Runner,
     tunnel_ifaces: list[str] | None = None,
+    scoped_ifaces: list[str] | None = None,
 ) -> None:
     await _nft(runner, ["add", "table", "inet", "netinja_egress"])
     await _nft(
@@ -2463,22 +2872,44 @@ async def _sync_masquerade_nft(
     )
     await _nft(runner, ["flush", "chain", "inet", "netinja_egress", _NFT_CHAIN])
     await _nft(runner, ["flush", "chain", "inet", "netinja_egress", "forward"])
+    scoped = set(scoped_ifaces or [])
+    tunnels = [str(name).strip() for name in (tunnel_ifaces or []) if str(name).strip()]
     for iface in ifaces:
-        await _nft(
-            runner,
-            [
-                "add",
-                "rule",
-                "inet",
-                "netinja_egress",
-                _NFT_CHAIN,
-                "oifname",
-                iface,
-                "masquerade",
-                "comment",
-                f"{_MASQ_COMMENT_PREFIX}{iface}",
-            ],
-        )
+        if iface in scoped and tunnels:
+            for tunnel in tunnels:
+                await _nft(
+                    runner,
+                    [
+                        "add",
+                        "rule",
+                        "inet",
+                        "netinja_egress",
+                        _NFT_CHAIN,
+                        "iifname",
+                        _nft_iface_match(tunnel),
+                        "oifname",
+                        iface,
+                        "masquerade",
+                        "comment",
+                        f"{_MASQ_COMMENT_PREFIX}{iface}",
+                    ],
+                )
+        else:
+            await _nft(
+                runner,
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    "netinja_egress",
+                    _NFT_CHAIN,
+                    "oifname",
+                    iface,
+                    "masquerade",
+                    "comment",
+                    f"{_MASQ_COMMENT_PREFIX}{iface}",
+                ],
+            )
         # Clamp MSS for WG MTU (1420) — reduces blackhole-looking TCP loss.
         await _nft(
             runner,
@@ -2610,12 +3041,23 @@ async def _sync_masquerade_iptables(
     previous_ifaces: list[str],
     runner: Runner,
     binary: str = "iptables",
+    tunnel_ifaces: list[str] | None = None,
+    scoped_ifaces: list[str] | None = None,
 ) -> None:
     wanted = set(ifaces)
+    scoped = set(scoped_ifaces or [])
+    tunnels = [str(name).strip() for name in (tunnel_ifaces or []) if str(name).strip()]
     for iface in previous_ifaces:
         if iface in wanted:
             continue
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+        await _iptables_delete_by_comment(
+            runner,
+            binary=binary,
+            table="nat",
+            chain="POSTROUTING",
+            comment=comment,
+        )
         await _iptables(
             runner,
             ["-t", "nat", "-D", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
@@ -2630,6 +3072,25 @@ async def _sync_masquerade_iptables(
         )
     for iface in ifaces:
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
+        if iface in scoped:
+            # Rebuild from a clean comment so a renamed tunnel cannot leave a twin.
+            await _iptables_delete_by_comment(
+                runner,
+                binary=binary,
+                table="nat",
+                chain="POSTROUTING",
+                comment=comment,
+            )
+            sources = tunnels or [""]
+            for tunnel in sources:
+                args = ["-t", "nat", "-A", "POSTROUTING"]
+                if tunnel:
+                    args.extend(["-i", tunnel])
+                args.extend(
+                    ["-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"]
+                )
+                await _iptables(runner, args, binary=binary)
+            continue
         check = await _iptables(
             runner,
             ["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],

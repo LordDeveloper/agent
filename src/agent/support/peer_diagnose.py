@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -11,7 +12,12 @@ from agent.db import Store
 from agent.support import record_is_enabled
 from agent.support.disable_reason import explain_disabled
 from agent.asyncutil import gather_independent, maybe_await
-from agent.support.peer_egress import peer_source_cidr, rule_pref_for_addr, table_id_for_interface
+from agent.support.peer_egress import (
+    device_from_route_text,
+    peer_source_cidr,
+    rule_pref_for_addr,
+    table_id_for_interface,
+)
 from agent.support.process import run_dump
 
 Runner = Callable[..., Any]
@@ -268,6 +274,114 @@ async def _nat_status(runner: Runner | None, iface: str) -> dict[str, Any]:
     return {'backend': None, 'masquerade': False, 'details': ''}
 
 
+def _iface_token(line: str, iface: str) -> bool:
+    if not iface:
+        return False
+    return re.search(rf'(?<![A-Za-z0-9_.-]){re.escape(iface)}(?![A-Za-z0-9_.-])', line) is not None
+
+
+def _line_direction(line: str, iface: str, *, incoming: bool) -> bool:
+    if not _iface_token(line, iface):
+        return False
+    if incoming:
+        return (
+            f'iifname "{iface}"' in line
+            or f'iifname {iface}' in line
+            or f'-i {iface}' in line
+        )
+    return (
+        f'oifname "{iface}"' in line
+        or f'oifname {iface}' in line
+        or f'-o {iface}' in line
+    )
+
+
+def _firewall_covers_main_table(text: str, egress: str, tunnel: str) -> dict[str, bool]:
+    """True when the dumped rules NAT egress and accept both directions.
+
+    A route lookup is not enough: the decrypted packet still has to be forwarded
+    and, when the source is a tunnel address, translated on the way out.
+    """
+    nat = False
+    forward = False
+    returning = False
+    for raw in str(text or '').splitlines():
+        line = raw.strip()
+        lower = line.lower()
+        if not line or line.startswith('#') or line.startswith('table ') or line.startswith('chain '):
+            continue
+        if egress and _line_direction(line, egress, incoming=False) and (
+            'masquerade' in lower or 'MASQUERADE' in line
+        ):
+            nat = True
+        if tunnel and 'accept' in lower and _line_direction(line, tunnel, incoming=True):
+            forward = True
+        if tunnel and 'accept' in lower and _line_direction(line, tunnel, incoming=False):
+            returning = True
+        if egress and 'accept' in lower and _line_direction(line, egress, incoming=False):
+            forward = True
+        if (
+            egress
+            and 'accept' in lower
+            and _line_direction(line, egress, incoming=True)
+            and 'established' in lower
+        ):
+            returning = True
+    return {'nat': nat, 'forward': forward, 'return': returning}
+
+
+async def _firewall_text(runner: Runner | None) -> tuple[str, str | None]:
+    if shutil.which('nft'):
+        dump = await _run_cmd(runner, ['nft', 'list', 'table', 'inet', 'netinja_egress'])
+        if not dump['ok']:
+            dump = await _run_cmd(runner, ['nft', 'list', 'ruleset'])
+        return str(dump.get('stdout') or ''), 'nft'
+    for cmd in ('iptables', 'iptables-legacy'):
+        if not shutil.which(cmd):
+            continue
+        nat = await _run_cmd(runner, [cmd, '-t', 'nat', '-S', 'POSTROUTING'])
+        forward = await _run_cmd(runner, [cmd, '-S', 'FORWARD'])
+        return f"{nat.get('stdout') or ''}\n{forward.get('stdout') or ''}", cmd
+    return '', None
+
+
+async def _live_forward_observed(runner: Runner | None, host: str) -> bool:
+    """True only when conntrack has seen a reply for this peer, not merely a route."""
+    if not host or not shutil.which('conntrack'):
+        return False
+    dump = await _run_cmd(runner, ['conntrack', '-L', '-s', host])
+    text = str(dump.get('stdout') or '')
+    for line in text.splitlines():
+        if host not in line:
+            continue
+        if 'ESTABLISHED' in line or 'ASSURED' in line:
+            return True
+    return False
+
+
+def _path_verification(
+    *,
+    route_lookup: bool,
+    firewall_checked: bool,
+    live: bool,
+    summary: str,
+) -> dict[str, Any]:
+    if live:
+        scope = 'live_traffic'
+    elif firewall_checked:
+        scope = 'firewall_rules'
+    else:
+        scope = 'route_lookup'
+    return {
+        'route_lookup_performed': route_lookup,
+        'route_lookup_only': not firewall_checked and not live,
+        'firewall_rules_checked': firewall_checked,
+        'live_traffic_observed': live,
+        'scope': scope,
+        'summary': summary,
+    }
+
+
 def _issue(level: str, code: str, message: str, **extra: Any) -> dict[str, Any]:
     row: dict[str, Any] = {'level': level, 'code': code, 'message': message}
     row.update(extra)
@@ -472,15 +586,107 @@ async def diagnose_peer_match(
             )
 
         routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
+        observed = await _live_forward_observed(runner, host)
+        routing['path_verification'] = _path_verification(
+            route_lookup=True,
+            firewall_checked=True,
+            live=observed,
+            summary=(
+                'Policy routing and the NAT rule were checked, and conntrack shows an established flow for this peer.'
+                if observed
+                else 'Policy routing and the NAT rule were checked. Live forwarded traffic was not observed; '
+                'the route lookup alone does not prove packets leave the host.'
+            ),
+        )
     else:
         issues.append(
             _issue(
                 'warning',
                 'EXIT_INTERFACE_UNSET',
-                'Peer has no exit_interface — traffic uses main routing table only',
+                'Peer has no exit_interface. Traffic stays on the main routing table and still needs '
+                'FORWARD plus SNAT on the live default device.',
             )
         )
         routing['simulated_egress'] = await _route_lookup_from(runner, '1.1.1.1', host, iface_name or None)
+        egress = device_from_route_text(str((routing['simulated_egress'] or {}).get('raw') or ''))
+        if egress and iface_name and egress == iface_name:
+            egress = None
+        routing['main_egress'] = egress
+        observed = await _live_forward_observed(runner, host)
+        if not egress:
+            routing['path_verification'] = _path_verification(
+                route_lookup=True,
+                firewall_checked=False,
+                live=observed,
+                summary=(
+                    'Only an ip route lookup was performed. It did not name an egress device, so NAT and FORWARD were not checked.'
+                    if not observed
+                    else 'Conntrack shows an established flow. The route lookup did not name an egress device, so the firewall rules were not checked.'
+                ),
+            )
+            if not observed:
+                issues.append(
+                    _issue(
+                        'warning',
+                        'EGRESS_PATH_UNVERIFIED',
+                        'Route lookup did not identify an egress device. NAT and FORWARD were not verified.',
+                    )
+                )
+        else:
+            text, backend = await _firewall_text(runner)
+            covered = _firewall_covers_main_table(text, egress, iface_name)
+            routing['nat'] = {
+                'backend': backend,
+                'masquerade': covered['nat'],
+                'details': f'{backend} masquerade for {egress}' if covered['nat'] and backend else '',
+            }
+            routing['forward'] = {
+                'backend': backend,
+                'from_tunnel': covered['forward'],
+                'established_return': covered['return'],
+            }
+            checks.append({'name': 'exit_nat', 'ok': covered['nat'], 'interface': egress})
+            checks.append({'name': 'forward_out', 'ok': covered['forward'], 'interface': egress})
+            checks.append({'name': 'forward_return', 'ok': covered['return'], 'interface': egress})
+            if not covered['nat']:
+                issues.append(
+                    _issue(
+                        'error',
+                        'NAT_MISSING',
+                        f'No MASQUERADE rule for main-table egress [{egress}]. '
+                        'Decrypted WireGuard packets keep their tunnel source and replies never return.',
+                        interface=egress,
+                    )
+                )
+            if not covered['forward']:
+                issues.append(
+                    _issue(
+                        'error',
+                        'FORWARD_MISSING',
+                        f'No FORWARD accept from the tunnel toward egress [{egress}].',
+                        interface=egress,
+                    )
+                )
+            if not covered['return']:
+                issues.append(
+                    _issue(
+                        'error',
+                        'RETURN_PATH_MISSING',
+                        f'No ESTABLISHED return rule from [{egress}] back toward the tunnel.',
+                        interface=egress,
+                    )
+                )
+            routing['path_verification'] = _path_verification(
+                route_lookup=True,
+                firewall_checked=True,
+                live=observed,
+                summary=(
+                    'NAT, FORWARD, and the established return path were checked, and conntrack shows an established flow.'
+                    if observed
+                    else 'NAT, FORWARD, and the established return path were checked against the firewall rules. '
+                    'That is not the same as observing a live packet; conntrack had no established flow for this peer.'
+                ),
+            )
 
     ip_forward = _read_sysctl('/proc/sys/net/ipv4/ip_forward')
     host_info = {
