@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-NotifyAccess=main
+# PyInstaller onefile keeps the bootloader as the main PID and runs Python
+# in a child. READY=1 is sent from that child, so main would ignore it and
+# systemd would wait until TimeoutStartSec.
+NotifyAccess=all
 TimeoutStartSec=600
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent

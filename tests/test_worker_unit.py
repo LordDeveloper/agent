@@ -31,7 +31,7 @@ async def test_restart_installs_a_missing_worker_unit(tmp_path, monkeypatch):
     text = worker.read_text(encoding="utf-8")
     assert "ExecStart=/opt/agent/bin/agent work" in text
     assert "Type=notify" in text
-    assert "NotifyAccess=main" in text
+    assert "NotifyAccess=all" in text
     assert ["systemctl", "daemon-reload"] in commands
     assert ["systemctl", "enable", "agent-worker"] in commands
     assert commands[-2:] == [

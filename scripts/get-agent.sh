@@ -242,6 +242,7 @@ for asset in payload.get("assets") or []:
 PY
 )"
   if [[ -n "${asset_id}" ]]; then
+    echo "Downloading ${name} (${ref})..."
     download_asset "$asset_id" "$tmp" || rm -f "$tmp"
   fi
 
@@ -307,7 +308,10 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-NotifyAccess=main
+# PyInstaller onefile keeps the bootloader as the main PID and runs Python
+# in a child. READY=1 is sent from that child, so main would ignore it and
+# systemd would wait until TimeoutStartSec.
+NotifyAccess=all
 TimeoutStartSec=600
 EnvironmentFile=/etc/agent/.env
 WorkingDirectory=/opt/agent
@@ -389,6 +393,7 @@ fi
 systemctl daemon-reload
 systemctl enable agent-worker.service
 systemctl enable "$SERVICE_NAME"
+echo "Starting agent-worker (database migrations, waiting for READY)..."
 if ! systemctl restart agent-worker.service; then
   echo "agent-worker.service failed to start. Recent logs:" >&2
   systemctl status agent-worker.service --no-pager -l >&2 || true
