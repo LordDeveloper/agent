@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from agent.logutil import get_logger
@@ -48,6 +49,20 @@ LEGACY_IPSEC_IKE = (
 LEGACY_IPSEC_ESP = 'aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1,3des-sha1!'
 
 
+def sanitize_listen_addr(value: Any) -> str:
+    """IPv4/IPv6 only. Blank, 0.0.0.0, and :: mean every interface."""
+    text = str(value or '').strip()
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1].strip()
+    if not text or text in {'0.0.0.0', '::', '::0', '*', '%any'}:
+        return ''
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return ''
+    return text
+
+
 def sanitize_lns_name(name: str, fallback: str = 'l2tpd') -> str:
     """xl2tpd section titles / pppd name must be simple tokens."""
     cleaned = ''.join(ch if (ch.isalnum() or ch in '-_') else '-' for ch in str(name or '').strip())
@@ -64,6 +79,8 @@ def default_templates() -> dict[str, Any]:
         'require_authentication': False,
         'access_control': False,
         'lns_name': 'l2tpd',
+        # Empty = xl2tpd INADDR_ANY and ipsec left=%any.
+        'listen_addr': '',
     }
 
 
@@ -102,6 +119,7 @@ def normalize_templates(raw: Any) -> dict[str, Any]:
             ),
             'access_control': _as_bool(src.get('access_control'), bool(defaults['access_control'])),
             'lns_name': sanitize_lns_name(str(src.get('lns_name') or ''), str(defaults['lns_name'])),
+            'listen_addr': sanitize_listen_addr(src.get('listen_addr')),
         }
     )
 
@@ -195,10 +213,17 @@ def render_xl2tpd_conf(
         '; Managed by Netinja Agent — do not edit manually',
         '[global]',
         'port = 1701',
-        'auth file = /etc/ppp/chap-secrets',
-        f'access control = {access}',
-        '',
     ]
+    listen = str(tpl.get('listen_addr') or '').strip()
+    if listen:
+        lines.append(f'listen-addr = {listen}')
+    lines.extend(
+        [
+            'auth file = /etc/ppp/chap-secrets',
+            f'access control = {access}',
+            '',
+        ]
+    )
 
     ranges: list[tuple[str, str]] = []
     gateways: list[str] = []
@@ -283,6 +308,7 @@ def render_ipsec_conf(
 ) -> str:
     tpl = normalize_templates(templates) if templates is not None else resolve_templates(servers)
     force = 'yes' if tpl['forceencaps'] else 'no'
+    left = str(tpl.get('listen_addr') or '').strip() or '%any'
     lines = [
         '# Managed by Netinja Agent',
         'config setup',
@@ -294,7 +320,7 @@ def render_ipsec_conf(
         '    keyexchange=ikev1',
         '    authby=secret',
         '    type=transport',
-        '    left=%any',
+        f'    left={left}',
         '    leftprotoport=17/%any',
         '    right=%any',
         '    rightprotoport=17/%any',

@@ -554,16 +554,26 @@ class L2tpDriver(CoreDriver):
 
         pool_changed = before[1] != after[1] or before[2] != after[2]
         ipsec_changed = before[4] != after[4] or before[6] != after[6]
+        listen_before = str(normalize_templates(server.get('templates')).get('listen_addr') or '')
+        listen_after = str(normalize_templates(candidate.get('templates')).get('listen_addr') or '')
+        listen_changed = listen_before != listen_after
         await self.store.save_server_config(self.key, str(server.get('id')), candidate)
         await self.audit.record('update', f'{self.key}/server/{server.get("id")}')
         await self._write_stack_configs()
         if ipsec_changed or pool_changed:
             # Start units that are down. Do not pkill charon or bounce xl2tpd
-            # unless the address pool or listen port actually changed.
+            # unless the address pool, listen port, or listen address changed.
             await self._ensure_services(start=True, restart=False)
         if ipsec_changed:
             await self._reload_ipsec_secrets()
-        if pool_changed:
+        if pool_changed or listen_changed:
+            if listen_changed:
+                log.info(
+                    'l2tp server %s listen address %s -> %s — restart xl2tpd',
+                    server.get('id'),
+                    listen_before or 'any',
+                    listen_after or 'any',
+                )
             await self._ensure_xl2tpd(force_restart=True)
         return candidate
 

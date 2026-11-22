@@ -278,6 +278,41 @@ def test_psk_change_reloads_secrets_without_hard_restart(tmp_path, monkeypatch):
     assert calls['xl2tpd'] == 0
 
 
+def test_listen_addr_change_restarts_xl2tpd(tmp_path, monkeypatch):
+    calls = {'write': 0, 'xl2tpd_force': None}
+
+    async def _count_write(self):
+        calls['write'] += 1
+
+    async def _count_xl2tpd(self, **kwargs):
+        calls['xl2tpd_force'] = bool(kwargs.get('force_restart'))
+
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._apply_all_configs', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_services', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._write_stack_configs', _count_write)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._reload_ipsec_secrets', _async_none)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._ensure_xl2tpd', _count_xl2tpd)
+    monkeypatch.setattr('agent.drivers.l2tp.L2tpDriver._commit_user_runtime', _async_none)
+
+    from tests.conftest import open_store
+
+    settings = AgentSettings(data_dir=str(tmp_path), l2tp_config_dir=str(tmp_path / 'l2tp'))
+    store = open_store(settings.resolve_db_path())
+    driver = L2tpDriver(settings, AuditLog(store), store)
+
+    async def scenario():
+        server = await driver.create_server({'subnet': '10.92.0.0/16', 'name': 'bind'})
+        updated = await driver.update_server(server['id'], {
+            'templates': {'listen_addr': '203.0.113.10'},
+        })
+        return updated
+
+    updated = asyncio.run(scenario())
+    assert updated['templates']['listen_addr'] == '203.0.113.10'
+    assert calls['write'] == 1
+    assert calls['xl2tpd_force'] is True
+
+
 def test_normalize_templates_upgrades_windows_slow_defaults():
     from agent.support.l2tp_config import DEFAULT_IPSEC_ESP, DEFAULT_IPSEC_IKE, normalize_templates
 
