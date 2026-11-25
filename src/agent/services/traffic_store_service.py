@@ -572,33 +572,25 @@ class TrafficStoreService:
         found: set[str] = set()
         touched: set[tuple[str, str]] = set()
         async with self._runtime.writing() as session:
-            for offset in range(0, len(ids), 400):
-                batch = ids[offset : offset + 400]
-                rows = (
+            for offset in range(0, len(ids), 1000):
+                batch = ids[offset : offset + 1000]
+                deleted = (
                     await session.execute(
-                        select(
-                            TrafficPendingChunk.chunk_id,
-                            TrafficPendingChunk.core,
-                            TrafficPendingChunk.client_key,
-                        ).where(
+                        delete(TrafficPendingChunk)
+                        .where(
                             TrafficPendingChunk.scope == scope,
                             TrafficPendingChunk.chunk_id.in_(batch),
                         )
+                        .returning(
+                            TrafficPendingChunk.chunk_id,
+                            TrafficPendingChunk.core,
+                            TrafficPendingChunk.client_key,
+                        )
                     )
                 ).all()
-                if not rows:
-                    continue
-                delete_ids: list[str] = []
-                for chunk_id, core, client_key in rows:
+                for chunk_id, core, client_key in deleted:
                     found.add(str(chunk_id))
                     touched.add((str(core), str(client_key)))
-                    delete_ids.append(str(chunk_id))
-                await session.execute(
-                    delete(TrafficPendingChunk).where(
-                        TrafficPendingChunk.scope == scope,
-                        TrafficPendingChunk.chunk_id.in_(delete_ids),
-                    )
-                )
             await self._delete_pending_without_chunks(session, scope, touched)
             await session.commit()
         missing = [item for item in ids if item not in found]

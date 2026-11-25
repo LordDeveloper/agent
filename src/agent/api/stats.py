@@ -265,14 +265,21 @@ async def stats_clients_traffic_pending_ack(
     chunks_missing: list[str] = []
     if chunk_ids:
         chunks_deleted, chunks_missing = await traffic.ack_chunk_ids(chunk_ids)
-    # chunk_ids already removed this page. A second FIFO pass of the same
-    # billed totals would delete the next page before the panel bills it.
-    acked, not_found = await traffic.ack_clients(
-        client_keys,
-        _billed_amounts(body.get("billed")),
-        drop_keys,
-        consume_billed_chunks=not chunk_ids,
-    )
+    # The chunk ids are the page the panel billed. Settling them by walking
+    # every pending row (or FIFO-deleting the billed totals again) holds the
+    # write lock past the panel's 20s timeout and returns zero bytes.
+    if chunk_ids and not drop_keys:
+        acked = client_keys
+        not_found = []
+    else:
+        acked, not_found = await traffic.ack_clients(
+            [] if chunk_ids else client_keys,
+            None if chunk_ids else _billed_amounts(body.get("billed")),
+            drop_keys,
+            consume_billed_chunks=not chunk_ids,
+        )
+        if chunk_ids:
+            acked = list(dict.fromkeys([*client_keys, *acked]))
 
     return {
         "success": True,
