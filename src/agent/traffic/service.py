@@ -416,7 +416,7 @@ class TrafficService:
         owners: dict[tuple[str, str], str],
         registry: CoreRegistry,
     ) -> tuple[dict[str, int], dict[str, int]]:
-        from agent.auth_scope import DEFAULT_SCOPE, current_scope
+        from agent.auth_scope import DEFAULT_SCOPE
 
         sampled_at = datetime.now(timezone.utc).isoformat()
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -428,8 +428,41 @@ class TrafficService:
         if not grouped:
             grouped[DEFAULT_SCOPE] = []
 
-        cursor_keys: set[tuple[str, str]] = set()
-        for group in grouped.values():
+        xray_reset = bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
+        has_core_counter = any(
+            str(sample["core"]) in _CORE_COUNTER_CORES
+            for group in grouped.values()
+            for sample in group
+        )
+        anchor = has_core_counter and await self._needs_core_counter_anchor()
+
+        # The worker has no request token, so current_scope() is "default".
+        # Clients created with an auth token live in that token's scope. One
+        # commit under default hides their queue from the panel that owns them.
+        try:
+            await self.store.rehome_pending_scopes()
+        except Exception:
+            log.exception("traffic pending scope rehome failed")
+
+        merged_stats = {
+            "clients_seen": 0,
+            "pending": 0,
+            "initialized": 0,
+            "regressed": 0,
+            "unchanged": 0,
+        }
+        sqlite_detail = {
+            "cursor_load_ms": 0,
+            "plan_ms": 0,
+            "write_ms": 0,
+            "chunk_count": 0,
+        }
+        committed = False
+
+        for scope, group in grouped.items():
+            if not group:
+                continue
+            cursor_keys: set[tuple[str, str]] = set()
             for sample in group:
                 core = str(sample["core"])
                 label = str(sample["label"])
@@ -439,64 +472,39 @@ class TrafficService:
                     if alias_text:
                         cursor_keys.add((core, alias_text))
 
-        xray_reset = bool(getattr(registry.settings, "traffic_xray_reset_stats", False))
-        has_core_counter = any(
-            str(sample["core"]) in _CORE_COUNTER_CORES
-            for group in grouped.values()
-            for sample in group
-        )
-        anchor = has_core_counter and await self._needs_core_counter_anchor()
-
-        def plan(cursors: dict[tuple[str, str], tuple[int, int]]) -> dict[str, Any]:
-            merged_stats = {
-                "clients_seen": 0,
-                "pending": 0,
-                "initialized": 0,
-                "regressed": 0,
-                "unchanged": 0,
-            }
-            chunk_inserts: list[dict[str, Any]] = []
-            client_cursor_upserts: list[tuple[str, str, int, int]] = []
-            identity_upserts: list[tuple[str, str, str]] = []
-            for _scope, group in grouped.items():
-                if not group:
-                    continue
-                part = self._plan_sample(
-                    group,
+            def plan(
+                cursors: dict[tuple[str, str], tuple[int, int]],
+                samples: list[dict[str, Any]] = group,
+            ) -> dict[str, Any]:
+                body = self._plan_sample(
+                    samples,
                     cursors,
                     sampled_at,
                     xray_reset_stats=xray_reset,
                     anchor_core_counters=anchor,
                 )
-                for key in merged_stats:
-                    if key == "pending":
-                        merged_stats[key] += int(part.get("stats", {}).get(key, 0))
-                    else:
-                        merged_stats[key] += int(part.get("stats", {}).get(key, 0))
-                chunk_inserts.extend(part.get("chunk_inserts") or [])
-                client_cursor_upserts.extend(part.get("client_cursor_upserts") or [])
-                identity_upserts.extend(part.get("identity_upserts") or [])
-            return {
-                "stats": merged_stats,
-                "chunk_inserts": chunk_inserts,
-                "client_cursor_upserts": client_cursor_upserts,
-                "identity_upserts": identity_upserts,
-                "meta": (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at),
-            }
+                body["meta"] = (AGENT_META_CORE, LAST_SAMPLE_META_KEY, sampled_at)
+                return body
 
-        try:
-            stats, sqlite_detail = await self.store.apply_traffic_sample(
-                plan,
-                current_scope(),
-                fast_stats=True,
-                cursor_keys=cursor_keys,
-                return_sqlite_timing=True,
-            )
-            if anchor:
-                await self._mark_core_counter_anchor()
-            return stats, sqlite_detail
-        except Exception:
-            log.exception("traffic merged sqlite commit failed")
+            try:
+                stats, detail = await self.store.apply_traffic_sample(
+                    plan,
+                    scope,
+                    fast_stats=True,
+                    cursor_keys=cursor_keys,
+                    return_sqlite_timing=True,
+                )
+            except Exception:
+                log.exception("traffic merged sqlite commit failed scope=%s", scope)
+                continue
+            committed = True
+            for key in merged_stats:
+                merged_stats[key] += int(stats.get(key, 0))
+            if isinstance(detail, dict):
+                for key in sqlite_detail:
+                    sqlite_detail[key] += int(detail.get(key, 0))
+
+        if not committed:
             return (
                 {
                     "clients_seen": 0,
@@ -506,6 +514,9 @@ class TrafficService:
                 },
                 {},
             )
+        if anchor:
+            await self._mark_core_counter_anchor()
+        return merged_stats, sqlite_detail
 
     async def _sample_core(
         self,

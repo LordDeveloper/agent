@@ -556,6 +556,146 @@ class TrafficStoreService:
         ]
         return chunks, rows, truncated
 
+    async def rehome_pending_scopes(self) -> int:
+        """Move default-scope queue rows onto the auth-token scope of their client.
+
+        The sampler used to stamp every chunk with the worker scope. A panel
+        that connects with its own token then reads an empty queue.
+        """
+        from agent.auth_scope import DEFAULT_SCOPE
+
+        moved = 0
+        while moved < 50000:
+            count = await self._rehome_chunk_batch(DEFAULT_SCOPE, 1000)
+            moved += count
+            if count < 1000:
+                break
+        await self._rehome_legacy_pending(DEFAULT_SCOPE)
+        await self._rehome_identity(DEFAULT_SCOPE)
+        return moved
+
+    async def _rehome_chunk_batch(self, default_scope: str, limit: int) -> int:
+        async with self._runtime.writing() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT c.chunk_id, c.core, c.client_key, c.incoming, c.outgoing, "
+                        "c.sampled_at, cl.scope "
+                        "FROM traffic_pending_chunk AS c "
+                        "JOIN clients AS cl ON cl.core_id = c.core AND cl.id = c.client_key "
+                        "WHERE c.scope = :default_scope "
+                        "AND cl.scope != :default_scope "
+                        "AND cl.scope != '' "
+                        "LIMIT :limit"
+                    ),
+                    {"default_scope": default_scope, "limit": int(limit)},
+                )
+            ).all()
+            if not rows:
+                return 0
+            ids = [str(chunk_id) for chunk_id, *_rest in rows]
+            await session.execute(
+                delete(TrafficPendingChunk).where(
+                    TrafficPendingChunk.scope == default_scope,
+                    TrafficPendingChunk.chunk_id.in_(ids),
+                )
+            )
+            session.add_all(
+                [
+                    TrafficPendingChunk(
+                        scope=str(owner_scope),
+                        chunk_id=str(chunk_id),
+                        core=str(core),
+                        client_key=str(client_key),
+                        incoming=int(incoming or 0),
+                        outgoing=int(outgoing or 0),
+                        sampled_at=str(sampled_at),
+                    )
+                    for chunk_id, core, client_key, incoming, outgoing, sampled_at, owner_scope in rows
+                ]
+            )
+            await session.commit()
+        return len(rows)
+
+    async def _rehome_legacy_pending(self, default_scope: str) -> None:
+        async with self._runtime.writing() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT p.core, p.client_key, p.delta_incoming, p.delta_outgoing, "
+                        "p.current_incoming, p.current_outgoing, cl.scope "
+                        "FROM traffic_pending AS p "
+                        "JOIN clients AS cl ON cl.core_id = p.core AND cl.id = p.client_key "
+                        "WHERE p.scope = :default_scope "
+                        "AND cl.scope != :default_scope "
+                        "AND cl.scope != ''"
+                    ),
+                    {"default_scope": default_scope},
+                )
+            ).all()
+            if not rows:
+                return
+            for core, client_key, delta_in, delta_out, current_in, current_out, owner_scope in rows:
+                await session.execute(
+                    delete(TrafficPending).where(
+                        TrafficPending.scope == default_scope,
+                        TrafficPending.core == str(core),
+                        TrafficPending.client_key == str(client_key),
+                    )
+                )
+                await self._upsert_pending(
+                    session,
+                    str(owner_scope),
+                    {
+                        "core": str(core),
+                        "client_key": str(client_key),
+                        "delta_incoming": int(delta_in or 0),
+                        "delta_outgoing": int(delta_out or 0),
+                        "current_incoming": int(current_in or 0),
+                        "current_outgoing": int(current_out or 0),
+                    },
+                )
+            await session.commit()
+
+    async def _rehome_identity(self, default_scope: str) -> None:
+        async with self._runtime.writing() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT i.core, i.alias, i.canonical_key, cl.scope "
+                        "FROM traffic_identity AS i "
+                        "JOIN clients AS cl ON cl.core_id = i.core AND cl.id = i.canonical_key "
+                        "WHERE i.scope = :default_scope "
+                        "AND cl.scope != :default_scope "
+                        "AND cl.scope != ''"
+                    ),
+                    {"default_scope": default_scope},
+                )
+            ).all()
+            if not rows:
+                return
+            for core, alias, canonical_key, owner_scope in rows:
+                await session.execute(
+                    delete(TrafficIdentity).where(
+                        TrafficIdentity.scope == default_scope,
+                        TrafficIdentity.core == str(core),
+                        TrafficIdentity.alias == str(alias),
+                    )
+                )
+                existing = await session.get(TrafficIdentity, (str(owner_scope), str(core), str(alias)))
+                if existing is None:
+                    session.add(
+                        TrafficIdentity(
+                            scope=str(owner_scope),
+                            core=str(core),
+                            alias=str(alias),
+                            canonical_key=str(canonical_key),
+                        )
+                    )
+                else:
+                    existing.canonical_key = str(canonical_key)
+            await session.commit()
+
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         """Delete billed chunks in batches. One statement per batch, not one per row.
 
