@@ -1011,15 +1011,24 @@ class TrafficService:
 
         self._fetch_snapshot[current_scope()] = snapshot
 
-    async def pending_payload(self, *, persist_snapshot: bool = True) -> dict[str, Any]:
+    async def pending_payload(
+        self,
+        *,
+        persist_snapshot: bool = True,
+        chunk_limit: int | None = None,
+    ) -> dict[str, Any]:
         """Return unacked pending deltas and optionally persist a fetch snapshot for POST ack.
 
         The panel runs a single billing writer per node (UpdateSubscribeStats
         withoutOverlapping). ``persist_snapshot=False`` keeps GET off the write lock;
         the in-memory snapshot is enough until a background meta write finishes.
         """
+        from agent.services.traffic_store_service import BILLING_CHUNK_PAGE
+
         await self._load_persisted_aliases()
-        chunks, rows = await self.store.load_pending_billing()
+        if chunk_limit is None:
+            chunk_limit = BILLING_CHUNK_PAGE
+        chunks, rows, truncated = await self.store.load_pending_billing(chunk_limit=chunk_limit)
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()
@@ -1113,6 +1122,7 @@ class TrafficService:
             ),
             "worker_lag_ms": await self._worker_lag_ms(),
             "users": users,
+            "truncated": truncated,
         }
 
     async def ack_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
@@ -1136,6 +1146,7 @@ class TrafficService:
         client_keys: list[str],
         billed: dict[str, tuple[int, int]] | None = None,
         drop: list[str] | None = None,
+        consume_billed_chunks: bool = True,
     ) -> tuple[list[str], list[str]]:
         """Ack the panel node_id keys the panel says it has billed.
 
@@ -1204,7 +1215,8 @@ class TrafficService:
                 acked.append(published)
             log.debug("traffic ack client=%s rows=%s", published or label, len(rows))
 
-        await self.store.ack_billed_snapshots(to_ack)
+        if consume_billed_chunks:
+            await self.store.ack_billed_snapshots(to_ack)
         await self._forget_acked_snapshot(to_ack)
 
         acked_ids = set(acked)

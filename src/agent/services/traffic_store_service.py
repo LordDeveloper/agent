@@ -20,6 +20,11 @@ def _sqlite(session) -> bool:
     return session.get_bind().dialect.name == "sqlite"
 
 
+# One panel GET must answer inside the 20s client timeout. A full backlog of
+# hundreds of thousands of chunks builds the body only after that deadline.
+BILLING_CHUNK_PAGE = 8000
+
+
 class TrafficStoreService:
     def __init__(self, runtime: DatabaseRuntime):
         self._runtime = runtime
@@ -340,38 +345,44 @@ class TrafficStoreService:
             "clients_cleared": clients_before,
         }
 
-    async def _select_pending_chunk_rows(self, session, scope: str) -> list[Any]:
+    async def _select_pending_chunk_rows(
+        self,
+        session,
+        scope: str,
+        limit: int | None = None,
+    ) -> list[Any]:
         """Ordered chunk rows from the covering index, not a sort of the whole table."""
         if _sqlite(session):
-            return (
-                await session.execute(
-                    text(
-                        "SELECT chunk_id, core, client_key, incoming, outgoing, sampled_at "
-                        "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
-                        "WHERE scope = :scope "
-                        "ORDER BY core, client_key, sampled_at"
-                    ),
-                    {"scope": scope},
-                )
-            ).all()
-        return (
-            await session.execute(
-                select(
-                    TrafficPendingChunk.chunk_id,
-                    TrafficPendingChunk.core,
-                    TrafficPendingChunk.client_key,
-                    TrafficPendingChunk.incoming,
-                    TrafficPendingChunk.outgoing,
-                    TrafficPendingChunk.sampled_at,
-                )
-                .where(TrafficPendingChunk.scope == scope)
-                .order_by(
-                    TrafficPendingChunk.core,
-                    TrafficPendingChunk.client_key,
-                    TrafficPendingChunk.sampled_at,
-                )
+            sql = (
+                "SELECT chunk_id, core, client_key, incoming, outgoing, sampled_at "
+                "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
+                "WHERE scope = :scope "
+                "ORDER BY core, client_key, sampled_at"
             )
-        ).all()
+            params: dict[str, Any] = {"scope": scope}
+            if limit is not None and limit > 0:
+                sql += " LIMIT :limit"
+                params["limit"] = int(limit)
+            return (await session.execute(text(sql), params)).all()
+        query = (
+            select(
+                TrafficPendingChunk.chunk_id,
+                TrafficPendingChunk.core,
+                TrafficPendingChunk.client_key,
+                TrafficPendingChunk.incoming,
+                TrafficPendingChunk.outgoing,
+                TrafficPendingChunk.sampled_at,
+            )
+            .where(TrafficPendingChunk.scope == scope)
+            .order_by(
+                TrafficPendingChunk.core,
+                TrafficPendingChunk.client_key,
+                TrafficPendingChunk.sampled_at,
+            )
+        )
+        if limit is not None and limit > 0:
+            query = query.limit(int(limit))
+        return (await session.execute(query)).all()
 
     async def list_traffic_pending_chunks(self) -> list[dict[str, Any]]:
         scope = current_scope()
@@ -389,15 +400,23 @@ class TrafficStoreService:
                 for chunk_id, core, client_key, incoming, outgoing, sampled_at in rows
             ]
 
-    async def load_pending_billing(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    async def load_pending_billing(
+        self,
+        *,
+        chunk_limit: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
         """Chunk rows and their sums from one read.
 
-        The panel GET used to scan every chunk twice and then load each client's
-        JSON document only to fill counters the response does not return.
+        ``chunk_limit`` keeps a panel GET to one page. Totals count only the
+        rows in that page, so the following ack deletes the same bytes.
         """
         scope = current_scope()
+        fetch_limit = int(chunk_limit) + 1 if chunk_limit is not None and chunk_limit > 0 else None
         async with self._runtime.reading() as session:
-            chunk_rows = await self._select_pending_chunk_rows(session, scope)
+            chunk_rows = await self._select_pending_chunk_rows(session, scope, fetch_limit)
+            truncated = fetch_limit is not None and len(chunk_rows) >= fetch_limit
+            if truncated:
+                chunk_rows = chunk_rows[: int(chunk_limit)]
             chunks: list[dict[str, Any]] = []
             pending: dict[tuple[str, str], dict[str, int]] = {}
             for chunk_id, core, client_key, incoming, outgoing, sampled_at in chunk_rows:
@@ -437,7 +456,7 @@ class TrafficStoreService:
             ).all()
             for core, client_key, delta_in, delta_out, current_in, current_out in legacy:
                 key = (str(core), str(client_key))
-                if key in pending:
+                if key in pending or truncated:
                     continue
                 pending[key] = {
                     "delta_incoming": int(delta_in),
@@ -457,7 +476,7 @@ class TrafficStoreService:
             }
             for (core, client_key), item in sorted(pending.items())
         ]
-        return chunks, rows
+        return chunks, rows, truncated
 
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         """Delete billed chunks in batches. One statement per batch, not one per row.

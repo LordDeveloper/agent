@@ -170,11 +170,12 @@ async def stats_clients_traffic_pending(
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` samples on an interval and appends one pending **chunk**
          per client when counters grow. Chunks are not held until panel ack.
-      2. GET returns ``users[node_id]`` with summed ``downlink``/``uplink`` and
+      2. GET returns one page of ``users[node_id]`` (oldest chunks first, capped)
+         with ``downlink``/``uplink`` equal to that page and
          ``chunks: [{id, incoming, outgoing, sampled_at}, ...]``.
-      3. Panel bills the summed totals, then POST ``/pending/ack`` with
-         ``chunk_ids`` (processed chunk rows) plus optional ``clients``/``billed``
-         for baseline settlement. GET does not take a write lock.
+         ``truncated`` is true while older rows remain.
+      3. Panel bills the page totals, then POST ``/pending/ack`` with those
+         ``chunk_ids``. GET does not take a write lock.
     """
     payload = await traffic.pending_payload(persist_snapshot=False)
 
@@ -191,6 +192,7 @@ async def stats_clients_traffic_pending(
         "sampled_at": payload.get("sampled_at"),
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
+        "truncated": bool(payload.get("truncated")),
         "sample_refresh_scheduled": sample_refresh_scheduled,
     }
 
@@ -254,10 +256,13 @@ async def stats_clients_traffic_pending_ack(
     chunks_missing: list[str] = []
     if chunk_ids:
         chunks_deleted, chunks_missing = await traffic.ack_chunk_ids(chunk_ids)
+    # chunk_ids already removed this page. A second FIFO pass of the same
+    # billed totals would delete the next page before the panel bills it.
     acked, not_found = await traffic.ack_clients(
         client_keys,
         _billed_amounts(body.get("billed")),
         drop_keys,
+        consume_billed_chunks=not chunk_ids,
     )
 
     return {
