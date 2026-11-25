@@ -161,8 +161,8 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 
 @router.get("/stats/clients/traffic/pending")
 async def stats_clients_traffic_pending(
-    clients: int = Query(100, ge=1, le=5000),
-    chunks: int = Query(200, ge=1, le=5000),
+    clients: int = Query(100, ge=0, le=5000),
+    chunks: int = Query(200, ge=0, le=5000),
     registry: CoreRegistry = Depends(get_registry),
     traffic: TrafficService = Depends(get_traffic),
 ):
@@ -171,6 +171,7 @@ async def stats_clients_traffic_pending(
 
     ``clients`` is how many pending clients this response includes (default 100).
     ``chunks`` is the oldest chunks kept per client (default 200).
+    ``0`` on either value means no limit.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` samples on an interval and appends one pending **chunk**
