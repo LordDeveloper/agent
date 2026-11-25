@@ -276,6 +276,9 @@ class Store:
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         return await self._traffic.ack_traffic_chunk_ids(chunk_ids)
 
+    async def drop_pending_client_keys(self, client_keys: list[str]) -> list[str]:
+        return await self._traffic.drop_pending_client_keys(client_keys)
+
     async def clear_pending_traffic_queue(self, scope: str | None = None) -> dict[str, int]:
         return await self._traffic.clear_pending_traffic_queue(scope)
 
