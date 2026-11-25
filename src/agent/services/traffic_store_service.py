@@ -460,49 +460,50 @@ class TrafficStoreService:
         return chunks, rows
 
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
-        ids = [str(item).strip() for item in chunk_ids if str(item or "").strip()]
+        """Delete billed chunks in batches. One statement per batch, not one per row.
+
+        The previous loop held the SQLite write lock across a DELETE and a COUNT
+        for every chunk. A few hundred clients with a backlog never answered
+        inside the panel's 20s read, so curl reported 0 bytes.
+        """
+        ids = list(dict.fromkeys(str(item).strip() for item in chunk_ids if str(item or "").strip()))
         if not ids:
             return 0, []
         scope = current_scope()
-        deleted = 0
+        found: set[str] = set()
+        touched: set[tuple[str, str]] = set()
         async with self._runtime.writing() as session:
-            rows = (
-                await session.execute(
-                    select(TrafficPendingChunk).where(
-                        TrafficPendingChunk.scope == scope,
-                        TrafficPendingChunk.chunk_id.in_(ids),
-                    )
-                )
-            ).scalars().all()
-            if not rows:
-                return 0, ids
-            found = {str(row.chunk_id) for row in rows}
-            touched: set[tuple[str, str]] = set()
-            for row in rows:
-                touched.add((str(row.core), str(row.client_key)))
-                await session.delete(row)
-                deleted += 1
-            for core, client_key in touched:
-                left = await session.scalar(
-                    select(func.count())
-                    .select_from(TrafficPendingChunk)
-                    .where(
-                        TrafficPendingChunk.scope == scope,
-                        TrafficPendingChunk.core == core,
-                        TrafficPendingChunk.client_key == client_key,
-                    )
-                )
-                if int(left or 0) == 0:
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset : offset + 400]
+                rows = (
                     await session.execute(
-                        delete(TrafficPending).where(
-                            TrafficPending.scope == scope,
-                            TrafficPending.core == core,
-                            TrafficPending.client_key == client_key,
+                        select(
+                            TrafficPendingChunk.chunk_id,
+                            TrafficPendingChunk.core,
+                            TrafficPendingChunk.client_key,
+                        ).where(
+                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.chunk_id.in_(batch),
                         )
                     )
+                ).all()
+                if not rows:
+                    continue
+                delete_ids: list[str] = []
+                for chunk_id, core, client_key in rows:
+                    found.add(str(chunk_id))
+                    touched.add((str(core), str(client_key)))
+                    delete_ids.append(str(chunk_id))
+                await session.execute(
+                    delete(TrafficPendingChunk).where(
+                        TrafficPendingChunk.scope == scope,
+                        TrafficPendingChunk.chunk_id.in_(delete_ids),
+                    )
+                )
+            await self._delete_pending_without_chunks(session, scope, touched)
             await session.commit()
         missing = [item for item in ids if item not in found]
-        return deleted, missing
+        return len(found), missing
 
     async def list_traffic_identity(self) -> list[dict[str, Any]]:
         async with self._runtime.reading() as session:
@@ -964,84 +965,119 @@ class TrafficStoreService:
         """Remove billed bytes from chunk rows (panel also sends chunk_ids)."""
         if not rows:
             return
+        plans: dict[tuple[str, str], tuple[int, int]] = {}
+        for snap in rows:
+            core = str(snap.get("core") or "")
+            client_key = str(snap.get("client_key") or "")
+            pair = (core, client_key)
+            if not core or not client_key or pair in plans:
+                continue
+            if "billed_incoming" in snap or "billed_outgoing" in snap:
+                take_in = max(0, int(snap.get("billed_incoming") or 0))
+                take_out = max(0, int(snap.get("billed_outgoing") or 0))
+            else:
+                take_in = max(
+                    0,
+                    int(snap.get("incoming") or snap.get("delta_incoming") or 0),
+                )
+                take_out = max(
+                    0,
+                    int(snap.get("outgoing") or snap.get("delta_outgoing") or 0),
+                )
+            if take_in == 0 and take_out == 0:
+                continue
+            plans[pair] = (take_in, take_out)
+        if not plans:
+            return
         async with self._runtime.writing() as session:
             scope = current_scope()
-            seen: set[tuple[str, str]] = set()
-            for snap in rows:
-                core = str(snap.get("core") or "")
-                client_key = str(snap.get("client_key") or "")
-                pair = (core, client_key)
-                if not core or not client_key or pair in seen:
-                    continue
-                seen.add(pair)
-                if "billed_incoming" in snap or "billed_outgoing" in snap:
-                    take_in = max(0, int(snap.get("billed_incoming") or 0))
-                    take_out = max(0, int(snap.get("billed_outgoing") or 0))
-                else:
-                    take_in = max(
-                        0,
-                        int(snap.get("incoming") or snap.get("delta_incoming") or 0),
-                    )
-                    take_out = max(
-                        0,
-                        int(snap.get("outgoing") or snap.get("delta_outgoing") or 0),
-                    )
-                if take_in == 0 and take_out == 0:
-                    continue
-                chunks = (
-                    await session.execute(
-                        select(TrafficPendingChunk)
-                        .where(
-                            TrafficPendingChunk.scope == scope,
-                            TrafficPendingChunk.core == core,
-                            TrafficPendingChunk.client_key == client_key,
+            by_core: dict[str, list[str]] = defaultdict(list)
+            for core, client_key in plans:
+                by_core[core].append(client_key)
+            chunks_by_client: dict[tuple[str, str], list[TrafficPendingChunk]] = defaultdict(list)
+            for core, client_ids in by_core.items():
+                unique_ids = list(dict.fromkeys(client_ids))
+                for offset in range(0, len(unique_ids), 400):
+                    batch = unique_ids[offset : offset + 400]
+                    found = (
+                        await session.execute(
+                            select(TrafficPendingChunk)
+                            .where(
+                                TrafficPendingChunk.scope == scope,
+                                TrafficPendingChunk.core == core,
+                                TrafficPendingChunk.client_key.in_(batch),
+                            )
+                            .order_by(TrafficPendingChunk.sampled_at)
                         )
-                        .order_by(TrafficPendingChunk.sampled_at)
-                    )
-                ).scalars().all()
-                await self._consume_chunks_fifo(session, chunks, take_in, take_out)
-                left = await session.scalar(
-                    select(func.count())
-                    .select_from(TrafficPendingChunk)
-                    .where(
+                    ).scalars().all()
+                    for chunk in found:
+                        chunks_by_client[(core, str(chunk.client_key))].append(chunk)
+            delete_ids: list[str] = []
+            for pair, (take_in, take_out) in plans.items():
+                delete_ids.extend(
+                    self._chunk_ids_consumed_fifo(chunks_by_client.get(pair, []), take_in, take_out)
+                )
+            for offset in range(0, len(delete_ids), 400):
+                batch = delete_ids[offset : offset + 400]
+                if not batch:
+                    continue
+                await session.execute(
+                    delete(TrafficPendingChunk).where(
                         TrafficPendingChunk.scope == scope,
-                        TrafficPendingChunk.core == core,
-                        TrafficPendingChunk.client_key == client_key,
+                        TrafficPendingChunk.chunk_id.in_(batch),
                     )
                 )
-                if int(left or 0) == 0:
-                    await session.execute(
-                        delete(TrafficPending).where(
-                            TrafficPending.scope == scope,
-                            TrafficPending.core == core,
-                            TrafficPending.client_key == client_key,
-                        )
-                    )
+            await self._delete_pending_without_chunks(session, scope, set(plans))
             await session.commit()
 
-    @staticmethod
-    async def _consume_chunks_fifo(
+    async def _delete_pending_without_chunks(
+        self,
         session,
+        scope: str,
+        clients: set[tuple[str, str]],
+    ) -> None:
+        by_core: dict[str, list[str]] = defaultdict(list)
+        for core, client_key in clients:
+            if core and client_key:
+                by_core[core].append(client_key)
+        for core, client_ids in by_core.items():
+            unique_ids = list(dict.fromkeys(client_ids))
+            for offset in range(0, len(unique_ids), 400):
+                batch = unique_ids[offset : offset + 400]
+                await session.execute(
+                    delete(TrafficPending).where(
+                        TrafficPending.scope == scope,
+                        TrafficPending.core == core,
+                        TrafficPending.client_key.in_(batch),
+                        ~select(TrafficPendingChunk.chunk_id)
+                        .where(
+                            TrafficPendingChunk.scope == TrafficPending.scope,
+                            TrafficPendingChunk.core == TrafficPending.core,
+                            TrafficPendingChunk.client_key == TrafficPending.client_key,
+                        )
+                        .exists(),
+                    )
+                )
+
+    @staticmethod
+    def _chunk_ids_consumed_fifo(
         chunks: list[TrafficPendingChunk],
         take_incoming: int,
         take_outgoing: int,
-    ) -> list[TrafficPendingChunk]:
+    ) -> list[str]:
         remaining_in = int(take_incoming)
         remaining_out = int(take_outgoing)
-        keep: list[TrafficPendingChunk] = []
+        consumed: list[str] = []
         for chunk in chunks:
             if remaining_in <= 0 and remaining_out <= 0:
-                keep.append(chunk)
-                continue
+                break
             chunk_in = int(chunk.incoming)
             chunk_out = int(chunk.outgoing)
             if chunk_in <= remaining_in and chunk_out <= remaining_out:
                 remaining_in -= chunk_in
                 remaining_out -= chunk_out
-                await session.delete(chunk)
-                continue
-            keep.append(chunk)
-        return keep
+                consumed.append(str(chunk.chunk_id))
+        return consumed
 
     @staticmethod
     def _settle_billed_direction(
