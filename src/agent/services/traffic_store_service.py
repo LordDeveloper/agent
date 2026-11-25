@@ -12,7 +12,13 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent.auth_scope import current_scope
 from agent.database.models.client import Client
-from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending, TrafficPendingChunk
+from agent.database.models.traffic import (
+    TrafficAck,
+    TrafficIdentity,
+    TrafficPending,
+    TrafficPendingChunk,
+    TrafficPendingClient,
+)
 from agent.database.session import DatabaseRuntime
 
 
@@ -706,9 +712,15 @@ class TrafficStoreService:
         ids = list(dict.fromkeys(str(item).strip() for item in chunk_ids if str(item or "").strip()))
         if not ids:
             return 0, []
+        from agent.auth_scope import DEFAULT_SCOPE
+
         scope = current_scope()
+        # The panel posts the chunk ids it billed. Delete those rows in this
+        # token's scope, and the same ids still sitting in default from before
+        # samples were filed under the token.
+        scopes = [scope] if scope == DEFAULT_SCOPE else [scope, DEFAULT_SCOPE]
         found: set[str] = set()
-        touched: set[tuple[str, str]] = set()
+        touched: dict[str, set[tuple[str, str]]] = defaultdict(set)
         async with self._runtime.writing() as session:
             for offset in range(0, len(ids), 1000):
                 batch = ids[offset : offset + 1000]
@@ -718,27 +730,32 @@ class TrafficStoreService:
                 rows = (
                     await session.execute(
                         select(
+                            TrafficPendingChunk.scope,
                             TrafficPendingChunk.chunk_id,
                             TrafficPendingChunk.core,
                             TrafficPendingChunk.client_key,
                         ).where(
-                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.scope.in_(scopes),
                             TrafficPendingChunk.chunk_id.in_(batch),
                         )
                     )
                 ).all()
-                matched = [str(chunk_id) for chunk_id, _core, _client_key in rows]
-                for chunk_id, core, client_key in rows:
-                    found.add(str(chunk_id))
-                    touched.add((str(core), str(client_key)))
-                if matched:
+                by_scope: dict[str, list[str]] = defaultdict(list)
+                for row_scope, chunk_id, core, client_key in rows:
+                    row_scope = str(row_scope)
+                    chunk_id = str(chunk_id)
+                    found.add(chunk_id)
+                    by_scope[row_scope].append(chunk_id)
+                    touched[row_scope].add((str(core), str(client_key)))
+                for row_scope, matched in by_scope.items():
                     await session.execute(
                         delete(TrafficPendingChunk).where(
-                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.scope == row_scope,
                             TrafficPendingChunk.chunk_id.in_(matched),
                         )
                     )
-            await self._delete_legacy_pending(session, scope, touched)
+            for row_scope, clients in touched.items():
+                await self._delete_legacy_pending(session, row_scope, clients)
             await session.commit()
         missing = [item for item in ids if item not in found]
         return len(found), missing
@@ -748,59 +765,62 @@ class TrafficStoreService:
         keys = list(dict.fromkeys(str(item).strip() for item in client_keys if str(item or "").strip()))
         if not keys:
             return []
+        from agent.auth_scope import DEFAULT_SCOPE
+
         scope = current_scope()
+        scopes = [scope] if scope == DEFAULT_SCOPE else [scope, DEFAULT_SCOPE]
         dropped: list[str] = []
         async with self._runtime.writing() as session:
-            pairs: set[tuple[str, str]] = set()
+            pairs: set[tuple[str, str, str]] = set()
             for offset in range(0, len(keys), 400):
                 batch = keys[offset : offset + 400]
-                if _sqlite(session):
-                    rows = (
-                        await session.execute(
-                            text(
-                                "SELECT core, client_key FROM traffic_pending_client "
-                                "WHERE scope = :scope AND client_key IN :keys"
-                            ).bindparams(bindparam("keys", expanding=True)),
-                            {"scope": scope, "keys": batch},
+                rows = (
+                    await session.execute(
+                        select(
+                            TrafficPendingClient.scope,
+                            TrafficPendingClient.core,
+                            TrafficPendingClient.client_key,
+                        ).where(
+                            TrafficPendingClient.scope.in_(scopes),
+                            TrafficPendingClient.client_key.in_(batch),
                         )
-                    ).all()
-                else:
-                    rows = (
-                        await session.execute(
-                            select(TrafficPending.core, TrafficPending.client_key).where(
-                                TrafficPending.scope == scope,
-                                TrafficPending.client_key.in_(batch),
-                            )
-                        )
-                    ).all()
-                for core, client_key in rows:
-                    pairs.add((str(core), str(client_key)))
+                    )
+                ).all()
+                for row_scope, core, client_key in rows:
+                    pairs.add((str(row_scope), str(core), str(client_key)))
                 legacy = (
                     await session.execute(
-                        select(TrafficPending.core, TrafficPending.client_key).where(
-                            TrafficPending.scope == scope,
+                        select(
+                            TrafficPending.scope,
+                            TrafficPending.core,
+                            TrafficPending.client_key,
+                        ).where(
+                            TrafficPending.scope.in_(scopes),
                             TrafficPending.client_key.in_(batch),
                         )
                     )
                 ).all()
-                for core, client_key in legacy:
-                    pairs.add((str(core), str(client_key)))
-            by_core: dict[str, list[str]] = defaultdict(list)
-            for core, client_key in pairs:
-                by_core[core].append(client_key)
+                for row_scope, core, client_key in legacy:
+                    pairs.add((str(row_scope), str(core), str(client_key)))
+            by_scope_core: dict[tuple[str, str], list[str]] = defaultdict(list)
+            legacy_by_scope: dict[str, set[tuple[str, str]]] = defaultdict(set)
+            for row_scope, core, client_key in pairs:
+                by_scope_core[(row_scope, core)].append(client_key)
+                legacy_by_scope[row_scope].add((core, client_key))
                 dropped.append(client_key)
-            for core, client_ids in by_core.items():
+            for (row_scope, core), client_ids in by_scope_core.items():
                 unique_ids = list(dict.fromkeys(client_ids))
                 for offset in range(0, len(unique_ids), 50):
                     batch = unique_ids[offset : offset + 50]
                     await session.execute(
                         delete(TrafficPendingChunk).where(
-                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.scope == row_scope,
                             TrafficPendingChunk.core == core,
                             TrafficPendingChunk.client_key.in_(batch),
                         )
                     )
-            await self._delete_legacy_pending(session, scope, pairs)
+            for row_scope, clients in legacy_by_scope.items():
+                await self._delete_legacy_pending(session, row_scope, clients)
             await session.commit()
         return list(dict.fromkeys(dropped))
 
