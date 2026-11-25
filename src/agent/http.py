@@ -245,7 +245,7 @@ class AgentHttpMiddleware:
                     500,
                     {
                         "success": False,
-                        "error": {"code": "INTERNAL_ERROR", "message": type(failure).__name__},
+                        "error": {"code": "INTERNAL_ERROR", "message": _failure_message(failure)},
                     },
                     request_id,
                 )
@@ -494,6 +494,16 @@ class _WarnRequest:
 
     def __repr__(self) -> str:
         return f"{self.method} {self.path}"
+
+
+def _failure_message(failure: BaseException) -> str:
+    name = type(failure).__name__
+    detail = str(failure).strip()
+    if not detail or detail == name:
+        return name
+    if len(detail) > 240:
+        detail = detail[:240]
+    return f"{name}: {detail}"
 
 
 def _task_exception(task: asyncio.Task[Any]) -> BaseException | None:

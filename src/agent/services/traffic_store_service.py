@@ -572,23 +572,32 @@ class TrafficStoreService:
         async with self._runtime.writing() as session:
             for offset in range(0, len(ids), 1000):
                 batch = ids[offset : offset + 1000]
-                deleted = (
+                # Do not use DELETE RETURNING here. The AFTER DELETE trigger on
+                # traffic_pending_chunk runs more statements, SQLite clears the
+                # cursor description, and SQLAlchemy raises AttributeError.
+                rows = (
                     await session.execute(
-                        delete(TrafficPendingChunk)
-                        .where(
-                            TrafficPendingChunk.scope == scope,
-                            TrafficPendingChunk.chunk_id.in_(batch),
-                        )
-                        .returning(
+                        select(
                             TrafficPendingChunk.chunk_id,
                             TrafficPendingChunk.core,
                             TrafficPendingChunk.client_key,
+                        ).where(
+                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.chunk_id.in_(batch),
                         )
                     )
                 ).all()
-                for chunk_id, core, client_key in deleted:
+                matched = [str(chunk_id) for chunk_id, _core, _client_key in rows]
+                for chunk_id, core, client_key in rows:
                     found.add(str(chunk_id))
                     touched.add((str(core), str(client_key)))
+                if matched:
+                    await session.execute(
+                        delete(TrafficPendingChunk).where(
+                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.chunk_id.in_(matched),
+                        )
+                    )
             await self._delete_legacy_pending(session, scope, touched)
             await session.commit()
         missing = [item for item in ids if item not in found]
