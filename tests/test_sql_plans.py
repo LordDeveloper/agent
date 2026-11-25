@@ -46,10 +46,22 @@ async def test_cursor_reads_use_covering_indexes(tmp_path):
 
         chunks = await _plans(
             store,
-            "SELECT core, client_key, sum(incoming), sum(outgoing) "
-            "FROM traffic_pending_chunk WHERE scope = ? GROUP BY core, client_key",
+            "SELECT core, client_key, coalesce(sum(incoming), 0), coalesce(sum(outgoing), 0), count(*) "
+            "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
+            "WHERE scope = ? GROUP BY core, client_key",
             ("default",),
         )
-        assert "ix_traffic_pending_chunk_client" in chunks
+        assert "ix_traffic_pending_chunk_totals" in chunks
+        assert "COVERING" in chunks.upper()
+
+        ordered = await _plans(
+            store,
+            "SELECT chunk_id, core, client_key, incoming, outgoing, sampled_at "
+            "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
+            "WHERE scope = ? ORDER BY core, client_key, sampled_at",
+            ("default",),
+        )
+        assert "ix_traffic_pending_chunk_totals" in ordered
+        assert "COVERING" in ordered.upper()
     finally:
         await store.close()

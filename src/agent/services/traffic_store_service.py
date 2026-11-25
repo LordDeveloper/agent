@@ -240,6 +240,7 @@ class TrafficStoreService:
                     "delta_outgoing": int(item["delta_outgoing"]),
                     "current_incoming": int(item["current_incoming"]),
                     "current_outgoing": int(item["current_outgoing"]),
+                    "chunk_count": int(item.get("chunk_count") or 0),
                     "updated_at": None,
                 }
             )
@@ -339,27 +340,43 @@ class TrafficStoreService:
             "clients_cleared": clients_before,
         }
 
+    async def _select_pending_chunk_rows(self, session, scope: str) -> list[Any]:
+        """Ordered chunk rows from the covering index, not a sort of the whole table."""
+        if _sqlite(session):
+            return (
+                await session.execute(
+                    text(
+                        "SELECT chunk_id, core, client_key, incoming, outgoing, sampled_at "
+                        "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
+                        "WHERE scope = :scope "
+                        "ORDER BY core, client_key, sampled_at"
+                    ),
+                    {"scope": scope},
+                )
+            ).all()
+        return (
+            await session.execute(
+                select(
+                    TrafficPendingChunk.chunk_id,
+                    TrafficPendingChunk.core,
+                    TrafficPendingChunk.client_key,
+                    TrafficPendingChunk.incoming,
+                    TrafficPendingChunk.outgoing,
+                    TrafficPendingChunk.sampled_at,
+                )
+                .where(TrafficPendingChunk.scope == scope)
+                .order_by(
+                    TrafficPendingChunk.core,
+                    TrafficPendingChunk.client_key,
+                    TrafficPendingChunk.sampled_at,
+                )
+            )
+        ).all()
+
     async def list_traffic_pending_chunks(self) -> list[dict[str, Any]]:
         scope = current_scope()
         async with self._runtime.reading() as session:
-            rows = (
-                await session.execute(
-                    select(
-                        TrafficPendingChunk.chunk_id,
-                        TrafficPendingChunk.core,
-                        TrafficPendingChunk.client_key,
-                        TrafficPendingChunk.incoming,
-                        TrafficPendingChunk.outgoing,
-                        TrafficPendingChunk.sampled_at,
-                    )
-                    .where(TrafficPendingChunk.scope == scope)
-                    .order_by(
-                        TrafficPendingChunk.core,
-                        TrafficPendingChunk.client_key,
-                        TrafficPendingChunk.sampled_at,
-                    )
-                )
-            ).all()
+            rows = await self._select_pending_chunk_rows(session, scope)
             return [
                 {
                     "chunk_id": str(chunk_id),
@@ -380,24 +397,7 @@ class TrafficStoreService:
         """
         scope = current_scope()
         async with self._runtime.reading() as session:
-            chunk_rows = (
-                await session.execute(
-                    select(
-                        TrafficPendingChunk.chunk_id,
-                        TrafficPendingChunk.core,
-                        TrafficPendingChunk.client_key,
-                        TrafficPendingChunk.incoming,
-                        TrafficPendingChunk.outgoing,
-                        TrafficPendingChunk.sampled_at,
-                    )
-                    .where(TrafficPendingChunk.scope == scope)
-                    .order_by(
-                        TrafficPendingChunk.core,
-                        TrafficPendingChunk.client_key,
-                        TrafficPendingChunk.sampled_at,
-                    )
-                )
-            ).all()
+            chunk_rows = await self._select_pending_chunk_rows(session, scope)
             chunks: list[dict[str, Any]] = []
             pending: dict[tuple[str, str], dict[str, int]] = {}
             for chunk_id, core, client_key, incoming, outgoing, sampled_at in chunk_rows:
@@ -560,6 +560,47 @@ class TrafficStoreService:
                     found[(str(core_id), str(client_id))] = (int(incoming or 0), int(outgoing or 0))
         return found
 
+    async def _sum_pending_chunks(
+        self,
+        session,
+        scope: str,
+        core_name: str,
+        client_name: str,
+    ) -> list[Any]:
+        """Per-client sums from the covering index. One pass, no row materialization."""
+        if _sqlite(session):
+            sql = (
+                "SELECT core, client_key, "
+                "coalesce(sum(incoming), 0), coalesce(sum(outgoing), 0), count(*) "
+                "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
+                "WHERE scope = :scope"
+            )
+            params: dict[str, Any] = {"scope": scope}
+            if core_name:
+                sql += " AND core = :core"
+                params["core"] = core_name
+            if client_name:
+                sql += " AND client_key = :client"
+                params["client"] = client_name
+            sql += " GROUP BY core, client_key"
+            return (await session.execute(text(sql), params)).all()
+        query = (
+            select(
+                TrafficPendingChunk.core,
+                TrafficPendingChunk.client_key,
+                func.coalesce(func.sum(TrafficPendingChunk.incoming), 0),
+                func.coalesce(func.sum(TrafficPendingChunk.outgoing), 0),
+                func.count(),
+            )
+            .where(TrafficPendingChunk.scope == scope)
+            .group_by(TrafficPendingChunk.core, TrafficPendingChunk.client_key)
+        )
+        if core_name:
+            query = query.where(TrafficPendingChunk.core == core_name)
+        if client_name:
+            query = query.where(TrafficPendingChunk.client_key == client_name)
+        return (await session.execute(query)).all()
+
     async def _traffic_books(
         self,
         scope: str | None = None,
@@ -579,34 +620,23 @@ class TrafficStoreService:
                 TrafficAck.incoming,
                 TrafficAck.outgoing,
             ).where(TrafficAck.scope == scope)
-            chunk_query = (
-                select(
-                    TrafficPendingChunk.core,
-                    TrafficPendingChunk.client_key,
-                    func.coalesce(func.sum(TrafficPendingChunk.incoming), 0),
-                    func.coalesce(func.sum(TrafficPendingChunk.outgoing), 0),
-                )
-                .where(TrafficPendingChunk.scope == scope)
-                .group_by(TrafficPendingChunk.core, TrafficPendingChunk.client_key)
-            )
             if core_name:
                 ack_query = ack_query.where(TrafficAck.core == core_name)
-                chunk_query = chunk_query.where(TrafficPendingChunk.core == core_name)
             if client_name:
                 ack_query = ack_query.where(TrafficAck.client_key == client_name)
-                chunk_query = chunk_query.where(TrafficPendingChunk.client_key == client_name)
             acks = {
                 (str(ack_core), str(ack_key)): (int(incoming), int(outgoing))
                 for ack_core, ack_key, incoming, outgoing in (await session.execute(ack_query)).all()
             }
             pending: dict[tuple[str, str], dict[str, int]] = {}
-            summed = (await session.execute(chunk_query)).all()
-            for chunk_core, chunk_key, incoming, outgoing in summed:
+            summed = await self._sum_pending_chunks(session, scope, core_name, client_name)
+            for chunk_core, chunk_key, incoming, outgoing, chunk_count in summed:
                 pending[(str(chunk_core), str(chunk_key))] = {
                     "delta_incoming": int(incoming or 0),
                     "delta_outgoing": int(outgoing or 0),
                     "current_incoming": 0,
                     "current_outgoing": 0,
+                    "chunk_count": int(chunk_count or 0),
                 }
             cursor_map = await self._select_cursors(session, list(pending))
             for key, agg in pending.items():

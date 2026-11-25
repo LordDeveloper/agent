@@ -56,7 +56,18 @@ class TrafficPendingChunk(Base):
             ("clients.core_id", "clients.id"),
             ondelete="CASCADE",
         ),
-        Index("ix_traffic_pending_chunk_client", "scope", "core", "client_key"),
+        # Grouped sums and ordered chunk reads stay inside this index.
+        # The primary key appends chunk_id, so the index covers those selects.
+        Index(
+            "ix_traffic_pending_chunk_totals",
+            "scope",
+            "core",
+            "client_key",
+            "sampled_at",
+            "incoming",
+            "outgoing",
+            "chunk_id",
+        ),
         {"sqlite_with_rowid": False},
     )
 

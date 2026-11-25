@@ -112,7 +112,6 @@ async def collect_volume_billing_snapshot(
     registry: CoreRegistry | None = None,
 ) -> dict[str, Any]:
     rows = await traffic.store.list_traffic_pending()
-    chunks = await traffic.store.list_traffic_pending_chunks()
     panel_id_by_stored: dict[tuple[str, str], str] = {}
     for ident in await traffic.store.list_traffic_identity():
         core_name = str(ident.get("core") or "").strip()
@@ -122,12 +121,17 @@ async def collect_volume_billing_snapshot(
             panel_id_by_stored[(core_name, alias)] = canonical
     chunks_by_client: dict[tuple[str, str], int] = {}
     pending_bytes = 0
+    pending_chunk_count = 0
     wg_chunk_clients: set[str] = set()
     pending_by_core: dict[str, dict[str, Any]] = {}
-    for chunk in chunks:
-        key = (str(chunk.get("core") or ""), str(chunk.get("client_key") or ""))
-        chunks_by_client[key] = chunks_by_client.get(key, 0) + 1
-        chunk_bytes = int(chunk.get("incoming") or 0) + int(chunk.get("outgoing") or 0)
+    for row in rows:
+        key = (str(row.get("core") or ""), str(row.get("client_key") or ""))
+        count = int(row.get("chunk_count") or 0)
+        chunk_bytes = int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0)
+        if count <= 0 and chunk_bytes <= 0:
+            continue
+        chunks_by_client[key] = count
+        pending_chunk_count += count
         pending_bytes += chunk_bytes
         core_name = key[0] or "—"
         bucket = pending_by_core.setdefault(
@@ -135,9 +139,9 @@ async def collect_volume_billing_snapshot(
             {"clients": set(), "chunks": 0, "bytes": 0},
         )
         bucket["clients"].add(key[1])
-        bucket["chunks"] += 1
+        bucket["chunks"] += count
         bucket["bytes"] += chunk_bytes
-        if key[0] == "wireguard" and key[1]:
+        if key[0] == "wireguard" and key[1] and count > 0:
             wg_chunk_clients.add(key[1])
 
     row_delta_bytes = sum(
@@ -160,7 +164,7 @@ async def collect_volume_billing_snapshot(
 
     snapshot_body: dict[str, Any] = {
         "pending_clients": len(chunks_by_client) or len(rows),
-        "pending_chunks": len(chunks),
+        "pending_chunks": pending_chunk_count,
         "pending_bytes": pending_bytes,
         "pending_bytes_label": _format_bytes(pending_bytes),
         "pending_last_touch": pending_last_touch,

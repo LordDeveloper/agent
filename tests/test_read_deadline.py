@@ -25,13 +25,15 @@ def test_short_read_paths_cover_every_stats_and_health_route():
     assert short_read_path("GET", "/cores/xray/health")
     assert short_read_path("GET", "/api/v1/wireguard/diagnose")
     assert short_read_path("GET", "/api/v1/mullvad/locations")
+    assert not short_read_path("GET", "/api/v1/stats/clients/traffic/pending")
     assert not short_read_path("POST", "/api/v1/stats/clients/traffic/pending/ack")
     assert not short_read_path("GET", "/api/v1/xray/inbounds/1")
 
 
 def test_panel_reads_are_the_routes_that_must_answer_quickly():
     assert panel_read_path("GET", "/health")
-    assert panel_read_path("GET", "/api/v1/stats/clients/traffic/pending")
+    assert panel_read_path("GET", "/api/v1/stats/live")
+    assert not panel_read_path("GET", "/api/v1/stats/clients/traffic/pending")
     assert panel_read_path("GET", "/api/v1/mullvad/locations")
     assert not panel_read_path("GET", "/api/v1/mullvad/locations/se/relays")
     assert not panel_read_path("POST", "/api/v1/stats/clients/traffic/pending/ack")
@@ -183,7 +185,7 @@ async def test_slow_panel_reads_return_json_within_the_deadline():
         started = time.perf_counter()
         health, pending = await asyncio.gather(
             client.get("/health"),
-            client.get("/api/v1/stats/clients/traffic/pending"),
+            client.get("/api/v1/stats/live"),
         )
         elapsed = time.perf_counter() - started
 
@@ -194,7 +196,43 @@ async def test_slow_panel_reads_return_json_within_the_deadline():
         body = response.json()
         assert body["success"] is True
         assert body["stale"] is True
-    assert pending.json()["users"] == {}
+        assert pending.json()["users"] == {}
+
+
+@pytest.mark.asyncio
+async def test_pending_billing_read_is_not_replaced_with_an_empty_queue():
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from agent.http import AgentHttpMiddleware
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await asyncio.sleep(0.4)
+        body = b'{"success":true,"users":{"node":{"downlink":5,"uplink":1}}}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    wrapped = AgentHttpMiddleware(app, read_response_seconds=0.2, write_response_seconds=2.0)
+    transport = ASGITransport(app=wrapped)
+    async with AsyncClient(transport=transport, base_url="http://agent") as client:
+        started = time.perf_counter()
+        response = await client.get("/api/v1/stats/clients/traffic/pending")
+        elapsed = time.perf_counter() - started
+
+    assert elapsed >= 0.4
+    assert response.status_code == 200
+    body = response.json()
+    assert body["users"]["node"]["downlink"] == 5
+    assert "stale" not in body
 
 
 @pytest.mark.asyncio
@@ -225,13 +263,13 @@ async def test_read_deadline_replays_the_last_json_body():
     wrapped = AgentHttpMiddleware(app, read_response_seconds=0.2, write_response_seconds=2.0)
     transport = ASGITransport(app=wrapped)
     async with AsyncClient(transport=transport, base_url="http://agent") as client:
-        fresh = await client.get("/api/v1/stats/clients/traffic/pending")
+        fresh = await client.get("/api/v1/stats/live")
         assert fresh.status_code == 200
         assert fresh.json()["users"]["node"]["uplink"] == 4
         assert "stale" not in fresh.json()
         gate["slow"] = True
         started = time.perf_counter()
-        stale = await client.get("/api/v1/stats/clients/traffic/pending")
+        stale = await client.get("/api/v1/stats/live")
         elapsed = time.perf_counter() - started
 
     assert elapsed < 1.0

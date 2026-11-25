@@ -73,9 +73,18 @@ def _request_path(path: str) -> str:
     return path.split("?", 1)[0].rstrip("/") or "/"
 
 
+def _pending_billing_read(method: str, path: str) -> bool:
+    """The volume queue. An empty stand-in would make the panel bill nothing."""
+    if method.upper() not in {"GET", "HEAD"}:
+        return False
+    return _request_path(path).endswith("/stats/clients/traffic/pending")
+
+
 def short_read_path(method: str, path: str) -> bool:
     """Routes whose result the panel can replace on the next poll."""
     if method.upper() not in {"GET", "HEAD"}:
+        return False
+    if _pending_billing_read(method, path):
         return False
     normalized = _request_path(path)
     if normalized == "/health" or normalized.endswith("/health"):
@@ -90,6 +99,8 @@ def short_read_path(method: str, path: str) -> bool:
 def panel_read_path(method: str, path: str) -> bool:
     """Polls that must answer in a few seconds, from cache when the handler is slow."""
     if method.upper() not in {"GET", "HEAD"}:
+        return False
+    if _pending_billing_read(method, path):
         return False
     normalized = _request_path(path)
     if normalized == "/health" or normalized.endswith("/health"):
