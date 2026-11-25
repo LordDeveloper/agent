@@ -589,10 +589,94 @@ class TrafficStoreService:
                 for chunk_id, core, client_key in deleted:
                     found.add(str(chunk_id))
                     touched.add((str(core), str(client_key)))
-            await self._delete_pending_without_chunks(session, scope, touched)
+            await self._delete_legacy_pending(session, scope, touched)
             await session.commit()
         missing = [item for item in ids if item not in found]
         return len(found), missing
+
+    async def drop_pending_client_keys(self, client_keys: list[str]) -> list[str]:
+        """Delete one client's queue by key. Does not read any other client's chunks."""
+        keys = list(dict.fromkeys(str(item).strip() for item in client_keys if str(item or "").strip()))
+        if not keys:
+            return []
+        scope = current_scope()
+        dropped: list[str] = []
+        async with self._runtime.writing() as session:
+            pairs: set[tuple[str, str]] = set()
+            for offset in range(0, len(keys), 400):
+                batch = keys[offset : offset + 400]
+                if _sqlite(session):
+                    rows = (
+                        await session.execute(
+                            text(
+                                "SELECT core, client_key FROM traffic_pending_client "
+                                "WHERE scope = :scope AND client_key IN :keys"
+                            ).bindparams(bindparam("keys", expanding=True)),
+                            {"scope": scope, "keys": batch},
+                        )
+                    ).all()
+                else:
+                    rows = (
+                        await session.execute(
+                            select(TrafficPending.core, TrafficPending.client_key).where(
+                                TrafficPending.scope == scope,
+                                TrafficPending.client_key.in_(batch),
+                            )
+                        )
+                    ).all()
+                for core, client_key in rows:
+                    pairs.add((str(core), str(client_key)))
+                legacy = (
+                    await session.execute(
+                        select(TrafficPending.core, TrafficPending.client_key).where(
+                            TrafficPending.scope == scope,
+                            TrafficPending.client_key.in_(batch),
+                        )
+                    )
+                ).all()
+                for core, client_key in legacy:
+                    pairs.add((str(core), str(client_key)))
+            by_core: dict[str, list[str]] = defaultdict(list)
+            for core, client_key in pairs:
+                by_core[core].append(client_key)
+                dropped.append(client_key)
+            for core, client_ids in by_core.items():
+                unique_ids = list(dict.fromkeys(client_ids))
+                for offset in range(0, len(unique_ids), 50):
+                    batch = unique_ids[offset : offset + 50]
+                    await session.execute(
+                        delete(TrafficPendingChunk).where(
+                            TrafficPendingChunk.scope == scope,
+                            TrafficPendingChunk.core == core,
+                            TrafficPendingChunk.client_key.in_(batch),
+                        )
+                    )
+            await self._delete_legacy_pending(session, scope, pairs)
+            await session.commit()
+        return list(dict.fromkeys(dropped))
+
+    async def _delete_legacy_pending(
+        self,
+        session,
+        scope: str,
+        clients: set[tuple[str, str]],
+    ) -> None:
+        """Drop old aggregate rows for these clients. The chunk index is not scanned."""
+        by_core: dict[str, list[str]] = defaultdict(list)
+        for core, client_key in clients:
+            if core and client_key:
+                by_core[core].append(client_key)
+        for core, client_ids in by_core.items():
+            unique_ids = list(dict.fromkeys(client_ids))
+            for offset in range(0, len(unique_ids), 400):
+                batch = unique_ids[offset : offset + 400]
+                await session.execute(
+                    delete(TrafficPending).where(
+                        TrafficPending.scope == scope,
+                        TrafficPending.core == core,
+                        TrafficPending.client_key.in_(batch),
+                    )
+                )
 
     async def list_traffic_identity(self) -> list[dict[str, Any]]:
         async with self._runtime.reading() as session:

@@ -1134,6 +1134,9 @@ class TrafficService:
     async def ack_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         return await self.store.ack_traffic_chunk_ids(chunk_ids)
 
+    async def drop_pending_keys(self, client_keys: list[str]) -> list[str]:
+        return await self.store.drop_pending_client_keys(client_keys)
+
     async def ack_pending(self) -> int:
         rows = await self.store.list_traffic_pending()
         await self.store.ack_traffic_rows(rows)

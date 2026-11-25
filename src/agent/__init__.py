@@ -1,3 +1,3 @@
 """Netinja node agent."""
 
-__version__ = "0.4.266"
+__version__ = "0.4.267"

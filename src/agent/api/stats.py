@@ -263,23 +263,22 @@ async def stats_clients_traffic_pending_ack(
     ]
     chunks_deleted = 0
     chunks_missing: list[str] = []
+    dropped: list[str] = []
     if chunk_ids:
         chunks_deleted, chunks_missing = await traffic.ack_chunk_ids(chunk_ids)
-    # The chunk ids are the page the panel billed. Settling them by walking
-    # every pending row (or FIFO-deleting the billed totals again) holds the
-    # write lock past the panel's 20s timeout and returns zero bytes.
-    if chunk_ids and not drop_keys:
-        acked = client_keys
+    if drop_keys:
+        dropped = await traffic.drop_pending_keys(drop_keys)
+    # Chunk ids and drop keys are exact deletes. Walking the rest of the queue
+    # to settle billed totals holds the write lock for the whole backlog.
+    if chunk_ids or drop_keys:
+        acked = list(dict.fromkeys([*client_keys, *dropped]))
         not_found = []
     else:
         acked, not_found = await traffic.ack_clients(
-            [] if chunk_ids else client_keys,
-            None if chunk_ids else _billed_amounts(body.get("billed")),
+            client_keys,
+            _billed_amounts(body.get("billed")),
             drop_keys,
-            consume_billed_chunks=not chunk_ids,
         )
-        if chunk_ids:
-            acked = list(dict.fromkeys([*client_keys, *acked]))
 
     return {
         "success": True,
