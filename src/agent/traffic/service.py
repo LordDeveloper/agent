@@ -1015,7 +1015,8 @@ class TrafficService:
         self,
         *,
         persist_snapshot: bool = True,
-        chunk_limit: int | None = None,
+        client_limit: int | None = None,
+        chunks_per_client: int | None = None,
     ) -> dict[str, Any]:
         """Return unacked pending deltas and optionally persist a fetch snapshot for POST ack.
 
@@ -1023,12 +1024,17 @@ class TrafficService:
         withoutOverlapping). ``persist_snapshot=False`` keeps GET off the write lock;
         the in-memory snapshot is enough until a background meta write finishes.
         """
-        from agent.services.traffic_store_service import BILLING_CHUNK_PAGE
+        from agent.services.traffic_store_service import BILLING_CHUNKS_PER_CLIENT, BILLING_CLIENT_PAGE
 
         await self._load_persisted_aliases()
-        if chunk_limit is None:
-            chunk_limit = BILLING_CHUNK_PAGE
-        chunks, rows, truncated = await self.store.load_pending_billing(chunk_limit=chunk_limit)
+        if client_limit is None:
+            client_limit = BILLING_CLIENT_PAGE
+        if chunks_per_client is None:
+            chunks_per_client = BILLING_CHUNKS_PER_CLIENT
+        chunks, rows, truncated = await self.store.load_pending_billing(
+            client_limit=client_limit,
+            chunks_per_client=chunks_per_client,
+        )
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
         linked_l2tp = await self._linked_l2tp_client_keys()

@@ -78,7 +78,11 @@ async def test_pending_page_leaves_the_rest_of_the_queue(store):
     later.incoming = 7
     await traffic.sample_all(registry)
 
-    page = await traffic.pending_payload(persist_snapshot=False, chunk_limit=2)
+    page = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=1,
+        chunks_per_client=2,
+    )
     assert page["truncated"] is True
     assert page["users"]["a-page"]["downlink"] == 30
     assert len(page["users"]["a-page"]["chunks"]) == 2
@@ -95,7 +99,11 @@ async def test_pending_page_leaves_the_rest_of_the_queue(store):
         consume_billed_chunks=False,
     )
 
-    rest = await traffic.pending_payload(persist_snapshot=False, chunk_limit=10)
+    rest = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=10,
+        chunks_per_client=10,
+    )
     assert rest["truncated"] is False
     assert rest["users"]["a-page"]["downlink"] == 30
     assert rest["users"]["z-later"]["downlink"] == 7

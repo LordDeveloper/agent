@@ -161,23 +161,32 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 
 @router.get("/stats/clients/traffic/pending")
 async def stats_clients_traffic_pending(
+    clients: int = Query(100, ge=1, le=5000),
+    chunks: int = Query(200, ge=1, le=5000),
     registry: CoreRegistry = Depends(get_registry),
     traffic: TrafficService = Depends(get_traffic),
 ):
     """
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
+    ``clients`` is how many pending clients this response includes (default 100).
+    ``chunks`` is the oldest chunks kept per client (default 200).
+
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` samples on an interval and appends one pending **chunk**
          per client when counters grow. Chunks are not held until panel ack.
-      2. GET returns one page of ``users[node_id]`` (oldest chunks first, capped)
-         with ``downlink``/``uplink`` equal to that page and
+      2. GET returns that page of ``users[node_id]`` with ``downlink``/``uplink``
+         equal to the included chunks and
          ``chunks: [{id, incoming, outgoing, sampled_at}, ...]``.
-         ``truncated`` is true while older rows remain.
+         ``truncated`` is true while more clients or chunks remain.
       3. Panel bills the page totals, then POST ``/pending/ack`` with those
          ``chunk_ids``. GET does not take a write lock.
     """
-    payload = await traffic.pending_payload(persist_snapshot=False)
+    payload = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=clients,
+        chunks_per_client=chunks,
+    )
 
     settings = getattr(registry, "settings", None)
     interval_s = float(getattr(settings, "traffic_sample_interval", 5.0) or 5.0)
