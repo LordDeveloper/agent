@@ -80,6 +80,20 @@ class TrafficPendingChunk(Base):
     sampled_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class TrafficPendingClient(Base):
+    """One row per client with pending bytes. Chunk inserts and deletes maintain it."""
+
+    __tablename__ = "traffic_pending_client"
+    __table_args__ = {"sqlite_with_rowid": False}
+
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
+    core: Mapped[str] = mapped_column(String(64), primary_key=True)
+    client_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    outgoing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class TrafficIdentity(Base):
     __tablename__ = "traffic_identity"
     __table_args__ = {"sqlite_with_rowid": False}

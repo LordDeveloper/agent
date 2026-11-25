@@ -8,7 +8,12 @@ from agent.database.models.interface import Interface
 from agent.database.models.quota import Quota
 from agent.database.models.resource_scope import ResourceScope
 from agent.database.models.server import Server
-from agent.database.models.traffic import TrafficAck, TrafficIdentity, TrafficPending
+from agent.database.models.traffic import (
+    TrafficAck,
+    TrafficIdentity,
+    TrafficPending,
+    TrafficPendingClient,
+)
 
 __all__ = [
     "AuditLogEntry",
@@ -24,4 +29,5 @@ __all__ = [
     "TrafficAck",
     "TrafficIdentity",
     "TrafficPending",
+    "TrafficPendingClient",
 ]

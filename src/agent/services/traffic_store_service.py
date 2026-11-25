@@ -403,13 +403,11 @@ class TrafficStoreService:
             ]
 
     async def _pending_client_keys(self, session, scope: str, limit: int | None) -> list[tuple[str, str]]:
-        """Clients in index order. ``limit`` stops after that many groups."""
+        """Clients in index order. The rollup is one row per client, so LIMIT stops there."""
         if _sqlite(session):
             sql = (
-                "SELECT core, client_key "
-                "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
-                "WHERE scope = :scope "
-                "GROUP BY core, client_key "
+                "SELECT core, client_key FROM traffic_pending_client "
+                "WHERE scope = :scope AND chunk_count > 0 "
                 "ORDER BY core, client_key"
             )
             params: dict[str, Any] = {"scope": scope}
@@ -658,13 +656,12 @@ class TrafficStoreService:
         core_name: str,
         client_name: str,
     ) -> list[Any]:
-        """Per-client sums from the covering index. One pass, no row materialization."""
+        """Per-client sums. SQLite reads the one-row rollup, not every chunk."""
         if _sqlite(session):
             sql = (
-                "SELECT core, client_key, "
-                "coalesce(sum(incoming), 0), coalesce(sum(outgoing), 0), count(*) "
-                "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
-                "WHERE scope = :scope"
+                "SELECT core, client_key, incoming, outgoing, chunk_count "
+                "FROM traffic_pending_client "
+                "WHERE scope = :scope AND chunk_count > 0"
             )
             params: dict[str, Any] = {"scope": scope}
             if core_name:
@@ -673,7 +670,6 @@ class TrafficStoreService:
             if client_name:
                 sql += " AND client_key = :client"
                 params["client"] = client_name
-            sql += " GROUP BY core, client_key"
             return (await session.execute(text(sql), params)).all()
         query = (
             select(
