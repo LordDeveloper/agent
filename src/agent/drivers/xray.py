@@ -1126,6 +1126,24 @@ class XrayDriver(CoreDriver):
         ]
         return inbound
 
+    @staticmethod
+    def _clients_absent_from_index(
+        clients: list[dict[str, Any]],
+        by_email: dict[str, dict[str, Any]],
+        by_id: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Payloads whose email and id are both absent from the inbound already loaded from disk."""
+        missing: list[dict[str, Any]] = []
+        for raw in clients:
+            if not isinstance(raw, dict):
+                continue
+            email = str(raw.get("email") or "").strip()
+            cid = str(raw.get("id") or raw.get("client_link_uuid") or "").strip()
+            if (email and email in by_email) or (cid and cid in by_id):
+                continue
+            missing.append(raw)
+        return missing
+
     async def _lookup_clients_for_batch(
         self,
         tag: str,
@@ -2170,9 +2188,11 @@ class XrayDriver(CoreDriver):
             inbound = await self._inbound_shell(inbound_id)
             inbound = await self._ensure_shadowsocks_method(inbound)
             by_email, by_id = self._index_clients(inbound)
-            live_email, live_id = await self._lookup_clients_for_batch(tag, clients)
-            by_email.update(live_email)
-            by_id.update(live_id)
+            unresolved = self._clients_absent_from_index(clients, by_email, by_id)
+            if unresolved:
+                live_email, live_id = await self._lookup_clients_for_batch(tag, unresolved)
+                by_email.update(live_email)
+                by_id.update(live_id)
             # One client update does not need every user's counters.
             # New rows are not in the index, so a create does not query stats.
             if needs_live_baseline and len(clients) <= _SMALL_CLIENT_BATCH:
