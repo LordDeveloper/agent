@@ -406,6 +406,74 @@ async def _delete_rule_pref(runner: Runner | None, pref: int) -> None:
     )
 
 
+def table_id_for_source(ip: str) -> int:
+    """Side table for one public source address. Kept out of the oif-bind range."""
+    digest = zlib.crc32(f"src:{ip}".encode("utf-8")) & 0xFFFF
+    return 30000 + (digest % 20000)
+
+
+def source_rule_pref(ip: str) -> int:
+    digest = zlib.crc32(f"src-pref:{ip}".encode("utf-8")) & 0xFFFF
+    return 9000 + (digest % 800)
+
+
+async def _device_for_ipv4(ip: str, runner: Runner | None) -> str:
+    result = await execute(runner, ["ip", "-o", "-4", "addr", "show"], check=False, timeout=5)
+    if not _ok(result):
+        return ""
+    needle = f" {ip}/"
+    for line in _stdout(result).splitlines():
+        if needle not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            return parts[1].split("@", 1)[0]
+    return ""
+
+
+async def ensure_source_address_route(ip: str, *, runner: Runner | None = None) -> dict[str, Any]:
+    """Send packets sourced from an extra public IP back out that address.
+
+    This is a from-source rule with the NIC's real gateway. It does not install
+    an oif rule, which would blackhole every other client on the same NIC.
+    """
+    address = str(ip or "").strip()
+    if not address:
+        return {"ok": False, "skipped": True}
+    iface = await _device_for_ipv4(address, runner)
+    if not iface:
+        return {"ok": False, "skipped": True, "reason": "address is not assigned"}
+    gateway = await _main_gateway(iface, runner)
+    if not gateway:
+        return {"ok": False, "skipped": True, "reason": "nic has no default gateway"}
+
+    table = table_id_for_source(address)
+    pref = source_rule_pref(address)
+    routed = await execute(
+        runner,
+        [
+            "ip", "route", "replace", "default", "via", gateway,
+            "dev", iface, "src", address, "table", str(table),
+        ],
+        check=False,
+        timeout=5,
+    )
+    if not _ok(routed):
+        return {"ok": False, "skipped": True, "reason": "route replace failed"}
+
+    listed = await execute(runner, ["ip", "rule", "show"], check=False, timeout=5)
+    text = _stdout(listed)
+    marker = f"from {address} "
+    if marker not in text or f"lookup {table}" not in text:
+        await execute(
+            runner,
+            ["ip", "rule", "add", "from", address, "lookup", str(table), "pref", str(pref)],
+            check=False,
+            timeout=5,
+        )
+    return {"ok": True, "address": address, "interface": iface, "table": table, "pref": pref}
+
+
 async def reapply_saved_binds(*, runner: Runner | None = None) -> dict[str, Any]:
     applied: list[str] = []
     failed: list[dict[str, str]] = []

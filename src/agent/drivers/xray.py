@@ -3703,8 +3703,13 @@ class XrayDriver(CoreDriver):
             source = str(outbound.get("sendThrough") or "").strip()
             if source:
                 from agent.support.peer_egress import preserve_public_sources
+                from agent.support.xray_exit_bind import ensure_source_address_route
 
                 await preserve_public_sources([source])
+                try:
+                    await ensure_source_address_route(source)
+                except Exception:
+                    _log.exception("failed to route sendThrough %s", source)
 
     async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
         return await self._api_call("remove_outbounds", tags)
