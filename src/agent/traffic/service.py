@@ -1030,6 +1030,7 @@ class TrafficService:
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
         claim: bool = True,
+        timeout_seconds: int = 180,
     ) -> dict[str, Any]:
         """Return unacked pending deltas and optionally persist a fetch snapshot for POST ack.
 
@@ -1054,6 +1055,7 @@ class TrafficService:
             client_limit=client_limit,
             chunks_per_client=chunks_per_client,
             claim=claim,
+            timeout_seconds=timeout_seconds,
         )
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}

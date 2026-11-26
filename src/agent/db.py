@@ -268,11 +268,13 @@ class Store:
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
         claim: bool = True,
+        timeout_seconds: int = 180,
     ):
         return await self._traffic.load_pending_billing(
             client_limit=client_limit,
             chunks_per_client=chunks_per_client,
             claim=claim,
+            timeout_seconds=timeout_seconds,
         )
 
     async def release_expired_pending_ticks(self) -> int:

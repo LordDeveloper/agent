@@ -163,6 +163,7 @@ async def stats_clients_traffic(registry: CoreRegistry = Depends(get_registry)):
 async def stats_clients_traffic_pending(
     clients: int = Query(100, ge=0, le=5000),
     chunks: int = Query(200, ge=0, le=5000),
+    timeout: int = Query(180, ge=1, le=86400),
     registry: CoreRegistry = Depends(get_registry),
     traffic: TrafficService = Depends(get_traffic),
 ):
@@ -172,6 +173,7 @@ async def stats_clients_traffic_pending(
     ``clients`` is how many pending clients this response includes (default 100).
     ``chunks`` is the oldest unmarked chunks kept per client (default 200).
     ``0`` on either value means no limit.
+    ``timeout`` is how many seconds this fetch stays reserved (default 180).
     The response carries ``tick_id`` for those rows and does not list chunk ids.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
@@ -188,6 +190,7 @@ async def stats_clients_traffic_pending(
         persist_snapshot=False,
         client_limit=clients,
         chunks_per_client=chunks,
+        timeout_seconds=timeout,
     )
 
     settings = getattr(registry, "settings", None)

@@ -99,6 +99,7 @@ class TrafficPendingTick(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     scope: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
 
 
 class TrafficPendingClient(Base):

@@ -33,7 +33,7 @@ def _sqlite(session) -> bool:
 # chunks, so one huge queue cannot fill the body by itself.
 BILLING_CLIENT_PAGE = 100
 BILLING_CHUNKS_PER_CLIENT = 200
-TICK_HOLD_SECONDS = 300
+TICK_HOLD_SECONDS = 180
 
 
 class TrafficStoreService:
@@ -478,16 +478,18 @@ class TrafficStoreService:
             query = query.limit(int(limit))
         return (await session.execute(query)).all()
 
-    async def release_expired_pending_ticks(self, *, older_than_seconds: int = TICK_HOLD_SECONDS) -> int:
-        """Unreserve fetches whose ticks.created_at is past the hold. Pending bytes stay."""
-        cutoff = datetime.now(timezone.utc).timestamp() - max(1, int(older_than_seconds))
-        cutoff_text = datetime.fromtimestamp(cutoff, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async def release_expired_pending_ticks(self) -> int:
+        """Unreserve fetches whose created_at plus timeout_seconds is in the past."""
         async with self._runtime.writing() as session:
             expired = [
                 int(row[0])
                 for row in (
                     await session.execute(
-                        select(TrafficPendingTick.id).where(TrafficPendingTick.created_at < cutoff_text)
+                        text(
+                            "SELECT id FROM ticks "
+                            "WHERE datetime(created_at, '+' || timeout_seconds || ' seconds') "
+                            "< datetime('now')"
+                        )
                     )
                 ).all()
             ]
@@ -503,7 +505,7 @@ class TrafficStoreService:
             await session.commit()
         return released
 
-    async def claim_pending_tick(self, chunk_ids: list[str]) -> int | None:
+    async def claim_pending_tick(self, chunk_ids: list[str], *, timeout_seconds: int = TICK_HOLD_SECONDS) -> int | None:
         """Insert one ticks row and point the fetched chunks at it. Reserved rows stay reserved."""
         ids = list(dict.fromkeys(str(item).strip() for item in chunk_ids if str(item or "").strip()))
         if not ids:
@@ -514,8 +516,11 @@ class TrafficStoreService:
         scopes = [scope] if scope == DEFAULT_SCOPE else [scope, DEFAULT_SCOPE]
         tick = secrets.randbits(62) or 1
         stamped = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        hold = max(1, int(timeout_seconds))
         async with self._runtime.writing() as session:
-            session.add(TrafficPendingTick(id=tick, scope=scope, created_at=stamped))
+            session.add(
+                TrafficPendingTick(id=tick, scope=scope, created_at=stamped, timeout_seconds=hold)
+            )
             await session.flush()
             for offset in range(0, len(ids), 1000):
                 batch = ids[offset : offset + 1000]
@@ -573,6 +578,7 @@ class TrafficStoreService:
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
         claim: bool = True,
+        timeout_seconds: int = TICK_HOLD_SECONDS,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, int | None]:
         """One page of unmarked clients, oldest chunks first.
 
@@ -657,7 +663,10 @@ class TrafficStoreService:
             for (core, client_key), item in sorted(pending.items())
         ]
         tick = (
-            await self.claim_pending_tick([str(item["chunk_id"]) for item in chunks])
+            await self.claim_pending_tick(
+                [str(item["chunk_id"]) for item in chunks],
+                timeout_seconds=timeout_seconds,
+            )
             if claim
             else None
         )

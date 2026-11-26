@@ -57,6 +57,7 @@ def upgrade() -> None:
             sa.Column("id", sa.BigInteger(), primary_key=True),
             sa.Column("scope", sa.String(length=64), nullable=False),
             sa.Column("created_at", sa.Text(), nullable=False),
+            sa.Column("timeout_seconds", sa.Integer(), nullable=False, server_default="180"),
             sqlite_with_rowid=False,
         )
         op.create_index("ix_ticks_created", "ticks", ["created_at"])
