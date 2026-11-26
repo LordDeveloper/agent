@@ -265,8 +265,13 @@ class Store:
     async def list_traffic_identity_all_scopes(self) -> list[dict[str, Any]]:
         return await self._traffic.list_traffic_identity_all_scopes()
 
-    async def list_client_bandwidth_all_scopes(self) -> list[dict[str, Any]]:
-        return await self._traffic.list_client_bandwidth_all_scopes()
+    async def list_recent_pending_chunks(
+        self,
+        keys: list[tuple[str, str, str]],
+        *,
+        since: str,
+    ) -> list[dict[str, Any]]:
+        return await self._traffic.list_recent_pending_chunks(keys, since=since)
 
     async def list_traffic_pending_chunks(self) -> list[dict[str, Any]]:
         return await self._traffic.list_traffic_pending_chunks()

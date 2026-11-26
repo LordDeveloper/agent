@@ -1,6 +1,9 @@
 from agent.config import AgentSettings
+from datetime import datetime, timedelta, timezone
+
 from agent.support.volume_billing_watch import (
     _LOG_FILTER,
+    _client_bitrate,
     _format_bytes,
     _filtered_activity_lines,
     _format_timing_summary,
@@ -9,10 +12,27 @@ from agent.support.volume_billing_watch import (
 from agent.logutil import activity_log
 
 
-def test_watch_frame_shows_used_bandwidth_on_the_top_rows_only():
+def test_client_bitrate_uses_the_shortest_fresh_window():
+    now = datetime(2026, 11, 26, 12, 0, 30, tzinfo=timezone.utc)
+    # 625_000 bytes over 5s is 1 Mbps. Three fresh samples stay inside 30s.
+    chunks = []
+    for index in range(3):
+        chunks.append(
+            {
+                "sampled_at": (now - timedelta(seconds=10 - index * 5)).isoformat(),
+                "incoming": 625_000,
+                "outgoing": 62_500,
+            }
+        )
+    down, up = _client_bitrate(chunks, interval_s=5, now=now)
+    assert round(down) == 1_000_000
+    assert round(up) == 100_000
+
+
+def test_watch_frame_shows_live_speed_instead_of_used_total():
     snapshot = {
-        "pending_clients": 2,
-        "pending_chunks": 4,
+        "pending_clients": 1,
+        "pending_chunks": 2,
         "pending_bytes": 1024 * 1024,
         "pending_bytes_label": "1.00 MiB",
         "worker_lag_ms": 10,
@@ -31,18 +51,16 @@ def test_watch_frame_shows_used_bandwidth_on_the_top_rows_only():
                 "downlink": 2 * 1024 * 1024,
                 "uplink": 1024 * 1024,
                 "total": 3 * 1024 * 1024,
-                "used_total": 9 * 1024 * 1024,
+                "rate_down_bps": 10_000_000,
+                "rate_up_bps": 1_000_000,
                 "chunk_count": 2,
             }
-        ],
-        "config_bandwidth": [
-            {"label": "should-not-appear", "total": 99 * 1024 * 1024},
         ],
     }
     text = "\n".join(format_volume_billing_frame(snapshot, ["traffic sample should stay hidden"]))
     assert "node-1" in text
-    assert "9.00 MiB" in text
-    assert "should-not-appear" not in text
+    assert "10 Mbps ↓ | 1.0 Mbps ↑" in text
+    assert "used" not in text
     assert "traffic sample should stay hidden" not in text
 
 

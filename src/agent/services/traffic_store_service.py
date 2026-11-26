@@ -355,42 +355,48 @@ class TrafficStoreService:
                 for scope, core, alias, canonical_key in rows
             ]
 
-    async def list_client_bandwidth_all_scopes(self) -> list[dict[str, Any]]:
-        """Last sampled counters for every config. These columns exclude the meta blob."""
+    async def list_recent_pending_chunks(
+        self,
+        keys: list[tuple[str, str, str]],
+        *,
+        since: str,
+    ) -> list[dict[str, Any]]:
+        """Pending deltas for specific clients since an ISO timestamp."""
+        wanted = [(str(scope), str(core), str(client_key)) for scope, core, client_key in keys if client_key]
+        if not wanted:
+            return []
+        clauses = [
+            and_(
+                TrafficPendingChunk.scope == scope,
+                TrafficPendingChunk.core == core,
+                TrafficPendingChunk.client_key == client_key,
+            )
+            for scope, core, client_key in wanted
+        ]
         async with self._runtime.reading() as session:
             rows = (
                 await session.execute(
                     select(
-                        Client.scope,
-                        Client.core_id,
-                        Client.id,
-                        Client.email,
-                        Client.name,
-                        Client.incoming,
-                        Client.outgoing,
-                    ).where(Client.role != "quota")
+                        TrafficPendingChunk.scope,
+                        TrafficPendingChunk.core,
+                        TrafficPendingChunk.client_key,
+                        TrafficPendingChunk.incoming,
+                        TrafficPendingChunk.outgoing,
+                        TrafficPendingChunk.sampled_at,
+                    ).where(or_(*clauses), TrafficPendingChunk.sampled_at >= since)
                 )
             ).all()
-        usage: list[dict[str, Any]] = []
-        for scope, core, client_id, email, name, incoming, outgoing in rows:
-            down = int(incoming or 0)
-            up = int(outgoing or 0)
-            if down <= 0 and up <= 0:
-                continue
-            label = str(email or name or client_id or "").strip() or str(client_id)
-            usage.append(
-                {
-                    "scope": str(scope or ""),
-                    "core": str(core or ""),
-                    "client_key": str(client_id or ""),
-                    "label": label,
-                    "downlink": down,
-                    "uplink": up,
-                    "total": down + up,
-                }
-            )
-        usage.sort(key=lambda row: int(row["total"]), reverse=True)
-        return usage
+        return [
+            {
+                "scope": str(scope or ""),
+                "core": str(core or ""),
+                "client_key": str(client_key or ""),
+                "incoming": int(incoming or 0),
+                "outgoing": int(outgoing or 0),
+                "sampled_at": str(sampled_at or ""),
+            }
+            for scope, core, client_key, incoming, outgoing, sampled_at in rows
+        ]
 
     async def count_traffic_pending(self) -> int:
         scope = current_scope()

@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
 _WATCH_TOP_PENDING = 10
+# Shortest window with samples wins, so a busy last half-minute beats an older average.
+_RATE_WINDOWS_S = (30, 120, 300)
 _TIMING_META_KEYS = {
     "parallel_snapshot_ms",
     "cycle_ms",
@@ -63,6 +66,82 @@ class _LiveScreen:
 
     def reset(self) -> None:
         self._lines = 0
+
+
+def _parse_sample_time(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _client_bitrate(
+    chunks: list[dict[str, Any]],
+    *,
+    interval_s: float,
+    now: datetime,
+) -> tuple[float, float]:
+    """Bits per second from pending samples. The shortest fresh window wins."""
+    points: list[tuple[datetime, int, int]] = []
+    for row in chunks:
+        sampled = _parse_sample_time(str(row.get("sampled_at") or ""))
+        if sampled is None:
+            continue
+        points.append((sampled, int(row.get("incoming") or 0), int(row.get("outgoing") or 0)))
+    if not points:
+        return 0.0, 0.0
+    points.sort(key=lambda item: item[0])
+    fallback = max(1.0, float(interval_s))
+    durations: list[float] = []
+    for index, (sampled, _down, _up) in enumerate(points):
+        if index == 0:
+            durations.append(fallback)
+            continue
+        gap = (sampled - points[index - 1][0]).total_seconds()
+        durations.append(fallback if gap <= 0 else min(gap, float(_RATE_WINDOWS_S[-1])))
+    newest = points[-1][0]
+    for window in _RATE_WINDOWS_S:
+        if (now - newest).total_seconds() > window:
+            continue
+        cutoff = newest - timedelta(seconds=window)
+        down_bytes = 0
+        up_bytes = 0
+        covered = 0.0
+        for (sampled, down, up), duration in zip(points, durations):
+            if sampled < cutoff:
+                continue
+            down_bytes += down
+            up_bytes += up
+            covered += duration
+        if covered <= 0:
+            continue
+        return down_bytes * 8 / covered, up_bytes * 8 / covered
+    return 0.0, 0.0
+
+
+def _format_bitrate(bits_per_sec: float) -> str:
+    rate = max(0.0, float(bits_per_sec))
+    if rate >= 1_000_000_000:
+        return f"{rate / 1_000_000_000:.1f} Gbps"
+    if rate >= 10_000_000:
+        return f"{rate / 1_000_000:.0f} Mbps"
+    if rate >= 1_000_000:
+        return f"{rate / 1_000_000:.1f} Mbps"
+    if rate >= 10_000:
+        return f"{rate / 1_000:.0f} Kbps"
+    if rate >= 1000:
+        return f"{rate / 1_000:.1f} Kbps"
+    return "0 Mbps"
+
+
+def _format_speed(down_bps: float, up_bps: float) -> str:
+    return f"{_format_bitrate(down_bps)} ↓ | {_format_bitrate(up_bps)} ↑"
 
 
 def _format_bytes(value: int) -> str:
@@ -203,21 +282,32 @@ async def collect_volume_billing_snapshot(
                 continue
             kernel_ahead_bytes += delta_down + delta_up
 
-    usage_by_scope: dict[tuple[str, str, str], dict[str, Any]] = {}
-    usage_by_client: dict[tuple[str, str], dict[str, Any]] = {}
-    for usage in await traffic.store.list_client_bandwidth_all_scopes():
-        scope_name = str(usage.get("scope") or "")
-        core = str(usage.get("core") or "")
-        client_key = str(usage.get("client_key") or "")
-        usage_by_scope[(scope_name, core, client_key)] = usage
-        usage_by_client.setdefault((core, client_key), usage)
+    shown_rows = rows_sorted[:slice_end]
+    rate_keys = [
+        (str(row.get("scope") or ""), str(row.get("core") or ""), str(row.get("client_key") or ""))
+        for row in shown_rows
+    ]
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(seconds=_RATE_WINDOWS_S[-1])).replace(microsecond=0).isoformat()
+    recent_chunks = await traffic.store.list_recent_pending_chunks(rate_keys, since=since)
+    chunks_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for chunk in recent_chunks:
+        chunks_by_key.setdefault(
+            (str(chunk.get("scope") or ""), str(chunk.get("core") or ""), str(chunk.get("client_key") or "")),
+            [],
+        ).append(chunk)
+    interval_s = float(settings.traffic_sample_interval or 5.0)
 
-    for row in rows_sorted[:slice_end]:
+    for row in shown_rows:
         scope_name = str(row.get("scope") or "")
         core = str(row.get("core") or "")
         client_key = str(row.get("client_key") or "")
         panel_node_id = panel_id_by_stored.get((core, client_key), client_key)
-        usage = usage_by_scope.get((scope_name, core, client_key)) or usage_by_client.get((core, client_key))
+        down_bps, up_bps = _client_bitrate(
+            chunks_by_key.get((scope_name, core, client_key), []),
+            interval_s=interval_s,
+            now=now,
+        )
         item: dict[str, Any] = {
             "scope": scope_name,
             "core": core,
@@ -226,7 +316,8 @@ async def collect_volume_billing_snapshot(
             "downlink": int(row.get("delta_incoming") or 0),
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
-            "used_total": None if usage is None else int(usage.get("total") or 0),
+            "rate_down_bps": down_bps,
+            "rate_up_bps": up_bps,
             "chunk_count": int(chunks_by_client.get((scope_name, core, client_key), 0)),
             "updated_at": row.get("updated_at"),
         }
@@ -476,7 +567,7 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         f"  {_tone(shown, DIM)}",
         "  "
         + _tone(
-            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'node':<28}  {'down':>10}  {'up':>10}  {'pending':>10}  {'used':>10}  {'ck':>4}",
+            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'node':<28}  {'down':>10}  {'up':>10}  {'pending':>10}  {'speed':<24}  {'ck':>4}",
             DIM,
         ),
     ]
@@ -487,12 +578,11 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         down = _pad(_format_bytes(int(row.get("downlink") or 0)), 10, ">")
         up = _pad(_format_bytes(int(row.get("uplink") or 0)), 10, ">")
         total = _pad(_format_bytes(int(row.get("total") or 0)), 10, ">")
-        used_raw = row.get("used_total")
-        used = "—" if used_raw is None else _format_bytes(int(used_raw))
+        speed = _format_speed(float(row.get("rate_down_bps") or 0), float(row.get("rate_up_bps") or 0))
         chunks = f"{int(row.get('chunk_count') or 0):>4d}"
         lines.append(
             f"  {_tone(f'{index:>3}', DIM)}  {scope_name}  {_tone(core, CYAN)}  {panel}  "
-            f"{down}  {up}  {_tone(total, WHITE)}  {_tone(_pad(used, 10, '>'), YELLOW)}  {chunks}"
+            f"{down}  {up}  {_tone(total, WHITE)}  {_tone(_pad(speed, 24), YELLOW)}  {chunks}"
         )
     return lines
 
