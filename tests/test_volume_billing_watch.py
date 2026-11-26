@@ -9,12 +9,12 @@ from agent.support.volume_billing_watch import (
 from agent.logutil import activity_log
 
 
-def test_watch_frame_lists_consumed_bandwidth_per_config():
+def test_watch_frame_shows_used_bandwidth_on_the_top_rows_only():
     snapshot = {
-        "pending_clients": 0,
-        "pending_chunks": 0,
-        "pending_bytes": 0,
-        "pending_bytes_label": "0 B",
+        "pending_clients": 2,
+        "pending_chunks": 4,
+        "pending_bytes": 1024 * 1024,
+        "pending_bytes_label": "1.00 MiB",
         "worker_lag_ms": 10,
         "last_sample_at": "2026-11-26 13:40:01",
         "enforce_local_volume_quota": False,
@@ -23,25 +23,26 @@ def test_watch_frame_lists_consumed_bandwidth_per_config():
         "billing_cores": ["xray"],
         "enabled_cores": ["xray"],
         "pending_by_core": {},
-        "top_pending": [],
-        "config_bandwidth_total": 1,
-        "config_bandwidth_bytes": 3 * 1024 * 1024,
-        "config_bandwidth": [
+        "top_pending": [
             {
                 "scope": "default",
                 "core": "xray",
-                "client_key": "node-1",
-                "label": "user@example",
+                "panel_node_id": "node-1",
                 "downlink": 2 * 1024 * 1024,
                 "uplink": 1024 * 1024,
                 "total": 3 * 1024 * 1024,
+                "used_total": 9 * 1024 * 1024,
+                "chunk_count": 2,
             }
+        ],
+        "config_bandwidth": [
+            {"label": "should-not-appear", "total": 99 * 1024 * 1024},
         ],
     }
     text = "\n".join(format_volume_billing_frame(snapshot, ["traffic sample should stay hidden"]))
-    assert "Bandwidth" in text
-    assert "user@example" in text
-    assert "3.00 MiB" in text
+    assert "node-1" in text
+    assert "9.00 MiB" in text
+    assert "should-not-appear" not in text
     assert "traffic sample should stay hidden" not in text
 
 

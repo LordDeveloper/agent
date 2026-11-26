@@ -173,9 +173,6 @@ async def collect_volume_billing_snapshot(
         "pending_limit": max(0, int(pending_limit)),
         "billing_cores": list(settings.traffic_billing_cores()),
         "enabled_cores": list(settings.cores()),
-        "config_bandwidth": [],
-        "config_bandwidth_total": 0,
-        "config_bandwidth_bytes": 0,
         "pending_by_core": {
             core: {
                 "clients": len(item["clients"]),
@@ -206,11 +203,21 @@ async def collect_volume_billing_snapshot(
                 continue
             kernel_ahead_bytes += delta_down + delta_up
 
+    usage_by_scope: dict[tuple[str, str, str], dict[str, Any]] = {}
+    usage_by_client: dict[tuple[str, str], dict[str, Any]] = {}
+    for usage in await traffic.store.list_client_bandwidth_all_scopes():
+        scope_name = str(usage.get("scope") or "")
+        core = str(usage.get("core") or "")
+        client_key = str(usage.get("client_key") or "")
+        usage_by_scope[(scope_name, core, client_key)] = usage
+        usage_by_client.setdefault((core, client_key), usage)
+
     for row in rows_sorted[:slice_end]:
         scope_name = str(row.get("scope") or "")
         core = str(row.get("core") or "")
         client_key = str(row.get("client_key") or "")
         panel_node_id = panel_id_by_stored.get((core, client_key), client_key)
+        usage = usage_by_scope.get((scope_name, core, client_key)) or usage_by_client.get((core, client_key))
         item: dict[str, Any] = {
             "scope": scope_name,
             "core": core,
@@ -219,6 +226,7 @@ async def collect_volume_billing_snapshot(
             "downlink": int(row.get("delta_incoming") or 0),
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
+            "used_total": None if usage is None else int(usage.get("total") or 0),
             "chunk_count": int(chunks_by_client.get((scope_name, core, client_key), 0)),
             "updated_at": row.get("updated_at"),
         }
@@ -234,11 +242,6 @@ async def collect_volume_billing_snapshot(
     snapshot_body["kernel_ahead_unreliable"] = (
         pending_bytes > 0 and kernel_ahead_bytes > max(pending_bytes * 20, 512 * 1024 * 1024)
     )
-    usage = await traffic.store.list_client_bandwidth_all_scopes()
-    usage_cap = None if int(pending_limit) <= 0 else max(1, int(pending_limit))
-    snapshot_body["config_bandwidth_total"] = len(usage)
-    snapshot_body["config_bandwidth_bytes"] = sum(int(row.get("total") or 0) for row in usage)
-    snapshot_body["config_bandwidth"] = usage if usage_cap is None else usage[:usage_cap]
     return snapshot_body
 
 
@@ -473,7 +476,7 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         f"  {_tone(shown, DIM)}",
         "  "
         + _tone(
-            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'node':<28}  {'down':>10}  {'up':>10}  {'total':>10}  {'ck':>4}",
+            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'node':<28}  {'down':>10}  {'up':>10}  {'pending':>10}  {'used':>10}  {'ck':>4}",
             DIM,
         ),
     ]
@@ -484,39 +487,12 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         down = _pad(_format_bytes(int(row.get("downlink") or 0)), 10, ">")
         up = _pad(_format_bytes(int(row.get("uplink") or 0)), 10, ">")
         total = _pad(_format_bytes(int(row.get("total") or 0)), 10, ">")
+        used_raw = row.get("used_total")
+        used = "—" if used_raw is None else _format_bytes(int(used_raw))
         chunks = f"{int(row.get('chunk_count') or 0):>4d}"
         lines.append(
             f"  {_tone(f'{index:>3}', DIM)}  {scope_name}  {_tone(core, CYAN)}  {panel}  "
-            f"{down}  {up}  {_tone(total, WHITE)}  {chunks}"
-        )
-        return lines
-
-
-def _format_config_bandwidth(rows: list[dict[str, Any]], total_count: int, total_bytes: int) -> list[str]:
-    if total_count <= 0 or not rows:
-        return []
-    shown = (
-        f"showing {len(rows)} of {total_count}"
-        if len(rows) != total_count
-        else f"{total_count} configs"
-    )
-    lines = [
-        _heading("Bandwidth"),
-        f"  {_tone(shown, DIM)}  {_tone(_format_bytes(total_bytes), YELLOW)}",
-        "  "
-        + _tone(
-            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'config':<28}  {'down':>10}  {'up':>10}  {'used':>10}",
-            DIM,
-        ),
-    ]
-    for index, row in enumerate(rows, start=1):
-        lines.append(
-            f"  {_tone(f'{index:>3}', DIM)}  {_pad(str(row.get('scope') or '—'), 16)}  "
-            f"{_tone(_pad(str(row.get('core') or '—'), 10), CYAN)}  "
-            f"{_pad(str(row.get('label') or row.get('client_key') or '—'), 28)}  "
-            f"{_pad(_format_bytes(int(row.get('downlink') or 0)), 10, '>')}  "
-            f"{_pad(_format_bytes(int(row.get('uplink') or 0)), 10, '>')}  "
-            f"{_tone(_pad(_format_bytes(int(row.get('total') or 0)), 10, '>'), WHITE)}"
+            f"{down}  {up}  {_tone(total, WHITE)}  {_tone(_pad(used, 10, '>'), YELLOW)}  {chunks}"
         )
     return lines
 
@@ -605,14 +581,6 @@ def format_volume_billing_frame(
         out.append(f"  {_tone('Queue is empty.', GREEN)}")
     else:
         out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], clients))
-
-    bandwidth = _format_config_bandwidth(
-        list(snapshot.get("config_bandwidth") or []),
-        int(snapshot.get("config_bandwidth_total") or 0),
-        int(snapshot.get("config_bandwidth_bytes") or 0),
-    )
-    if bandwidth:
-        out.extend(["", *bandwidth])
 
     alerts = _frame_alerts(snapshot)
     if alerts:
