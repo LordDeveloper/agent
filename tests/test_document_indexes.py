@@ -75,7 +75,7 @@ async def test_legacy_rowid_documents_are_rebuilt_without_rowid(tmp_path):
     store = Store(path)
     await store.open()
     try:
-        assert await store.get_doc("xray", "client_quota", "a") == {"id": "a"}
+        assert await store.get_doc("xray", "client_quota", "a") == {"id": "a", "node_id": "a"}
         assert await store.list_docs("wireguard", "interface") == [{"name": "wg0"}]
         schema = await store._fetch(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clients'"

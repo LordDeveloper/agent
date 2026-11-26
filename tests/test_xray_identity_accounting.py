@@ -1,3 +1,6 @@
+from agent.database.models.client import Client
+from agent.database.models.quota import Quota
+from agent.services.document_store import DocumentStore
 from agent.support.client_diagnose import describe_traffic_accounting
 from agent.support.client_identity import (
     apply_panel_identity,
@@ -178,6 +181,59 @@ def test_legacy_coupled_row_keeps_its_existing_key():
 
     meta = select_quota_meta(index, protocol_id=XRAY_UUID, email="user@example.com")
     assert billing_client_id(meta, protocol_id=XRAY_UUID, email="user@example.com") == XRAY_UUID
+
+
+def test_quota_document_publishes_the_clients_primary_key_when_json_omits_it():
+    quota = Quota(
+        core_id="xray",
+        client_id=NODE_ID,
+        email="HWlyRU",
+        protocol_id=XRAY_UUID,
+        volume=100,
+        baseline_incoming=0,
+        baseline_outgoing=0,
+    )
+    client = Client(
+        core_id="xray",
+        id=NODE_ID,
+        parent_type="",
+        email="HWlyRU",
+        is_enabled=True,
+        role="quota",
+        meta={},
+    )
+    document = DocumentStore._quota_as_document(DocumentStore.__new__(DocumentStore), quota, client)
+
+    assert document["id"] == NODE_ID
+    assert document["node_id"] == NODE_ID
+    assert document["client_link_uuid"] == XRAY_UUID
+    assert document["email"] == "HWlyRU"
+
+    index = {
+        f"e:{document['email']}": document,
+        f"l:{document['client_link_uuid']}": document,
+        f"n:{document['node_id']}": document,
+        f"i:{document['id']}": document,
+    }
+    meta = select_quota_meta(index, protocol_id=XRAY_UUID, email="HWlyRU")
+    assert billing_client_id(meta, protocol_id=XRAY_UUID, email="HWlyRU") == NODE_ID
+
+
+def test_quota_document_keeps_a_json_node_id_that_differs_from_the_primary_key():
+    quota = Quota(core_id="xray", client_id=NODE_ID, protocol_id=XRAY_UUID)
+    client = Client(
+        core_id="xray",
+        id=NODE_ID,
+        parent_type="",
+        is_enabled=True,
+        role="quota",
+        meta={"id": NODE_ID, "node_id": XRAY_UUID},
+    )
+    document = DocumentStore._quota_as_document(DocumentStore.__new__(DocumentStore), quota, client)
+
+    assert document["node_id"] == XRAY_UUID
+    assert document["id"] == NODE_ID
+    assert billing_client_id(document, protocol_id=XRAY_UUID, email="") == NODE_ID
 
 
 def test_legacy_swapped_quota_row_returns_the_stored_primary_key():

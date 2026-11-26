@@ -124,7 +124,11 @@ def test_traffic_sample_does_not_stick_the_writer_snapshot() -> None:
                 [("node-1", {"volume": 10})],
                 [],
             )
-            assert await store.get_doc("xray", "client_quota", "node-1") == {"volume": 10}
+            assert await store.get_doc("xray", "client_quota", "node-1") == {
+                "volume": 10,
+                "id": "node-1",
+                "node_id": "node-1",
+            }
         finally:
             await store.close()
 
@@ -162,7 +166,11 @@ def test_quota_write_waits_out_another_process_lock() -> None:
                 [],
             )
             elapsed = time.perf_counter() - started_at
-            assert await store.get_doc("xray", "client_quota", "node-1") == {"volume": 4}
+            assert await store.get_doc("xray", "client_quota", "node-1") == {
+                "volume": 4,
+                "id": "node-1",
+                "node_id": "node-1",
+            }
             assert elapsed >= 2.5
         finally:
             release.set()
@@ -181,7 +189,11 @@ def test_quota_write_keeps_every_row_in_one_commit() -> None:
             puts = [(f"node-{index}", {"volume": index}) for index in range(101)]
             await store.write_docs("xray", "client_quota", puts, ["stale-alias"])
             for index in range(101):
-                assert await store.get_doc("xray", "client_quota", f"node-{index}") == {"volume": index}
+                assert await store.get_doc("xray", "client_quota", f"node-{index}") == {
+                    "volume": index,
+                    "id": f"node-{index}",
+                    "node_id": f"node-{index}",
+                }
             assert await store.get_doc("xray", "client_quota", "stale-alias") is None
         finally:
             await store.close()

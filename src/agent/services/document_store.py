@@ -481,18 +481,18 @@ class DocumentStore:
             data["inbound_id"] = row.inbound_id
         if row.inbound_tag:
             data["inbound_tag"] = row.inbound_tag
-        if row.email and not data.get("email"):
+        if row.email and not str(data.get("email") or "").strip():
             data["email"] = row.email
-        if "id" not in data:
-            if meta:
-                data["id"] = str(meta.get("id") or meta.get("node_id") or row.client_id)
-            elif (
-                row.volume is None
-                and not row.baseline_incoming
-                and not row.baseline_outgoing
-                and not row.email
-            ):
-                data["id"] = row.client_id
+        # clients.id is the quota primary key. A document whose JSON never
+        # repeated that key is still that client; the Xray UUID is not filled in.
+        primary = str(row.client_id or "").strip()
+        protocol = str(row.protocol_id or "").strip()
+        if protocol and protocol != primary and not str(data.get("client_link_uuid") or "").strip():
+            data["client_link_uuid"] = protocol
+        if primary and not str(data.get("node_id") or "").strip():
+            data["node_id"] = primary
+        if primary and not str(data.get("id") or "").strip():
+            data["id"] = primary
         return data
 
     async def get_doc(self, core: str, kind: str, doc_id: str) -> dict[str, Any] | None:
