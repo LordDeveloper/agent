@@ -3697,10 +3697,14 @@ class XrayDriver(CoreDriver):
             stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
             sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
             iface = str(sockopt.get("interface") or "").strip()
-            if not iface or iface in seen:
-                continue
-            seen.add(iface)
-            await ensure_interface_bind_route(iface)
+            if iface and iface not in seen:
+                seen.add(iface)
+                await ensure_interface_bind_route(iface)
+            source = str(outbound.get("sendThrough") or "").strip()
+            if source:
+                from agent.support.peer_egress import preserve_public_sources
+
+                await preserve_public_sources([source])
 
     async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
         return await self._api_call("remove_outbounds", tags)

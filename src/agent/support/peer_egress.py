@@ -53,6 +53,7 @@ packet loss every time the panel/API touched a peer.
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -403,6 +404,108 @@ def apply_script_path(data_dir: str | Path | None = None) -> Path:
     return base / "peer-egress-apply.sh"
 
 
+def public_exit_ipv4(value: Any) -> str:
+    """Public IPv4 a peer should SNAT to. Empty when missing or not public."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return ""
+    if (
+        ip.version != 4
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_link_local
+        or ip.is_reserved
+    ):
+        return ""
+    return str(ip)
+
+
+async def preserve_public_sources(addresses: list[str], *, runner: Runner | None = None) -> None:
+    """Keep an already-chosen public source. MASQUERADE would put the primary back."""
+    ips: list[str] = []
+    for raw in addresses:
+        ip = public_exit_ipv4(raw)
+        if ip and ip not in ips:
+            ips.append(ip)
+    if not ips:
+        return
+    run = runner or process_run
+    if shutil.which("nft"):
+        await _nft(run, ["add", "table", "inet", "netinja_egress"])
+        await _nft(
+            run,
+            [
+                "add",
+                "chain",
+                "inet",
+                "netinja_egress",
+                "postrouting",
+                "{ type nat hook postrouting priority srcnat; policy accept; }",
+            ],
+        )
+        try:
+            listed = await execute(
+                run,
+                ["nft", "-a", "list", "chain", "inet", "netinja_egress", "postrouting"],
+                check=False,
+                timeout=10,
+            )
+            text = str(getattr(listed, "stdout", "") or "")
+        except Exception:
+            text = ""
+        for ip in ips:
+            comment = f"netinja-keep-{ip}"
+            if comment in text:
+                continue
+            await _nft(
+                run,
+                [
+                    "insert",
+                    "rule",
+                    "inet",
+                    "netinja_egress",
+                    "postrouting",
+                    "ip",
+                    "saddr",
+                    ip,
+                    "return",
+                    "comment",
+                    comment,
+                ],
+            )
+        return
+    binary = "iptables" if shutil.which("iptables") else ""
+    if not binary:
+        return
+    for ip in ips:
+        comment = f"netinja-keep-{ip}"
+        exists = await _iptables(
+            run,
+            ["-t", "nat", "-C", "POSTROUTING", "-s", ip, "-m", "comment", "--comment", comment, "-j", "RETURN"],
+            quiet=True,
+            binary=binary,
+        )
+        if exists:
+            continue
+        await _iptables(
+            run,
+            ["-t", "nat", "-I", "POSTROUTING", "1", "-s", ip, "-m", "comment", "--comment", comment, "-j", "RETURN"],
+            binary=binary,
+        )
+
+
+def _with_snat(row: dict[str, str | int], snat: str) -> dict[str, str | int]:
+    if snat:
+        row["snat"] = snat
+    return row
+
+
 def desired_rules_from_interfaces(interfaces: list[dict[str, Any]]) -> list[dict[str, str | int]]:
     rules: list[dict[str, str | int]] = []
     seen: set[str] = set()
@@ -434,13 +537,16 @@ def desired_rules_from_interfaces(interfaces: list[dict[str, Any]]) -> list[dict
                 continue
             seen.add(addr)
             rules.append(
-                {
-                    "addr": addr,
-                    "cidr": cidr,
-                    "iface": exit_iface,
-                    "table": table_id_for_interface(exit_iface),
-                    "action": "lookup",
-                }
+                _with_snat(
+                    {
+                        "addr": addr,
+                        "cidr": cidr,
+                        "iface": exit_iface,
+                        "table": table_id_for_interface(exit_iface),
+                        "action": "lookup",
+                    },
+                    public_exit_ipv4(peer.get("exit_ipv4")),
+                )
             )
     return rules
 
@@ -485,13 +591,16 @@ async def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int
                     if not iface or table <= 0:
                         continue
                     source.append(
-                        {
-                            "addr": addr,
-                            "cidr": f"{addr}/32",
-                            "iface": iface,
-                            "table": table,
-                            "action": "lookup",
-                        }
+                        _with_snat(
+                            {
+                                "addr": addr,
+                                "cidr": f"{addr}/32",
+                                "iface": iface,
+                                "table": table,
+                                "action": "lookup",
+                            },
+                            public_exit_ipv4(row.get("snat")),
+                        )
                     )
         else:
             ifaces = await store.list_docs(core, _IFACE_KIND)
@@ -523,13 +632,16 @@ async def all_desired_rules_from_store(store: Store) -> list[dict[str, str | int
                     if not iface or table <= 0:
                         continue
                     source.append(
-                        {
-                            "addr": addr,
-                            "cidr": f"{addr}/32",
-                            "iface": iface,
-                            "table": table,
-                            "action": "lookup",
-                        }
+                        _with_snat(
+                            {
+                                "addr": addr,
+                                "cidr": f"{addr}/32",
+                                "iface": iface,
+                                "table": table,
+                                "action": "lookup",
+                            },
+                            public_exit_ipv4(row.get("snat")),
+                        )
                     )
         for row in source:
             addr = str(row["addr"])
@@ -705,6 +817,7 @@ def render_apply_script(
             "  nft flush chain inet netinja_egress forward 2>/dev/null || true",
         ]
     )
+    _append_nft_snat_shell(lines, _snat_rows(rules))
     for iface in sorted(masq):
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
         lines.append(
@@ -766,10 +879,12 @@ def render_apply_script(
         )
     lines.append("  fi")
     lines.append("elif command -v iptables >/dev/null 2>&1; then")
+    _append_iptables_snat_shell(lines, _snat_rows(rules), binary="iptables", indent="  ")
     _append_iptables_firewall_shell(lines, binary="iptables", masq=masq, tunnels=tunnels, indent="  ")
     if masquerade_main_table:
         _append_main_table_iptables_shell(lines, binary="iptables", tunnels=tunnels, indent="  ")
     lines.append("elif command -v iptables-legacy >/dev/null 2>&1; then")
+    _append_iptables_snat_shell(lines, _snat_rows(rules), binary="iptables-legacy", indent="  ")
     _append_iptables_firewall_shell(lines, binary="iptables-legacy", masq=masq, tunnels=tunnels, indent="  ")
     if masquerade_main_table:
         _append_main_table_iptables_shell(lines, binary="iptables-legacy", tunnels=tunnels, indent="  ")
@@ -782,6 +897,69 @@ def render_apply_script(
         lines.extend(script_lines(bind_ifaces))
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
+
+
+def _snat_rows(rules: list[dict[str, str | int]]) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in rules:
+        if str(row.get("action") or "lookup") == "prohibit":
+            continue
+        snat = public_exit_ipv4(row.get("snat"))
+        iface = normalize_exit_interface(row.get("iface"))
+        addr = str(row.get("addr") or "").strip()
+        cidr = str(row.get("cidr") or "").strip() or (f"{addr}/32" if addr else "")
+        if not snat or not iface or not cidr:
+            continue
+        key = (cidr, iface, snat)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append({"cidr": cidr, "iface": iface, "snat": snat})
+    return found
+
+
+def _append_nft_snat_shell(lines: list[str], rows: list[dict[str, str]]) -> None:
+    """SNAT each peer to its node IP before the interface MASQUERADE."""
+    kept: set[str] = set()
+    for row in rows:
+        comment = f"netinja-src-{row['snat']}"
+        lines.append(
+            f'  nft add rule inet netinja_egress postrouting ip saddr {row["cidr"]} '
+            f'oifname "{row["iface"]}" snat to {row["snat"]} comment "{comment}" 2>/dev/null || true'
+        )
+        kept.add(row["snat"])
+    for ip in sorted(kept):
+        lines.append(
+            f'  nft add rule inet netinja_egress postrouting ip saddr {ip} '
+            f'return comment "netinja-keep-{ip}" 2>/dev/null || true'
+        )
+
+
+def _append_iptables_snat_shell(
+    lines: list[str],
+    rows: list[dict[str, str]],
+    *,
+    binary: str,
+    indent: str,
+) -> None:
+    kept: set[str] = set()
+    for row in rows:
+        comment = f"netinja-src-{row['snat']}"
+        lines.append(
+            f'{indent}{binary} -t nat -C POSTROUTING -s {row["cidr"]} -o "{row["iface"]}" '
+            f'-m comment --comment "{comment}" -j SNAT --to-source {row["snat"]} 2>/dev/null || '
+            f'{binary} -t nat -I POSTROUTING 1 -s {row["cidr"]} -o "{row["iface"]}" '
+            f'-m comment --comment "{comment}" -j SNAT --to-source {row["snat"]}'
+        )
+        kept.add(row["snat"])
+    for ip in sorted(kept):
+        comment = f"netinja-keep-{ip}"
+        lines.append(
+            f'{indent}{binary} -t nat -C POSTROUTING -s {ip} -m comment --comment "{comment}" '
+            f'-j RETURN 2>/dev/null || '
+            f'{binary} -t nat -I POSTROUTING 1 -s {ip} -m comment --comment "{comment}" -j RETURN'
+        )
 
 
 def _append_main_table_nft_shell(lines: list[str], tunnels: list[str]) -> None:
@@ -1549,6 +1727,9 @@ async def reconcile_core_egress(
             await _mutate_rule(runner, ["rule", "del", "from", cidr, "prohibit"], cache)
             switched.append(addr)
 
+        if str((old or {}).get("snat") or "") != str(row.get("snat") or ""):
+            switched.append(addr)
+
         applied.append(row)
 
     desired_keys = {(str(row["addr"]), int(row["table"]), str(row["iface"])) for row in applied}
@@ -1644,25 +1825,37 @@ async def reconcile_core_egress(
     scoped_main = [dev for dev in new_main if dev not in new_masq_set]
     nat_ok = await _nat_already_healthy(sorted(firewall_now), runner=runner)
     forward_ok = await _forward_already_healthy(tunnel_ifaces, runner=runner)
+    snat_now = _snat_rows(applied)
+    snat_prev = _snat_rows(prev_rules)
     nat_rebuilt = False
-    if force or firewall_now != firewall_prev or not nat_ok or (tunnel_ifaces and not forward_ok):
+    if (
+        force
+        or firewall_now != firewall_prev
+        or snat_now != snat_prev
+        or not nat_ok
+        or (tunnel_ifaces and not forward_ok)
+    ):
         await _sync_masquerade(
             sorted(firewall_now),
             previous_ifaces=sorted(firewall_prev),
             runner=runner,
             tunnel_ifaces=tunnel_ifaces,
             scoped_ifaces=scoped_main,
+            snat_rows=snat_now,
         )
         nat_rebuilt = True
 
     state = {
         "rules": [
-            {
-                "addr": str(row["addr"]),
-                "table": int(row["table"]),
-                "iface": str(row["iface"]),
-                "action": str(row.get("action") or "lookup"),
-            }
+            _with_snat(
+                {
+                    "addr": str(row["addr"]),
+                    "table": int(row["table"]),
+                    "iface": str(row["iface"]),
+                    "action": str(row.get("action") or "lookup"),
+                },
+                public_exit_ipv4(row.get("snat")),
+            )
             for row in applied
         ],
         "tables": sorted(desired_tables.keys()),
@@ -2350,6 +2543,7 @@ async def _sync_masquerade(
     runner: Runner,
     tunnel_ifaces: list[str] | None = None,
     scoped_ifaces: list[str] | None = None,
+    snat_rows: list[dict[str, str]] | None = None,
 ) -> None:
     """Install SNAT/MASQUERADE on every exit NIC using a single backend.
 
@@ -2369,6 +2563,7 @@ async def _sync_masquerade(
             runner=runner,
             tunnel_ifaces=tunnel_ifaces or [],
             scoped_ifaces=scoped,
+            snat_rows=snat_rows or [],
         )
         nft_ok = await _nft_has_masquerade_for(ifaces, runner=runner)
 
@@ -2386,6 +2581,7 @@ async def _sync_masquerade(
             binary="iptables-legacy",
             tunnel_ifaces=tunnel_ifaces or [],
             scoped_ifaces=scoped,
+            snat_rows=snat_rows or [],
         )
         await _sync_forward(
             ifaces,
@@ -2406,6 +2602,7 @@ async def _sync_masquerade(
             binary="iptables",
             tunnel_ifaces=tunnel_ifaces or [],
             scoped_ifaces=scoped,
+            snat_rows=snat_rows or [],
         )
         await _sync_forward(
             ifaces,
@@ -2857,6 +3054,7 @@ async def _sync_masquerade_nft(
     runner: Runner,
     tunnel_ifaces: list[str] | None = None,
     scoped_ifaces: list[str] | None = None,
+    snat_rows: list[dict[str, str]] | None = None,
 ) -> None:
     await _nft(runner, ["add", "table", "inet", "netinja_egress"])
     await _nft(
@@ -2883,6 +3081,51 @@ async def _sync_masquerade_nft(
     )
     await _nft(runner, ["flush", "chain", "inet", "netinja_egress", _NFT_CHAIN])
     await _nft(runner, ["flush", "chain", "inet", "netinja_egress", "forward"])
+    kept_sources: set[str] = set()
+    for row in snat_rows or []:
+        cidr = str(row.get("cidr") or "").strip()
+        iface = str(row.get("iface") or "").strip()
+        snat = str(row.get("snat") or "").strip()
+        if not cidr or not iface or not snat:
+            continue
+        await _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                _NFT_CHAIN,
+                "ip",
+                "saddr",
+                cidr,
+                "oifname",
+                iface,
+                "snat",
+                "to",
+                snat,
+                "comment",
+                f"netinja-src-{snat}",
+            ],
+        )
+        kept_sources.add(snat)
+    for ip in sorted(kept_sources):
+        await _nft(
+            runner,
+            [
+                "add",
+                "rule",
+                "inet",
+                "netinja_egress",
+                _NFT_CHAIN,
+                "ip",
+                "saddr",
+                ip,
+                "return",
+                "comment",
+                f"netinja-keep-{ip}",
+            ],
+        )
     scoped = set(scoped_ifaces or [])
     tunnels = [str(name).strip() for name in (tunnel_ifaces or []) if str(name).strip()]
     for iface in ifaces:
@@ -3054,6 +3297,7 @@ async def _sync_masquerade_iptables(
     binary: str = "iptables",
     tunnel_ifaces: list[str] | None = None,
     scoped_ifaces: list[str] | None = None,
+    snat_rows: list[dict[str, str]] | None = None,
 ) -> None:
     wanted = set(ifaces)
     scoped = set(scoped_ifaces or [])
@@ -3123,6 +3367,47 @@ async def _sync_masquerade_iptables(
             ["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-m", "comment", "--comment", comment, "-j", "MASQUERADE"],
             binary=binary,
         )
+    kept_sources: set[str] = set()
+    for row in snat_rows or []:
+        cidr = str(row.get("cidr") or "").strip()
+        iface = str(row.get("iface") or "").strip()
+        snat = str(row.get("snat") or "").strip()
+        if not cidr or not iface or not snat:
+            continue
+        comment = f"netinja-src-{snat}"
+        exists = await _iptables(
+            runner,
+            [
+                "-t", "nat", "-C", "POSTROUTING", "-s", cidr, "-o", iface,
+                "-m", "comment", "--comment", comment, "-j", "SNAT", "--to-source", snat,
+            ],
+            quiet=True,
+            binary=binary,
+        )
+        if not exists:
+            await _iptables(
+                runner,
+                [
+                    "-t", "nat", "-I", "POSTROUTING", "1", "-s", cidr, "-o", iface,
+                    "-m", "comment", "--comment", comment, "-j", "SNAT", "--to-source", snat,
+                ],
+                binary=binary,
+            )
+        kept_sources.add(snat)
+    for ip in sorted(kept_sources):
+        comment = f"netinja-keep-{ip}"
+        exists = await _iptables(
+            runner,
+            ["-t", "nat", "-C", "POSTROUTING", "-s", ip, "-m", "comment", "--comment", comment, "-j", "RETURN"],
+            quiet=True,
+            binary=binary,
+        )
+        if not exists:
+            await _iptables(
+                runner,
+                ["-t", "nat", "-I", "POSTROUTING", "1", "-s", ip, "-m", "comment", "--comment", comment, "-j", "RETURN"],
+                binary=binary,
+            )
 
 
 def _nft_iface_match(name: str) -> str:
