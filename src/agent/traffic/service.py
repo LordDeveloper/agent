@@ -265,6 +265,7 @@ class TrafficService:
 
     async def sample_all(self, registry: CoreRegistry) -> dict[str, int]:
         """Refresh pending deltas from every core at once (online not required)."""
+        await self.store.release_expired_pending_ticks()
         stats, _, _ = await self._sample_cores_merged(registry)
         return stats
 
@@ -1028,6 +1029,7 @@ class TrafficService:
         persist_snapshot: bool = True,
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
+        claim: bool = True,
     ) -> dict[str, Any]:
         """Return unacked pending deltas and optionally persist a fetch snapshot for POST ack.
 
@@ -1038,13 +1040,20 @@ class TrafficService:
         from agent.services.traffic_store_service import BILLING_CHUNKS_PER_CLIENT, BILLING_CLIENT_PAGE
 
         await self._load_persisted_aliases()
+        # None is the HTTP default page. 0 is unlimited and must stay 0;
+        # replacing it here would cap the queue at the default page size.
         if client_limit is None:
             client_limit = BILLING_CLIENT_PAGE
+        elif int(client_limit) <= 0:
+            client_limit = 0
         if chunks_per_client is None:
             chunks_per_client = BILLING_CHUNKS_PER_CLIENT
-        chunks, rows, truncated = await self.store.load_pending_billing(
+        elif int(chunks_per_client) <= 0:
+            chunks_per_client = 0
+        chunks, rows, truncated, tick_id = await self.store.load_pending_billing(
             client_limit=client_limit,
             chunks_per_client=chunks_per_client,
+            claim=claim,
         )
         users: dict[str, dict[str, Any]] = {}
         snapshot: dict[str, list[dict[str, Any]]] = {}
@@ -1097,7 +1106,6 @@ class TrafficService:
                 "core": str(row["core"]),
                 "uplink": int(row["delta_outgoing"]),
                 "downlink": int(row["delta_incoming"]),
-                "chunks": chunk_list,
             }
 
         for label, chunk_list in chunks_by_label.items():
@@ -1116,7 +1124,6 @@ class TrafficService:
                 "core": core,
                 "uplink": uplink,
                 "downlink": downlink,
-                "chunks": chunk_list,
             }
             published = {
                 "core": core,
@@ -1140,7 +1147,11 @@ class TrafficService:
             "worker_lag_ms": await self._worker_lag_ms(),
             "users": users,
             "truncated": truncated,
+            "tick_id": tick_id,
         }
+
+    async def ack_tick(self, tick: int) -> int:
+        return await self.store.ack_pending_tick(int(tick))
 
     async def ack_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         return await self.store.ack_traffic_chunk_ids(chunk_ids)

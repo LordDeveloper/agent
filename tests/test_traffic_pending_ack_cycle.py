@@ -85,19 +85,12 @@ async def test_pending_page_leaves_the_rest_of_the_queue(store):
     )
     assert page["truncated"] is True
     assert page["users"]["a-page"]["downlink"] == 30
-    assert len(page["users"]["a-page"]["chunks"]) == 2
+    assert "chunks" not in page["users"]["a-page"]
     assert "z-later" not in page["users"]
+    assert page["tick_id"]
 
-    deleted, missing = await traffic.ack_chunk_ids(
-        [chunk["id"] for chunk in page["users"]["a-page"]["chunks"]]
-    )
+    deleted = await traffic.ack_tick(page["tick_id"])
     assert deleted == 2
-    assert missing == []
-    await traffic.ack_clients(
-        ["a-page"],
-        billed={"a-page": (30, 0)},
-        consume_billed_chunks=False,
-    )
 
     rest = await traffic.pending_payload(
         persist_snapshot=False,
@@ -107,3 +100,55 @@ async def test_pending_page_leaves_the_rest_of_the_queue(store):
     assert rest["truncated"] is False
     assert rest["users"]["a-page"]["downlink"] == 30
     assert rest["users"]["z-later"]["downlink"] == 7
+
+
+async def test_pending_client_limit_zero_reads_every_client(store):
+    """client_limit 0 is unlimited. It must not collapse to a one-client page."""
+    traffic = TrafficService(store)
+    first = ClientUsageModel(id="a-page", email="a@example.com", incoming=0, outgoing=0)
+    later = ClientUsageModel(id="z-later", email="z@example.com", incoming=0, outgoing=0)
+    driver = FakeDriver([first, later])
+    registry = FakeRegistry(["xray"], driver)
+
+    await traffic.sample_all(registry)
+    first.incoming = 10
+    await traffic.sample_all(registry)
+    first.incoming = 30
+    await traffic.sample_all(registry)
+    later.incoming = 7
+    await traffic.sample_all(registry)
+
+    page = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=0,
+        chunks_per_client=0,
+    )
+    assert page["truncated"] is False
+    assert set(page["users"]) == {"a-page", "z-later"}
+    assert "chunks" not in page["users"]["a-page"]
+    assert page["users"]["z-later"]["downlink"] == 7
+    assert page["tick_id"]
+
+    locked = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=0,
+        chunks_per_client=0,
+    )
+    assert locked["users"] == {}
+
+    from sqlalchemy import text
+
+    async with traffic.store._runtime.writing() as session:
+        await session.execute(text("UPDATE ticks SET created_at = '2000-01-01 00:00:00'"))
+        await session.commit()
+    released = await traffic.store.release_expired_pending_ticks()
+    assert released == 3
+
+    again = await traffic.pending_payload(
+        persist_snapshot=False,
+        client_limit=0,
+        chunks_per_client=0,
+    )
+    assert set(again["users"]) == {"a-page", "z-later"}
+    assert again["tick_id"] != page["tick_id"]
+    assert await traffic.ack_tick(again["tick_id"]) == 3

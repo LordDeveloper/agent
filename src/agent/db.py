@@ -267,11 +267,19 @@ class Store:
         *,
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
+        claim: bool = True,
     ):
         return await self._traffic.load_pending_billing(
             client_limit=client_limit,
             chunks_per_client=chunks_per_client,
+            claim=claim,
         )
+
+    async def release_expired_pending_ticks(self) -> int:
+        return await self._traffic.release_expired_pending_ticks()
+
+    async def ack_pending_tick(self, tick: int) -> int:
+        return await self._traffic.ack_pending_tick(tick)
 
     async def ack_traffic_chunk_ids(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
         return await self._traffic.ack_traffic_chunk_ids(chunk_ids)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKeyConstraint, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, ForeignKeyConstraint, Index, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent.database.base import Base
@@ -68,6 +68,12 @@ class TrafficPendingChunk(Base):
             "outgoing",
             "chunk_id",
         ),
+        Index(
+            "ix_traffic_pending_chunk_tick",
+            "scope",
+            "tick_id",
+            sqlite_where=text("tick_id IS NOT NULL"),
+        ),
         {"sqlite_with_rowid": False},
     )
 
@@ -78,6 +84,21 @@ class TrafficPendingChunk(Base):
     incoming: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     outgoing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sampled_at: Mapped[str] = mapped_column(Text, nullable=False)
+    tick_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class TrafficPendingTick(Base):
+    """One reserved fetch. created_at is the timeout clock. Pending rows point here."""
+
+    __tablename__ = "ticks"
+    __table_args__ = (
+        Index("ix_ticks_created", "created_at"),
+        {"sqlite_with_rowid": False},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class TrafficPendingClient(Base):

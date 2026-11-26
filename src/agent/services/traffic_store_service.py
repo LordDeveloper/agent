@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from agent.database.models.traffic import (
     TrafficPending,
     TrafficPendingChunk,
     TrafficPendingClient,
+    TrafficPendingTick,
 )
 from agent.database.session import DatabaseRuntime
 
@@ -31,6 +33,7 @@ def _sqlite(session) -> bool:
 # chunks, so one huge queue cannot fill the body by itself.
 BILLING_CLIENT_PAGE = 100
 BILLING_CHUNKS_PER_CLIENT = 200
+TICK_HOLD_SECONDS = 300
 
 
 class TrafficStoreService:
@@ -446,6 +449,7 @@ class TrafficStoreService:
                 "SELECT chunk_id, core, client_key, incoming, outgoing, sampled_at "
                 "FROM traffic_pending_chunk INDEXED BY ix_traffic_pending_chunk_totals "
                 "WHERE scope = :scope AND core = :core AND client_key = :client "
+                "AND tick_id IS NULL "
                 "ORDER BY sampled_at"
             )
             params: dict[str, Any] = {"scope": scope, "core": core, "client": client_key}
@@ -466,6 +470,7 @@ class TrafficStoreService:
                 TrafficPendingChunk.scope == scope,
                 TrafficPendingChunk.core == core,
                 TrafficPendingChunk.client_key == client_key,
+                TrafficPendingChunk.tick_id.is_(None),
             )
             .order_by(TrafficPendingChunk.sampled_at)
         )
@@ -473,17 +478,108 @@ class TrafficStoreService:
             query = query.limit(int(limit))
         return (await session.execute(query)).all()
 
+    async def release_expired_pending_ticks(self, *, older_than_seconds: int = TICK_HOLD_SECONDS) -> int:
+        """Unreserve fetches whose ticks.created_at is past the hold. Pending bytes stay."""
+        cutoff = datetime.now(timezone.utc).timestamp() - max(1, int(older_than_seconds))
+        cutoff_text = datetime.fromtimestamp(cutoff, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._runtime.writing() as session:
+            expired = [
+                int(row[0])
+                for row in (
+                    await session.execute(
+                        select(TrafficPendingTick.id).where(TrafficPendingTick.created_at < cutoff_text)
+                    )
+                ).all()
+            ]
+            released = 0
+            if expired:
+                result = await session.execute(
+                    update(TrafficPendingChunk)
+                    .where(TrafficPendingChunk.tick_id.in_(expired))
+                    .values(tick_id=None)
+                )
+                released = int(result.rowcount or 0)
+                await session.execute(delete(TrafficPendingTick).where(TrafficPendingTick.id.in_(expired)))
+            await session.commit()
+        return released
+
+    async def claim_pending_tick(self, chunk_ids: list[str]) -> int | None:
+        """Insert one ticks row and point the fetched chunks at it. Reserved rows stay reserved."""
+        ids = list(dict.fromkeys(str(item).strip() for item in chunk_ids if str(item or "").strip()))
+        if not ids:
+            return None
+        from agent.auth_scope import DEFAULT_SCOPE
+
+        scope = current_scope()
+        scopes = [scope] if scope == DEFAULT_SCOPE else [scope, DEFAULT_SCOPE]
+        tick = secrets.randbits(62) or 1
+        stamped = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._runtime.writing() as session:
+            session.add(TrafficPendingTick(id=tick, scope=scope, created_at=stamped))
+            await session.flush()
+            for offset in range(0, len(ids), 1000):
+                batch = ids[offset : offset + 1000]
+                await session.execute(
+                    update(TrafficPendingChunk)
+                    .where(
+                        TrafficPendingChunk.scope.in_(scopes),
+                        TrafficPendingChunk.chunk_id.in_(batch),
+                        TrafficPendingChunk.tick_id.is_(None),
+                    )
+                    .values(tick_id=tick)
+                )
+            await session.commit()
+        return tick
+
+    async def ack_pending_tick(self, tick: int) -> int:
+        """Delete pending rows for this tick, then delete the tick itself."""
+        from agent.auth_scope import DEFAULT_SCOPE
+
+        scope = current_scope()
+        scopes = [scope] if scope == DEFAULT_SCOPE else [scope, DEFAULT_SCOPE]
+        async with self._runtime.writing() as session:
+            rows = (
+                await session.execute(
+                    select(TrafficPendingChunk.scope, TrafficPendingChunk.core, TrafficPendingChunk.client_key)
+                    .where(
+                        TrafficPendingChunk.tick_id == int(tick),
+                        TrafficPendingChunk.scope.in_(scopes),
+                    )
+                )
+            ).all()
+            touched: dict[str, set[tuple[str, str]]] = defaultdict(set)
+            for row_scope, core, client_key in rows:
+                touched[str(row_scope)].add((str(core), str(client_key)))
+            result = await session.execute(
+                delete(TrafficPendingChunk).where(
+                    TrafficPendingChunk.tick_id == int(tick),
+                    TrafficPendingChunk.scope.in_(scopes),
+                )
+            )
+            for row_scope, clients in touched.items():
+                await self._delete_legacy_pending(session, row_scope, clients)
+            await session.execute(
+                delete(TrafficPendingTick).where(
+                    TrafficPendingTick.id == int(tick),
+                    TrafficPendingTick.scope.in_(scopes),
+                )
+            )
+            await session.commit()
+        return int(result.rowcount or 0)
+
     async def load_pending_billing(
         self,
         *,
         client_limit: int | None = None,
         chunks_per_client: int | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-        """One page of clients, oldest chunks first.
+        claim: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, int | None]:
+        """One page of unmarked clients, oldest chunks first.
 
-        Totals count only the chunks in this page, so the following ack deletes
-        the same bytes. ``client_limit`` None reads every client.
+        The returned chunks are stamped with one tick. Totals count only those
+        chunks. ``client_limit`` None reads every unmarked client.
         """
+        await self.release_expired_pending_ticks()
         scope = current_scope()
         client_fetch = int(client_limit) + 1 if client_limit is not None and client_limit > 0 else None
         chunk_fetch = (
@@ -560,7 +656,12 @@ class TrafficStoreService:
             }
             for (core, client_key), item in sorted(pending.items())
         ]
-        return chunks, rows, truncated
+        tick = (
+            await self.claim_pending_tick([str(item["chunk_id"]) for item in chunks])
+            if claim
+            else None
+        )
+        return chunks, rows, truncated, tick
 
     async def rehome_pending_scopes(self) -> int:
         """Move default-scope queue rows onto the auth-token scope of their client.

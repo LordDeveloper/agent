@@ -170,8 +170,9 @@ async def stats_clients_traffic_pending(
     Unacked traffic queue for all cores. Not gated on online/handshake.
 
     ``clients`` is how many pending clients this response includes (default 100).
-    ``chunks`` is the oldest chunks kept per client (default 200).
+    ``chunks`` is the oldest unmarked chunks kept per client (default 200).
     ``0`` on either value means no limit.
+    The response carries ``tick_id`` for those rows and does not list chunk ids.
 
     Contract with NetinjaBot ``UpdateSubscribeStats``:
       1. ``agent work`` samples on an interval and appends one pending **chunk**
@@ -203,6 +204,7 @@ async def stats_clients_traffic_pending(
         "worker_lag_ms": payload.get("worker_lag_ms"),
         "users": payload.get("users") or {},
         "truncated": bool(payload.get("truncated")),
+        "tick_id": payload.get("tick_id"),
         "sample_refresh_scheduled": sample_refresh_scheduled,
     }
 
@@ -238,15 +240,15 @@ async def stats_clients_traffic_pending_ack(
     Subtracts the GET snapshot from the live pending row. Bytes sampled onto
     the queue after that GET stay pending and are not cleared.
 
-    Body: ``{"chunk_ids": ["<uuid>", ...], "clients": [...], "billed": {...}, "drop": [...]}``.
-    ``chunk_ids`` delete the billed sample chunks (primary idempotent clear).
-    ``clients``/``billed`` settle the ack watermark when needed; ``drop`` clears
-    keys the panel will never bill.
+    Body: ``{"tick_id": <int>}`` deletes the rows marked by that fetch.
+    Older panels still send ``chunk_ids``. ``drop`` clears keys the panel will never bill.
     """
     raw = body.get("clients")
     if raw is None:
         raw = body.get("client_keys") or []
 
+    if raw is None:
+        raw = []
     if not isinstance(raw, list):
         raise_agent_error("INVALID_PAYLOAD", "clients must be a list of client ids", 400)
 
@@ -265,6 +267,25 @@ async def stats_clients_traffic_pending_ack(
     chunks_deleted = 0
     chunks_missing: list[str] = []
     dropped: list[str] = []
+    tick_raw = body.get("tick_id")
+    if tick_raw is not None and str(tick_raw).strip() != "":
+        try:
+            tick = int(tick_raw)
+        except (TypeError, ValueError):
+            raise_agent_error("INVALID_PAYLOAD", "tick_id must be an integer", 400)
+        chunks_deleted = await traffic.ack_tick(tick)
+        if drop_keys:
+            dropped = await traffic.drop_pending_keys(drop_keys)
+        acked = list(dict.fromkeys([*client_keys, *dropped]))
+        return {
+            "success": True,
+            "acked": acked,
+            "not_found": [],
+            "chunks_deleted": chunks_deleted,
+            "chunks_missing": [],
+            "billed_ack": True,
+            "tick_id": tick,
+        }
     if chunk_ids:
         chunks_deleted, chunks_missing = await traffic.ack_chunk_ids(chunk_ids)
     if drop_keys:
