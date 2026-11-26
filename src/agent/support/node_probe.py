@@ -620,6 +620,71 @@ async def _curl_probe(
     return False, detail, None
 
 
+def _public_ipv4(text: str) -> str:
+    match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', str(text or ''))
+    if not match:
+        return ''
+    candidate = match.group(0)
+    return candidate if _looks_like_ip(candidate) else ''
+
+
+async def _resolve_ipv4(host: str) -> str:
+    """Resolve on the main stack. DNS on a bound exit interface can hang the probe."""
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.to_thread(socket.getaddrinfo, host, 443, socket.AF_INET, socket.SOCK_STREAM),
+            timeout=2,
+        )
+    except (OSError, asyncio.TimeoutError):
+        return ''
+    for info in infos:
+        sockaddr = info[4] if len(info) > 4 else ()
+        address = str(sockaddr[0] if sockaddr else '').strip()
+        if _looks_like_ip(address):
+            return address
+    return ''
+
+
+async def _ifconfig_me_ip(
+    bind: str | None,
+    *,
+    runner: Runner | None = None,
+) -> tuple[bool, str]:
+    """Ask ifconfig.me which public address this source is using."""
+    if not shutil.which('curl'):
+        return False, 'curl is not installed on the agent'
+
+    resolved = await _resolve_ipv4('ifconfig.me')
+    cmd = [
+        'curl',
+        '-4',
+        '--connect-timeout',
+        '3',
+        '--max-time',
+        '6',
+        '-fsS',
+        'https://ifconfig.me/ip',
+    ]
+    if resolved:
+        cmd[1:1] = ['--resolve', f'ifconfig.me:443:{resolved}']
+    curl_bind = _curl_interface_arg(bind) if bind else None
+    if curl_bind:
+        cmd[1:1] = ['--interface', curl_bind]
+
+    try:
+        result = await execute(runner, cmd, check=False, timeout=8)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, str(exc) or 'ifconfig.me timed out'
+
+    code = int(getattr(result, 'returncode', 1) or 0)
+    body = (getattr(result, 'stdout', '') or '').strip()
+    stderr = (getattr(result, 'stderr', '') or '').strip()
+    seen = _public_ipv4(body)
+    if code == 0 and seen:
+        return True, f'ifconfig.me: {seen}'
+    return False, stderr or 'ifconfig.me returned no address'
+
+
 def _parse_curl_speed(body: str) -> tuple[int, float | None]:
     parts = (body or '').strip().split()
     if not parts:
@@ -878,11 +943,22 @@ async def probe_exit_interface(
             }
 
     bind = source or iface
-    # Traffic path = curl; panel ping = ping -I. Independent, so they overlap.
-    (ok, message, _curl_latency), ping_ms = await gather_independent(
-        _curl_probe(interface=bind, runner=runner, start_index=start_index),
-        maybe_await(_iface_ping_ms(bind, runner=runner)),
+    # A pinned source is checked by the address ifconfig.me actually sees.
+    identity = (
+        _ifconfig_me_ip(source, runner=runner)
+        if source
+        else _curl_probe(interface=bind, runner=runner, start_index=start_index)
     )
+    try:
+        (ok, message, *_rest), ping_ms = await asyncio.wait_for(
+            gather_independent(
+                identity,
+                maybe_await(_iface_ping_ms(bind, runner=runner)),
+            ),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        ok, message, ping_ms = False, 'ifconfig.me timed out', None
 
     if ok:
         row = {
