@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent.auth_scope import current_scope
 from agent.logutil import activity_log, resolve_log_path
 from agent.traffic.service import (
     AGENT_META_CORE,
@@ -111,21 +110,25 @@ async def collect_volume_billing_snapshot(
     pending_limit: int = 0,
     registry: CoreRegistry | None = None,
 ) -> dict[str, Any]:
-    rows = await traffic.store.list_traffic_pending()
+    rows = await traffic.store.list_traffic_pending_all_scopes()
     panel_id_by_stored: dict[tuple[str, str], str] = {}
-    for ident in await traffic.store.list_traffic_identity():
+    for ident in await traffic.store.list_traffic_identity_all_scopes():
         core_name = str(ident.get("core") or "").strip()
         alias = str(ident.get("alias") or "").strip()
         canonical = str(ident.get("canonical_key") or "").strip()
         if core_name and alias and canonical:
             panel_id_by_stored[(core_name, alias)] = canonical
-    chunks_by_client: dict[tuple[str, str], int] = {}
+    chunks_by_client: dict[tuple[str, str, str], int] = {}
     pending_bytes = 0
     pending_chunk_count = 0
     wg_chunk_clients: set[str] = set()
     pending_by_core: dict[str, dict[str, Any]] = {}
     for row in rows:
-        key = (str(row.get("core") or ""), str(row.get("client_key") or ""))
+        key = (
+            str(row.get("scope") or ""),
+            str(row.get("core") or ""),
+            str(row.get("client_key") or ""),
+        )
         count = int(row.get("chunk_count") or 0)
         chunk_bytes = int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0)
         if count <= 0 and chunk_bytes <= 0:
@@ -133,16 +136,16 @@ async def collect_volume_billing_snapshot(
         chunks_by_client[key] = count
         pending_chunk_count += count
         pending_bytes += chunk_bytes
-        core_name = key[0] or "—"
+        core_name = key[1] or "—"
         bucket = pending_by_core.setdefault(
             core_name,
             {"clients": set(), "chunks": 0, "bytes": 0},
         )
-        bucket["clients"].add(key[1])
+        bucket["clients"].add((key[0], key[2]))
         bucket["chunks"] += count
         bucket["bytes"] += chunk_bytes
-        if key[0] == "wireguard" and key[1] and count > 0:
-            wg_chunk_clients.add(key[1])
+        if key[1] == "wireguard" and key[2] and count > 0:
+            wg_chunk_clients.add(key[2])
 
     row_delta_bytes = sum(
         int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0) for row in rows
@@ -208,17 +211,19 @@ async def collect_volume_billing_snapshot(
             kernel_ahead_bytes += delta_down + delta_up
 
     for row in rows_sorted[:slice_end]:
+        scope_name = str(row.get("scope") or "")
         core = str(row.get("core") or "")
         client_key = str(row.get("client_key") or "")
         panel_node_id = panel_id_by_stored.get((core, client_key), client_key)
         item: dict[str, Any] = {
+            "scope": scope_name,
             "core": core,
             "client_key": client_key,
             "panel_node_id": panel_node_id,
             "downlink": int(row.get("delta_incoming") or 0),
             "uplink": int(row.get("delta_outgoing") or 0),
             "total": int(row.get("delta_incoming") or 0) + int(row.get("delta_outgoing") or 0),
-            "chunk_count": int(chunks_by_client.get((core, client_key), 0)),
+            "chunk_count": int(chunks_by_client.get((scope_name, core, client_key), 0)),
             "updated_at": row.get("updated_at"),
         }
         top.append(item)
@@ -391,10 +396,11 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
     lines.append(f"  Top unacked by volume (showing {len(top)} of {total_clients} clients)")
     wid = _PANEL_NODE_ID_WIDTH
     lines.append(
-        f"  {'#':>3}  {'core':8}  {'panel node_id':<{wid}}  {'down':>10}  {'up':>10}  {'total':>10}  ck"
+        f"  {'#':>3}  {'scope':16}  {'core':8}  {'panel node_id':<{wid}}  {'down':>10}  {'up':>10}  {'total':>10}  ck"
     )
-    lines.append(f"  {'-' * 3}  {'-' * 8}  {'-' * wid}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ---")
+    lines.append(f"  {'-' * 3}  {'-' * 16}  {'-' * 8}  {'-' * wid}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ---")
     for index, row in enumerate(top, start=1):
+        scope_name = str(row.get("scope") or "")[:16]
         core = str(row.get("core") or "")[:8]
         panel = str(row.get("panel_node_id") or row.get("client_key") or "")
         down = _format_bytes(int(row.get("downlink") or 0))
@@ -402,7 +408,7 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
         total = _format_bytes(int(row.get("total") or 0))
         chunks = int(row.get("chunk_count") or 0)
         lines.append(
-            f"  {index:3d}  {core:8}  {panel:<{wid}}  {down:>10}  {up:>10}  {total:>10}  {chunks:3d}"
+            f"  {index:3d}  {scope_name:16}  {core:8}  {panel:<{wid}}  {down:>10}  {up:>10}  {total:>10}  {chunks:3d}"
         )
     return lines
 

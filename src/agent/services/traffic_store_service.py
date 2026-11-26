@@ -262,6 +262,99 @@ class TrafficStoreService:
             )
         return rows
 
+    async def list_traffic_pending_all_scopes(self) -> list[dict[str, Any]]:
+        """Every unacked client, including rows filed under other auth-token scopes."""
+        async with self._runtime.reading() as session:
+            if _sqlite(session):
+                summed = (
+                    await session.execute(
+                        text(
+                            "SELECT scope, core, client_key, incoming, outgoing, chunk_count "
+                            "FROM traffic_pending_client WHERE chunk_count > 0"
+                        )
+                    )
+                ).all()
+            else:
+                summed = (
+                    await session.execute(
+                        select(
+                            TrafficPendingClient.scope,
+                            TrafficPendingClient.core,
+                            TrafficPendingClient.client_key,
+                            TrafficPendingClient.incoming,
+                            TrafficPendingClient.outgoing,
+                            TrafficPendingClient.chunk_count,
+                        ).where(TrafficPendingClient.chunk_count > 0)
+                    )
+                ).all()
+            pending: dict[tuple[str, str, str], dict[str, int]] = {}
+            for scope, core, client_key, incoming, outgoing, chunk_count in summed:
+                pending[(str(scope), str(core), str(client_key))] = {
+                    "delta_incoming": int(incoming or 0),
+                    "delta_outgoing": int(outgoing or 0),
+                    "chunk_count": int(chunk_count or 0),
+                }
+            legacy = (
+                await session.execute(
+                    select(
+                        TrafficPending.scope,
+                        TrafficPending.core,
+                        TrafficPending.client_key,
+                        TrafficPending.delta_incoming,
+                        TrafficPending.delta_outgoing,
+                    )
+                )
+            ).all()
+            for scope, core, client_key, delta_in, delta_out in legacy:
+                key = (str(scope), str(core), str(client_key))
+                if key in pending:
+                    continue
+                incoming = int(delta_in or 0)
+                outgoing = int(delta_out or 0)
+                if incoming == 0 and outgoing == 0:
+                    continue
+                pending[key] = {
+                    "delta_incoming": incoming,
+                    "delta_outgoing": outgoing,
+                    "chunk_count": 0,
+                }
+        rows: list[dict[str, Any]] = []
+        for (scope, core, client_key), item in sorted(pending.items()):
+            rows.append(
+                {
+                    "scope": scope,
+                    "core": core,
+                    "client_key": client_key,
+                    "delta_incoming": int(item["delta_incoming"]),
+                    "delta_outgoing": int(item["delta_outgoing"]),
+                    "chunk_count": int(item["chunk_count"]),
+                    "updated_at": None,
+                }
+            )
+        return rows
+
+    async def list_traffic_identity_all_scopes(self) -> list[dict[str, Any]]:
+        async with self._runtime.reading() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TrafficIdentity.scope,
+                        TrafficIdentity.core,
+                        TrafficIdentity.alias,
+                        TrafficIdentity.canonical_key,
+                    ).order_by(TrafficIdentity.scope, TrafficIdentity.core, TrafficIdentity.alias)
+                )
+            ).all()
+            return [
+                {
+                    "scope": scope,
+                    "core": core,
+                    "alias": alias,
+                    "canonical_key": canonical_key,
+                }
+                for scope, core, alias, canonical_key in rows
+            ]
+
     async def count_traffic_pending(self) -> int:
         scope = current_scope()
         async with self._runtime.reading() as session:
