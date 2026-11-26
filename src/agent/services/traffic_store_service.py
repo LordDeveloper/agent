@@ -355,6 +355,43 @@ class TrafficStoreService:
                 for scope, core, alias, canonical_key in rows
             ]
 
+    async def list_client_bandwidth_all_scopes(self) -> list[dict[str, Any]]:
+        """Last sampled counters for every config. These columns exclude the meta blob."""
+        async with self._runtime.reading() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Client.scope,
+                        Client.core_id,
+                        Client.id,
+                        Client.email,
+                        Client.name,
+                        Client.incoming,
+                        Client.outgoing,
+                    ).where(Client.role != "quota")
+                )
+            ).all()
+        usage: list[dict[str, Any]] = []
+        for scope, core, client_id, email, name, incoming, outgoing in rows:
+            down = int(incoming or 0)
+            up = int(outgoing or 0)
+            if down <= 0 and up <= 0:
+                continue
+            label = str(email or name or client_id or "").strip() or str(client_id)
+            usage.append(
+                {
+                    "scope": str(scope or ""),
+                    "core": str(core or ""),
+                    "client_key": str(client_id or ""),
+                    "label": label,
+                    "downlink": down,
+                    "uplink": up,
+                    "total": down + up,
+                }
+            )
+        usage.sort(key=lambda row: int(row["total"]), reverse=True)
+        return usage
+
     async def count_traffic_pending(self) -> int:
         scope = current_scope()
         async with self._runtime.reading() as session:

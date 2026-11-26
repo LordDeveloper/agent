@@ -173,6 +173,9 @@ async def collect_volume_billing_snapshot(
         "pending_limit": max(0, int(pending_limit)),
         "billing_cores": list(settings.traffic_billing_cores()),
         "enabled_cores": list(settings.cores()),
+        "config_bandwidth": [],
+        "config_bandwidth_total": 0,
+        "config_bandwidth_bytes": 0,
         "pending_by_core": {
             core: {
                 "clients": len(item["clients"]),
@@ -231,6 +234,11 @@ async def collect_volume_billing_snapshot(
     snapshot_body["kernel_ahead_unreliable"] = (
         pending_bytes > 0 and kernel_ahead_bytes > max(pending_bytes * 20, 512 * 1024 * 1024)
     )
+    usage = await traffic.store.list_client_bandwidth_all_scopes()
+    usage_cap = None if int(pending_limit) <= 0 else max(1, int(pending_limit))
+    snapshot_body["config_bandwidth_total"] = len(usage)
+    snapshot_body["config_bandwidth_bytes"] = sum(int(row.get("total") or 0) for row in usage)
+    snapshot_body["config_bandwidth"] = usage if usage_cap is None else usage[:usage_cap]
     return snapshot_body
 
 
@@ -327,6 +335,31 @@ def _core_timing_entries(timing: dict[str, Any]) -> list[tuple[str, dict[str, An
 
 def _short_core_name(core: str) -> str:
     return "wg" if core == "wireguard" else core
+
+
+def _format_timing_summary(raw: Any) -> str | None:
+    timing = _load_sample_timing(raw)
+    if not timing and raw:
+        return str(raw)
+    if not timing:
+        return None
+    parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
+    sqlite_ms = timing.get("_sqlite_ms", timing.get("sqlite_ms"))
+    parts = [f"parallel={parallel}ms", f"sqlite={sqlite_ms}ms"]
+    for key, value in _core_timing_entries(timing):
+        short = _short_core_name(key)
+        if value.get("error"):
+            parts.append(f"{short}=FAIL")
+            continue
+        snap = value.get("snapshot_ms")
+        if snap is None:
+            continue
+        clients = value.get("clients")
+        if clients is not None:
+            parts.append(f"{short}={snap}ms/{clients}c")
+        else:
+            parts.append(f"{short}={snap}ms")
+    return "  sample  " + "  ".join(str(part) for part in parts if part is not None)
 
 
 def _tone(text: str, *codes: str) -> str:
@@ -456,6 +489,35 @@ def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> 
             f"  {_tone(f'{index:>3}', DIM)}  {scope_name}  {_tone(core, CYAN)}  {panel}  "
             f"{down}  {up}  {_tone(total, WHITE)}  {chunks}"
         )
+        return lines
+
+
+def _format_config_bandwidth(rows: list[dict[str, Any]], total_count: int, total_bytes: int) -> list[str]:
+    if total_count <= 0 or not rows:
+        return []
+    shown = (
+        f"showing {len(rows)} of {total_count}"
+        if len(rows) != total_count
+        else f"{total_count} configs"
+    )
+    lines = [
+        _heading("Bandwidth"),
+        f"  {_tone(shown, DIM)}  {_tone(_format_bytes(total_bytes), YELLOW)}",
+        "  "
+        + _tone(
+            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'config':<28}  {'down':>10}  {'up':>10}  {'used':>10}",
+            DIM,
+        ),
+    ]
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            f"  {_tone(f'{index:>3}', DIM)}  {_pad(str(row.get('scope') or '—'), 16)}  "
+            f"{_tone(_pad(str(row.get('core') or '—'), 10), CYAN)}  "
+            f"{_pad(str(row.get('label') or row.get('client_key') or '—'), 28)}  "
+            f"{_pad(_format_bytes(int(row.get('downlink') or 0)), 10, '>')}  "
+            f"{_pad(_format_bytes(int(row.get('uplink') or 0)), 10, '>')}  "
+            f"{_tone(_pad(_format_bytes(int(row.get('total') or 0)), 10, '>'), WHITE)}"
+        )
     return lines
 
 
@@ -504,11 +566,6 @@ def format_volume_billing_frame(
             f"    {_tone('sqlite', DIM)} {_tone('—' if sqlite_ms is None else f'{sqlite_ms} ms', WHITE)}"
         ),
     ]
-    ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
-    if ahead > 0 and not snapshot.get("kernel_ahead_unreliable"):
-        out.append(
-            f"    {_tone('wireguard ahead', DIM)} {_tone(str(snapshot.get('kernel_ahead_label')), YELLOW)}"
-        )
     if billing or skipped:
         sampled = ", ".join(billing) if billing else "none"
         skip_note = f"    {_tone('skipped', DIM)} {_tone(', '.join(skipped), DIM)}" if skipped else ""
@@ -548,6 +605,14 @@ def format_volume_billing_frame(
         out.append(f"  {_tone('Queue is empty.', GREEN)}")
     else:
         out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], clients))
+
+    bandwidth = _format_config_bandwidth(
+        list(snapshot.get("config_bandwidth") or []),
+        int(snapshot.get("config_bandwidth_total") or 0),
+        int(snapshot.get("config_bandwidth_bytes") or 0),
+    )
+    if bandwidth:
+        out.extend(["", *bandwidth])
 
     alerts = _frame_alerts(snapshot)
     if alerts:
