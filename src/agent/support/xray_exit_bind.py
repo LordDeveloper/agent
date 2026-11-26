@@ -218,10 +218,73 @@ async def _primary_ipv4(iface: str, runner: Runner | None) -> str:
     return match.group(1) if match else ""
 
 
+def _gateway_on_dev(route_text: str, dev: str) -> str:
+    """Gateway of a main-table default route already leaving through ``dev``."""
+    iface = str(dev or "").strip()
+    for line in str(route_text or "").splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "default":
+            continue
+        found = ""
+        gateway = ""
+        for index, token in enumerate(parts):
+            if token == "dev" and index + 1 < len(parts):
+                found = parts[index + 1]
+            elif token == "via" and index + 1 < len(parts):
+                gateway = parts[index + 1]
+        if found == iface and gateway:
+            return gateway
+    return ""
+
+
+async def _main_gateway(dev: str, runner: Runner | None) -> str:
+    result = await execute(runner, ["ip", "-4", "route", "show", "default"], check=False, timeout=5)
+    if not _ok(result):
+        return ""
+    return _gateway_on_dev(_stdout(result), dev)
+
+
+async def release_interface_bind_route(iface: str, *, runner: Runner | None = None) -> dict[str, Any]:
+    """Drop an oif policy rule for a normal NIC. That rule blackholes its main default route."""
+    name = normalize_exit_interface(iface)
+    if not name:
+        raise AgentError("VALIDATION_ERROR", f"Invalid exit interface [{iface}]", 422)
+
+    table = table_id_for_interface(name)
+    rules = await _show_ip_rules(runner)
+    removed = 0
+    for row in rules:
+        if table >= 10000 and _rule_to_drop(row, name, table, None):
+            await _delete_rule_pref(runner, int(row["pref"]))
+            removed += 1
+    if table >= 10000:
+        await execute(
+            runner,
+            ["ip", "route", "del", "default", "dev", name, "table", str(table)],
+            check=False,
+            timeout=5,
+        )
+    forget_bind_iface(name)
+    return {"ok": True, "released": True, "interface": name, "removed_rules": removed}
+
+
+async def release_binds_on_main_nics(*, runner: Runner | None = None) -> None:
+    for name in load_bind_ifaces():
+        if await _main_gateway(name, runner):
+            await release_interface_bind_route(name, runner=runner)
+
+
 async def ensure_interface_bind_route(iface: str, *, runner: Runner | None = None) -> dict[str, Any]:
     name = normalize_exit_interface(iface)
     if not name:
         raise AgentError("VALIDATION_ERROR", f"Invalid exit interface [{iface}]", 422)
+
+    # A host NIC that already has ``default via <gw> dev <nic>`` must not get an
+    # ``oif <nic>`` rule. That rule sends every packet out the NIC into a table
+    # whose default route has no gateway, which drops the server's own traffic.
+    if await _main_gateway(name, runner):
+        released = await release_interface_bind_route(name, runner=runner)
+        return {**released, "skipped": "main-default-route"}
 
     link = await execute(runner, ["ip", "link", "show", "dev", name], check=False, timeout=5)
     if not _ok(link):

@@ -366,6 +366,39 @@ def _curl_interface_arg(bind: str | None) -> str | None:
     return text or None
 
 
+def _default_gateway_on_dev(route_text: str, dev: str) -> str | None:
+    """Gateway of an IPv4 default route that already egresses ``dev``."""
+    iface = str(dev or '').strip()
+    if not iface:
+        return None
+    for line in str(route_text or '').splitlines():
+        if not line.startswith('default'):
+            continue
+        parts = line.split()
+        found_dev = ''
+        gateway = ''
+        for index, token in enumerate(parts):
+            if token == 'dev' and index + 1 < len(parts):
+                found_dev = parts[index + 1]
+            elif token == 'via' and index + 1 < len(parts):
+                gateway = parts[index + 1]
+        if found_dev == iface and _looks_like_ip(gateway):
+            return gateway
+    return None
+
+
+async def _ipv4_default_gateway(dev: str, *, runner: Runner | None = None) -> str | None:
+    if not shutil.which('ip'):
+        return None
+    result = await execute(
+        runner,
+        ['ip', '-4', 'route', 'show', 'default'],
+        check=False,
+        timeout=5,
+    )
+    return _default_gateway_on_dev(str(getattr(result, 'stdout', '') or ''), dev)
+
+
 @asynccontextmanager
 async def _host_routes_for_iface(
     iface: str | None,
@@ -373,9 +406,17 @@ async def _host_routes_for_iface(
     *,
     runner: Runner | None = None,
 ) -> AsyncIterator[None]:
-    """Install temporary /32 routes so curl --interface works with Table=off WG."""
+    """Install temporary /32 routes so curl --interface works with Table=off WG.
+
+    A normal NIC that already has ``default via <gw> dev <iface>`` must not get a
+    gateway-less /32: that route blackholes the probe and the panel marks the node down.
+    """
     bind = str(iface or '').strip()
     if not bind or _looks_like_ip(bind) or not shutil.which('ip'):
+        yield
+        return
+
+    if await _ipv4_default_gateway(bind, runner=runner):
         yield
         return
 
@@ -829,6 +870,12 @@ async def probe_exit_interface(
             return {'ok': False, 'message': f'interface {iface} was not found'}
         if row.get('is_up') is False:
             return {'ok': False, 'message': f'interface {iface} is down'}
+        if source and source not in await _interface_addresses(iface, runner=runner):
+            return {
+                'ok': False,
+                'message': f'{source} is not assigned to {iface}',
+                'interface': iface,
+            }
 
     bind = source or iface
     # Traffic path = curl; panel ping = ping -I. Independent, so they overlap.

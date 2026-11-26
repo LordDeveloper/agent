@@ -151,6 +151,37 @@ def test_curl_probe_continues_after_timeout(monkeypatch):
     assert any(row[:3] == ['ip', 'route', 'del'] and 'poland' in row for row in calls)
 
 
+def test_default_gateway_on_dev_parses_via():
+    text = 'default via 1.2.3.1 dev eth0 proto dhcp src 1.2.3.4 metric 100\n'
+    assert node_probe._default_gateway_on_dev(text, 'eth0') == '1.2.3.1'
+    assert node_probe._default_gateway_on_dev(text, 'eth1') is None
+
+
+def test_curl_probe_skips_host_route_when_nic_has_default(monkeypatch):
+    calls: list[list[str]] = []
+
+    def runner(args, **_kwargs):
+        row = list(args)
+        calls.append(row)
+        if row[:5] == ['ip', '-4', 'route', 'show', 'default']:
+            return SimpleNamespace(returncode=0, stdout='default via 10.0.0.1 dev eth0\n', stderr='')
+        return SimpleNamespace(returncode=0, stdout='200 0.01', stderr='')
+
+    monkeypatch.setattr(node_probe.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    ok, message, _latency = asyncio.run(_curl_probe(interface='eth0', runner=runner))
+    assert ok is True
+    assert message == 'connection established'
+    assert not any(row[:3] == ['ip', 'route', 'replace'] for row in calls)
+
+
+@patch('agent.support.node_probe.list_host_interfaces')
+def test_probe_exit_interface_reports_unassigned_source_ip(_interfaces):
+    _interfaces.return_value = [{'name': 'eth0', 'is_up': True, 'addresses': ['1.1.1.1/24']}]
+    result = asyncio.run(node_probe.probe_exit_interface('eth0', source_ip='8.8.8.8', runner=object()))
+    assert result['ok'] is False
+    assert 'not assigned' in result['message']
+
+
 def test_host_routes_skipped_for_ip_bind(monkeypatch):
     calls: list[list[str]] = []
 

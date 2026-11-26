@@ -3660,6 +3660,14 @@ class XrayDriver(CoreDriver):
         return result if isinstance(result, dict) else {"ok": True}
 
     async def list_outbounds(self) -> list[dict[str, Any]]:
+        if not getattr(self, "_released_main_nic_binds", False):
+            self._released_main_nic_binds = True
+            try:
+                from agent.support.xray_exit_bind import release_binds_on_main_nics
+
+                await release_binds_on_main_nics()
+            except Exception:
+                _log.exception("failed to release main-nic exit binds")
         return await self._api_call("list_outbounds", )
 
     async def add_outbounds(self, outbounds: list[dict[str, Any]]) -> dict[str, Any]:
