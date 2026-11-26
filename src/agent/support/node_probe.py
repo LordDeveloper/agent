@@ -812,30 +812,36 @@ async def _should_skip_exit_interface_check(
 async def probe_exit_interface(
     name: str,
     *,
+    source_ip: str | None = None,
     runner: Runner | None = None,
     start_index: int = 0,
 ) -> dict[str, Any]:
     iface = str(name or '').strip()
-    if not iface:
+    source = str(source_ip or '').strip()
+    if source and not _looks_like_ip(source):
+        source = ''
+    if not iface and not source:
         return {'ok': False, 'message': 'exit_interface is not set'}
 
-    row = await _interface_row(iface, runner=runner)
-    if row is None:
-        return {'ok': False, 'message': f'interface {iface} was not found'}
-    if row.get('is_up') is False:
-        return {'ok': False, 'message': f'interface {iface} is down'}
+    if iface and not _looks_like_ip(iface):
+        row = await _interface_row(iface, runner=runner)
+        if row is None:
+            return {'ok': False, 'message': f'interface {iface} was not found'}
+        if row.get('is_up') is False:
+            return {'ok': False, 'message': f'interface {iface} is down'}
 
+    bind = source or iface
     # Traffic path = curl; panel ping = ping -I. Independent, so they overlap.
     (ok, message, _curl_latency), ping_ms = await gather_independent(
-        _curl_probe(interface=iface, runner=runner, start_index=start_index),
-        maybe_await(_iface_ping_ms(iface, runner=runner)),
+        _curl_probe(interface=bind, runner=runner, start_index=start_index),
+        maybe_await(_iface_ping_ms(bind, runner=runner)),
     )
 
     if ok:
         row = {
             'ok': True,
             'message': message,
-            'interface': iface,
+            'interface': source or iface,
             'via': 'egress',
         }
         if ping_ms is not None:
@@ -843,7 +849,8 @@ async def probe_exit_interface(
         return row
 
     # Curl egress flake on Table=off Mullvad — recent handshake = interface online.
-    if await _wg_has_recent_handshake(iface, runner=runner):
+    # A pinned source IP must fail on its own; a handshake on the NIC is not that IP.
+    if not source and iface and await _wg_has_recent_handshake(iface, runner=runner):
         return await _handshake_online_result(iface, runner=runner, latency_ms=ping_ms)
 
     failed: dict[str, Any] = {'ok': False, 'message': message, 'interface': iface}
@@ -950,6 +957,7 @@ async def probe_region_node(
     node_id: int | str,
     outbound_tag: str | None = None,
     exit_interface: str | None = None,
+    exit_ipv4: str | None = None,
     outbounds: list[dict[str, Any]] | None = None,
     runner: Runner | None = None,
     start_index: int = 0,
@@ -959,19 +967,26 @@ async def probe_region_node(
 
     outbound_tag = str(outbound_tag or '').strip() or None
     exit_interface = str(exit_interface or '').strip() or None
-
-    skip_exit = bool(
-        exit_interface
-        and await _should_skip_exit_interface_check(
-            outbound_tag,
-            exit_interface,
-            outbounds,
-            runner=runner,
-        )
-    )
+    exit_ipv4 = str(exit_ipv4 or '').strip() or None
+    if exit_ipv4 and not _looks_like_ip(exit_ipv4):
+        exit_ipv4 = None
 
     jobs: list[tuple[str, Any]] = []
-    if outbound_tag:
+    # A pinned public IP is the egress under test. Do not also accept the
+    # outbound tag, which can succeed on the host default route.
+    if exit_ipv4:
+        jobs.append(
+            (
+                'exit_interface',
+                probe_exit_interface(
+                    exit_interface or '',
+                    source_ip=exit_ipv4,
+                    runner=runner,
+                    start_index=start_index,
+                ),
+            )
+        )
+    elif outbound_tag:
         jobs.append(
             (
                 'outbound',
@@ -984,7 +999,12 @@ async def probe_region_node(
                 ),
             )
         )
-    if exit_interface and not skip_exit:
+    elif exit_interface and not await _should_skip_exit_interface_check(
+        outbound_tag,
+        exit_interface,
+        outbounds,
+        runner=runner,
+    ):
         jobs.append(
             (
                 'exit_interface',
@@ -1065,6 +1085,7 @@ async def probe_region_nodes(
             node_id=item.get('id'),
             outbound_tag=item.get('outbound_tag'),
             exit_interface=item.get('exit_interface'),
+            exit_ipv4=item.get('exit_ipv4'),
             outbounds=outbounds,
             runner=runner,
             start_index=index,

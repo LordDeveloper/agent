@@ -9,7 +9,7 @@ from agent.db import Store
 from agent.errors import AgentError, raise_agent_error
 from agent.logutil import get_logger
 from agent.support.peer_egress import all_desired_rules_from_store, all_tunnel_interface_names, repair_peer_egress
-from agent.support.host_interfaces import list_host_interfaces
+from agent.support.host_interfaces import add_interface_address, list_host_interfaces
 
 log = get_logger("network")
 
@@ -25,6 +25,21 @@ _probe_tasks: set[asyncio.Task[None]] = set()
 @router.get("/interfaces")
 async def network_interfaces():
     return {"success": True, "interfaces": await list_host_interfaces()}
+
+
+@router.post("/interfaces/address")
+async def network_add_interface_address(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        result = await add_interface_address(
+            str(body.get("interface") or ""),
+            str(body.get("address") or ""),
+        )
+    except ValueError as exc:
+        raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    return {"success": True, **result}
 
 
 @router.get("/ads-block")

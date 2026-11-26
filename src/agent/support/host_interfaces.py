@@ -66,6 +66,87 @@ async def list_host_interfaces(*, runner: Runner | None = None) -> list[dict[str
     return rows
 
 
+async def add_interface_address(
+    name: str,
+    address: str,
+    *,
+    prefix: int = 32,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Assign a public IPv4 to a host NIC (`ip addr add`)."""
+    iface = str(name or "").strip()
+    ip = str(address or "").strip()
+    if not iface or not _safe_iface_name(iface):
+        raise ValueError("interface name is invalid")
+    if not _is_public_ipv4(ip):
+        raise ValueError("address must be a public IPv4")
+    if prefix < 1 or prefix > 32:
+        raise ValueError("prefix is invalid")
+
+    rows = await list_host_interfaces(runner=runner)
+    row = next((item for item in rows if str(item.get("name") or "") == iface), None)
+    if row is None:
+        raise ValueError(f"interface {iface} was not found")
+
+    for existing in row.get("addresses") or []:
+        if str(existing).split("/", 1)[0] == ip:
+            return {
+                "added": False,
+                "already_present": True,
+                "interface": iface,
+                "address": ip,
+                "prefix": prefix,
+            }
+
+    if runner is None and not shutil.which("ip"):
+        raise ValueError("iproute2 is not installed")
+
+    result = await execute(
+        runner,
+        ["ip", "addr", "add", f"{ip}/{prefix}", "dev", iface],
+        check=False,
+        timeout=10,
+    )
+    code = int(getattr(result, "returncode", 1) or 0)
+    stderr = str(getattr(result, "stderr", None) or "").strip()
+    if code != 0 and "file exists" not in stderr.lower() and "exists" not in stderr.lower():
+        raise ValueError(stderr or f"ip addr add failed ({code})")
+
+    return {
+        "added": code == 0,
+        "already_present": code != 0,
+        "interface": iface,
+        "address": ip,
+        "prefix": prefix,
+    }
+
+
+def _safe_iface_name(name: str) -> bool:
+    if not name or len(name) > 15:
+        return False
+    first = name[0]
+    if not (first.isalpha()):
+        return False
+    return all(char.isalnum() or char in "_.-" for char in name)
+
+
+def _is_public_ipv4(value: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.IPv4Address(value)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 async def _ip_json(args: list[str], runner: Runner | None) -> Any:
     try:
         result = await execute(runner, ["ip", *args], check=False, timeout=10)
