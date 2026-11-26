@@ -24,6 +24,7 @@ from agent.ops import (
     write_env_file,
 )
 from agent.tui import (
+    BOLD,
     BLUE,
     CYAN,
     Choice,
@@ -756,6 +757,28 @@ def _cores_menu() -> None:
         _core_ops_menu(picked)
 
 
+def _bytes_label(value: int) -> str:
+    size = max(0, int(value))
+    if size < 1024:
+        return f"{size} B"
+    units = ("KiB", "MiB", "GiB", "TiB")
+    scaled = float(size)
+    for unit in units:
+        scaled /= 1024.0
+        if scaled < 1024.0 or unit == units[-1]:
+            return f"{scaled:.2f} {unit}"
+    return f"{size} B"
+
+
+def _fit(text: str, width: int) -> str:
+    flat = " ".join(str(text).split()) or "—"
+    if len(flat) <= width:
+        return flat
+    if width <= 3:
+        return flat[:width]
+    return flat[: width - 3] + "..."
+
+
 def _show_stats(*, online_only: bool) -> None:
     from agent.runtime import open_runtime
 
@@ -763,30 +786,57 @@ def _show_stats(*, online_only: bool) -> None:
     try:
         if online_only:
             users = run_sync(runtime.registry.online_traffic())
-            _print(kv("Online", str(len(users)), GREEN))
             _print()
+            _print(f"  {paint('ONLINE', BOLD + CYAN)}  {paint(str(len(users)), GREEN)}")
+            _print(f"  {paint('─' * 72, DIM)}")
             if not users:
-                _print(paint("  No online users.", DIM))
+                _print(paint("  No one is online.", DIM))
                 return
+            _print(
+                "  "
+                + paint(
+                    f"{'user':<36}  {'up':>12}  {'down':>12}  {'sessions':>8}",
+                    DIM,
+                )
+            )
             for email, traffic in sorted(users.items()):
-                up = int(traffic.get("uplink") or 0)
-                down = int(traffic.get("downlink") or 0)
+                up = _bytes_label(int(traffic.get("uplink") or 0))
+                down = _bytes_label(int(traffic.get("downlink") or 0))
                 sessions = traffic.get("sessions")
-                line = f"  • {email}  up={up}  down={down}"
-                if sessions is not None:
-                    line += f"  sessions={sessions}"
-                _print(paint(line, WHITE))
+                session_label = "—" if sessions is None else str(sessions)
+                _print(
+                    f"  {paint(f'{_fit(email, 36):<36}', WHITE)}  {up:>12}  {down:>12}  {session_label:>8}"
+                )
             return
 
         snapshot = run_sync(runtime.registry.usage_snapshot())
+        _print()
+        _print(f"  {paint('USAGE', BOLD + CYAN)}")
+        _print(f"  {paint('─' * 72, DIM)}")
         if not snapshot.inbounds:
             _print(paint("  No usage data.", DIM))
             return
         for inbound in snapshot.inbounds:
-            _print(paint(f"  {inbound.tag}  in={inbound.incoming}  out={inbound.outgoing}", CYAN))
-            for client in inbound.clients:
-                label = client.email or client.id or "-"
-                _print(paint(f"    {label}  in={client.incoming}  out={client.outgoing}", WHITE))
+            clients = list(inbound.clients or [])
+            _print()
+            _print(f"  {paint(_fit(inbound.tag or '—', 24), BOLD + CYAN)}  {paint(f'{len(clients)} clients', DIM)}")
+            _print(
+                f"    {paint('in', DIM)} {paint(_bytes_label(int(inbound.incoming or 0)), WHITE)}"
+                f"    {paint('out', DIM)} {paint(_bytes_label(int(inbound.outgoing or 0)), WHITE)}"
+            )
+            if not clients:
+                continue
+            _print(
+                "    "
+                + paint(f"{'client':<32}  {'in':>12}  {'out':>12}", DIM)
+            )
+            for client in clients:
+                label = client.email or client.id or "—"
+                _print(
+                    f"    {_fit(label, 32):<32}  "
+                    f"{_bytes_label(int(client.incoming or 0)):>12}  "
+                    f"{_bytes_label(int(client.outgoing or 0)):>12}"
+                )
     finally:
         run_sync(runtime.close())
 

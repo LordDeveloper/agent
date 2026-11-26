@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.logutil import activity_log, resolve_log_path
+from agent.tui import BOLD, CYAN, DIM, GREEN, RED, RESET, WHITE, YELLOW
 from agent.traffic.service import (
     AGENT_META_CORE,
     LAST_SAMPLE_META_KEY,
@@ -23,15 +24,7 @@ if TYPE_CHECKING:
     from agent.runtime import Runtime
 
 _LOG_FILTER = re.compile(r"(traffic|quota|pending|volume|ack|sample)", re.IGNORECASE)
-_WATCH_LOG_HINTS = (
-    "traffic sample timing",
-    "traffic sample cycle",
-    "traffic snapshot failed",
-    "traffic snapshot errors",
-    "traffic sample failed",
-)
 _WATCH_TOP_PENDING = 10
-_PANEL_NODE_ID_WIDTH = 64
 _TIMING_META_KEYS = {
     "parallel_snapshot_ms",
     "cycle_ms",
@@ -336,34 +329,32 @@ def _short_core_name(core: str) -> str:
     return "wg" if core == "wireguard" else core
 
 
-def _format_timing_summary(raw: Any) -> str | None:
-    timing = _load_sample_timing(raw)
-    if not timing and raw:
-        return str(raw)
-    if not timing:
-        return None
-    parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
-    sqlite_ms = timing.get("_sqlite_ms", timing.get("sqlite_ms"))
-    parts = [f"parallel={parallel}ms", f"sqlite={sqlite_ms}ms"]
-    core_parts: list[str] = []
-    for key, value in _core_timing_entries(timing):
-        short = _short_core_name(key)
-        if value.get("error"):
-            core_parts.append(f"{short}=FAIL")
-            continue
-        snap = value.get("snapshot_ms")
-        if snap is None:
-            continue
-        clients = value.get("clients")
-        if clients is not None:
-            core_parts.append(f"{short}={snap}ms/{clients}c")
-        else:
-            core_parts.append(f"{short}={snap}ms")
-    parts.extend(core_parts)
-    return "  sample  " + "  ".join(str(p) for p in parts if p is not None)
+def _tone(text: str, *codes: str) -> str:
+    return f"{''.join(codes)}{text}{RESET}"
 
 
-def _format_snapshot_errors(raw: Any) -> list[str]:
+def _clip(text: str, width: int) -> str:
+    flat = " ".join(str(text).split())
+    if len(flat) <= width:
+        return flat
+    if width <= 3:
+        return flat[:width]
+    return flat[: width - 3] + "..."
+
+
+def _pad(text: str, width: int, align: str = "<") -> str:
+    return f"{_clip(text, width):{align}{width}}"
+
+
+def _heading(title: str) -> str:
+    return f"  {_tone(title, BOLD, CYAN)}"
+
+
+def _rule() -> str:
+    return f"  {_tone('─' * 72, DIM)}"
+
+
+def _snapshot_errors(raw: Any) -> list[tuple[str, str]]:
     timing = _load_sample_timing(raw)
     if not timing:
         return []
@@ -381,34 +372,89 @@ def _format_snapshot_errors(raw: Any) -> list[str]:
         if any(name == core and msg == text for name, msg in errors):
             continue
         errors.append((core, text))
-    if not errors:
-        return []
-    lines = ["  snapshot errors:"]
-    for core, message in errors:
-        lines.append(f"    {core}: {message}")
-    return lines
+    return errors
+
+
+def _sample_is_stale(snapshot: dict[str, Any]) -> bool:
+    lag = snapshot.get("worker_lag_ms")
+    interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
+    stale_ms = max(30_000, int(interval_s * 15_000))
+    return isinstance(lag, int) and lag > stale_ms
+
+
+def _status_badge(snapshot: dict[str, Any], note: str | None) -> str:
+    if _sample_is_stale(snapshot):
+        return _tone("stale", BOLD, RED)
+    if note:
+        return _tone("idle", DIM)
+    return _tone("live", BOLD, GREEN)
+
+
+def _frame_alerts(snapshot: dict[str, Any]) -> list[str]:
+    alerts: list[str] = []
+    lag = snapshot.get("worker_lag_ms")
+    if _sample_is_stale(snapshot) and isinstance(lag, int):
+        alerts.append(f"Sample lag {lag // 1000}s. Pending grows only after a sample finishes.")
+    unacked = int(snapshot.get("pending_bytes") or 0)
+    clients = int(snapshot.get("pending_clients") or 0)
+    if unacked >= 256 * 1024 * 1024 or clients >= 80:
+        alerts.append(
+            f"Backlog {snapshot.get('pending_bytes_label')} across {clients} clients is still waiting for ack."
+        )
+    billing = list(snapshot.get("billing_cores") or [])
+    enabled = list(snapshot.get("enabled_cores") or [])
+    if "wireguard" not in enabled and "amnezia" not in enabled:
+        alerts.append("WireGuard and Amnezia are not in ENABLED_CORES, so those peers are not sampled.")
+    elif "wireguard" in enabled and "wireguard" not in billing:
+        alerts.append("WireGuard is enabled but excluded from volume sampling.")
+    by_core = snapshot.get("pending_by_core") or {}
+    wg_unacked = int((by_core.get("wireguard") or {}).get("bytes") or 0)
+    amz_unacked = int((by_core.get("amnezia") or {}).get("bytes") or 0)
+    wg_gap = int(snapshot.get("wg_live_gap_bytes") or 0)
+    timing = _load_sample_timing(snapshot.get("sample_timing"))
+    wg_sample = next((value for key, value in _core_timing_entries(timing) if key == "wireguard"), {})
+    bundled = timing.get("errors") if isinstance(timing.get("errors"), dict) else {}
+    wg_error = str(bundled.get("wireguard") or wg_sample.get("error") or "").strip()
+    if wg_gap >= 512 * 1024 and wg_unacked == 0 and amz_unacked == 0:
+        gap = snapshot.get("wg_live_gap_label")
+        if "wireguard" not in billing:
+            alerts.append(f"WireGuard live is {gap} ahead and WireGuard is not being sampled.")
+        elif wg_error:
+            alerts.append(f"WireGuard live is {gap} ahead. Snapshot failed: {wg_error}")
+        else:
+            alerts.append(f"WireGuard live is {gap} ahead, with nothing queued for WireGuard.")
+    for core, message in _snapshot_errors(snapshot.get("sample_timing")):
+        alerts.append(f"{core}: {message}")
+    ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
+    if ahead > 0 and snapshot.get("kernel_ahead_unreliable"):
+        alerts.append(f"WireGuard cursor looks desynced ({snapshot.get('kernel_ahead_label')}).")
+    return alerts
 
 
 def _format_top_pending_table(top: list[dict[str, Any]], total_clients: int) -> list[str]:
-    lines: list[str] = []
     if not top:
-        return lines
-    lines.append(f"  Top unacked by volume (showing {len(top)} of {total_clients} clients)")
-    wid = _PANEL_NODE_ID_WIDTH
-    lines.append(
-        f"  {'#':>3}  {'scope':16}  {'core':8}  {'panel node_id':<{wid}}  {'down':>10}  {'up':>10}  {'total':>10}  ck"
-    )
-    lines.append(f"  {'-' * 3}  {'-' * 16}  {'-' * 8}  {'-' * wid}  {'-' * 10}  {'-' * 10}  {'-' * 10}  ---")
+        return []
+    shown = f"showing {len(top)} of {total_clients}" if len(top) != total_clients else f"{total_clients} clients"
+    lines = [
+        _heading("Pending"),
+        f"  {_tone(shown, DIM)}",
+        "  "
+        + _tone(
+            f"{'#':>3}  {'scope':<16}  {'core':<10}  {'node':<28}  {'down':>10}  {'up':>10}  {'total':>10}  {'ck':>4}",
+            DIM,
+        ),
+    ]
     for index, row in enumerate(top, start=1):
-        scope_name = str(row.get("scope") or "")[:16]
-        core = str(row.get("core") or "")[:8]
-        panel = str(row.get("panel_node_id") or row.get("client_key") or "")
-        down = _format_bytes(int(row.get("downlink") or 0))
-        up = _format_bytes(int(row.get("uplink") or 0))
-        total = _format_bytes(int(row.get("total") or 0))
-        chunks = int(row.get("chunk_count") or 0)
+        scope_name = _pad(str(row.get("scope") or "—"), 16)
+        core = _pad(str(row.get("core") or "—"), 10)
+        panel = _pad(str(row.get("panel_node_id") or row.get("client_key") or "—"), 28)
+        down = _pad(_format_bytes(int(row.get("downlink") or 0)), 10, ">")
+        up = _pad(_format_bytes(int(row.get("uplink") or 0)), 10, ">")
+        total = _pad(_format_bytes(int(row.get("total") or 0)), 10, ">")
+        chunks = f"{int(row.get('chunk_count') or 0):>4d}"
         lines.append(
-            f"  {index:3d}  {scope_name:16}  {core:8}  {panel:<{wid}}  {down:>10}  {up:>10}  {total:>10}  {chunks:3d}"
+            f"  {_tone(f'{index:>3}', DIM)}  {scope_name}  {_tone(core, CYAN)}  {panel}  "
+            f"{down}  {up}  {_tone(total, WHITE)}  {chunks}"
         )
     return lines
 
@@ -419,137 +465,107 @@ def format_volume_billing_frame(
     *,
     note: str | None = None,
 ) -> list[str]:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    del log_lines
     lag = snapshot.get("worker_lag_ms")
     lag_label = f"{lag} ms" if lag is not None else "—"
-    out: list[str] = []
-    header = f"--- volume billing · {ts} ---"
-    if note:
-        header += f"  · {note}"
-    out.append(header)
-    out.append(
-        f"  pending_clients={snapshot.get('pending_clients')}  "
-        f"pending_chunks={snapshot.get('pending_chunks', 0)}  "
-        f"unacked={snapshot.get('pending_bytes_label')}  "
-        f"sample_lag={lag_label}"
-    )
-    interval_s = float(snapshot.get("traffic_sample_interval_s") or 2.0)
-    stale_ms = max(30_000, int(interval_s * 15_000))
-    if isinstance(lag, int) and lag > stale_ms:
-        out.append(
-            f"  hint: sample_lag>{stale_ms // 1000}s — worker may be stuck; "
-            "pending grows only when a sample finishes."
-        )
-    unacked = int(snapshot.get("pending_bytes") or 0)
     clients = int(snapshot.get("pending_clients") or 0)
-    if unacked >= 256 * 1024 * 1024 or clients >= 80:
-        out.append(
-            f"  hint: backlog {snapshot.get('pending_bytes_label')} / {clients} clients — "
-            "panel must POST ack after billing."
-        )
-    billing = snapshot.get("billing_cores") or []
-    enabled = snapshot.get("enabled_cores") or []
-    skipped = [c for c in enabled if c not in billing]
-    out.append(
-        f"  sample_interval={snapshot.get('traffic_sample_interval_s')}s  "
-        f"quota_interval={snapshot.get('quota_enforce_interval_s')}s  "
-        f"local_volume_quota={'on' if snapshot.get('enforce_local_volume_quota') else 'off (panel owns cutoff)'}"
-    )
-    if billing:
-        skip_note = f"  skip: {','.join(skipped)}" if skipped else ""
-        out.append(f"  volume sample cores: {','.join(billing)}{skip_note}")
-    if "wireguard" not in enabled and "amnezia" not in enabled:
-        out.append(
-            "  hint: ENABLED_CORES has no wireguard/amnezia — the traffic worker never samples WG peers."
-        )
-    elif "wireguard" not in billing and "wireguard" in enabled:
-        out.append("  hint: wireguard is enabled but excluded from volume sampling (traffic_sample_skip_cores).")
-    if "l2tp" in enabled and "l2tp" not in billing:
-        out.append(
-            "  note: L2TP is excluded by traffic_sample_skip_cores, so standalone L2TP volume is not sampled. "
-            "Companion users still credit the linked wireguard/amnezia peer."
-        )
-    wg_unacked = int((snapshot.get("pending_by_core") or {}).get("wireguard", {}).get("bytes") or 0)
-    amz_unacked = int((snapshot.get("pending_by_core") or {}).get("amnezia", {}).get("bytes") or 0)
-    wg_gap = int(snapshot.get("wg_live_gap_bytes") or 0)
+    chunks = int(snapshot.get("pending_chunks") or 0)
+    unacked_label = str(snapshot.get("pending_bytes_label") or "0 B")
+    quota = "on" if snapshot.get("enforce_local_volume_quota") else "off"
+    last_sample = str(snapshot.get("last_sample_at") or "—")
     timing = _load_sample_timing(snapshot.get("sample_timing"))
-    wg_sample = next((value for key, value in _core_timing_entries(timing) if key == "wireguard"), {})
-    bundled_errors = timing.get("errors") if isinstance(timing.get("errors"), dict) else {}
-    wg_error = str(bundled_errors.get("wireguard") or wg_sample.get("error") or "").strip()
-    if wg_gap >= 512 * 1024 and wg_unacked == 0 and amz_unacked == 0:
-        if "wireguard" not in billing:
-            out.append(
-                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but no wg unacked — "
-                "add wireguard to ENABLED_CORES and restart agent work."
-            )
-        elif wg_error:
-            out.append(
-                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but pending wg=0 — "
-                f"snapshot failed: {wg_error}"
-            )
-        else:
-            out.append(
-                f"  hint: WG live−cursor={snapshot.get('wg_live_gap_label')} but pending wg=0 — "
-                "snapshot ok but no delta queued (unchanged, zero-cursor skew, or peer id ≠ subscribe.node_id)."
-            )
-    out.extend(_format_snapshot_errors(snapshot.get("sample_timing")))
-    out.append(f"  last_sample_at={snapshot.get('last_sample_at') or '—'}")
+    parallel = timing.get("parallel_snapshot_ms", timing.get("cycle_ms"))
+    sqlite_ms = timing.get("_sqlite_ms", timing.get("sqlite_ms"))
+    billing = list(snapshot.get("billing_cores") or [])
+    enabled = list(snapshot.get("enabled_cores") or [])
+    skipped = [core for core in enabled if core not in billing]
+
+    out: list[str] = [
+        "",
+        f"  {_tone('VOLUME', BOLD, CYAN)}  {_tone(time.strftime('%H:%M:%S'), DIM)}  {_status_badge(snapshot, note)}",
+        _rule(),
+        _heading("Queue"),
+        (
+            f"    {_tone('clients', DIM)} {_tone(str(clients), WHITE)}"
+            f"    {_tone('chunks', DIM)} {_tone(str(chunks), WHITE)}"
+            f"    {_tone('unacked', DIM)} {_tone(unacked_label, YELLOW if clients else GREEN)}"
+            f"    {_tone('lag', DIM)} {_tone(lag_label, RED if _sample_is_stale(snapshot) else WHITE)}"
+        ),
+        "",
+        _heading("Sample"),
+        (
+            f"    {_tone('every', DIM)} {_tone(str(snapshot.get('traffic_sample_interval_s')) + 's', WHITE)}"
+            f"    {_tone('quota', DIM)} {_tone(str(snapshot.get('quota_enforce_interval_s')) + 's', WHITE)}"
+            f"    {_tone('local quota', DIM)} {_tone(quota, GREEN if quota == 'off' else YELLOW)}"
+        ),
+        (
+            f"    {_tone('last', DIM)} {_tone(last_sample, WHITE)}"
+            f"    {_tone('parallel', DIM)} {_tone('—' if parallel is None else f'{parallel} ms', WHITE)}"
+            f"    {_tone('sqlite', DIM)} {_tone('—' if sqlite_ms is None else f'{sqlite_ms} ms', WHITE)}"
+        ),
+    ]
     ahead = int(snapshot.get("kernel_ahead_bytes") or 0)
-    if ahead > 0:
-        wg_note = (
-            "live WG since last stored cursor"
-            if not snapshot.get("kernel_ahead_unreliable")
-            else "IGNORE if huge — cursor desync"
-        )
-        out.append(f"  wg_kernel_ahead={snapshot.get('kernel_ahead_label')} ({wg_note})")
-    timing_line = _format_timing_summary(snapshot.get("sample_timing"))
-    if timing_line:
-        out.append(timing_line)
-    total_clients = int(snapshot.get("pending_clients") or 0)
-    total_chunks = int(snapshot.get("pending_chunks") or 0)
-    if total_clients <= 0:
-        out.append("  (no unacked pending rows)")
-    else:
+    if ahead > 0 and not snapshot.get("kernel_ahead_unreliable"):
         out.append(
-            f"  queue: {total_clients} clients · {total_chunks} chunks · "
-            f"{snapshot.get('pending_bytes_label')} unacked"
+            f"    {_tone('wireguard ahead', DIM)} {_tone(str(snapshot.get('kernel_ahead_label')), YELLOW)}"
         )
-        by_core = snapshot.get("pending_by_core") or {}
-        if by_core:
-            core_bits = [
-                f"{name} {item.get('clients', 0)}c/{item.get('chunks', 0)}ch/{item.get('label', '0 B')}"
-                for name, item in sorted(by_core.items())
-            ]
-            out.append(f"  unacked by core: {', '.join(core_bits)}")
-        out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], total_clients))
-    for line in log_lines[-8:]:
-        lowered = line.lower()
-        if any(token in lowered for token in _WATCH_LOG_HINTS):
-            out.append(f"  log | {line}")
+    if billing or skipped:
+        sampled = ", ".join(billing) if billing else "none"
+        skip_note = f"    {_tone('skipped', DIM)} {_tone(', '.join(skipped), DIM)}" if skipped else ""
+        out.append(f"    {_tone('sampled', DIM)} {_tone(sampled, CYAN)}{skip_note}")
+
+    core_rows = _core_timing_entries(timing)
+    if core_rows:
+        out.extend(["", _heading("Cores")])
+        for name, value in core_rows:
+            if value.get("error"):
+                detail = _tone("failed", RED)
+            else:
+                snap = value.get("snapshot_ms")
+                count = value.get("clients")
+                parts = []
+                if snap is not None:
+                    parts.append(f"{snap} ms")
+                if count is not None:
+                    parts.append(f"{count} clients")
+                detail = _tone("  ".join(parts) or "—", WHITE)
+            out.append(f"    {_tone(_pad(_short_core_name(name), 12), CYAN)}{detail}")
+
+    by_core = snapshot.get("pending_by_core") or {}
+    if by_core:
+        out.extend(["", _heading("By core")])
+        for name, item in sorted(by_core.items()):
+            out.append(
+                f"    {_tone(_pad(name, 12), CYAN)}"
+                f"{_tone(_pad(str(item.get('clients', 0)) + ' clients', 14), WHITE)}"
+                f"{_tone(_pad(str(item.get('chunks', 0)) + ' chunks', 14), DIM)}"
+                f"{_tone(str(item.get('label') or '0 B'), YELLOW)}"
+            )
+
+    out.append("")
+    if clients <= 0:
+        out.append(_heading("Pending"))
+        out.append(f"  {_tone('Queue is empty.', GREEN)}")
+    else:
+        out.extend(_format_top_pending_table(snapshot.get("top_pending") or [], clients))
+
+    alerts = _frame_alerts(snapshot)
+    if alerts:
+        out.extend(["", _heading("Needs attention")])
+        for alert in alerts:
+            out.append(f"    {_tone('!', YELLOW)} {_tone(_clip(alert, 96), YELLOW)}")
+    out.append("")
     return out
 
 
 def print_pending_queue_summary(snapshot: dict[str, Any], *, limit: int = 30) -> None:
     """Print the same pending rows as the live watch (for reset preview)."""
     total = int(snapshot.get("pending_clients") or 0)
-    if total <= 0:
-        print("  (no unacked pending rows)", flush=True)
-        return
-    top = snapshot.get("top_pending") or []
-    shown = len(top)
-    if limit > 0 and total > shown:
-        print(f"  (showing {shown} of {total} clients)", flush=True)
-    for row in top[: max(1, limit) if limit > 0 else len(top)]:
-        key = str(row.get("panel_node_id") or row.get("client_key") or "")
-        core = str(row.get("core") or "")
-        down = _format_bytes(int(row.get("downlink") or 0))
-        up = _format_bytes(int(row.get("uplink") or 0))
-        chunk_count = int(row.get("chunk_count") or 0)
-        extra = f"  ({chunk_count} chunks)" if chunk_count > 0 else ""
-        ahead = int(row.get("kernel_ahead") or 0)
-        if ahead > 0:
-            extra += f"  (wg live +{_format_bytes(ahead)} not in pending yet)"
-        print(f"    {core:8} {key:<{_PANEL_NODE_ID_WIDTH}}  ↓{down}  ↑{up}{extra}", flush=True)
+    top = list(snapshot.get("top_pending") or [])
+    if limit > 0:
+        top = top[:limit]
+    for line in _format_top_pending_table(top, total) or [f"  {_tone('Queue is empty.', GREEN)}"]:
+        print(line, flush=True)
 
 
 def render_volume_billing_frame(
@@ -579,7 +595,6 @@ def run_volume_billing_watch(
     wait_s = max(0.5, float(interval))
 
     screen = _LiveScreen()
-    banner_printed = False
 
     prev_fp: tuple[Any, ...] | None = None
     try:
@@ -610,13 +625,6 @@ def run_volume_billing_watch(
                     flush=True,
                 )
             else:
-                if not banner_printed and sys.stderr.isatty():
-                    print(
-                        "Volume billing watch (screen refresh in place). Ctrl+C to stop.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    banner_printed = True
                 frame = format_volume_billing_frame(snapshot, log_lines_out, note=note)
                 if once or not screen._tty:
                     for line in frame:
