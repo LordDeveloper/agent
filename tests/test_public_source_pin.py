@@ -20,6 +20,11 @@ def test_source_pin_script_is_a_separate_table_at_priority_minus_200():
     assert "flush set inet netinja_egress pinned" in script
     assert "nft add element inet netinja_egress pinned '{ 8.8.8.8 }'" in script
     assert "flush chain inet netinja_egress" not in script
+    assert (
+        "nft insert rule inet netinja_egress postrouting "
+        "ip saddr 10.7.0.2/32 snat to 8.8.8.8 accept "
+        'comment "netinja-wgsnat-10.7.0.2"'
+    ) in script
 
 
 def test_peer_egress_script_does_not_own_the_source_pin_table():

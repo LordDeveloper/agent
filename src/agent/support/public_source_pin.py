@@ -107,8 +107,37 @@ def render_script(state: dict[str, Any]) -> str:
             f'  nft add rule inet {_TABLE} {_CHAIN} ip saddr {row["cidr"]} '
             f'snat to {row["snat"]} accept comment "netinja-src-peer-{host}"'
         )
+    # WireGuard/Amnezia/L2TP/OpenVPN are forwarded with a private source.
+    # SNAT in an earlier chain is overwritten by MASQUERADE in this one,
+    # because accept does not stop the next base chain. The translation has
+    # to be inside the masquerade chain, ahead of it.
+    lines.extend(_masquerade_chain_peer_lines(peers))
     lines.extend(["  exit 0", "fi", "exit 0", ""])
     return "\n".join(lines)
+
+
+def _masquerade_chain_peer_lines(peers: list[dict[str, str]]) -> list[str]:
+    lines = [
+        "  if nft list chain inet netinja_egress postrouting >/dev/null 2>&1; then",
+        "    nft -a list chain inet netinja_egress postrouting 2>/dev/null "
+        "| sed -n 's/.*netinja-wgsnat-.*handle \\([0-9][0-9]*\\).*/\\1/p' "
+        "| while read -r handle; do",
+        '      nft delete rule inet netinja_egress postrouting handle "$handle" '
+        "2>/dev/null || true",
+        "    done",
+    ]
+    for row in peers:
+        host = row["cidr"].split("/", 1)[0]
+        lines.append(
+            "    nft insert rule inet netinja_egress postrouting "
+            f'ip saddr {row["cidr"]} snat to {row["snat"]} accept '
+            f'comment "netinja-wgsnat-{host}" 2>/dev/null || true'
+        )
+        lines.append(
+            f'    conntrack -D -s {host} >/dev/null 2>&1 || true'
+        )
+    lines.append("  fi")
+    return lines
 
 
 def _install_enabled() -> bool:
@@ -142,6 +171,10 @@ async def apply_state(
         await execute(run, ["sh", str(path)], check=False, timeout=30)
         await _retarget_masquerade(run)
         await _drop_pinned_conntrack(clean["addresses"], run)
+        await _drop_pinned_conntrack(
+            [{"ip": row["cidr"].split("/", 1)[0]} for row in clean["peers"]],
+            run,
+        )
         if install_unit:
             await ensure_unit(path, runner=run)
     return clean
@@ -285,7 +318,7 @@ async def ensure_unit(script: Path, *, runner: Runner | None = None) -> None:
         [
             "[Unit]",
             "Description=Netinja additional-IP source pin",
-            "After=network-online.target",
+            "After=network-online.target agent-peer-egress.service",
             "Wants=network-online.target",
             "",
             "[Service]",
