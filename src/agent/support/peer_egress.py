@@ -2810,6 +2810,7 @@ async def _sync_masquerade(
         for binary in ("iptables", "iptables-legacy"):
             if shutil.which(binary):
                 await _purge_iptables_exit_masq(targets, runner=runner, binary=binary)
+        await _restore_xray_source_pins(runner)
         return
 
     if shutil.which("iptables-legacy"):
@@ -2831,6 +2832,7 @@ async def _sync_masquerade(
         )
         if shutil.which("iptables") and await _iptables_is_nft(runner):
             await _purge_iptables_exit_masq(targets, runner=runner, binary="iptables")
+        await _restore_xray_source_pins(runner)
         return
 
     if shutil.which("iptables"):
@@ -2850,6 +2852,23 @@ async def _sync_masquerade(
             tunnel_ifaces=tunnel_ifaces or [],
             binary="iptables",
         )
+    await _restore_xray_source_pins(runner)
+
+
+async def _restore_xray_source_pins(runner: Runner) -> None:
+    """Put the Xray source pin back after a NAT rebuild.
+
+    Peer MASQUERADE is installed in the normal srcnat hook. The earlier pin is
+    what stops that hook from rewriting a node address to the server primary.
+    Rebuilding NAT must not leave that pin missing.
+    """
+    try:
+        from agent.support.xray_exit_bind import reapply_config_public_pins
+
+        path = os.environ.get("XRAY_CONFIG", "").strip() or "/usr/local/etc/xray/config.json"
+        await reapply_config_public_pins(path)
+    except Exception:
+        log.exception("xray source pin restore failed")
 
 
 async def _sync_forward(

@@ -1167,16 +1167,38 @@ async def probe_region_node(
         for check in checks.values()
         if isinstance(check, dict) and not check.get('ok')
     ]
+    seen_ip = ''
+    seen_message = ''
+    for check in checks.values():
+        if not isinstance(check, dict):
+            continue
+        matched = re.search(
+            r'ifconfig\.me:\s*(\d{1,3}(?:\.\d{1,3}){3})',
+            str(check.get('message') or ''),
+        )
+        if matched:
+            seen_ip = matched.group(1)
+            seen_message = f'ifconfig.me: {seen_ip}'
+            break
+    if seen_message and exit_ipv4 and seen_ip != exit_ipv4:
+        ok = False
     latency_values = [
         int(check['latency_ms'])
         for check in checks.values()
         if isinstance(check, dict) and check.get('ok') and isinstance(check.get('latency_ms'), int)
     ]
 
+    if seen_message:
+        message = seen_message
+    elif ok:
+        message = 'traffic is flowing through this node'
+    else:
+        message = failure_messages[0] if failure_messages else 'failed'
+
     result: dict[str, Any] = {
         'id': node_id,
         'ok': ok,
-        'message': 'traffic is flowing through this node' if ok else (failure_messages[0] if failure_messages else 'failed'),
+        'message': message,
         'checks': checks,
     }
     if latency_values:
