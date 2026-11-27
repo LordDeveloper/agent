@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+
+from agent.support import public_source_pin
+
 from agent.support.peer_egress import render_apply_script
 from agent.support.public_source_pin import masquerade_rewrites, render_script
 
@@ -70,3 +74,18 @@ def test_existing_masquerade_is_rewritten_to_skip_pinned_sources():
     assert args[args.index("@pinned") - 1] == "!="
     assert "@peer_src" in args
     assert "masquerade" in args
+
+
+def test_host_address_exemption_survives_xray_rebuild(tmp_path, monkeypatch):
+    config = tmp_path / "xray.json"
+    config.write_text('{"outbounds": []}', encoding="utf-8")
+    previous = {"addresses": [{"ip": "64.49.15.27", "mark": 0, "preserve": True}], "peers": []}
+    monkeypatch.setattr(public_source_pin, "load_state", lambda: previous)
+    monkeypatch.setattr(public_source_pin, "_install_enabled", lambda: False)
+
+    state = asyncio.run(public_source_pin.rebuild_from_host(None, config))
+
+    assert state["addresses"] == previous["addresses"]
+    script = render_script(state)
+    assert "pinned '{ 64.49.15.27 }'" in script
+    assert "snat ip to 64.49.15.27" not in script

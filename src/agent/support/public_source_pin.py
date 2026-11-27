@@ -104,6 +104,8 @@ def render_script(state: dict[str, Any]) -> str:
             f'  nft add rule inet {_TABLE} {_CHAIN} ip saddr {address} '
             f'accept comment "netinja-src-keep-{address}"'
         )
+        if not mark:
+            continue
         lines.append(
             f'  nft add rule inet {_TABLE} {_CHAIN} meta mark {hex(mark)} '
             f'snat ip to {address} comment \'"netinja-src-mark-{mark}"\''
@@ -187,19 +189,33 @@ async def apply_state(
     return clean
 
 
-async def remember_address(ip: str, mark: int = 0, *, runner: Runner | None = None) -> None:
-    """Keep one Xray source in the pin table without dropping other nodes."""
+async def remember_address(
+    ip: str,
+    mark: int = 0,
+    *,
+    preserve_only: bool = False,
+    runner: Runner | None = None,
+) -> None:
+    """Exempt a local source from MASQUERADE and optionally install its Xray mark."""
     from agent.support.peer_egress import egress_mark, public_exit_ipv4
 
     address = public_exit_ipv4(ip)
     if not address:
         return
-    wanted = int(mark) if int(mark) > 0 else egress_mark(address)
     current = load_state()
+    existing = next((row for row in current["addresses"] if row["ip"] == address), None)
+    if preserve_only:
+        wanted = existing["mark"] if existing else 0
+    else:
+        wanted = int(mark) if int(mark) > 0 else egress_mark(address)
     current["addresses"] = [
         row for row in current["addresses"] if row["ip"] != address
     ]
-    current["addresses"].append({"ip": address, "mark": wanted})
+    current["addresses"].append({
+        "ip": address,
+        "mark": wanted,
+        "preserve": preserve_only or bool(existing and existing.get("preserve")),
+    })
     await apply_state(current, runner=runner)
 
 
@@ -232,7 +248,12 @@ async def rebuild_from_host(
         except (OSError, json.JSONDecodeError):
             payload = None
         if isinstance(payload, dict):
-            addresses = pins_from_outbounds(list(payload.get("outbounds") or []))
+            xray_pins = pins_from_outbounds(list(payload.get("outbounds") or []))
+            merged = {row["ip"]: {"ip": row["ip"], "mark": 0, "preserve": True}
+                      for row in addresses if row.get("preserve")}
+            for row in xray_pins:
+                merged[row["ip"]] = {**merged.get(row["ip"], {}), **row}
+            addresses = list(merged.values())
     peers = previous["peers"]
     try:
         from agent.support.peer_egress import _pin_rows, all_desired_rules_from_store
@@ -242,6 +263,8 @@ async def rebuild_from_host(
         peers = previous["peers"]
     clean = await apply_state({"addresses": addresses, "peers": peers}, runner=runner)
     for row in clean["addresses"]:
+        if not row["mark"]:
+            continue
         try:
             await ensure_source_address_route(str(row["ip"]), runner=runner)
         except Exception:
@@ -372,10 +395,14 @@ def _addresses(raw: Any) -> list[dict[str, Any]]:
             mark = int(row.get("mark") or 0)
         except (TypeError, ValueError):
             mark = 0
+        preserve = row.get("preserve") is True
         if mark <= 0:
-            mark = egress_mark(address)
+            mark = 0 if preserve else egress_mark(address)
         seen.add(address)
-        found.append({"ip": address, "mark": mark})
+        item = {"ip": address, "mark": mark}
+        if preserve:
+            item["preserve"] = True
+        found.append(item)
     return found
 
 

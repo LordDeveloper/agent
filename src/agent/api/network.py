@@ -10,6 +10,7 @@ from agent.errors import AgentError, raise_agent_error
 from agent.logutil import get_logger
 from agent.support.peer_egress import all_desired_rules_from_store, all_tunnel_interface_names, repair_peer_egress
 from agent.support.host_interfaces import add_interface_address, list_host_interfaces
+from agent.support.public_source_pin import remember_address
 
 log = get_logger("network")
 
@@ -39,6 +40,7 @@ async def network_add_interface_address(request: Request):
         )
     except ValueError as exc:
         raise_agent_error("VALIDATION_ERROR", str(exc), 422)
+    await remember_address(result["address"], preserve_only=True)
     return {"success": True, **result}
 
 
