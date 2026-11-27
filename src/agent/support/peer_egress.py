@@ -1947,10 +1947,6 @@ async def reconcile_core_egress(
     # in another table. Those rules win by priority and blackhole one peer.
     conflicts_ok = await _drop_conflicting_policy(runner, interfaces, applied, cache, switched)
 
-    # 4) Flush conntrack so old NAT paths do not stick after exit change/removal.
-    for addr in dict.fromkeys(switched):
-        await _flush_conntrack(runner, addr)
-
     desired_tables = {int(row["table"]): str(row["iface"]) for row in applied if int(row.get("table") or 0) > 0}
     prev_tables = {
         int(row.get("table") or 0): str(row.get("iface") or "")
@@ -2066,6 +2062,10 @@ async def reconcile_core_egress(
         await reapply_saved_binds(runner=runner)
     except Exception:
         log.exception("xray exit bind reapply failed")
+    # Drop sticky NAT only after the replacement or removal is in the kernel.
+    for addr in dict.fromkeys(switched):
+        await _flush_conntrack(runner, addr)
+
     persist = await persist_peer_egress(store, data_dir=data_dir, runner=runner, force_start=force)
     route_ok = True
     if core in {"wireguard", "amnezia"}:

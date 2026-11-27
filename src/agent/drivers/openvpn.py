@@ -842,6 +842,9 @@ class OpenVpnDriver(CoreDriver):
                     if key in _IMMUTABLE_USER_KEYS or key in _USAGE_COUNTER_KEYS:
                         continue
                     merged[key] = value
+                for field in ('exit_interface', 'exit_ipv4'):
+                    if field in payload and field not in normalized:
+                        merged.pop(field, None)
                 merged['username'] = user.get('username')
                 merged['password'] = user.get('password')
                 requested = openvpn_host(payload.get('address'))

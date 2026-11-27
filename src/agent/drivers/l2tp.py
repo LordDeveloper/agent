@@ -715,6 +715,9 @@ class L2tpDriver(CoreDriver):
                     if key in _IMMUTABLE_USER_KEYS:
                         continue
                     merged[key] = value
+                for field in ('exit_interface', 'exit_ipv4'):
+                    if field in payload and field not in normalized:
+                        merged.pop(field, None)
                 merged['username'] = user.get('username')
                 merged['password'] = user.get('password')
                 requested = str(payload.get('address') or '').split('/', 1)[0].strip()

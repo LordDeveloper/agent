@@ -436,3 +436,41 @@ async def _async_true() -> bool:
 
 async def _async_none(*_args, **_kwargs) -> None:
     return None
+
+
+def test_route_only_batch_switch_replaces_node_ip_and_clears_it_on_host_return(tmp_path):
+    store, driver = _driver(tmp_path)
+    reconciled = []
+
+    async def sync_egress():
+        iface = await store.get_doc("wireguard", "interface", "1")
+        peer = iface["peers"][0]
+        reconciled.append((peer.get("exit_interface"), peer.get("exit_ipv4")))
+
+    driver._sync_peer_egress = sync_egress
+
+    async def run():
+        await store.open()
+        try:
+            iface = _iface()
+            iface["peers"][0].update(exit_interface="eth0", exit_ipv4="64.49.15.232")
+            await store.put_doc("wireguard", "interface", "1", iface)
+
+            for exit_interface, exit_ipv4 in (("eth0", "1.1.1.1"), ("", "")):
+                result = await driver.batch_peers(1, [{
+                    "id": "p1",
+                    "email": "a@b",
+                    "exit_interface": exit_interface,
+                    "exit_ipv4": exit_ipv4,
+                }])
+                assert result["succeeded"] == 1
+
+            iface = await store.get_doc("wireguard", "interface", "1")
+            assert iface["peers"][0]["private_key"] == "peer-private"
+            assert iface["peers"][0]["address"] == "10.80.0.2"
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+    assert reconciled == [("eth0", "1.1.1.1"), (None, None)]

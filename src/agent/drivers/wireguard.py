@@ -1996,11 +1996,9 @@ class WireGuardDriver(CoreDriver):
                 subnet_before = str(iface.get("subnet") or "")
                 _place_requested_peer_address(iface, list(iface.get("peers") or []), before, merged, payload)
                 subnet_changed = str(iface.get("subnet") or "") != subnet_before
-                if "exit_interface" in payload:
-                    if "exit_interface" in normalized:
-                        merged["exit_interface"] = normalized["exit_interface"]
-                    else:
-                        merged.pop("exit_interface", None)
+                for field in ("exit_interface", "exit_ipv4"):
+                    if field in payload and field not in normalized:
+                        merged.pop(field, None)
                 if any(key in payload for key in ("persistent_keepalive", "PersistentKeepalive", "keepalive")):
                     if "persistent_keepalive" in normalized:
                         merged["persistent_keepalive"] = normalized["persistent_keepalive"]
@@ -2194,11 +2192,9 @@ class WireGuardDriver(CoreDriver):
         merged["private_key"] = before.get("private_key")
         merged["public_key"] = before.get("public_key")
         _place_requested_peer_address(iface or {}, peers or [], before, merged, payload)
-        if "exit_interface" in payload:
-            if "exit_interface" in normalized:
-                merged["exit_interface"] = normalized["exit_interface"]
-            else:
-                merged.pop("exit_interface", None)
+        for field in ("exit_interface", "exit_ipv4"):
+            if field in payload and field not in normalized:
+                merged.pop(field, None)
         keep_stored_identity_fields(merged, before)
         self._preserve_cumulative_counters(merged, before)
         from agent.support.quota import reseed_baseline_if_stale
