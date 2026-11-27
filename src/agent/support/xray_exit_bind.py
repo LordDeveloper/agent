@@ -22,6 +22,175 @@ Runner = Callable[..., Any]
 _INET_RE = re.compile(r"\binet\s+(\d+\.\d+\.\d+\.\d+)")
 
 
+def public_pin_state_path() -> Path:
+    override = os.environ.get("NETINJA_XRAY_PUBLIC_PINS", "").strip()
+    if override:
+        return Path(override)
+    return Path("/var/lib/netinja-agent/xray-public-pins.json")
+
+
+def pins_from_outbounds(outbounds: list[Any]) -> list[dict[str, Any]]:
+    """Public sources already stored on freedom outbounds."""
+    from agent.support.peer_egress import egress_mark, public_exit_ipv4
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for outbound in outbounds:
+        if not isinstance(outbound, dict):
+            continue
+        if str(outbound.get("protocol") or "").lower() != "freedom":
+            continue
+        address = public_exit_ipv4(outbound.get("sendThrough"))
+        if not address or address in seen:
+            continue
+        stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
+        sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
+        try:
+            mark = int(sockopt.get("mark") or 0)
+        except (TypeError, ValueError):
+            mark = 0
+        if mark <= 0:
+            mark = egress_mark(address)
+        seen.add(address)
+        found.append({"ip": address, "mark": mark})
+    return found
+
+
+def load_public_pins(path: Path | None = None) -> list[dict[str, Any]]:
+    file = path or public_pin_state_path()
+    if not file.is_file():
+        return []
+    try:
+        payload = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = payload.get("pins") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return pins_from_outbounds(
+        [
+            {
+                "protocol": "freedom",
+                "sendThrough": row.get("ip"),
+                "streamSettings": {"sockopt": {"mark": row.get("mark")}},
+            }
+            for row in raw
+            if isinstance(row, dict)
+        ]
+    )
+
+
+def save_public_pins(pins: list[dict[str, Any]], path: Path | None = None) -> None:
+    file = path or public_pin_state_path()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    clean = pins_from_outbounds(
+        [
+            {
+                "protocol": "freedom",
+                "sendThrough": row.get("ip"),
+                "streamSettings": {"sockopt": {"mark": row.get("mark")}},
+            }
+            for row in pins
+            if isinstance(row, dict)
+        ]
+    )
+    file.write_text(json.dumps({"pins": clean}, indent=2) + "\n", encoding="utf-8")
+
+
+def remember_public_pins(pins: list[dict[str, Any]], path: Path | None = None) -> None:
+    """Keep pins from one outbound edit without dropping the other nodes."""
+    merged = {str(row["ip"]): row for row in load_public_pins(path)}
+    for row in pins_from_outbounds(
+        [
+            {
+                "protocol": "freedom",
+                "sendThrough": item.get("ip"),
+                "streamSettings": {"sockopt": {"mark": item.get("mark")}},
+            }
+            for item in pins
+            if isinstance(item, dict)
+        ]
+    ):
+        merged[str(row["ip"])] = row
+    save_public_pins(list(merged.values()), path)
+
+
+def public_pin_script_lines(pins: list[dict[str, Any]]) -> list[str]:
+    """Boot snippet: NAT pin plus a from-source route for each saved Xray address."""
+    lines: list[str] = []
+    if not pins:
+        return lines
+    lines.extend(
+        [
+            "if command -v nft >/dev/null 2>&1; then",
+            "  nft add table inet netinja_egress 2>/dev/null || true",
+            "  nft add chain inet netinja_egress srcpin "
+            '"{ type nat hook postrouting priority -10; policy accept; }" 2>/dev/null || true',
+            "  nft flush chain inet netinja_egress srcpin 2>/dev/null || true",
+        ]
+    )
+    for row in pins:
+        address = str(row["ip"])
+        mark = int(row["mark"])
+        lines.append(
+            f'  nft add rule inet netinja_egress srcpin ip saddr {address} '
+            f'accept comment "netinja-pin-{address}" 2>/dev/null || true'
+        )
+        lines.append(
+            f'  nft add rule inet netinja_egress srcpin meta mark {hex(mark)} '
+            f'snat to {address} accept comment "netinja-mark-{mark}" 2>/dev/null || true'
+        )
+    lines.append("fi")
+    for row in pins:
+        address = str(row["ip"])
+        table = table_id_for_source(address)
+        pref = source_rule_pref(address)
+        lines.extend(
+            [
+                f'_src_dev=$(ip -o -4 addr show | awk \'$4 ~ /^{address}\\// {{print $2; exit}}\')',
+                'if [ -n "$_src_dev" ]; then',
+                '  _src_gw=$(ip -4 route show default | awk -v dev="$_src_dev" \'$1=="default" && $2=="via" && index($0, "dev " dev)>0 {print $3; exit}\')',
+                '  if [ -n "$_src_gw" ]; then',
+                f'    ip route replace default via "$_src_gw" dev "$_src_dev" src {address} table {table} 2>/dev/null || true',
+                f'    ip rule del from {address} lookup {table} 2>/dev/null || true',
+                f'    ip rule add from {address} lookup {table} pref {pref} 2>/dev/null || true',
+                "  fi",
+                "fi",
+            ]
+        )
+    return lines
+
+
+async def reapply_config_public_pins(config_path: str | Path | None) -> list[dict[str, Any]]:
+    """Put saved Xray source pins back after an agent restart.
+
+    The nft rules are not part of the Xray config. A package update drops them
+    unless they are installed again from sendThrough on disk.
+    """
+    from agent.support.peer_egress import pin_public_egress
+
+    pins: list[dict[str, Any]] = []
+    path = Path(config_path) if config_path else None
+    if path is not None and path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            pins = pins_from_outbounds(list(payload.get("outbounds") or []))
+    if pins:
+        save_public_pins(pins)
+    else:
+        pins = load_public_pins()
+    for row in pins:
+        await pin_public_egress(str(row["ip"]), int(row["mark"]))
+        try:
+            await ensure_source_address_route(str(row["ip"]))
+        except Exception:
+            continue
+    return pins
+
+
 def bind_state_path() -> Path:
     override = os.environ.get("NETINJA_XRAY_EXIT_BINDS", "").strip()
     if override:

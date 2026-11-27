@@ -871,6 +871,7 @@ def render_apply_script(
     bind_ifaces: list[str] | None = None,
     *,
     masquerade_main_table: bool = False,
+    public_pins: list[dict[str, Any]] | None = None,
 ) -> str:
     """Self-contained shell script so egress survives reboot (wg-quick PostUp / systemd)."""
     lines = [
@@ -1111,6 +1112,9 @@ def render_apply_script(
         from agent.support.xray_exit_bind import script_lines
 
         lines.extend(script_lines(bind_ifaces))
+    from agent.support.xray_exit_bind import load_public_pins, public_pin_script_lines
+
+    lines.extend(public_pin_script_lines(load_public_pins() if public_pins is None else public_pins))
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 

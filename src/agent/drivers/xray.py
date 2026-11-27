@@ -3716,6 +3716,9 @@ class XrayDriver(CoreDriver):
                     await ensure_source_address_route(source)
                 except Exception:
                     _log.exception("failed to route sendThrough %s", source)
+        from agent.support.xray_exit_bind import pins_from_outbounds, remember_public_pins
+
+        remember_public_pins(pins_from_outbounds(outbounds))
 
     async def remove_outbounds(self, tags: list[str]) -> dict[str, Any]:
         return await self._api_call("remove_outbounds", tags)
