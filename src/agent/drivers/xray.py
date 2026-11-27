@@ -3702,10 +3702,16 @@ class XrayDriver(CoreDriver):
                 await ensure_interface_bind_route(iface)
             source = str(outbound.get("sendThrough") or "").strip()
             if source:
-                from agent.support.peer_egress import preserve_public_sources
+                from agent.support.peer_egress import pin_public_egress, preserve_public_sources
                 from agent.support.xray_exit_bind import ensure_source_address_route
 
+                raw_mark = sockopt.get("mark") if isinstance(sockopt, dict) else 0
+                try:
+                    mark = int(raw_mark or 0)
+                except (TypeError, ValueError):
+                    mark = 0
                 await preserve_public_sources([source])
+                await pin_public_egress(source, mark)
                 try:
                     await ensure_source_address_route(source)
                 except Exception:
