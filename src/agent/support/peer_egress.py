@@ -512,95 +512,12 @@ def egress_mark(ip: str) -> int:
 async def pin_public_egress(ip: str, mark: int = 0, *, runner: Runner | None = None) -> None:
     """Stop MASQUERADE from rewriting a node address back to the server primary.
 
-    Runs before the normal srcnat hook. Packets already using the node IP are
-    left alone. Packets marked by that node's Xray outbound are rewritten to it.
+    The pin lives in ``inet netinja_src`` at priority -200. This function never
+    writes the peer NAT table, so a later egress rebuild cannot undo it.
     """
-    address = public_exit_ipv4(ip)
-    if not address:
-        return
-    run = runner or process_run
-    wanted = mark if mark > 0 else egress_mark(address)
-    if shutil.which("nft"):
-        await _nft(run, ["add", "table", "inet", "netinja_egress"])
-        await _nft(
-            run,
-            [
-                "add",
-                "chain",
-                "inet",
-                "netinja_egress",
-                "srcpin",
-                "{ type nat hook postrouting priority -10; policy accept; }",
-            ],
-        )
-        try:
-            listed = await execute(
-                run,
-                ["nft", "-a", "list", "chain", "inet", "netinja_egress", "srcpin"],
-                check=False,
-                timeout=10,
-            )
-            text = str(getattr(listed, "stdout", "") or "")
-        except Exception:
-            text = ""
-        keep = f"netinja-pin-{address}"
-        if keep not in text:
-            await _nft(
-                run,
-                [
-                    "add", "rule", "inet", "netinja_egress", "srcpin",
-                    "ip", "saddr", address, "accept", "comment", keep,
-                ],
-            )
-        stamped = f"netinja-mark-{wanted}"
-        if wanted > 0 and stamped not in text:
-            await _nft(
-                run,
-                [
-                    "add", "rule", "inet", "netinja_egress", "srcpin",
-                    "meta", "mark", hex(wanted),
-                    "snat", "to", address,
-                    "accept",
-                    "comment", stamped,
-                ],
-            )
-        return
-    binary = "iptables" if shutil.which("iptables") else ""
-    if not binary:
-        return
-    keep = f"netinja-pin-{address}"
-    if not await _iptables(
-        run,
-        ["-t", "nat", "-C", "POSTROUTING", "-s", address, "-m", "comment", "--comment", keep, "-j", "ACCEPT"],
-        quiet=True,
-        binary=binary,
-    ):
-        await _iptables(
-            run,
-            ["-t", "nat", "-I", "POSTROUTING", "1", "-s", address, "-m", "comment", "--comment", keep, "-j", "ACCEPT"],
-            binary=binary,
-        )
-    if wanted <= 0:
-        return
-    stamped = f"netinja-mark-{wanted}"
-    if await _iptables(
-        run,
-        [
-            "-t", "nat", "-C", "POSTROUTING", "-m", "mark", "--mark", hex(wanted),
-            "-m", "comment", "--comment", stamped, "-j", "SNAT", "--to-source", address,
-        ],
-        quiet=True,
-        binary=binary,
-    ):
-        return
-    await _iptables(
-        run,
-        [
-            "-t", "nat", "-I", "POSTROUTING", "1", "-m", "mark", "--mark", hex(wanted),
-            "-m", "comment", "--comment", stamped, "-j", "SNAT", "--to-source", address,
-        ],
-        binary=binary,
-    )
+    from agent.support.public_source_pin import remember_address
+
+    await remember_address(ip, mark, runner=runner)
 
 
 _PIN_GENERATION = 1
@@ -642,6 +559,9 @@ async def ensure_peer_source_pins(
     rows = _pin_rows(source)
     run = runner or process_run
     await _install_peer_source_pins(rows, runner=run)
+    from agent.support.public_source_pin import replace_peers
+
+    await replace_peers(rows, runner=run)
     marker = await store.get_doc("network", _STATE_KIND, "pin") or {}
     if int(marker.get("generation") or 0) == _PIN_GENERATION:
         return
@@ -1112,9 +1032,9 @@ def render_apply_script(
         from agent.support.xray_exit_bind import script_lines
 
         lines.extend(script_lines(bind_ifaces))
-    from agent.support.xray_exit_bind import load_public_pins, public_pin_script_lines
-
-    lines.extend(public_pin_script_lines(load_public_pins() if public_pins is None else public_pins))
+    # Additional-IP pins live in inet netinja_src and are restored by
+    # netinja-srcpin.service. This script must not create or flush that table.
+    del public_pins
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 

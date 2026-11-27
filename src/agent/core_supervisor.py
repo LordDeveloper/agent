@@ -96,10 +96,10 @@ async def _refresh_boot_egress(settings, registry, logger: logging.Logger) -> No
     if store is None or not data_dir:
         return
     try:
-        from agent.support.xray_exit_bind import reapply_config_public_pins
+        from agent.support.public_source_pin import rebuild_from_host
 
         xray = getattr(settings, "xray", None)
-        await reapply_config_public_pins(getattr(xray, "config", None))
+        await rebuild_from_host(store, getattr(xray, "config", None))
     except Exception as exc:
         logger.warning("supervisor xray public pin reapply failed: %s", exc)
     try:
