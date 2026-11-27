@@ -106,13 +106,13 @@ def render_script(state: dict[str, Any]) -> str:
         )
         lines.append(
             f'  nft add rule inet {_TABLE} {_CHAIN} meta mark {hex(mark)} '
-            f'snat to {address} accept comment "netinja-src-mark-{mark}"'
+            f'snat ip to {address} comment \'"netinja-src-mark-{mark}"\''
         )
     for row in peers:
         host = row["cidr"].split("/", 1)[0]
         lines.append(
             f'  nft add rule inet {_TABLE} {_CHAIN} ip saddr {row["cidr"]} '
-            f'snat to {row["snat"]} accept comment "netinja-src-peer-{host}"'
+            f'snat ip to {row["snat"]} comment \'"netinja-src-peer-{host}"\''
         )
     # WireGuard/Amnezia/L2TP/OpenVPN are forwarded with a private source.
     # SNAT in an earlier chain is overwritten by MASQUERADE in this one,
@@ -137,8 +137,8 @@ def _masquerade_chain_peer_lines(peers: list[dict[str, str]]) -> list[str]:
         host = row["cidr"].split("/", 1)[0]
         lines.append(
             "    nft insert rule inet netinja_egress postrouting "
-            f'ip saddr {row["cidr"]} snat to {row["snat"]} accept '
-            f'comment "netinja-wgsnat-{host}" 2>/dev/null || true'
+            f'ip saddr {row["cidr"]} snat ip to {row["snat"]} '
+            f'comment \'"netinja-wgsnat-{host}"\' 2>/dev/null || true'
         )
         lines.append(
             f'    conntrack -D -s {host} >/dev/null 2>&1 || true'

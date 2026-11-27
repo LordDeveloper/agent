@@ -12,6 +12,7 @@ from agent.support import record_is_enabled
 from agent.support.disable_reason import explain_disabled
 from agent.support.l2tp_ip import assert_l2tp_address, is_l2tp_host, matching_l2tp_subnet
 from agent.support.peer_diagnose import (
+    _check_peer_snat,
     _iface_link,
     _ip_rules_for_source,
     _issue,
@@ -462,6 +463,8 @@ async def diagnose_user_match(
         )
     elif linked_exit and exit_iface:
         checks.append({'name': 'exit_matches_linked', 'ok': True})
+
+    await _check_peer_snat(runner, cidr, user.get('exit_ipv4'), checks, issues, routing)
 
     if exit_iface:
         exit_link = await _iface_link(runner, exit_iface)

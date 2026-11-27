@@ -249,3 +249,26 @@ def test_diagnose_main_table_checks_nat_and_does_not_call_route_lookup_enough(tm
     assert "NAT_MISSING" in codes
     assert bare["matches"][0]["routing"]["path_verification"]["route_lookup_only"] is False
     assert bare["matches"][0]["routing"]["path_verification"]["scope"] == "firewall_rules"
+
+
+def test_exit_snat_requires_matching_peer_and_destination(monkeypatch):
+    from agent.support.peer_diagnose import _check_peer_snat
+
+    monkeypatch.setattr("agent.support.peer_diagnose.shutil.which", lambda cmd: cmd if cmd == "nft" else None)
+    for listing, expected in (
+        ('oifname "eth0" masquerade', False),
+        ('ip saddr 10.84.81.6 snat ip to 8.8.8.8\nip saddr 10.84.81.7 snat ip to 64.49.15.232', False),
+        ('ip saddr 10.84.81.6 oifname "eth0" snat ip to 64.49.15.232', True),
+    ):
+        checks, issues, routing = [], [], {}
+        asyncio.run(_check_peer_snat(
+            lambda args, **kwargs: _Result(stdout=listing),
+            '10.84.81.6/32',
+            '64.49.15.232',
+            checks,
+            issues,
+            routing,
+        ))
+        assert checks[0]['ok'] is expected
+        assert routing['snat']['present'] is expected
+        assert [issue['code'] for issue in issues] == ([] if expected else ['SNAT_MISSING'])

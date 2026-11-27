@@ -138,7 +138,7 @@ def public_pin_script_lines(pins: list[dict[str, Any]]) -> list[str]:
         )
         lines.append(
             f'  nft add rule inet netinja_egress srcpin meta mark {hex(mark)} '
-            f'snat to {address} accept comment "netinja-mark-{mark}" 2>/dev/null || true'
+            f'snat ip to {address} comment \'"netinja-mark-{mark}"\' 2>/dev/null || true'
         )
     lines.append("fi")
     for row in pins:

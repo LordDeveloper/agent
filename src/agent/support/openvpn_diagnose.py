@@ -13,6 +13,7 @@ from agent.support.openvpn_config import (
 )
 from agent.support.openvpn_ip import assert_openvpn_address
 from agent.support.peer_diagnose import (
+    _check_peer_snat,
     _iface_link,
     _ip_rules_for_source,
     _issue,
@@ -252,6 +253,8 @@ async def diagnose_user_match(
         'tun_interface': tun,
         'tun_link': tun_link,
     }
+
+    await _check_peer_snat(runner, cidr, user.get('exit_ipv4'), checks, issues, routing)
 
     if exit_iface:
         exit_link = await _iface_link(runner, exit_iface)

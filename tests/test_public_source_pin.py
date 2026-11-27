@@ -15,8 +15,8 @@ def test_source_pin_script_is_a_separate_table_at_priority_minus_200():
     assert "nft add table inet netinja_src" in script
     assert "priority -200" in script
     assert "ip saddr 8.8.8.8 accept" in script
-    assert "meta mark 0x51000808 snat to 8.8.8.8 accept" in script
-    assert "ip saddr 10.7.0.2/32 snat to 8.8.8.8 accept" in script
+    assert "meta mark 0x51000808 snat ip to 8.8.8.8" in script
+    assert "ip saddr 10.7.0.2/32 snat ip to 8.8.8.8" in script
     assert "flush set inet netinja_egress pinned" in script
     assert "nft add element inet netinja_egress pinned '{ 8.8.8.8 }'" in script
     assert "flush set inet netinja_egress peer_src" in script
@@ -24,8 +24,8 @@ def test_source_pin_script_is_a_separate_table_at_priority_minus_200():
     assert "flush chain inet netinja_egress" not in script
     assert (
         "nft insert rule inet netinja_egress postrouting "
-        "ip saddr 10.7.0.2/32 snat to 8.8.8.8 accept "
-        'comment "netinja-wgsnat-10.7.0.2"'
+        "ip saddr 10.7.0.2/32 snat ip to 8.8.8.8 "
+        "comment '\"netinja-wgsnat-10.7.0.2\"'"
     ) in script
 
 
@@ -48,6 +48,9 @@ def test_peer_egress_script_does_not_own_the_source_pin_table():
     assert "flush chain inet netinja_src" not in script
     assert "nft flush chain inet netinja_egress srcpin" not in script
     assert "flush set inet netinja_egress pinned" not in script
+    assert 'ip saddr 10.7.0.2/32 snat ip to 8.8.8.8 comment' in script
+    assert 'oifname "eth0" snat ip to 8.8.8.8 comment' in script
+    assert 'snat ip to 8.8.8.8 accept' not in script
     assert 'ip saddr != @pinned ip saddr != @peer_src masquerade' in script
     assert "flush set inet netinja_egress peer_src" not in script
 

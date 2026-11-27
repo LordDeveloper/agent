@@ -14,7 +14,9 @@ from agent.support.disable_reason import explain_disabled
 from agent.asyncutil import gather_independent, maybe_await
 from agent.support.peer_egress import (
     device_from_route_text,
+    nft_has_peer_snat,
     peer_source_cidr,
+    public_exit_ipv4,
     rule_pref_for_addr,
     table_id_for_interface,
 )
@@ -239,6 +241,39 @@ async def _iface_link(runner: Runner | None, name: str) -> dict[str, Any]:
     raw = text_dump.get('stdout', '')
     is_up = 'state UP' in raw or ',UP,' in raw or '<UP,' in raw
     return {'name': name, 'is_up': is_up, 'state': 'UP' if is_up else 'DOWN', 'raw': raw.strip()}
+
+
+async def _check_peer_snat(
+    runner: Runner | None,
+    cidr: str,
+    value: Any,
+    checks: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    routing: dict[str, Any],
+) -> None:
+    address = public_exit_ipv4(value)
+    if not address:
+        return
+
+    found = False
+    if shutil.which('nft'):
+        dump = await _run_cmd(runner, ['nft', 'list', 'ruleset'])
+        found = nft_has_peer_snat(dump['stdout'], cidr, address)
+
+    for binary in ('iptables', 'iptables-legacy'):
+        if found or not shutil.which(binary):
+            continue
+        dump = await _run_cmd(runner, [binary, '-t', 'nat', '-S', 'POSTROUTING'])
+        src = re.escape(cidr.split('/', 1)[0])
+        dst = re.escape(address)
+        pattern = rf"^-A POSTROUTING .*?-s {src}(?:/32)? .*?-j SNAT --to-source {dst}(?:\s|$)"
+        found = re.search(pattern, dump['stdout'], re.MULTILINE) is not None
+
+    routing['exit_ipv4'] = address
+    routing['snat'] = {'source': cidr, 'to': address, 'present': found}
+    checks.append({'name': 'exit_snat', 'ok': found, 'source': cidr, 'to': address})
+    if not found:
+        issues.append(_issue('error', 'SNAT_MISSING', f'No SNAT rule found for {cidr} to {address}'))
 
 
 async def _nat_status(runner: Runner | None, iface: str) -> dict[str, Any]:
@@ -524,6 +559,8 @@ async def diagnose_peer_match(
         'policy_route': None,
         'simulated_egress': None,
     }
+
+    await _check_peer_snat(runner, cidr, peer.get('exit_ipv4'), checks, issues, routing)
 
     if exit_iface:
         exit_link = await _iface_link(runner, exit_iface)

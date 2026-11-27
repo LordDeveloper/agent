@@ -531,7 +531,7 @@ async def pin_public_egress(ip: str, mark: int = 0, *, runner: Runner | None = N
     await remember_address(ip, mark, runner=runner)
 
 
-_PIN_GENERATION = 1
+_PIN_GENERATION = 2
 _PIN_CHAIN = "peersrc"
 
 
@@ -581,6 +581,13 @@ async def ensure_peer_source_pins(
     await store.put_doc("network", _STATE_KIND, "pin", {"generation": _PIN_GENERATION})
 
 
+def nft_has_peer_snat(listing: str, cidr: str, address: str) -> bool:
+    host = re.escape(cidr.split("/", 1)[0])
+    destination = re.escape(address)
+    pattern = rf"\bip saddr {host}(?:/32)?\s[^\n]*?\bsnat (?:ip )?to {destination}(?=\s|$)"
+    return re.search(pattern, listing) is not None
+
+
 async def _install_peer_source_pins(rows: list[dict[str, str]], *, runner: Runner) -> None:
     if shutil.which("nft"):
         await _nft(runner, ["add", "table", "inet", "netinja_egress"])
@@ -601,8 +608,8 @@ async def _install_peer_source_pins(rows: list[dict[str, str]], *, runner: Runne
             text = str(getattr(listed, "stdout", "") or "")
         except Exception:
             text = ""
-        if text.count("snat to") == len(rows) and all(
-            f"saddr {row['cidr']}" in text and f"snat to {row['snat']}" in text for row in rows
+        if len(re.findall(r"\bsnat (?:ip )?to ", text)) == len(rows) and all(
+            nft_has_peer_snat(text, row["cidr"], row["snat"]) for row in rows
         ):
             return
         await _nft(runner, ["flush", "chain", "inet", "netinja_egress", _PIN_CHAIN])
@@ -613,8 +620,7 @@ async def _install_peer_source_pins(rows: list[dict[str, str]], *, runner: Runne
                 [
                     "add", "rule", "inet", "netinja_egress", _PIN_CHAIN,
                     "ip", "saddr", row["cidr"],
-                    "snat", "to", row["snat"],
-                    "accept",
+                    "snat", "ip", "to", row["snat"],
                     "comment", f"netinja-peer-{host}",
                 ],
             )
@@ -1093,13 +1099,13 @@ def _append_nft_snat_shell(lines: list[str], rows: list[dict[str, str]]) -> None
         host = row["cidr"].split("/", 1)[0]
         lines.append(
             f'  nft add rule inet netinja_egress peersrc ip saddr {row["cidr"]} '
-            f'snat to {row["snat"]} accept comment "netinja-peer-{host}" 2>/dev/null || true'
+            f'snat ip to {row["snat"]} comment \'"netinja-peer-{host}"\' 2>/dev/null || true'
         )
     for row in rows:
         comment = f"netinja-src-{row['snat']}"
         lines.append(
             f'  nft add rule inet netinja_egress postrouting ip saddr {row["cidr"]} '
-            f'oifname "{row["iface"]}" snat to {row["snat"]} accept comment "{comment}" 2>/dev/null || true'
+            f'oifname "{row["iface"]}" snat ip to {row["snat"]} comment \'"{comment}"\' 2>/dev/null || true'
         )
         kept.add(row["snat"])
     for ip in sorted(kept | set(_pinned_exit_addresses())):
@@ -3312,9 +3318,9 @@ async def _sync_masquerade_nft(
                 "oifname",
                 iface,
                 "snat",
+                "ip",
                 "to",
                 snat,
-                "accept",
                 "comment",
                 f"netinja-src-{snat}",
             ],
