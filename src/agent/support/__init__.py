@@ -509,6 +509,28 @@ def normalize_peer(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             peer.pop("exit_interface", None)
 
+    if "exit_ipv4" in peer:
+        import ipaddress
+
+        raw_ip = str(peer.get("exit_ipv4") or "").strip()
+        try:
+            parsed = ipaddress.ip_address(raw_ip)
+            public = (
+                parsed.version == 4
+                and not parsed.is_private
+                and not parsed.is_loopback
+                and not parsed.is_multicast
+                and not parsed.is_unspecified
+                and not parsed.is_link_local
+                and not parsed.is_reserved
+            )
+        except ValueError:
+            public = False
+        if public:
+            peer["exit_ipv4"] = str(parsed)
+        else:
+            peer.pop("exit_ipv4", None)
+
     keepalive_aliases = ("persistent_keepalive", "PersistentKeepalive", "keepalive")
     if any(key in payload for key in keepalive_aliases):
         raw = payload.get("persistent_keepalive")

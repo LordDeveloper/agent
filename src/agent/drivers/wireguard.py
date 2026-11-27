@@ -1316,15 +1316,18 @@ def _peer_routing_key(peer: dict[str, Any]) -> tuple[str, str, str] | None:
         return None
     host = cidr.split("/", 1)[0]
     exit_iface = normalize_exit_interface(peer.get("exit_interface")) or ""
+    from agent.support.peer_egress import public_exit_ipv4
+
+    exit_ip = public_exit_ipv4(peer.get("exit_ipv4"))
     linked = str(peer.get("linked_peer_id") or "").strip()
     enabled = record_is_enabled(peer)
     if linked and (not enabled or not exit_iface):
-        return (host, "prohibit", "")
+        return (host, "prohibit", "", "")
     if not enabled:
         return None
     if not exit_iface:
-        return (host, "main", "")
-    return (host, "lookup", exit_iface)
+        return (host, "main", "", exit_ip)
+    return (host, "lookup", exit_iface, exit_ip)
 
 
 def _peer_routing_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
@@ -2024,6 +2027,10 @@ class WireGuardDriver(CoreDriver):
                     await self._sync_peer_egress()
                 else:
                     await self.store.put_doc(self.key, self._kind, str(iface.get("id")), iface)
+                    if "exit_ipv4" in payload or "exit_interface" in payload:
+                        from agent.support.peer_egress import ensure_peer_source_pins
+
+                        await ensure_peer_source_pins(self.store)
                     await self._sync_bandwidth()
                 return merged
         raise AgentError("CLIENT_NOT_FOUND", f"Peer [{peer_id}] not found", 404)
@@ -2372,6 +2379,10 @@ class WireGuardDriver(CoreDriver):
                 )
             elif routing:
                 await self._sync_peer_egress()
+            elif any("exit_ipv4" in raw or "exit_interface" in raw for raw in peers if isinstance(raw, dict)):
+                from agent.support.peer_egress import ensure_peer_source_pins
+
+                await ensure_peer_source_pins(self.store)
         except AgentError:
             await self.store.put_doc(self.key, self._kind, str(previous.get("id")), previous)
             raise

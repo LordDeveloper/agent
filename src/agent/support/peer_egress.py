@@ -603,6 +603,116 @@ async def pin_public_egress(ip: str, mark: int = 0, *, runner: Runner | None = N
     )
 
 
+_PIN_GENERATION = 1
+_PIN_CHAIN = "peersrc"
+
+
+def _pin_rows(rules: list[dict[str, str | int]]) -> list[dict[str, str]]:
+    """Tunnel sources that must leave as a node IP, before any MASQUERADE."""
+    found: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rules:
+        if str(row.get("action") or "lookup") == "prohibit":
+            continue
+        snat = public_exit_ipv4(row.get("snat"))
+        addr = str(row.get("addr") or "").strip()
+        cidr = str(row.get("cidr") or "").strip() or (f"{addr}/32" if addr else "")
+        if not snat or not cidr:
+            continue
+        key = (cidr, snat)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append({"cidr": cidr, "snat": snat, "addr": addr or cidr.split("/", 1)[0]})
+    return found
+
+
+async def ensure_peer_source_pins(
+    store: Store,
+    *,
+    runner: Runner | None = None,
+    rules: list[dict[str, str | int]] | None = None,
+) -> None:
+    """SNAT WireGuard/Amnezia/L2TP/OpenVPN sources before the host MASQUERADE.
+
+    Xray pins itself with a packet mark. These cores keep the tunnel address
+    until postrouting, and a later MASQUERADE puts the server primary back.
+    """
+    source = rules if rules is not None else await all_desired_rules_from_store(store)
+    rows = _pin_rows(source)
+    run = runner or process_run
+    await _install_peer_source_pins(rows, runner=run)
+    marker = await store.get_doc("network", _STATE_KIND, "pin") or {}
+    if int(marker.get("generation") or 0) == _PIN_GENERATION:
+        return
+    for row in rows:
+        await _flush_conntrack(run, str(row.get("addr") or ""))
+    await store.put_doc("network", _STATE_KIND, "pin", {"generation": _PIN_GENERATION})
+
+
+async def _install_peer_source_pins(rows: list[dict[str, str]], *, runner: Runner) -> None:
+    if shutil.which("nft"):
+        await _nft(runner, ["add", "table", "inet", "netinja_egress"])
+        await _nft(
+            runner,
+            [
+                "add", "chain", "inet", "netinja_egress", _PIN_CHAIN,
+                "{ type nat hook postrouting priority -10; policy accept; }",
+            ],
+        )
+        try:
+            listed = await execute(
+                runner,
+                ["nft", "list", "chain", "inet", "netinja_egress", _PIN_CHAIN],
+                check=False,
+                timeout=10,
+            )
+            text = str(getattr(listed, "stdout", "") or "")
+        except Exception:
+            text = ""
+        if text.count("snat to") == len(rows) and all(
+            f"saddr {row['cidr']}" in text and f"snat to {row['snat']}" in text for row in rows
+        ):
+            return
+        await _nft(runner, ["flush", "chain", "inet", "netinja_egress", _PIN_CHAIN])
+        for row in rows:
+            host = str(row.get("addr") or row["cidr"].split("/", 1)[0])
+            await _nft(
+                runner,
+                [
+                    "add", "rule", "inet", "netinja_egress", _PIN_CHAIN,
+                    "ip", "saddr", row["cidr"],
+                    "snat", "to", row["snat"],
+                    "accept",
+                    "comment", f"netinja-peer-{host}",
+                ],
+            )
+        return
+    binary = "iptables" if shutil.which("iptables") else ""
+    if not binary:
+        return
+    for row in rows:
+        comment = f"netinja-peer-{row.get('addr') or row['cidr'].split('/', 1)[0]}"
+        if await _iptables(
+            runner,
+            [
+                "-t", "nat", "-C", "POSTROUTING", "-s", row["cidr"],
+                "-m", "comment", "--comment", comment, "-j", "SNAT", "--to-source", row["snat"],
+            ],
+            quiet=True,
+            binary=binary,
+        ):
+            continue
+        await _iptables(
+            runner,
+            [
+                "-t", "nat", "-I", "POSTROUTING", "1", "-s", row["cidr"],
+                "-m", "comment", "--comment", comment, "-j", "SNAT", "--to-source", row["snat"],
+            ],
+            binary=binary,
+        )
+
+
 def _with_snat(row: dict[str, str | int], snat: str) -> dict[str, str | int]:
     if snat:
         row["snat"] = snat
@@ -914,6 +1024,9 @@ def render_apply_script(
             "  nft add table inet netinja_egress 2>/dev/null || true",
             "  nft add chain inet netinja_egress postrouting "
             '"{ type nat hook postrouting priority srcnat; policy accept; }" 2>/dev/null || true',
+            "  nft add chain inet netinja_egress peersrc "
+            '"{ type nat hook postrouting priority -10; policy accept; }" 2>/dev/null || true',
+            "  nft flush chain inet netinja_egress peersrc 2>/dev/null || true",
             "  nft add chain inet netinja_egress forward "
             '"{ type filter hook forward priority filter; policy accept; }" 2>/dev/null || true',
             "  nft flush chain inet netinja_egress postrouting 2>/dev/null || true",
@@ -1023,8 +1136,18 @@ def _snat_rows(rules: list[dict[str, str | int]]) -> list[dict[str, str]]:
 
 
 def _append_nft_snat_shell(lines: list[str], rows: list[dict[str, str]]) -> None:
-    """SNAT each peer to its node IP before the interface MASQUERADE."""
+    """SNAT each peer to its node IP before the interface MASQUERADE.
+
+    peersrc runs before the normal srcnat hook, so a host MASQUERADE cannot
+    put the server primary back on WireGuard, Amnezia, L2TP, or OpenVPN.
+    """
     kept: set[str] = set()
+    for row in rows:
+        host = row["cidr"].split("/", 1)[0]
+        lines.append(
+            f'  nft add rule inet netinja_egress peersrc ip saddr {row["cidr"]} '
+            f'snat to {row["snat"]} accept comment "netinja-peer-{host}" 2>/dev/null || true'
+        )
     for row in rows:
         comment = f"netinja-src-{row['snat']}"
         lines.append(
@@ -1399,6 +1522,10 @@ async def apply_l2tp_user_egress(
             drop_addrs=set(drop) | {str(row["addr"]) for row in applied},
             retain_addrs=set(deferred),
         )
+    try:
+        await ensure_peer_source_pins(store, runner=runner)
+    except Exception:
+        log.exception("peer source pin failed")
     return {
         "ok": True,
         "applied": len(applied),
@@ -1687,6 +1814,7 @@ async def reconcile_core_egress(
             "iface": str(row.get("iface") or ""),
             "cidr": peer_source_cidr(row.get("addr")) or f"{row.get('addr')}/32",
             "action": str(row.get("action") or "lookup"),
+            "snat": public_exit_ipv4(row.get("snat")),
         }
         for row in prev_rules
         if str(row.get("addr") or "").strip()
@@ -1976,6 +2104,10 @@ async def reconcile_core_egress(
         cache.counts["route_replace"],
         cache.counts["sysctl_write"],
     )
+    try:
+        await ensure_peer_source_pins(store, runner=runner)
+    except Exception:
+        log.exception("peer source pin failed")
     try:
         await reapply_saved_binds(runner=runner)
     except Exception:

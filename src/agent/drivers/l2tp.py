@@ -170,12 +170,13 @@ class _UserEgressTouch:
         self.remove = remove
 
 
-def _egress_fingerprint(user: dict[str, Any]) -> tuple[str, str, bool, str]:
+def _egress_fingerprint(user: dict[str, Any]) -> tuple[str, str, bool, str, str]:
     return (
         _l2tp_host(user.get('address')),
         str(user.get('exit_interface') or ''),
         bool(record_is_enabled(user)),
         str(user.get('linked_peer_id') or ''),
+        str(user.get('exit_ipv4') or ''),
     )
 
 
