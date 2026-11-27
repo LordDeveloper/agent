@@ -87,7 +87,13 @@ _MASQ_COMMENT_PREFIX = "netinja-egress-"
 # rule cannot rewrite an additional IP back to the server primary. The set is
 # filled by public_source_pin and must survive chain flushes.
 _PINNED_SET = "pinned"
-_PINNED_MATCH = ("ip", "saddr", "!=", f"@{_PINNED_SET}")
+# Tunnel addresses that are translated to a node IP. MASQUERADE must not match
+# them, or it replaces that translation with the primary address of the NIC.
+_PEER_SET = "peer_src"
+_PINNED_MATCH = (
+    "ip", "saddr", "!=", f"@{_PINNED_SET}",
+    "ip", "saddr", "!=", f"@{_PEER_SET}",
+)
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
 _SYSCTL_DROPIN = Path("/etc/sysctl.d/99-netinja-peer-egress.conf")
@@ -956,6 +962,7 @@ def render_apply_script(
             "  nft add chain inet netinja_egress forward "
             '"{ type filter hook forward priority filter; policy accept; }" 2>/dev/null || true',
             "  nft add set inet netinja_egress pinned '{ type ipv4_addr; }' 2>/dev/null || true",
+            "  nft add set inet netinja_egress peer_src '{ type ipv4_addr; }' 2>/dev/null || true",
             "  nft flush chain inet netinja_egress postrouting 2>/dev/null || true",
             "  nft flush chain inet netinja_egress forward 2>/dev/null || true",
         ]
@@ -965,7 +972,8 @@ def render_apply_script(
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
         lines.append(
             f'  nft add rule inet netinja_egress postrouting oifname "{iface}" '
-            f'ip saddr != @{_PINNED_SET} masquerade comment "{comment}" 2>/dev/null || true'
+            f'ip saddr != @{_PINNED_SET} ip saddr != @{_PEER_SET} '
+            f'masquerade comment "{comment}" 2>/dev/null || true'
         )
         lines.append(
             f'  nft add rule inet netinja_egress forward oifname "{iface}" '
@@ -1144,13 +1152,13 @@ def _append_main_table_nft_shell(lines: list[str], tunnels: list[str]) -> None:
             match = _nft_iface_match(tunnel)
             lines.append(
                 f'    nft add rule inet netinja_egress postrouting iifname "{match}" '
-                'oifname "$_main_dev" ip saddr != @pinned masquerade '
+                'oifname "$_main_dev" ip saddr != @pinned ip saddr != @peer_src masquerade '
                 'comment "$_main_comment" 2>/dev/null || true'
             )
     else:
         lines.append(
             '    nft add rule inet netinja_egress postrouting oifname "$_main_dev" '
-            'ip saddr != @pinned masquerade comment "$_main_comment" 2>/dev/null || true'
+            'ip saddr != @pinned ip saddr != @peer_src masquerade comment "$_main_comment" 2>/dev/null || true'
         )
     lines.extend(
         [
@@ -3254,6 +3262,10 @@ async def _sync_masquerade_nft(
     await _nft(
         runner,
         ["add", "set", "inet", "netinja_egress", _PINNED_SET, "{ type ipv4_addr; }"],
+    )
+    await _nft(
+        runner,
+        ["add", "set", "inet", "netinja_egress", _PEER_SET, "{ type ipv4_addr; }"],
     )
     await _nft(
         runner,

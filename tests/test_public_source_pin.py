@@ -19,6 +19,8 @@ def test_source_pin_script_is_a_separate_table_at_priority_minus_200():
     assert "ip saddr 10.7.0.2/32 snat to 8.8.8.8 accept" in script
     assert "flush set inet netinja_egress pinned" in script
     assert "nft add element inet netinja_egress pinned '{ 8.8.8.8 }'" in script
+    assert "flush set inet netinja_egress peer_src" in script
+    assert "nft add element inet netinja_egress peer_src '{ 10.7.0.2 }'" in script
     assert "flush chain inet netinja_egress" not in script
     assert (
         "nft insert rule inet netinja_egress postrouting "
@@ -46,14 +48,15 @@ def test_peer_egress_script_does_not_own_the_source_pin_table():
     assert "flush chain inet netinja_src" not in script
     assert "nft flush chain inet netinja_egress srcpin" not in script
     assert "flush set inet netinja_egress pinned" not in script
-    assert 'ip saddr != @pinned masquerade' in script
+    assert 'ip saddr != @pinned ip saddr != @peer_src masquerade' in script
+    assert "flush set inet netinja_egress peer_src" not in script
 
 
 def test_existing_masquerade_is_rewritten_to_skip_pinned_sources():
     listing = """
     chain postrouting {
-        oifname "eth0" masquerade comment "netinja-egress-eth0" # handle 7
-        iifname "wg0" oifname "eth0" ip saddr != @pinned masquerade comment "kept" # handle 8
+        oifname "eth0" ip saddr != @pinned masquerade comment "netinja-egress-eth0" # handle 7
+        iifname "wg0" oifname "eth0" ip saddr != @pinned ip saddr != @peer_src masquerade comment "kept" # handle 8
     }
     """
     rewrites = masquerade_rewrites(listing)
@@ -61,5 +64,6 @@ def test_existing_masquerade_is_rewritten_to_skip_pinned_sources():
     handle, args = rewrites[0]
     assert handle == "7"
     assert args[args.index("oifname") + 1] == "eth0"
-    assert args[args.index("!=") + 1] == "@pinned"
+    assert args[args.index("@pinned") - 1] == "!="
+    assert "@peer_src" in args
     assert "masquerade" in args
