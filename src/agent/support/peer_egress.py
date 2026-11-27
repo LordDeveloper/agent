@@ -83,6 +83,11 @@ _STATE_ID = "applied"
 _IFACE_KIND = "interface"
 _NFT_CHAIN = "postrouting"
 _MASQ_COMMENT_PREFIX = "netinja-egress-"
+# Named set in inet netinja_egress. Masquerade skips these sources so a later
+# rule cannot rewrite an additional IP back to the server primary. The set is
+# filled by public_source_pin and must survive chain flushes.
+_PINNED_SET = "pinned"
+_PINNED_MATCH = ("ip", "saddr", "!=", f"@{_PINNED_SET}")
 _UNIT_NAME = "agent-peer-egress.service"
 _UNIT_PATH = Path("/etc/systemd/system") / _UNIT_NAME
 _SYSCTL_DROPIN = Path("/etc/sysctl.d/99-netinja-peer-egress.conf")
@@ -950,6 +955,7 @@ def render_apply_script(
             "  nft flush chain inet netinja_egress peersrc 2>/dev/null || true",
             "  nft add chain inet netinja_egress forward "
             '"{ type filter hook forward priority filter; policy accept; }" 2>/dev/null || true',
+            "  nft add set inet netinja_egress pinned '{ type ipv4_addr; }' 2>/dev/null || true",
             "  nft flush chain inet netinja_egress postrouting 2>/dev/null || true",
             "  nft flush chain inet netinja_egress forward 2>/dev/null || true",
         ]
@@ -959,7 +965,7 @@ def render_apply_script(
         comment = f"{_MASQ_COMMENT_PREFIX}{iface}"
         lines.append(
             f'  nft add rule inet netinja_egress postrouting oifname "{iface}" '
-            f'masquerade comment "{comment}" 2>/dev/null || true'
+            f'ip saddr != @{_PINNED_SET} masquerade comment "{comment}" 2>/dev/null || true'
         )
         lines.append(
             f'  nft add rule inet netinja_egress forward oifname "{iface}" '
@@ -1059,6 +1065,15 @@ def _snat_rows(rules: list[dict[str, str | int]]) -> list[dict[str, str]]:
     return found
 
 
+def _pinned_exit_addresses() -> list[str]:
+    """Additional public IPs that MASQUERADE must leave unchanged."""
+    try:
+        from agent.support.public_source_pin import load_state
+    except Exception:
+        return []
+    return [str(row["ip"]) for row in load_state().get("addresses") or [] if row.get("ip")]
+
+
 def _append_nft_snat_shell(lines: list[str], rows: list[dict[str, str]]) -> None:
     """SNAT each peer to its node IP before the interface MASQUERADE.
 
@@ -1079,7 +1094,7 @@ def _append_nft_snat_shell(lines: list[str], rows: list[dict[str, str]]) -> None
             f'oifname "{row["iface"]}" snat to {row["snat"]} accept comment "{comment}" 2>/dev/null || true'
         )
         kept.add(row["snat"])
-    for ip in sorted(kept):
+    for ip in sorted(kept | set(_pinned_exit_addresses())):
         lines.append(
             f'  nft add rule inet netinja_egress postrouting ip saddr {ip} '
             f'accept comment "netinja-keep-{ip}" 2>/dev/null || true'
@@ -1129,12 +1144,13 @@ def _append_main_table_nft_shell(lines: list[str], tunnels: list[str]) -> None:
             match = _nft_iface_match(tunnel)
             lines.append(
                 f'    nft add rule inet netinja_egress postrouting iifname "{match}" '
-                'oifname "$_main_dev" masquerade comment "$_main_comment" 2>/dev/null || true'
+                'oifname "$_main_dev" ip saddr != @pinned masquerade '
+                'comment "$_main_comment" 2>/dev/null || true'
             )
     else:
         lines.append(
             '    nft add rule inet netinja_egress postrouting oifname "$_main_dev" '
-            'masquerade comment "$_main_comment" 2>/dev/null || true'
+            'ip saddr != @pinned masquerade comment "$_main_comment" 2>/dev/null || true'
         )
     lines.extend(
         [
@@ -3237,6 +3253,10 @@ async def _sync_masquerade_nft(
     await _nft(runner, ["add", "table", "inet", "netinja_egress"])
     await _nft(
         runner,
+        ["add", "set", "inet", "netinja_egress", _PINNED_SET, "{ type ipv4_addr; }"],
+    )
+    await _nft(
+        runner,
         [
             "add",
             "chain",
@@ -3288,7 +3308,7 @@ async def _sync_masquerade_nft(
             ],
         )
         kept_sources.add(snat)
-    for ip in sorted(kept_sources):
+    for ip in sorted(kept_sources | set(_pinned_exit_addresses())):
         await _nft(
             runner,
             [
@@ -3322,6 +3342,7 @@ async def _sync_masquerade_nft(
                         _nft_iface_match(tunnel),
                         "oifname",
                         iface,
+                        *_PINNED_MATCH,
                         "masquerade",
                         "comment",
                         f"{_MASQ_COMMENT_PREFIX}{iface}",
@@ -3338,6 +3359,7 @@ async def _sync_masquerade_nft(
                     _NFT_CHAIN,
                     "oifname",
                     iface,
+                    *_PINNED_MATCH,
                     "masquerade",
                     "comment",
                     f"{_MASQ_COMMENT_PREFIX}{iface}",
