@@ -218,9 +218,6 @@ class ProxyProtocolForwarderManager:
         try:
             self._proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
                 start_new_session=True,
             )
         except OSError as exc:
@@ -230,10 +227,7 @@ class ProxyProtocolForwarderManager:
 
         time.sleep(0.05)
         if self._proc.poll() is not None:
-            output = ""
-            if self._proc.stdout is not None:
-                output = self._proc.stdout.read() or ""
-            log.warning("pp-forward exited early code=%s output=%s", self._proc.returncode, output.strip())
+            log.warning("pp-forward exited early code=%s", self._proc.returncode)
             self._proc = None
             return
 
